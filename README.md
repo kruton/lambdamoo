@@ -1,5 +1,14 @@
 # LambdaMOO Server
 
+> [!CAUTION]
+>
+> This is the 'dev' branch, as in development.  Meaning if
+> totally latest bleeding edge is what you need, then fine.
+> But you probably want to checkout the 'main' branch instead.
+>
+> Also, this branch gets rebased __a lot__.
+> Expect surprises if you fork from here.
+
 This is the source for the latest version of the LambdaMOO server.
 
 Please consult [the ChangeLog](./ChangeLog.txt) for the full list
