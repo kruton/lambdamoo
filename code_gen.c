@@ -55,6 +55,8 @@ struct gstate {
     Var *literals;
     unsigned num_fork_vectors, max_fork_vectors;
     Bytecodes *fork_vectors;
+    unsigned num_resume_points, max_resume_points;
+    ResumePoint *resume_points;
 };
 typedef struct gstate GState;
 
@@ -82,12 +84,18 @@ struct state {
     unsigned try_depth;
 #endif				/* BYTECODE_REDUCE_REF */
     unsigned cur_stack, max_stack;
+    unsigned max_stack_slots;
+    ResumeStackSlot *stack_slots;
     unsigned saved_stack;
     unsigned num_loops, max_loops;
     Loop *loops;
+    unsigned code_unit;
+    int vector;
     GState *gstate;
 };
 typedef struct state State;
+
+#define UNBOUND_RESUME_VECTOR -2
 
 #ifdef BYTECODE_REDUCE_REF
 #define INCR_TRY_DEPTH(SSS)	(++(SSS)->try_depth)
@@ -112,19 +120,29 @@ init_gstate(GState * gstate)
     gstate->max_literals = gstate->max_fork_vectors = 0;
     gstate->fork_vectors = 0;
     gstate->literals = 0;
+    gstate->num_resume_points = gstate->max_resume_points = 0;
+    gstate->resume_points = 0;
 }
 
 static void
 free_gstate(GState gstate)
 {
+    unsigned i;
+
     if (gstate.literals)
 	myfree(gstate.literals, M_CODE_GEN);
     if (gstate.fork_vectors)
 	myfree(gstate.fork_vectors, M_CODE_GEN);
+
+    for (i = 0; i < gstate.num_resume_points; i++)
+	if (gstate.resume_points[i].stack_slots)
+	    myfree(gstate.resume_points[i].stack_slots, M_PROGRAM);
+    if (gstate.resume_points)
+	myfree(gstate.resume_points, M_CODE_GEN);
 }
 
 static void
-init_state(State * state, GState * gstate)
+init_state(State * state, GState * gstate, unsigned code_unit, int vector)
 {
     state->num_literals = state->num_forks = state->num_labels = 0;
     state->num_var_refs = state->num_stacks = 0;
@@ -145,13 +163,72 @@ init_state(State * state, GState * gstate)
 #endif				/* BYTECODE_REDUCE_REF */
 
     state->cur_stack = state->max_stack = 0;
+    state->max_stack_slots = 16;
+    state->stack_slots = mymalloc(sizeof(ResumeStackSlot)
+				  * state->max_stack_slots, M_CODE_GEN);
     state->saved_stack = UINT_MAX;
 
     state->num_loops = 0;
     state->max_loops = 5;
     state->loops = mymalloc(sizeof(Loop) * state->max_loops, M_CODE_GEN);
 
+    state->code_unit = code_unit;
+    state->vector = vector;
     state->gstate = gstate;
+}
+
+static void
+add_resume_point(State * state, unsigned pc, unsigned error_pc,
+		 unsigned stack_depth, ResumePointKind kind, unsigned site)
+{
+    GState *gstate = state->gstate;
+    ResumePoint *point;
+    unsigned i;
+
+    if (gstate->num_resume_points == gstate->max_resume_points) {
+	unsigned new_max = gstate->max_resume_points == 0
+	    ? 16 : 2 * gstate->max_resume_points;
+	ResumePoint *new_points = mymalloc(sizeof(ResumePoint) * new_max,
+					   M_CODE_GEN);
+	for (i = 0; i < gstate->num_resume_points; i++)
+	    new_points[i] = gstate->resume_points[i];
+	if (gstate->resume_points)
+	    myfree(gstate->resume_points, M_CODE_GEN);
+	gstate->resume_points = new_points;
+	gstate->max_resume_points = new_max;
+    }
+
+    /* This encounter order is the persistent RESUME_SCHEMA 1 contract. */
+    point = &gstate->resume_points[gstate->num_resume_points++];
+    point->key.code_unit = state->code_unit;
+    point->key.site = site;
+    point->vector = state->vector;
+    point->pc = pc;
+    point->error_pc = error_pc;
+    point->stack_depth = stack_depth;
+    point->flags = RESUME_PRESERVE_TEMP;
+    point->kind = kind;
+    point->frame_slots = 1;	/* The canonical assignment temporary. */
+    point->stack_slots = stack_depth
+	? mymalloc(sizeof(ResumeStackSlot) * stack_depth, M_PROGRAM) : 0;
+    for (i = 0; i < stack_depth; i++) {
+	point->stack_slots[i] = state->stack_slots[i];
+	if (point->stack_slots[i].kind == RSS_VALUE)
+	    point->frame_slots++;
+    }
+}
+
+static void
+bind_resume_points(GState * gstate, unsigned code_unit, int vector)
+{
+    unsigned i;
+
+    for (i = 0; i < gstate->num_resume_points; i++)
+	if (gstate->resume_points[i].key.code_unit == code_unit) {
+	    if (gstate->resume_points[i].vector != UNBOUND_RESUME_VECTOR)
+		panic("ResumePoint code unit bound more than once");
+	    gstate->resume_points[i].vector = vector;
+	}
 }
 
 static void
@@ -159,6 +236,7 @@ free_state(State state)
 {
     myfree(state.fixups, M_CODE_GEN);
     myfree(state.bytes, M_BYTECODES);
+    myfree(state.stack_slots, M_CODE_GEN);
 #ifdef BYTECODE_REDUCE_REF
     myfree(state.pushmap, M_BYTECODES);
     myfree(state.trymap, M_BYTECODES);
@@ -288,7 +366,7 @@ add_literal(Var v, State * state)
 	state->max_literal = i;
 }
 
-static void
+static unsigned
 add_fork(Bytecodes b, State * state)
 {
     unsigned i;
@@ -315,6 +393,8 @@ add_fork(Bytecodes b, State * state)
     state->num_forks++;
     if (i > state->max_fork)
 	state->max_fork = i;
+
+    return i;
 }
 
 static void
@@ -415,11 +495,26 @@ add_stack_ref(unsigned index, State * state)
 }
 
 static void
-push_stack(unsigned n, State * state)
+push_stack_slot(ResumeStackSlotKind kind, unsigned data, State * state)
 {
-    state->cur_stack += n;
+    if (state->cur_stack == state->max_stack_slots) {
+	state->max_stack_slots *= 2;
+	state->stack_slots = myrealloc(state->stack_slots,
+				       sizeof(ResumeStackSlot)
+				       * state->max_stack_slots, M_CODE_GEN);
+    }
+    state->stack_slots[state->cur_stack].kind = kind;
+    state->stack_slots[state->cur_stack].data = data;
+    state->cur_stack++;
     if (state->cur_stack > state->max_stack)
 	state->max_stack = state->cur_stack;
+}
+
+static void
+push_stack(unsigned n, State * state)
+{
+    while (n--)
+	push_stack_slot(RSS_VALUE, 0, state);
 }
 
 static void
@@ -788,12 +883,20 @@ generate_expr(Expr * expr, State * state)
 	generate_arg_list(expr->e.call.args, state);
 	emit_byte(OP_BI_FUNC_CALL, state);
 	emit_byte(expr->e.call.func, state);
+	if (state->cur_stack == 0)
+	    panic("Bad built-in stack depth in GENERATE_EXPR()");
+	add_resume_point(state, state->num_bytes, state->num_bytes - 2,
+			 state->cur_stack - 1, RP_BUILTIN, expr->e.call.resume_site);
 	break;
     case EXPR_VERB:
 	generate_expr(expr->e.verb.obj, state);
 	generate_expr(expr->e.verb.verb, state);
 	generate_arg_list(expr->e.verb.args, state);
 	emit_call_verb_op(OP_CALL_VERB, state);
+	if (state->cur_stack < 3)
+	    panic("Bad verb-call stack depth in GENERATE_EXPR()");
+	add_resume_point(state, state->num_bytes, state->num_bytes - 1,
+			 state->cur_stack - 3, RP_CALL, expr->e.verb.resume_site);
 	pop_stack(2, state);
 	break;
     case EXPR_COND:
@@ -902,9 +1005,9 @@ generate_expr(Expr * expr, State * state)
 	    generate_codes(expr->e.catch.codes, state);
 	    emit_extended_byte(EOP_PUSH_LABEL, state);
 	    handler_label = add_label(state);
-	    push_stack(1, state);
+	    push_stack_slot(RSS_HANDLER_PC, handler_label, state);
 	    emit_extended_byte(EOP_CATCH, state);
-	    push_stack(1, state);
+	    push_stack_slot(RSS_CATCH, 1, state);
 	    INCR_TRY_DEPTH(state);
 	    generate_expr(expr->e.expr, state);
 	    DECR_TRY_DEPTH(state);
@@ -933,7 +1036,7 @@ generate_expr(Expr * expr, State * state)
     }
 }
 
-static Bytecodes stmt_to_code(Stmt *, GState *);
+static Bytecodes stmt_to_code(Stmt *, GState *, unsigned, int);
 
 static void
 generate_stmt(Stmt * stmt, State * state)
@@ -1033,15 +1136,25 @@ generate_stmt(Stmt * stmt, State * state)
 	    }
 	    break;
 	case STMT_FORK:
-	    generate_expr(stmt->s.fork.time, state);
-	    if (stmt->s.fork.id >= 0)
-		emit_byte(OP_FORK_WITH_ID, state);
-	    else
-		emit_byte(OP_FORK, state);
-	    add_fork(stmt_to_code(stmt->s.fork.body, state->gstate), state);
-	    if (stmt->s.fork.id >= 0)
-		add_var_ref(stmt->s.fork.id, state);
-	    pop_stack(1, state);
+	    {
+		Bytecodes fork_code;
+		unsigned code_unit, fork_index;
+
+		generate_expr(stmt->s.fork.time, state);
+		if (stmt->s.fork.id >= 0)
+		    emit_byte(OP_FORK_WITH_ID, state);
+		else
+		    emit_byte(OP_FORK, state);
+		/* Fork code-unit preorder is part of RESUME_SCHEMA 1. */
+		code_unit = stmt->s.fork.code_unit;
+		fork_code = stmt_to_code(stmt->s.fork.body, state->gstate,
+					 code_unit, UNBOUND_RESUME_VECTOR);
+		fork_index = add_fork(fork_code, state);
+		bind_resume_points(state->gstate, code_unit, fork_index);
+		if (stmt->s.fork.id >= 0)
+		    add_var_ref(stmt->s.fork.id, state);
+		pop_stack(1, state);
+	    }
 	    break;
 	case STMT_EXPR:
 	    generate_expr(stmt->s.expr, state);
@@ -1065,12 +1178,12 @@ generate_stmt(Stmt * stmt, State * state)
 		    generate_codes(ex->codes, state);
 		    emit_extended_byte(EOP_PUSH_LABEL, state);
 		    ex->label = add_label(state);
-		    push_stack(1, state);
+		    push_stack_slot(RSS_HANDLER_PC, ex->label, state);
 		    arm_count++;
 		}
 		emit_extended_byte(EOP_TRY_EXCEPT, state);
 		emit_byte(arm_count, state);
-		push_stack(1, state);
+		push_stack_slot(RSS_CATCH, arm_count, state);
 		INCR_TRY_DEPTH(state);
 		generate_stmt(stmt->s.catch.body, state);
 		DECR_TRY_DEPTH(state);
@@ -1099,7 +1212,7 @@ generate_stmt(Stmt * stmt, State * state)
 
 		emit_extended_byte(EOP_TRY_FINALLY, state);
 		handler_label = add_label(state);
-		push_stack(1, state);
+		push_stack_slot(RSS_FINALLY, handler_label, state);
 		INCR_TRY_DEPTH(state);
 		generate_stmt(stmt->s.finally.body, state);
 		DECR_TRY_DEPTH(state);
@@ -1168,6 +1281,67 @@ ref_size(unsigned rmax)
 	return 4;
 }
 
+static unsigned
+fixup_width(enum fixup_kind kind, Bytecodes bc)
+{
+    switch (kind) {
+    case FIXUP_LITERAL:
+	return bc.numbytes_literal;
+    case FIXUP_FORK:
+	return bc.numbytes_fork;
+    case FIXUP_VAR_REF:
+	return bc.numbytes_var_name;
+    case FIXUP_STACK:
+	return bc.numbytes_stack;
+    case FIXUP_LABEL:
+	return bc.numbytes_label;
+    default:
+	panic("Can't happen in FIXUP_WIDTH()");
+    }
+}
+
+static unsigned
+expanded_pc(State * state, Bytecodes bc, unsigned pc)
+{
+    Fixup *fixup;
+    unsigned i, result = pc;
+
+    for (fixup = state->fixups, i = 0; i < state->num_fixups; i++, fixup++) {
+	if (fixup->pc >= pc)
+	    continue;
+
+	result += fixup_width(fixup->kind, bc) - 1;
+    }
+
+    return result;
+}
+
+static void
+relocate_resume_points(State * state, Bytecodes bc)
+{
+    GState *gstate = state->gstate;
+    unsigned i, j;
+
+    for (i = 0; i < gstate->num_resume_points; i++)
+	if (gstate->resume_points[i].key.code_unit == state->code_unit) {
+	    ResumePoint *point = &gstate->resume_points[i];
+
+	    point->pc = expanded_pc(state, bc, point->pc);
+	    point->error_pc = expanded_pc(state, bc, point->error_pc);
+	    for (j = 0; j < point->stack_depth; j++)
+		if (point->stack_slots[j].kind == RSS_HANDLER_PC
+		    || point->stack_slots[j].kind == RSS_FINALLY) {
+		    unsigned label = point->stack_slots[j].data;
+
+		    if (label >= state->num_fixups
+			|| state->fixups[label].kind != FIXUP_LABEL)
+			panic("Bad handler label in RELOCATE_RESUME_POINTS()");
+		    point->stack_slots[j].data =
+			expanded_pc(state, bc, state->fixups[label].value);
+		}
+	}
+}
+
 #ifdef BYTECODE_REDUCE_REF
 static int
 bbd_cmp(int *a, int *b)
@@ -1177,7 +1351,7 @@ bbd_cmp(int *a, int *b)
 #endif				/* BYTECODE_REDUCE_REF */
 
 static Bytecodes
-stmt_to_code(Stmt * stmt, GState * gstate)
+stmt_to_code(Stmt * stmt, GState * gstate, unsigned code_unit, int vector)
 {
     State state;
     Bytecodes bc;
@@ -1191,7 +1365,7 @@ stmt_to_code(Stmt * stmt, GState * gstate)
 #endif				/* BYTECODE_REDUCE_REF */
     Fixup *fixup;
 
-    init_state(&state, gstate);
+    init_state(&state, gstate, code_unit, vector);
 
     generate_stmt(stmt, &state);
     emit_ending_op(OP_DONE, &state);
@@ -1306,33 +1480,16 @@ stmt_to_code(Stmt * stmt, GState * gstate)
      * Not so in the previous loop. */
     for (old_i = new_i = 0; (unsigned)old_i < state.num_bytes; old_i++) {
 	if ((unsigned)fix_i < state.num_fixups && fixup->pc == (unsigned)old_i) {
-	    unsigned value, size = 0;	/* initialized to silence warning */
+	    unsigned value, size;
 
 	    value = fixup->value;
-	    switch (fixup->kind) {
-	    case FIXUP_LITERAL:
-		size = bc.numbytes_literal;
-		break;
-	    case FIXUP_FORK:
-		size = bc.numbytes_fork;
-		break;
-	    case FIXUP_VAR_REF:
-		size = bc.numbytes_var_name;
-		break;
-	    case FIXUP_STACK:
-		size = bc.numbytes_stack;
-		break;
-	    case FIXUP_LABEL:
+	    if (fixup->kind == FIXUP_LABEL)
 		value += fixup->prev_literals * (bc.numbytes_literal - 1)
 		    + fixup->prev_forks * (bc.numbytes_fork - 1)
 		    + fixup->prev_var_refs * (bc.numbytes_var_name - 1)
 		    + fixup->prev_labels * (bc.numbytes_label - 1)
 		    + fixup->prev_stacks * (bc.numbytes_stack - 1);
-		size = bc.numbytes_label;
-		break;
-	    default:
-		panic("Can't happen #1 in STMT_TO_CODE()");
-	    }
+	    size = fixup_width(fixup->kind, bc);
 
 	    switch (size) {
 	    case 4:
@@ -1355,6 +1512,8 @@ stmt_to_code(Stmt * stmt, GState * gstate)
 	    bc.vector[new_i++] = state.bytes[old_i];
     }
 
+    relocate_resume_points(&state, bc);
+
     free_state(state);
 
     return bc;
@@ -1366,9 +1525,10 @@ generate_code(Stmt * stmt, DB_Version version)
     Program *prog = new_program();
     GState gstate;
 
+    assign_resume_ids(stmt);
     init_gstate(&gstate);
 
-    prog->main_vector = stmt_to_code(stmt, &gstate);
+    prog->main_vector = stmt_to_code(stmt, &gstate, 0, MAIN_VECTOR);
     prog->version = version;
 
     if (gstate.literals) {
@@ -1398,7 +1558,26 @@ generate_code(Stmt * stmt, DB_Version version)
 	prog->fork_vectors_size = 0;
     }
 
+    if (gstate.resume_points) {
+	unsigned i;
+
+	prog->resume_points =
+	    mymalloc(sizeof(ResumePoint) * gstate.num_resume_points,
+		     M_PROGRAM);
+	prog->num_resume_points = gstate.num_resume_points;
+	for (i = 0; i < gstate.num_resume_points; i++) {
+	    prog->resume_points[i] = gstate.resume_points[i];
+	    gstate.resume_points[i].stack_slots = 0;
+	}
+    } else {
+	prog->resume_points = 0;
+	prog->num_resume_points = 0;
+    }
+
     free_gstate(gstate);
+
+    if (!validate_program_resume_points(prog))
+	panic("Invalid ResumePoint table in GENERATE_CODE()");
 
     return prog;
 }

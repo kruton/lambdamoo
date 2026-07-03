@@ -50,6 +50,8 @@ struct bft_entry {
     bf_type func;
     bf_read_type read;
     bf_write_type write;
+    bf_import_type import;
+    bf_export_type export;
     int protected;
 };
 
@@ -58,7 +60,8 @@ static unsigned top_bf_table = 0;
 
 static unsigned
 register_common(const char *name, int minargs, int maxargs, bf_type func,
-		bf_read_type read, bf_write_type write, va_list args)
+		bf_read_type read, bf_write_type write,
+		bf_import_type import, bf_export_type export, va_list args)
 {
     int va_index;
     int num_arg_types = maxargs == -1 ? minargs : maxargs;
@@ -80,6 +83,8 @@ register_common(const char *name, int minargs, int maxargs, bf_type func,
     bf_table[top_bf_table].func = func;
     bf_table[top_bf_table].read = read;
     bf_table[top_bf_table].write = write;
+    bf_table[top_bf_table].import = import;
+    bf_table[top_bf_table].export = export;
     bf_table[top_bf_table].protected = 0;
 
     if (num_arg_types > 0)
@@ -101,7 +106,7 @@ register_function(const char *name, int minargs, int maxargs,
     unsigned ans;
 
     va_start(args, func);
-    ans = register_common(name, minargs, maxargs, func, 0, 0, args);
+    ans = register_common(name, minargs, maxargs, func, 0, 0, 0, 0, args);
     va_end(args);
     return ans;
 }
@@ -115,7 +120,24 @@ register_function_with_read_write(const char *name, int minargs, int maxargs,
     unsigned ans;
 
     va_start(args, write);
-    ans = register_common(name, minargs, maxargs, func, read, write, args);
+    ans = register_common(name, minargs, maxargs, func, read, write, 0, 0,
+			  args);
+    va_end(args);
+    return ans;
+}
+
+unsigned
+register_function_with_state(const char *name, int minargs, int maxargs,
+			     bf_type func, bf_read_type read,
+			     bf_write_type write, bf_import_type import,
+			     bf_export_type export,...)
+{
+    va_list args;
+    unsigned ans;
+
+    va_start(args, export);
+    ans = register_common(name, minargs, maxargs, func, read, write, import,
+			  export, args);
     va_end(args);
     return ans;
 }
@@ -270,6 +292,37 @@ read_bi_func_data(Byte f_id, void **bi_func_state, Byte * bi_func_pc)
 	    *bi_func_pc = 0;
 	}
     }
+    return 1;
+}
+
+int
+export_bi_func_state(void *data, Byte f_id, unsigned *version, Var *payload)
+{
+    if (f_id >= top_bf_table)
+	return 0;
+    if (bf_table[f_id].export)
+	return (*(bf_table[f_id].export)) (data, version, payload);
+    if (data)
+	return 0;
+
+    *version = 1;
+    payload->type = TYPE_NONE;
+    return 1;
+}
+
+int
+import_bi_func_state(Byte f_id, unsigned version, Var payload, void **data)
+{
+    if (f_id >= top_bf_table)
+	return 0;
+    if (bf_table[f_id].import) {
+	*data = (*(bf_table[f_id].import)) (version, payload);
+	return *data != 0;
+    }
+    if (version != 1 || payload.type != TYPE_NONE)
+	return 0;
+
+    *data = 0;
     return 1;
 }
 

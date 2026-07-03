@@ -81,6 +81,27 @@ static char *waif_indexset_verb;
 /* macros to ease indexing into activation stack */
 #define RUN_ACTIV     activ_stack[top_activ_stack]
 #define CALLER_ACTIV  activ_stack[top_activ_stack - 1]
+
+/* See SuspendResumeFormat.txt for the on-disk compatibility contract. */
+#define SUSPEND_FORMAT_RESUME_KEY 1
+
+static int
+current_activ_vector(void)
+{
+    return (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR
+	    ? MAIN_VECTOR
+	    : root_activ_vector);
+}
+
+static void
+set_activ_resume_key_for_location(activation * a, int which_vector)
+{
+    const ResumePoint *point =
+	resume_point_for_program_location(a->prog, which_vector, a->pc,
+					  a->error_pc);
+
+    a->resume_key = point ? point->key : invalid_resume_key();
+}
 
 /**** error handling ****/
 
@@ -679,6 +700,7 @@ call_verb2(Objid this, const char *vname
     alloc_rt_stack(&RUN_ACTIV, program->main_vector.max_stack);
     RUN_ACTIV.pc = 0;
     RUN_ACTIV.error_pc = 0;
+    RUN_ACTIV.resume_key = invalid_resume_key();
     RUN_ACTIV.bi_func_pc = 0;
     RUN_ACTIV.temp.type = TYPE_NONE;
 
@@ -823,6 +845,7 @@ do {  								\
 do {						\
     RUN_ACTIV.pc = bv - bc.vector;		\
     RUN_ACTIV.error_pc = error_bv - bc.vector;	\
+    set_activ_resume_key_for_location(&RUN_ACTIV, current_activ_vector()); \
     RUN_ACTIV.top_rt_stack = rts;		\
 } while (0)
 
@@ -2553,6 +2576,7 @@ do_task(Program * prog, int which_vector, Var * result, int is_fg, int do_db_tra
 
     RUN_ACTIV.pc = 0;
     RUN_ACTIV.error_pc = 0;
+    RUN_ACTIV.resume_key = invalid_resume_key();
     RUN_ACTIV.bi_func_pc = 0;
     RUN_ACTIV.temp.type = TYPE_NONE;
 
@@ -2726,6 +2750,7 @@ setup_activ_for_eval(Program * prog)
     alloc_rt_stack(&RUN_ACTIV, RUN_ACTIV.prog->main_vector.max_stack);
     RUN_ACTIV.pc = 0;
     RUN_ACTIV.error_pc = 0;
+    RUN_ACTIV.resume_key = invalid_resume_key();
     RUN_ACTIV.temp.type = TYPE_NONE;
 
     return 1;
@@ -2803,6 +2828,61 @@ bf_call_function_read(void)
 	free_data(s);
     }
     return 0;
+}
+
+static int
+bf_call_function_export(void *data, unsigned *version, Var *payload)
+{
+    struct cf_state *s = data;
+    unsigned nested_version;
+    Var nested_payload;
+
+    if (s->fnum > UCHAR_MAX
+	|| !export_bi_func_state(s->data, (Byte) s->fnum, &nested_version,
+				 &nested_payload))
+	return 0;
+#if NUM_MAX < UINT_MAX
+    if (nested_version > NUM_MAX) {
+	free_var(nested_payload);
+	return 0;
+    }
+#endif
+    *version = 1;
+    *payload = new_list(3);
+    payload->v.list[1].type = TYPE_STR;
+    payload->v.list[1].v.str = str_dup(name_func_by_num(s->fnum));
+    payload->v.list[2].type = TYPE_INT;
+    payload->v.list[2].v.num = nested_version;
+    payload->v.list[3] = nested_payload;
+    return 1;
+}
+
+static void *
+bf_call_function_import(unsigned version, Var payload)
+{
+    struct cf_state *s;
+    unsigned fnum;
+    Num nested_version;
+
+    if (version != 1 || payload.type != TYPE_LIST
+	|| payload.v.list[0].v.num != 3
+	|| payload.v.list[1].type != TYPE_STR
+	|| payload.v.list[2].type != TYPE_INT
+	|| payload.v.list[2].v.num < 0)
+	return 0;
+    fnum = number_func_by_name(payload.v.list[1].v.str);
+    nested_version = payload.v.list[2].v.num;
+    if (fnum == FUNC_NOT_FOUND || fnum > UCHAR_MAX)
+	return 0;
+
+    s = alloc_data(sizeof(*s));
+    s->fnum = fnum;
+    if (!import_bi_func_state((Byte) fnum, (unsigned) nested_version,
+			      payload.v.list[3], &s->data)) {
+	free_data(s);
+	return 0;
+    }
+    return s;
 }
 
 static package
@@ -2981,10 +3061,10 @@ bf_task_stack(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 void
 register_execute(void)
 {
-    register_function_with_read_write("call_function", 1, -1, bf_call_function,
-				      bf_call_function_read,
-				      bf_call_function_write,
-				      TYPE_STR);
+    register_function_with_state("call_function", 1, -1, bf_call_function,
+				 bf_call_function_read, bf_call_function_write,
+				 bf_call_function_import,
+				 bf_call_function_export, TYPE_STR);
     register_function("raise", 1, 3, bf_raise, TYPE_ANY, TYPE_STR, TYPE_ANY);
     register_function("suspend", 0, 1, bf_suspend, TYPE_INT);
     register_function("read", 0, 2, bf_read, TYPE_OBJ, TYPE_ANY);
@@ -3128,31 +3208,64 @@ reorder_rt_env(Var * old_rt_env, const char **old_names,
 }
 
 void
-write_activ(activation a)
+write_activ(activation a, int which_vector)
 {
-    register Var *v;
-
-    dbio_printf("language version %u\n", a.prog->version);
-    dbio_write_program(a.prog);
-    write_rt_env(a.prog->var_names, a.rt_env, a.prog->num_var_names);
+    unsigned i, frame_slots;
+    const ResumePoint *point = resume_point_for_key(a.prog, a.resume_key);
 
     if (a.top_rt_stack < a.base_rt_stack)
 	panic("rt_stack smash");
 
-    dbio_printf("%tu rt_stack slots in use\n",
-		a.top_rt_stack - a.base_rt_stack);
+    if (!point || point->vector != which_vector
+	|| point->pc != a.pc || point->error_pc != a.error_pc
+	|| point->stack_depth != (unsigned) (a.top_rt_stack - a.base_rt_stack))
+	panic("WRITE_ACTIV: Bad ResumeKey for suspended task.");
 
-    for (v = a.base_rt_stack; v != a.top_rt_stack; v++)
-	dbio_write_var(*v);
-
+    dbio_printf("language version %u\n", a.prog->version);
+    dbio_write_program(a.prog);
+    write_rt_env(a.prog->var_names, a.rt_env, a.prog->num_var_names);
     write_activ_as_pi(a);
+
+    dbio_printf("suspend format %u\n", SUSPEND_FORMAT_RESUME_KEY);
+    dbio_printf("resume %u %u %u\n", RESUME_SCHEMA,
+		a.resume_key.code_unit, a.resume_key.site);
+
+    frame_slots = point->frame_slots;
+    dbio_printf("frame %u values\n", frame_slots);
+    for (i = 0; i < point->stack_depth; i++)
+	if (point->stack_slots[i].kind == RSS_VALUE)
+	    dbio_write_var(a.base_rt_stack[i]);
     dbio_write_var(a.temp);
 
-    dbio_printf("%u %u %u\n", a.pc, a.bi_func_pc, a.error_pc);
     if (a.bi_func_pc != 0) {
+	unsigned version;
+	Var payload;
+
+	if (!export_bi_func_state(a.bi_func_data, a.bi_func_id, &version,
+				  &payload))
+	    panic("WRITE_ACTIV: Built-in state is not portable.");
+	dbio_printf("builtin %u %u\n", version, (unsigned) a.bi_func_pc);
 	dbio_write_string(name_func_by_num(a.bi_func_id));
-	write_bi_func_data(a.bi_func_data, a.bi_func_id);
+	dbio_write_var(payload);
+	free_var(payload);
+	} else {
+	dbio_printf("builtin 0 0\n");
+	dbio_write_string("none");
     }
+}
+
+static int
+set_bi_func_pc_from_db(activation * a, unsigned value)
+{
+    Byte narrowed = (Byte) value;
+
+    if ((unsigned) narrowed != value) {
+	errlog("READ_ACTIV: Built-in continuation PC %u is out of range.\n",
+	       value);
+	return 0;
+    }
+    a->bi_func_pc = narrowed;
+    return 1;
 }
 
 static int
@@ -3166,8 +3279,120 @@ check_pc_validity(Program * prog, int which_vector, unsigned pc)
      * move(), pass(), or suspend().
      */
     return (pc < bc->size
-	    && (bc->vector[pc - 1] == OP_CALL_VERB
-		|| bc->vector[pc - 2] == OP_BI_FUNC_CALL));
+	    && ((pc >= 1 && bc->vector[pc - 1] == OP_CALL_VERB)
+		|| (pc >= 2 && bc->vector[pc - 2] == OP_BI_FUNC_CALL)));
+}
+
+static int
+read_portable_activ(activation *a, int expected_vector)
+{
+    const ResumePoint *point;
+    unsigned format, schema, code_unit, site, frame_slots;
+    unsigned version, step, i;
+    const char *func_name;
+    int vector;
+
+    if (!read_activ_as_pi(a)) {
+	errlog("READ_ACTIV: Bad portable activation metadata.\n");
+	return 0;
+    }
+    if (!dbio_scxnf("suspend format %u", &format)
+	|| format != SUSPEND_FORMAT_RESUME_KEY) {
+	errlog("READ_ACTIV: Bad or unknown suspend format.\n");
+	return 0;
+    }
+    if (!dbio_scxnf("resume %u %u %u", &schema, &code_unit, &site)
+	|| schema != RESUME_SCHEMA) {
+	errlog("READ_ACTIV: Bad or unknown resume schema.\n");
+	return 0;
+    }
+    a->resume_key.code_unit = code_unit;
+    a->resume_key.site = site;
+    point = resume_point_for_key(a->prog, a->resume_key);
+    if (!point) {
+	errlog("READ_ACTIV: Bad ResumeKey for suspended task.\n");
+	return 0;
+    }
+    vector = point->vector;
+    if (expected_vector != ANY_RESUME_VECTOR
+	&& vector != expected_vector) {
+	errlog("READ_ACTIV: ResumeKey resolves to the wrong code unit.\n");
+	return 0;
+    }
+    a->pc = point->pc;
+    a->error_pc = point->error_pc;
+    alloc_rt_stack(a, vector == MAIN_VECTOR
+		   ? a->prog->main_vector.max_stack
+		   : a->prog->fork_vectors[vector].max_stack);
+    a->top_rt_stack = a->base_rt_stack;
+
+    if (!dbio_scxnf("frame %u values", &frame_slots)
+	|| frame_slots != point->frame_slots) {
+	errlog("READ_ACTIV: Resume frame size mismatch.\n");
+	return 0;
+    }
+    for (i = 0; i < point->stack_depth; i++) {
+	ResumeStackSlot slot = point->stack_slots[i];
+	Var value;
+
+	switch (slot.kind) {
+	case RSS_VALUE:
+	    if (!dbio_read_var(&value))
+		return 0;
+	    break;
+	case RSS_HANDLER_PC:
+	    value.type = TYPE_INT;
+	    value.v.num = slot.data;
+	    break;
+	case RSS_CATCH:
+	    value.type = TYPE_CATCH;
+	    value.v.num = slot.data;
+	    break;
+	case RSS_FINALLY:
+	    value.type = TYPE_FINALLY;
+	    value.v.num = slot.data;
+	    break;
+	default:
+	    return 0;
+	}
+	*a->top_rt_stack++ = value;
+    }
+    if (!dbio_read_var(&a->temp))
+	return 0;
+
+    if (!dbio_scxnf("builtin %u %u", &version, &step)
+	|| !dbio_read_string_intern(&func_name)) {
+	errlog("READ_ACTIV: Bad built-in continuation envelope.\n");
+	return 0;
+    }
+    if (!strcmp(func_name, "none")) {
+	free_str(func_name);
+	if (version != 0 || step != 0)
+	    return 0;
+	a->bi_func_pc = 0;
+	a->bi_func_id = 0;
+	a->bi_func_data = 0;
+    } else {
+	unsigned fnum = number_func_by_name(func_name);
+	Var payload;
+
+	free_str(func_name);
+	if (step == 0 || fnum == FUNC_NOT_FOUND || fnum > UCHAR_MAX
+	    || !set_bi_func_pc_from_db(a, step)
+	    || !dbio_read_var(&payload)) {
+	    errlog("READ_ACTIV: Bad built-in continuation.\n");
+	    return 0;
+	}
+	a->bi_func_id = (Byte) fnum;
+	if (!import_bi_func_state(a->bi_func_id, version, payload,
+				  &a->bi_func_data)) {
+	    free_var(payload);
+	    errlog("READ_ACTIV: Unsupported built-in continuation state.\n");
+	    return 0;
+	}
+	free_var(payload);
+    }
+    return check_pc_validity(a->prog, vector, a->pc);
 }
 
 int
@@ -3180,6 +3405,7 @@ read_activ(activation * a, int which_vector)
     unsigned old_size, stack_in_use;
     unsigned i;
     int max_stack;
+    const ResumePoint *resume_point;
 
     if (dbio_input_version < DBV_Float)
 	version = dbio_input_version;
@@ -3202,6 +3428,9 @@ read_activ(activation * a, int which_vector)
     }
     a->rt_env = reorder_rt_env(old_rt_env, old_names, old_size, a->prog);
 
+    if (dbio_input_version >= DBV_ResumeKey)
+	return read_portable_activ(a, which_vector);
+
     max_stack = (which_vector == MAIN_VECTOR
 		 ? a->prog->main_vector.max_stack
 		 : a->prog->fork_vectors[which_vector].max_stack);
@@ -3223,15 +3452,38 @@ read_activ(activation * a, int which_vector)
     if (!dbio_read_var(&a->temp))
 	return 0;
 
+    {
+	int pcscan = dbio_scxnf("%u %u\v %u", &a->pc, &i, &a->error_pc);
 
-    int pcscan = dbio_scxnf("%u %u\v %u", &a->pc, &i, &a->error_pc);
-    if (!pcscan) {
-	errlog("READ_ACTIV: bad pc, next, error_pc. stack_in_use = %u\n", stack_in_use);
+	if (!pcscan) {
+	    errlog("READ_ACTIV: bad pc, next, error_pc. stack_in_use = %u\n",
+		   stack_in_use);
+	    return 0;
+	}
+	if (!set_bi_func_pc_from_db(a, i))
+	    return 0;
+	if (pcscan < 2) {
+	    a->error_pc = a->pc;
+	    resume_point = resume_point_for_program_pc(a->prog, which_vector,
+						       a->pc);
+	} else
+	    resume_point = resume_point_for_program_location(a->prog,
+						     which_vector, a->pc,
+						     a->error_pc);
+	if (!resume_point) {
+	    errlog("READ_ACTIV: Bad legacy PC for suspended task.\n");
+	    return 0;
+	}
+	a->resume_key = resume_point->key;
+	a->error_pc = resume_point->error_pc;
+    }
+
+    if (resume_point->stack_depth != stack_in_use) {
+	errlog("READ_ACTIV: ResumeKey stack depth mismatch: "
+	       "expected %u, got %u.\n",
+	       resume_point->stack_depth, stack_in_use);
 	return 0;
     }
-    a->bi_func_pc = i;
-    if (pcscan < 2)
-	a->error_pc = a->pc;
 
     if (!check_pc_validity(a->prog, which_vector, a->pc)) {
 	errlog("READ_ACTIV: Bad PC for suspended task.\n");
