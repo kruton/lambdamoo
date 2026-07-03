@@ -61,11 +61,13 @@ struct Scatter {
 struct Expr_Call {
     unsigned func;
     Arg_List *args;
+    unsigned resume_site;
 };
 
 struct Expr_Verb {
     Expr *obj, *verb;
     Arg_List *args;
+    unsigned resume_site;
 };
 
 struct Expr_Range {
@@ -159,6 +161,7 @@ struct Stmt_Fork {
     int id;
     Expr *time;
     Stmt *body;
+    unsigned code_unit;
 };
 
 struct Stmt_Catch {
@@ -212,6 +215,7 @@ extern char *alloc_string(const char *);
 extern Var astpool_ref_var(Var);
 
 extern void dealloc_string(char *);
+extern void assign_resume_ids(Stmt *);
 extern void free_stmt(Stmt *);
 
 #if FLOATS_ARE_BOXED

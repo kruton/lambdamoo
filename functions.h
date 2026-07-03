@@ -81,8 +81,14 @@ package make_space_pack(void);
  *----------------*/
 
 typedef package(*bf_type) (Var, Byte, void *, Objid);
+/* `read' parses legacy database input and `write' is retained with that
+ * callback ABI.  `export' returns an owned payload; `import' borrows its
+ * payload for the call.
+ */
 typedef void (*bf_write_type) (void *vdata);
 typedef void *(*bf_read_type) (void);
+typedef int (*bf_export_type) (void *vdata, unsigned *version, Var *payload);
+typedef void *(*bf_import_type) (unsigned version, Var payload);
 
 #define MAX_FUNC         256
 #define FUNC_NOT_FOUND   MAX_FUNC
@@ -98,6 +104,9 @@ extern unsigned register_function(const char *, int, int, bf_type,...);
 extern unsigned register_function_with_read_write(const char *, int, int,
 						  bf_type, bf_read_type,
 						  bf_write_type,...);
+extern unsigned register_function_with_state(const char *, int, int, bf_type,
+					     bf_read_type, bf_write_type,
+					     bf_import_type, bf_export_type,...);
 
 /*--------------*
  |  invocation  |
@@ -113,6 +122,8 @@ extern package call_bi_func(unsigned, Var, Byte, Objid, void *);
 extern void write_bi_func_data(void *vdata, Byte f_id);
 extern int read_bi_func_data(Byte f_id, void **bi_func_state,
 			     Byte * bi_func_pc);
+extern int export_bi_func_state(void *, Byte, unsigned *, Var *);
+extern int import_bi_func_state(Byte, unsigned, Var, void **);
 extern Byte *pc_for_bi_func_data(void);
 
 /*--------------*
