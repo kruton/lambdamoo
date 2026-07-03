@@ -180,6 +180,12 @@
 #undef HAVE_SIGSETMASK
 #undef HAVE_SIGRELSE
 
+/* Type of gperf lookup-function length parameters. gperf >= 3.1 changed the
+ * signature from unsigned int to size_t. Use this to be compatible with
+ * both versions
+ */
+#undef GPERF_LEN_TYPE
+
 /* It used to be very much the fashion in UNIX programming to make use of
  * certain standard header files depend on the programmer having #include'd
  * other standard header files first.  This is obviously losing and, amazingly,
