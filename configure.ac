@@ -60,6 +60,7 @@ test x$ac_cv_prog_cc_c99 = xno &&]
   AC_MSG_ERROR([[We need a C compiler that knows about C99]])dnl
 
 AC_USE_SYSTEM_EXTENSIONS
+MOO_GPERF_LEN_TYPE()dnl
 AC_PROG_CPP
 MOO_NEXT
 MOO_ALPHA
