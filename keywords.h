@@ -32,7 +32,7 @@ struct keyword {
 
 typedef const struct keyword Keyword;
 
-extern Keyword *find_keyword(const char *, size_t);
+extern Keyword *find_keyword(const char *, GPERF_LEN_TYPE);
 
 #endif		/* !Keywords_H */
 
