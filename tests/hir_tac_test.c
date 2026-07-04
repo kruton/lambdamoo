@@ -102,21 +102,25 @@ return_stmt(Expr *expr)
 
 static HIRTacProgram *
 lower_stmt(Names *names, Stmt *stmt, HIRContext **ctx_out, HIRCFG **cfg_out,
-	   HIRSSAProgram **ssa_out)
+	   HIRDominatorTree **dom_out, HIRSSAProgram **ssa_out)
 {
     HIRContext *ctx = hir_context_new(names);
     HIRProgram *program = hir_lift_ast(ctx, stmt);
     HIRTacProgram *tac = hir_lower_to_tac(ctx, program);
     HIRCFG *cfg;
+    HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
 
     (void) hir_verify_tac(ctx, tac);
     cfg = hir_build_cfg(ctx, tac);
     (void) hir_verify_cfg(ctx, cfg);
+    dom = hir_build_dominator_tree(ctx, cfg);
+    (void) hir_verify_dominator_tree(ctx, cfg, dom);
     ssa = hir_build_ssa(ctx, cfg);
     (void) hir_verify_ssa(ctx, ssa);
     *ctx_out = ctx;
     *cfg_out = cfg;
+    *dom_out = dom;
     *ssa_out = ssa;
 
     return tac;
@@ -128,6 +132,7 @@ test_arithmetic_and_local_tac(void)
     Names names;
     HIRContext *ctx;
     HIRCFG *cfg;
+    HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
     Expr one = int_expr(1, 10);
@@ -145,7 +150,7 @@ test_arithmetic_and_local_tac(void)
     names.size = 32;
     assign_stmt_node.next = &return_stmt_node;
 
-    tac = lower_stmt(&names, &assign_stmt_node, &ctx, &cfg, &ssa);
+    tac = lower_stmt(&names, &assign_stmt_node, &ctx, &cfg, &dom, &ssa);
 
     check_int("arith const count", hir_tac_count_kind(tac, HIR_TAC_CONST), 3);
     check_int("arith load count", hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
@@ -157,6 +162,9 @@ test_arithmetic_and_local_tac(void)
     check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 4);
     check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("arith cfg edges", hir_cfg_edge_count(cfg), 0);
+    check_int("arith dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 1);
+    check_int("arith dom entry idom", hir_dom_idom_block(dom, 1), 1);
     check_int("arith ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 8);
     check_int("arith ssa values", hir_ssa_value_count(ssa), 6);
@@ -173,6 +181,7 @@ test_control_flow_tac(void)
     Names names;
     HIRContext *ctx;
     HIRCFG *cfg;
+    HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
     Cond_Arm arm;
@@ -195,7 +204,7 @@ test_control_flow_tac(void)
     if_stmt_node.s.cond.arms = &arm;
     if_stmt_node.s.cond.otherwise = 0;
 
-    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &ssa);
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
 
     check_int("control branch count",
 	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
@@ -206,6 +215,13 @@ test_control_flow_tac(void)
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
     check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
     check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
+    check_int("control dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 4);
+    check_int("control dom entry idom", hir_dom_idom_block(dom, 1), 1);
+    check_int("control dom then idom", hir_dom_idom_block(dom, 2), 1);
+    check_int("control dom unreachable idom", hir_dom_idom_block(dom, 3), 0);
+    check_int("control dom else-label idom", hir_dom_idom_block(dom, 4), 1);
+    check_int("control dom done idom", hir_dom_idom_block(dom, 5), 4);
     check_int("control ssa blocks", hir_ssa_block_count(ssa), 5);
     check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 9);
     check_int("control ssa values", hir_ssa_value_count(ssa), 4);
@@ -222,6 +238,7 @@ test_unsupported_tac(void)
     Names names;
     HIRContext *ctx;
     HIRCFG *cfg;
+    HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
     Expr list;
@@ -235,7 +252,7 @@ test_unsupported_tac(void)
     list.e.list = 0;
     ret = return_stmt(&list);
 
-    tac = lower_stmt(&names, &ret, &ctx, &cfg, &ssa);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
     check_int("unsupported tac count",
 	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 1);
@@ -244,6 +261,8 @@ test_unsupported_tac(void)
     check_int("unsupported cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("unsupported cfg unsupported blocks",
 	      hir_cfg_unsupported_block_count(cfg), 1);
+    check_int("unsupported dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 1);
     check_int("unsupported ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("unsupported ssa values", hir_ssa_value_count(ssa), 1);
     check_int("unsupported ssa unsupported count",
@@ -335,11 +354,75 @@ test_negative_ssa_verifier_cases(void)
     hir_context_free(ctx);
 }
 
+static Stmt
+while_stmt(Expr *condition, Stmt *body, int loop_id, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_WHILE;
+    stmt.lineno = lineno;
+    stmt.s.loop.id = loop_id;
+    stmt.s.loop.condition = condition;
+    stmt.s.loop.body = body;
+
+    return stmt;
+}
+
+static void
+test_loop_dominator_tree(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+
+    Expr one_init = int_expr(1, 60);
+    Expr local_x_init = id_expr(16, 60);
+    Expr assign_init = binary_expr(EXPR_ASGN, &local_x_init, &one_init);
+    Stmt init_stmt = expr_stmt(&assign_init);
+
+    Expr ten = int_expr(10, 61);
+    Expr local_x_cond = id_expr(16, 61);
+    Expr cond = binary_expr(EXPR_LT, &local_x_cond, &ten);
+
+    Expr local_x_lhs = id_expr(16, 62);
+    Expr local_x_rhs = id_expr(16, 62);
+    Expr one = int_expr(1, 62);
+    Expr add = binary_expr(EXPR_PLUS, &local_x_rhs, &one);
+    Expr assign = binary_expr(EXPR_ASGN, &local_x_lhs, &add);
+    Stmt body_stmt = expr_stmt(&assign);
+
+    Stmt loop = while_stmt(&cond, &body_stmt, 1, 61);
+    Expr local_x_ret = id_expr(16, 63);
+    Stmt ret = return_stmt(&local_x_ret);
+
+    init_stmt.next = &loop;
+    loop.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    (void) lower_stmt(&names, &init_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("loop dom cfg blocks", hir_cfg_block_count(cfg), 4);
+    check_int("loop dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 4);
+    check_int("loop dom entry idom", hir_dom_idom_block(dom, 1), 1);
+    check_int("loop dom header idom", hir_dom_idom_block(dom, 2), 1);
+    check_int("loop dom body idom", hir_dom_idom_block(dom, 3), 2);
+    check_int("loop dom exit idom", hir_dom_idom_block(dom, 4), 2);
+    check_int("loop dom verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
 int
 main(void)
 {
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
+    test_loop_dominator_tree();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
     test_negative_cfg_verifier_cases();

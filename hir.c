@@ -14,6 +14,7 @@ typedef struct HIRCondArm HIRCondArm;
 typedef struct HIRExceptArm HIRExceptArm;
 typedef struct HIRTacInstr HIRTacInstr;
 typedef struct HIRBasicBlock HIRBasicBlock;
+typedef struct HIRDominatorTree HIRDominatorTree;
 typedef struct HIRSSAInstr HIRSSAInstr;
 typedef struct HIRSSABlock HIRSSABlock;
 
@@ -181,6 +182,15 @@ struct HIRCFG {
     HIRBasicBlock *last_block;
     int num_blocks;
     int num_edges;
+};
+
+struct HIRDominatorTree {
+    HIRBasicBlock **block_by_id;
+    HIRBasicBlock **idom;
+    HIRBasicBlock **rpo;
+    int *rpo_index;
+    int max_block_id;
+    int num_reachable;
 };
 
 struct HIRSSAInstr {
@@ -663,6 +673,227 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 }
 
 static int
+max_cfg_block_id(HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int max = 0;
+
+    if (!cfg)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	if (block->id > max)
+	    max = block->id;
+    }
+
+    return max;
+}
+
+static void
+index_cfg_blocks(HIRDominatorTree *dom, HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int i;
+
+    for (i = 0; i <= dom->max_block_id; i++)
+	dom->block_by_id[i] = 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	if (block->id > 0 && block->id <= dom->max_block_id)
+	    dom->block_by_id[block->id] = block;
+    }
+}
+
+static int
+dom_contains_block(HIRDominatorTree *dom, HIRBasicBlock *block)
+{
+    return block && block->id > 0 && block->id <= dom->max_block_id
+	&& dom->block_by_id[block->id] == block;
+}
+
+static void
+postorder_cfg(HIRDominatorTree *dom, HIRBasicBlock *block,
+	      unsigned char *visited, HIRBasicBlock **postorder, int *count)
+{
+    int i;
+
+    if (!dom_contains_block(dom, block) || visited[block->id])
+	return;
+
+    visited[block->id] = 1;
+    for (i = 0; i < block->num_successors; i++)
+	postorder_cfg(dom, block->successors[i], visited, postorder, count);
+    postorder[(*count)++] = block;
+}
+
+static HIRBasicBlock *
+intersect_idom(HIRDominatorTree *dom, HIRBasicBlock *left,
+	       HIRBasicBlock *right)
+{
+    while (left != right) {
+	while (dom->rpo_index[left->id] > dom->rpo_index[right->id])
+	    left = dom->idom[left->id];
+	while (dom->rpo_index[right->id] > dom->rpo_index[left->id])
+	    right = dom->idom[right->id];
+    }
+
+    return left;
+}
+
+static int
+block_has_reachable_idom(HIRDominatorTree *dom, HIRBasicBlock *block)
+{
+    return block && block->id > 0 && block->id <= dom->max_block_id
+	&& dom->rpo_index[block->id] >= 0 && dom->idom[block->id] != 0;
+}
+
+static HIRBasicBlock *
+compute_block_idom(HIRCFG *cfg, HIRDominatorTree *dom, HIRBasicBlock *block)
+{
+    HIRBasicBlock *candidate = 0;
+    HIRBasicBlock *pred;
+
+    for (pred = cfg->blocks; pred; pred = pred->next) {
+	int i;
+
+	for (i = 0; i < pred->num_successors; i++) {
+	    if (pred->successors[i] != block)
+		continue;
+	    if (!block_has_reachable_idom(dom, pred))
+		continue;
+	    if (!candidate)
+		candidate = pred;
+	    else
+		candidate = intersect_idom(dom, pred, candidate);
+	}
+    }
+
+    return candidate;
+}
+
+HIRDominatorTree *
+hir_build_dominator_tree(HIRContext *ctx, HIRCFG *cfg)
+{
+    HIRDominatorTree *dom;
+    HIRBasicBlock **postorder;
+    unsigned char *visited;
+    int postorder_count = 0;
+    int changed = 1;
+    int i;
+
+    if (!ctx || !cfg)
+	return 0;
+
+    dom = hir_alloc(ctx, sizeof(HIRDominatorTree));
+    dom->max_block_id = max_cfg_block_id(cfg);
+    dom->num_reachable = 0;
+    dom->block_by_id = hir_alloc(ctx, sizeof(HIRBasicBlock *)
+				 * ((size_t) dom->max_block_id + 1));
+    dom->idom = hir_alloc(ctx, sizeof(HIRBasicBlock *)
+			  * ((size_t) dom->max_block_id + 1));
+    dom->rpo = hir_alloc(ctx, sizeof(HIRBasicBlock *)
+			 * ((size_t) cfg->num_blocks + 1));
+    dom->rpo_index = hir_alloc(ctx, sizeof(int)
+			       * ((size_t) dom->max_block_id + 1));
+    postorder = hir_alloc(ctx, sizeof(HIRBasicBlock *)
+			  * ((size_t) cfg->num_blocks + 1));
+    visited = hir_alloc(ctx, (size_t) dom->max_block_id + 1);
+
+    for (i = 0; i <= dom->max_block_id; i++) {
+	dom->idom[i] = 0;
+	dom->rpo_index[i] = -1;
+	visited[i] = 0;
+    }
+    index_cfg_blocks(dom, cfg);
+
+    if (!cfg->entry)
+	return dom;
+
+    postorder_cfg(dom, cfg->entry, visited, postorder, &postorder_count);
+    dom->num_reachable = postorder_count;
+    for (i = 0; i < postorder_count; i++) {
+	HIRBasicBlock *block = postorder[postorder_count - i - 1];
+
+	dom->rpo[i] = block;
+	dom->rpo_index[block->id] = i;
+    }
+
+    dom->idom[cfg->entry->id] = cfg->entry;
+    while (changed) {
+	changed = 0;
+	for (i = 1; i < dom->num_reachable; i++) {
+	    HIRBasicBlock *block = dom->rpo[i];
+	    HIRBasicBlock *new_idom = compute_block_idom(cfg, dom, block);
+
+	    if (new_idom && dom->idom[block->id] != new_idom) {
+		dom->idom[block->id] = new_idom;
+		changed = 1;
+	    }
+	}
+    }
+
+    return dom;
+}
+
+int
+hir_verify_dominator_tree(HIRContext *ctx, HIRCFG *cfg, HIRDominatorTree *dom)
+{
+    int errors_before;
+    int i;
+
+    if (!ctx || !cfg || !dom)
+	return 0;
+
+    errors_before = ctx->error_count;
+
+    if (cfg->num_blocks == 0)
+	return dom->num_reachable == 0;
+
+    if (!cfg->entry || dom->num_reachable <= 0)
+	record_unsupported(ctx, "Dominator tree has no reachable entry");
+    else if (dom->idom[cfg->entry->id] != cfg->entry)
+	record_unsupported(ctx, "Dominator tree entry idom is invalid");
+
+    for (i = 0; i < dom->num_reachable; i++) {
+	HIRBasicBlock *block = dom->rpo[i];
+	HIRBasicBlock *runner;
+	int steps;
+
+	if (!block || block->id <= 0 || block->id > dom->max_block_id) {
+	    record_unsupported(ctx, "Dominator tree has invalid RPO block");
+	    continue;
+	}
+	if (dom->block_by_id[block->id] != block)
+	    record_unsupported(ctx, "Dominator tree block index mismatch");
+	if (dom->rpo_index[block->id] != i)
+	    record_unsupported(ctx, "Dominator tree RPO index mismatch");
+	if (!dom->idom[block->id]) {
+	    record_unsupported(ctx, "Dominator tree missing reachable idom");
+	    continue;
+	}
+	if (!dom_contains_block(dom, dom->idom[block->id])
+	    || dom->rpo_index[dom->idom[block->id]->id] < 0)
+	    record_unsupported(ctx, "Dominator tree idom is unreachable");
+	if (block != cfg->entry && dom->idom[block->id] == block)
+	    record_unsupported(ctx, "Dominator tree non-entry self idom");
+
+	runner = block;
+	steps = 0;
+	while (runner && runner != cfg->entry && steps <= dom->num_reachable) {
+	    if (!dom_contains_block(dom, runner)
+		|| dom->rpo_index[runner->id] < 0)
+		break;
+	    runner = dom->idom[runner->id];
+	    steps++;
+	}
+	if (runner != cfg->entry || steps > dom->num_reachable)
+	    record_unsupported(ctx, "Dominator tree idom chain misses entry");
+    }
+
+    return ctx->error_count == errors_before;
+}
+
+static int
 ssa_defines_value(HIRSSAInstr *instr)
 {
     return instr
@@ -1139,6 +1370,22 @@ hir_cfg_unsupported_block_count(HIRCFG *cfg)
     }
 
     return count;
+}
+
+int
+hir_dom_reachable_block_count(HIRDominatorTree *dom)
+{
+    return dom ? dom->num_reachable : 0;
+}
+
+int
+hir_dom_idom_block(HIRDominatorTree *dom, int block_id)
+{
+    if (!dom || block_id <= 0 || block_id > dom->max_block_id
+	|| !dom->idom[block_id])
+	return 0;
+
+    return dom->idom[block_id]->id;
 }
 
 int
