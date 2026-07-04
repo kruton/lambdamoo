@@ -709,6 +709,47 @@ test_if_then_phi_uses_entry_local_ssa(void)
 }
 
 static void
+test_cfg_critical_edge_splitting(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    int before_blocks;
+    int before_edges;
+    int split_count;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    ctx = hir_context_new(&names);
+    cfg = hir_test_cfg_with_critical_edge(ctx);
+    (void) hir_verify_cfg(ctx, cfg);
+
+    before_blocks = hir_cfg_block_count(cfg);
+    before_edges = hir_cfg_edge_count(cfg);
+    check_int("critical cfg initial edges",
+	      hir_cfg_critical_edge_count(cfg), 1);
+
+    split_count = hir_split_critical_edges(ctx, cfg);
+    check_int("critical cfg split count", split_count, 1);
+    check_int("critical cfg final edges",
+	      hir_cfg_critical_edge_count(cfg), 0);
+    check_int("critical cfg split blocks",
+	      hir_cfg_block_count(cfg), before_blocks + 1);
+    check_int("critical cfg split edges",
+	      hir_cfg_edge_count(cfg), before_edges + 1);
+    check_int("critical cfg resplit count",
+	      hir_split_critical_edges(ctx, cfg), 0);
+    check_int("critical cfg resplit blocks",
+	      hir_cfg_block_count(cfg), before_blocks + 1);
+    check_int("critical cfg resplit edges",
+	      hir_cfg_edge_count(cfg), before_edges + 1);
+    (void) hir_verify_cfg(ctx, cfg);
+    check_int("critical cfg verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_repeated_local_assignment_ssa(void)
 {
     Names names;
@@ -767,6 +808,7 @@ main(void)
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
+    test_cfg_critical_edge_splitting();
     test_repeated_local_assignment_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();

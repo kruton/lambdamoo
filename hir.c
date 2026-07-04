@@ -719,6 +719,84 @@ cfg_expected_successors(HIRTacInstr *last)
     }
 }
 
+static int max_cfg_block_id(HIRCFG *);
+
+static int
+cfg_edge_is_critical(HIRBasicBlock *from, HIRBasicBlock *to)
+{
+    return from && to && from->num_successors > 1 && to->predecessor_count > 1;
+}
+
+static HIRTacInstr *
+new_cfg_split_jump(HIRContext *ctx, HIRBasicBlock *from, HIRBasicBlock *to)
+{
+    HIRTacInstr *jump = hir_alloc(ctx, sizeof(HIRTacInstr));
+
+    jump->kind = HIR_TAC_JUMP;
+    jump->source_lineno = from && from->last ? from->last->source_lineno : 0;
+    if (jump->source_lineno == 0 && to)
+	jump->source_lineno = to->first_lineno;
+    jump->dst = 0;
+    jump->src1 = 0;
+    jump->src2 = 0;
+    jump->label = to && to->first && to->first->kind == HIR_TAC_LABEL
+	? to->first->label : 0;
+    jump->local_id = -1;
+    jump->op = HIR_OP_ADD;
+    jump->literal.type = TYPE_NONE;
+    jump->next = 0;
+
+    return jump;
+}
+
+int
+hir_split_critical_edges(HIRContext *ctx, HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    HIRBasicBlock *original_last;
+    int next_id;
+    int split_count = 0;
+
+    if (!ctx || !cfg)
+	return 0;
+
+    original_last = cfg->last_block;
+    next_id = max_cfg_block_id(cfg) + 1;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    HIRBasicBlock *succ = block->successors[i];
+	    HIRTacInstr *jump;
+	    HIRBasicBlock *split;
+
+	    if (!cfg_edge_is_critical(block, succ))
+		continue;
+
+	    jump = new_cfg_split_jump(ctx, block, succ);
+	    split = new_block(ctx, next_id++, jump);
+	    split->last = jump;
+	    append_block(cfg, split);
+
+	    block->successors[i] = split;
+	    split->predecessor_count = 1;
+	    split->successors[0] = succ;
+	    split->num_successors = 1;
+	    cfg->num_edges++;
+	    split_count++;
+
+	    if (original_last == block)
+		original_last = split;
+	}
+
+	if (block == original_last)
+	    break;
+    }
+
+    return split_count;
+}
+
 int
 hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 {
@@ -2172,6 +2250,27 @@ hir_cfg_unsupported_block_count(HIRCFG *cfg)
 }
 
 int
+hir_cfg_critical_edge_count(HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int count = 0;
+
+    if (!cfg)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    if (cfg_edge_is_critical(block, block->successors[i]))
+		count++;
+	}
+    }
+
+    return count;
+}
+
+int
 hir_dom_reachable_block_count(HIRDominatorTree *dom)
 {
     return dom ? dom->num_reachable : 0;
@@ -3271,6 +3370,45 @@ hir_test_cfg_with_duplicate_block_id(HIRContext *ctx)
     init_test_block(first, 1, first_tac);
     init_test_block(second, 1, second_tac);
     first->next = second;
+
+    return cfg;
+}
+
+HIRCFG *
+hir_test_cfg_with_critical_edge(HIRContext *ctx)
+{
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_BRANCH_FALSE, 1016);
+    HIRTacInstr *then_tac = new_tac(ctx, HIR_TAC_JUMP, 1017);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN0, 1018);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *then_block = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    entry_tac->src1 = 1;
+    entry_tac->label = 1;
+    then_tac->label = 1;
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = join;
+    cfg->num_blocks = 3;
+    cfg->num_edges = 3;
+
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(then_block, 2, then_tac);
+    init_test_block(join, 3, join_tac);
+
+    entry->next = then_block;
+    then_block->next = join;
+
+    entry->successors[0] = join;
+    entry->successors[1] = then_block;
+    entry->num_successors = 2;
+    then_block->successors[0] = join;
+    then_block->num_successors = 1;
+    then_block->predecessor_count = 1;
+    join->predecessor_count = 2;
 
     return cfg;
 }
