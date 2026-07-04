@@ -475,7 +475,7 @@ test_loop_dominator_tree(void)
 }
 
 static void
-test_dominance_frontier_tac(void)
+test_while_loop_phi_ssa(void)
 {
     Names names;
     HIRContext *ctx;
@@ -524,6 +524,64 @@ test_dominance_frontier_tac(void)
     check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 11);
     check_int("loop ssa values", hir_ssa_value_count(ssa), 6);
     check_int("loop ssa phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_if_else_phi_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Cond_Arm arm;
+
+    Expr one = int_expr(1, 70);
+    Expr two = int_expr(2, 70);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+
+    Expr then_value = int_expr(3, 71);
+    Expr then_lhs = id_expr(16, 71);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+
+    Expr else_value = int_expr(4, 72);
+    Expr else_lhs = id_expr(16, 72);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+
+    Expr ret_expr = id_expr(16, 73);
+    Stmt ret = return_stmt(&ret_expr);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 70;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("ifelse tac stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("ifelse cfg blocks", hir_cfg_block_count(cfg), 4);
+    check_int("ifelse cfg edges", hir_cfg_edge_count(cfg), 4);
+    check_int("ifelse dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 4);
+    check_int("ifelse ssa blocks", hir_ssa_block_count(ssa), 4);
+    check_int("ifelse ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("ifelse verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
 }
@@ -580,7 +638,8 @@ main(void)
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_loop_dominator_tree();
-    test_dominance_frontier_tac();
+    test_while_loop_phi_ssa();
+    test_if_else_phi_ssa();
     test_repeated_local_assignment_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
