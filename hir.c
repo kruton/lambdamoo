@@ -14,6 +14,8 @@ typedef struct HIRCondArm HIRCondArm;
 typedef struct HIRExceptArm HIRExceptArm;
 typedef struct HIRTacInstr HIRTacInstr;
 typedef struct HIRBasicBlock HIRBasicBlock;
+typedef struct HIRSSAInstr HIRSSAInstr;
+typedef struct HIRSSABlock HIRSSABlock;
 
 struct HIRArg {
     enum Arg_Kind kind;
@@ -179,6 +181,36 @@ struct HIRCFG {
     HIRBasicBlock *last_block;
     int num_blocks;
     int num_edges;
+};
+
+struct HIRSSAInstr {
+    HIRTacKind kind;
+    unsigned source_lineno;
+    int value;
+    int src1;
+    int src2;
+    int label;
+    int local_id;
+    HIROp op;
+    Var literal;
+    HIRSSAInstr *next;
+};
+
+struct HIRSSABlock {
+    int id;
+    unsigned first_lineno;
+    unsigned last_lineno;
+    HIRSSAInstr *first;
+    HIRSSAInstr *last;
+    HIRSSABlock *next;
+};
+
+struct HIRSSAProgram {
+    HIRSSABlock *blocks;
+    HIRSSABlock *last_block;
+    int num_blocks;
+    int num_instructions;
+    int num_values;
 };
 
 struct HIRContext {
@@ -630,6 +662,207 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
     return ctx->error_count == errors_before;
 }
 
+static int
+ssa_defines_value(HIRSSAInstr *instr)
+{
+    return instr
+	&& (instr->kind == HIR_TAC_CONST
+	    || instr->kind == HIR_TAC_LOAD_LOCAL
+	    || instr->kind == HIR_TAC_UNARY
+	    || instr->kind == HIR_TAC_BINARY
+	    || instr->kind == HIR_TAC_UNSUPPORTED);
+}
+
+static void
+append_ssa_block(HIRSSAProgram *ssa, HIRSSABlock *block)
+{
+    if (ssa->last_block)
+	ssa->last_block->next = block;
+    else
+	ssa->blocks = block;
+    ssa->last_block = block;
+    ssa->num_blocks++;
+}
+
+static void
+append_ssa_instr(HIRSSAProgram *ssa, HIRSSABlock *block, HIRSSAInstr *instr)
+{
+    if (block->last)
+	block->last->next = instr;
+    else
+	block->first = instr;
+    block->last = instr;
+    ssa->num_instructions++;
+    if (ssa_defines_value(instr))
+	ssa->num_values++;
+}
+
+static HIRSSAInstr *
+new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
+{
+    HIRSSAInstr *instr = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+    instr->kind = tac->kind;
+    instr->source_lineno = tac->source_lineno;
+    instr->value = tac->dst;
+    instr->src1 = tac->src1;
+    instr->src2 = tac->src2;
+    instr->label = tac->label;
+    instr->local_id = tac->local_id;
+    instr->op = tac->op;
+    instr->literal = tac->literal;
+    instr->next = 0;
+
+    return instr;
+}
+
+HIRSSAProgram *
+hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
+{
+    HIRSSAProgram *ssa;
+    HIRBasicBlock *cfg_block;
+
+    if (!ctx || !cfg)
+	return 0;
+
+    ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    ssa->blocks = 0;
+    ssa->last_block = 0;
+    ssa->num_blocks = 0;
+    ssa->num_instructions = 0;
+    ssa->num_values = 0;
+
+    for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
+	HIRSSABlock *ssa_block = hir_alloc(ctx, sizeof(HIRSSABlock));
+	HIRTacInstr *tac;
+
+	ssa_block->id = cfg_block->id;
+	ssa_block->first_lineno = cfg_block->first_lineno;
+	ssa_block->last_lineno = cfg_block->last_lineno;
+	ssa_block->first = 0;
+	ssa_block->last = 0;
+	ssa_block->next = 0;
+	append_ssa_block(ssa, ssa_block);
+
+	for (tac = cfg_block->first; tac; tac = tac->next) {
+	    append_ssa_instr(ssa, ssa_block, new_ssa_instr(ctx, tac));
+	    if (tac == cfg_block->last)
+		break;
+	}
+    }
+
+    return ssa;
+}
+
+static void
+verify_ssa_value_use(HIRContext *ctx, int value, unsigned char *defined,
+		     int max_value)
+{
+    if (value <= 0 || value > max_value || !defined[value])
+	record_unsupported(ctx, "SSA value used before definition");
+}
+
+static void
+verify_ssa_value_def(HIRContext *ctx, int value, unsigned char *defined,
+		     int max_value)
+{
+    if (value <= 0 || value > max_value) {
+	record_unsupported(ctx, "Invalid SSA value definition");
+	return;
+    }
+
+    if (defined[value])
+	record_unsupported(ctx, "Duplicate SSA value definition");
+    defined[value] = 1;
+}
+
+int
+hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    unsigned char *defined;
+    int max_value;
+    int errors_before;
+    int block_count = 0;
+    int instruction_count = 0;
+    int value_count = 0;
+    int i;
+
+    if (!ctx || !ssa)
+	return 0;
+
+    errors_before = ctx->error_count;
+    max_value = ctx->next_temp - 1;
+    defined = hir_alloc(ctx, (size_t) max_value + 1);
+    for (i = 0; i <= max_value; i++)
+	defined[i] = 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	block_count++;
+	if (!block->first || !block->last)
+	    record_unsupported(ctx, "SSA block has no instructions");
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    instruction_count++;
+
+	    switch (instr->kind) {
+	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_LOCAL:
+		if (instr->kind == HIR_TAC_LOAD_LOCAL)
+		    verify_local(ctx, instr->local_id);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_STORE_LOCAL:
+		verify_local(ctx, instr->local_id);
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_UNARY:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_BINARY:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_BRANCH_FALSE:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_RETURN:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_UNSUPPORTED:
+		if (instr->value > 0) {
+		    verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		    value_count++;
+		}
+		break;
+	    case HIR_TAC_LABEL:
+	    case HIR_TAC_JUMP:
+	    case HIR_TAC_RETURN0:
+		break;
+	    }
+
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    if (block_count != ssa->num_blocks)
+	record_unsupported(ctx, "SSA block count mismatch");
+    if (instruction_count != ssa->num_instructions)
+	record_unsupported(ctx, "SSA instruction count mismatch");
+    if (value_count != ssa->num_values)
+	record_unsupported(ctx, "SSA value count mismatch");
+
+    return ctx->error_count == errors_before;
+}
+
 #ifdef HIR_DUMP_TAC
 static const char *tac_kind_name(HIRTacKind);
 static const char *op_name(HIROp);
@@ -903,6 +1136,47 @@ hir_cfg_unsupported_block_count(HIRCFG *cfg)
     for (block = cfg->blocks; block; block = block->next) {
 	if (block->contains_unsupported)
 	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_ssa_block_count(HIRSSAProgram *ssa)
+{
+    return ssa ? ssa->num_blocks : 0;
+}
+
+int
+hir_ssa_instruction_count(HIRSSAProgram *ssa)
+{
+    return ssa ? ssa->num_instructions : 0;
+}
+
+int
+hir_ssa_value_count(HIRSSAProgram *ssa)
+{
+    return ssa ? ssa->num_values : 0;
+}
+
+int
+hir_ssa_count_kind(HIRSSAProgram *ssa, HIRTacKind kind)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == kind)
+		count++;
+	    if (instr == block->last)
+		break;
+	}
     }
 
     return count;
