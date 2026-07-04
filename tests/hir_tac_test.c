@@ -33,6 +33,38 @@ check_rejected(const char *name, int accepted, int before_errors,
     }
 }
 
+#ifdef HIR_DUMP_SSA
+static void
+check_ssa_dump_contains(const char *name, HIRSSAProgram *ssa,
+			const char *needle)
+{
+    FILE *file = tmpfile();
+    char line[512];
+    int found = 0;
+
+    if (!file) {
+	fprintf(stderr, "%s: failed to create dump comparison file\n", name);
+	failures++;
+	return;
+    }
+
+    hir_dump_ssa_to_file(file, ssa);
+    rewind(file);
+    while (fgets(line, sizeof(line), file)) {
+	if (strstr(line, needle)) {
+	    found = 1;
+	    break;
+	}
+    }
+    fclose(file);
+
+    if (!found) {
+	fprintf(stderr, "%s: SSA dump missing '%s'\n", name, needle);
+	failures++;
+    }
+}
+#endif
+
 static Expr
 int_expr(Num value, unsigned lineno)
 {
@@ -602,6 +634,19 @@ test_if_else_phi_ssa(void)
     check_int("ifelse ssa zero phi args", hir_ssa_zero_phi_arg_count(ssa), 0);
     check_int("ifelse ssa return uses phi",
 	      hir_ssa_return_uses_phi_count(ssa), 1);
+#ifdef HIR_DUMP_SSA
+    check_ssa_dump_contains("ifelse ssa dump header", ssa, "HIR SSA BEGIN");
+    check_ssa_dump_contains("ifelse ssa dump counts", ssa,
+			    "blocks=4 instructions=");
+    check_ssa_dump_contains("ifelse ssa dump branch topology", ssa,
+			    "preds=[] succs=[B2,B3]");
+    check_ssa_dump_contains("ifelse ssa dump join topology", ssa,
+			    "preds=[B2,B3] succs=[]");
+    check_ssa_dump_contains("ifelse ssa dump phi", ssa,
+			    "phi local[16] [B2:t");
+    check_ssa_dump_contains("ifelse ssa dump phi arg", ssa, ", B3:t");
+    check_ssa_dump_contains("ifelse ssa dump footer", ssa, "HIR SSA END");
+#endif
     check_int("ifelse verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);

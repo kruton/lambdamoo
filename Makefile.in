@@ -122,10 +122,10 @@ moo:	$(OBJS) $(XT_LOBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@
 
 tests/hir_test_hir.o: hir.c hir.h
-	$(COMPILE.c) -DHIR_TESTING -o $@ hir.c
+	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ hir.c
 
 tests/hir_tac_test.o: tests/hir_tac_test.c hir.h ast.h structures.h
-	$(COMPILE.c) -DHIR_TESTING -o $@ tests/hir_tac_test.c
+	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ tests/hir_tac_test.c
 
 tests/hir_test_stubs.o: tests/hir_test_stubs.c storage.h
 	$(COMPILE.c) -o $@ tests/hir_test_stubs.c

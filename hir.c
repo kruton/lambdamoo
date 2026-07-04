@@ -1716,11 +1716,13 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     return ctx->error_count == errors_before;
 }
 
-#ifdef HIR_DUMP_TAC
+#if defined(HIR_DUMP_TAC) || defined(HIR_DUMP_SSA)
 static const char *tac_kind_name(HIRTacKind);
 static const char *op_name(HIROp);
 static void dump_var(FILE *, Var);
+#endif
 
+#ifdef HIR_DUMP_TAC
 void
 hir_dump_tac(HIRTacProgram *program)
 {
@@ -1783,7 +1785,177 @@ hir_dump_tac(HIRTacProgram *program)
 
     fprintf(stderr, "HIR TAC END\n");
 }
+#endif
 
+#ifdef HIR_DUMP_SSA
+static void
+dump_ssa_block_list(FILE *file, HIRCFG *cfg, HIRSSABlock *block,
+		    int predecessors)
+{
+    HIRBasicBlock *cfg_block;
+    int max_block_id;
+    int printed = 0;
+    int i;
+
+    fprintf(file, "[");
+    if (!cfg || !block) {
+	fprintf(file, "]");
+	return;
+    }
+
+    cfg_block = cfg_block_for_id(cfg, block->id);
+    max_block_id = max_cfg_block_id(cfg);
+    for (i = 1; i <= max_block_id; i++) {
+	HIRBasicBlock *candidate = cfg_block_for_id(cfg, i);
+	int has_edge = 0;
+	int j;
+
+	if (!candidate)
+	    continue;
+	if (predecessors) {
+	    if (!cfg_block)
+		continue;
+	    for (j = 0; j < candidate->num_successors; j++) {
+		if (candidate->successors[j] == cfg_block) {
+		    has_edge = 1;
+		    break;
+		}
+	    }
+	} else if (cfg_block) {
+	    for (j = 0; j < cfg_block->num_successors; j++) {
+		if (cfg_block->successors[j] == candidate) {
+		    has_edge = 1;
+		    break;
+		}
+	    }
+	}
+
+	if (has_edge) {
+	    fprintf(file, "%sB%d", printed ? "," : "", i);
+	    printed = 1;
+	}
+    }
+    fprintf(file, "]");
+}
+
+static void
+dump_ssa_phi_args(FILE *file, HIRSSAProgram *ssa, HIRSSAInstr *instr)
+{
+    int max_block_id = ssa && ssa->cfg ? max_cfg_block_id(ssa->cfg) : 0;
+    int printed = 0;
+    int i;
+
+    fprintf(file, "[");
+    for (i = 1; i <= max_block_id; i++) {
+	HIRPhiArg *arg;
+
+	for (arg = instr->phi_args; arg; arg = arg->next) {
+	    if (arg->block_id == i) {
+		fprintf(file, "%sB%d:t%d", printed ? ", " : "", arg->block_id,
+			arg->value);
+		printed = 1;
+		break;
+	    }
+	}
+    }
+    fprintf(file, "]");
+}
+
+void
+hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+
+    if (!file)
+	return;
+
+    fprintf(file, "HIR SSA BEGIN\n");
+    if (!ssa) {
+	fprintf(file, "HIR SSA END\n");
+	return;
+    }
+
+    fprintf(file, "blocks=%d instructions=%d values=%d\n",
+	    ssa->num_blocks, ssa->num_instructions, ssa->num_values);
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	fprintf(file, "B%d lines=%u..%u preds=", block->id,
+		block->first_lineno, block->last_lineno);
+	dump_ssa_block_list(file, ssa->cfg, block, 1);
+	fprintf(file, " succs=");
+	dump_ssa_block_list(file, ssa->cfg, block, 0);
+	fprintf(file, "\n");
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    fprintf(file, "  line %-5u %-14s", instr->source_lineno,
+		    tac_kind_name(instr->kind));
+
+	    switch (instr->kind) {
+	    case HIR_TAC_CONST:
+		fprintf(file, " t%d = ", instr->value);
+		dump_var(file, instr->literal);
+		break;
+	    case HIR_TAC_LOAD_LOCAL:
+		fprintf(file, " t%d = local[%d]", instr->value,
+			instr->local_id);
+		break;
+	    case HIR_TAC_STORE_LOCAL:
+		fprintf(file, " local[%d] = t%d", instr->local_id,
+			instr->src1);
+		break;
+	    case HIR_TAC_UNARY:
+		fprintf(file, " t%d = %s t%d", instr->value,
+			op_name(instr->op), instr->src1);
+		break;
+	    case HIR_TAC_BINARY:
+		fprintf(file, " t%d = t%d %s t%d", instr->value,
+			instr->src1, op_name(instr->op), instr->src2);
+		break;
+	    case HIR_TAC_LABEL:
+		fprintf(file, " L%d:", instr->label);
+		break;
+	    case HIR_TAC_JUMP:
+		fprintf(file, " L%d", instr->label);
+		break;
+	    case HIR_TAC_BRANCH_FALSE:
+		fprintf(file, " if_false t%d goto L%d", instr->src1,
+			instr->label);
+		break;
+	    case HIR_TAC_RETURN:
+		fprintf(file, " t%d", instr->src1);
+		break;
+	    case HIR_TAC_RETURN0:
+		break;
+	    case HIR_TAC_UNSUPPORTED:
+		if (instr->value > 0)
+		    fprintf(file, " t%d", instr->value);
+		break;
+	    case HIR_TAC_PHI:
+		fprintf(file, " t%d = phi local[%d] ", instr->value,
+			instr->local_id);
+		dump_ssa_phi_args(file, ssa, instr);
+		break;
+	    }
+
+	    fprintf(file, "\n");
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    fprintf(file, "HIR SSA END\n");
+}
+
+void
+hir_dump_ssa(HIRSSAProgram *ssa)
+{
+    hir_dump_ssa_to_file(stderr, ssa);
+}
+#endif
+
+#if defined(HIR_DUMP_TAC) || defined(HIR_DUMP_SSA)
 static const char *
 tac_kind_name(HIRTacKind kind)
 {

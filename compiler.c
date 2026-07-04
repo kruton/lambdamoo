@@ -46,6 +46,9 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 #ifdef HIR_DUMP_TAC
     hir_dump_tac(tac_program);
 #endif
+#ifdef HIR_DUMP_SSA
+    hir_dump_ssa(ssa_program);
+#endif
     (void) ssa_program;
     (void) dom_tree;
     (void) cfg;

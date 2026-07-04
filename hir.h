@@ -118,6 +118,10 @@ extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
 #ifdef HIR_DUMP_TAC
 extern void hir_dump_tac(HIRTacProgram *);
 #endif
+#ifdef HIR_DUMP_SSA
+extern void hir_dump_ssa_to_file(FILE *, HIRSSAProgram *);
+extern void hir_dump_ssa(HIRSSAProgram *);
+#endif
 
 #ifdef HIR_TESTING
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
