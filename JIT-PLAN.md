@@ -1,0 +1,407 @@
+# Architecture Specification: JIT Compiler for LambdaMOO
+
+## 1. Executive Summary
+
+This document describes the current long-term compiler plan for LambdaMOO.
+The active frontend is AST-first:
+
+```text
+source/list input
+  -> parser
+  -> AST
+  -> compiler orchestration layer
+       -> existing bytecode backend -> Program
+       -> HIR frontend -> TAC -> CFG -> dominators/frontiers -> SSA
+       -> optimizations -> MIR/native code
+```
+
+The interpreter and database compatibility boundary is still bytecode-based.
+Compiled code must always be able to deoptimize to canonical interpreter state:
+`Program *`, bytecode vector, bytecode PC, `error_pc`, runtime locals, stack,
+`temp`, and any built-in continuation state. The AST-first pipeline is the
+compiler construction path; bytecode remains the persistence and fallback path.
+
+This direction avoids lowering to bytecode and raising it back into a higher
+level IR. The bytecode decoder can still be added later as a compatibility or
+optimization frontend, but it is no longer the v1 compiler frontend.
+
+## 2. Core Principles
+
+* Preserve current `parse_program()` behavior and database compatibility.
+* Keep bytecode generation as the source of executable interpreter programs.
+* Build JIT analysis from the AST while the compiler still owns it.
+* Represent unsupported language features explicitly and fall back cleanly.
+* Attach source line information throughout HIR/TAC/CFG/SSA for diagnostics.
+* Treat every future native safepoint as a place where interpreter state can be
+  reconstructed exactly.
+* Prefer small verifier-backed IR steps over a large native-code jump.
+
+## 3. Completed Foundation
+
+The current branch has already established the first compiler backbone:
+
+* arena allocation for AST/compiler transient state;
+* compiler orchestration split around parsing, bytecode generation, and HIR
+  hooks;
+* ResumePoint groundwork for serialized suspended activations;
+* structured HIR construction from the AST;
+* TAC lowering for constants, locals, arithmetic, comparisons, branches,
+  returns, and unsupported operations;
+* gated TAC dumping behind `HIR_DUMP_TAC`;
+* TAC verifier and negative tests;
+* direct C unit test harness for the compiler/HIR subsystem;
+* source line propagation through TAC;
+* CFG construction from TAC;
+* CFG verifier and negative tests;
+* dominator tree using Cooper's iterative algorithm;
+* dominance frontier computation;
+* initial SSA construction over CFG;
+* SSA verifier, including phi-shape negative tests;
+* positive SSA phi tests for `if`/`else` joins and `while` loop backedges.
+
+## 4. Phase 1: AST to HIR
+
+HIR is the structured compiler IR derived directly from the parser AST. It
+should stay close enough to the language to preserve semantics, while exposing
+control flow and values enough for lowering.
+
+HIR should model:
+
+* integer and float constants;
+* literal values;
+* local variable reads and writes;
+* `temp` register use;
+* arithmetic and comparison expressions;
+* assignment;
+* conditional branches;
+* loops;
+* returns;
+* unsupported or bailout-first expressions/statements;
+* source line information on every lowered operation.
+
+The v1 supported subset should remain intentionally conservative:
+
+* integer and float arithmetic;
+* comparisons;
+* local loads and stores;
+* simple `if`/`else`;
+* simple `while`;
+* returns when no active `finally`/`except` state complicates unwinding.
+
+The v1 unsupported or bailout-first set should include:
+
+* verb calls;
+* built-in calls;
+* property access and mutation;
+* fork creation;
+* try/except/finally;
+* scatter assignment;
+* list/string construction and mutation;
+* WAIF-specific paths;
+* any operation that can suspend, push an activation, or depend on complex
+  interpreter stack markers.
+
+Unsupported operations should remain visible in IR so verifiers, dumps, and
+future lowering passes can reason about bailout boundaries.
+
+## 5. Phase 2: TAC
+
+TAC is the normalized pre-CFG IR. It makes expression evaluation order explicit
+and assigns intermediate results to compiler temporaries.
+
+TAC should provide:
+
+* one explicit result for each value-producing instruction;
+* local loads and stores;
+* explicit labels, jumps, conditional branches, and returns;
+* unsupported instructions for bailout-first operations;
+* source line numbers on generated instructions;
+* a verifier that catches undefined temps, duplicate defs, malformed control
+  instructions, and invalid local references.
+
+TAC is not the final optimizer IR. It is the stable handoff into CFG and SSA.
+
+## 6. Phase 3: CFG
+
+Build CFG blocks from TAC:
+
+* start a block at entry, labels, branch targets, and fallthrough after
+  terminators;
+* retain labels as instruction anchors where useful for dumps and diagnostics;
+* compute predecessor and successor sets;
+* represent unsupported operations as blocks that force interpreter fallback;
+* verify successor/predecessor symmetry and terminator shapes.
+
+The CFG should remain conservative. Complex runtime constructs can become
+single unsupported regions until the compiler has exact state reconstruction
+for them.
+
+## 7. Phase 4: Dominators and SSA
+
+### 7.1 Dominator Tree
+
+Use Cooper's iterative data-flow algorithm:
+
+1. Compute reverse postorder over reachable CFG blocks.
+2. Calculate immediate dominators for every reachable block.
+3. Iterate until the IDOM array stops changing.
+4. Leave unreachable blocks explicit but not part of the reachable dominator
+   tree.
+
+### 7.2 Dominance Frontiers
+
+Compute dominance frontiers from the dominator tree. These frontiers drive phi
+placement for locals and compiler temporaries whose definitions can reach a
+join.
+
+### 7.3 Phi Placement
+
+Use iterated dominance frontiers for SSA variables:
+
+* place phis at control-flow joins where multiple definitions may reach;
+* include loop headers when a loop-carried definition reaches the next
+  iteration;
+* ensure phi argument count and predecessor blocks match the CFG exactly.
+
+### 7.4 Register Renaming
+
+SSA construction should use dominator-tree preorder traversal:
+
+1. Maintain active version stacks for each local and compiler temporary.
+2. Assign new versions at definitions and phi nodes.
+3. Rewrite reads to the current active version.
+4. Fill successor phi arguments from the current version stack.
+5. Pop versions when backtracking out of a dominator subtree.
+
+If the current SSA builder only handles a subset of this behavior, completing
+full register renaming is the next SSA correctness milestone.
+
+### 7.5 SSA Destruction
+
+CPUs do not have phi instructions. Before MIR/native lowering, destroy SSA by
+inserting moves along predecessor edges. Critical edges may need to be split so
+phi moves can be placed without changing branch semantics.
+
+## 8. Phase 5: Optimization Passes
+
+### 8.1 Sparse Conditional Type Propagation
+
+Use Wegman-Zadeck style sparse conditional propagation adapted to LambdaMOO
+type tags:
+
+* constants start with precise types;
+* conflicting phi inputs degrade to `TYPE_ANY`;
+* unreachable branches should not pollute downstream phi types;
+* operations that can raise `E_TYPE`, `E_RANGE`, `E_DIV`, `E_QUOTA`, or
+  `E_FLOAT` must retain the same observable behavior as the interpreter.
+
+### 8.2 Simple Canonical Optimizations
+
+Before native code, add small verifier-backed optimizations:
+
+* constant folding for pure arithmetic/comparisons;
+* dead temp elimination;
+* unreachable block pruning after branch simplification;
+* redundant local load/store cleanup when ownership is unaffected.
+
+Each optimization should preserve line/resume metadata or explicitly remap it.
+
+### 8.3 Guarded Native Operations
+
+If an SSA value degrades to `TYPE_ANY`, native specialized operations must be
+guarded. Guard failure should deoptimize to the interpreter at the attached
+ResumePoint/ResumeID.
+
+## 9. Phase 6: Runtime Semantics
+
+### 9.1 Tick Accounting
+
+LambdaMOO tick accounting is per ticked operation. The first native tier should
+preserve this exactly by charging the same logical work as the interpreter would
+have charged for the compiled region.
+
+Later tiers may batch tick checks, but only when bailout can reconstruct an
+activation at a valid resume point and preserve abort behavior for tick and
+seconds exhaustion.
+
+### 9.2 Built-In and Verb Calls
+
+Built-ins can return, raise, call another verb, suspend, or abort. Verb calls
+can push new activations and affect permissions, traceback, and suspension.
+
+For v1:
+
+* deopt before built-in and verb calls;
+* let the existing interpreter perform the call;
+* keep `bi_func_pc`, `bi_func_id`, and `bi_func_data` as interpreter-owned
+  continuation state.
+
+Built-in inlining must be opt-in and metadata-driven. A built-in may be inlined
+only if its registered contract declares it continuation-free:
+
+* it cannot return `BI_CALL`;
+* it cannot return `BI_SUSPEND`;
+* it cannot return `BI_ABORT`;
+* it has no private `bi_func_data`;
+* its error behavior and ownership behavior are fully modeled by the JIT.
+
+Continuation-capable built-ins must remain runtime call boundaries.
+
+### 9.3 Exceptions and Finally
+
+The current interpreter implements exception and finally behavior through
+runtime stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) and `unwind_stack()`.
+This is not equivalent to native exception tables alone.
+
+For v1:
+
+* bail out before try/except/finally regions;
+* preserve stack-marker semantics in the interpreter;
+* avoid drawing synthetic exceptional edges from every instruction until HIR
+  explicitly models stack markers and unwind behavior.
+
+Native landing pads may be added later as an optimization, but they must still
+materialize the same activation and stack-marker state expected by
+`unwind_stack()`.
+
+## 10. Phase 7: Resume, Deoptimization, and Persistence
+
+### 10.1 Resume Anchoring
+
+Suspended tasks must survive database checkpoints, server restarts, compiler
+updates, and the absence of JIT code. Raw native pointers and native PCs must
+never be serialized.
+
+A resume anchor identifies a point where all live execution state can be
+represented in canonical interpreter activation form:
+
+* `Program *` snapshot for the running activation;
+* bytecode vector identity;
+* bytecode `pc`;
+* `error_pc`;
+* `rt_env`;
+* runtime stack contents and depth;
+* `temp`;
+* built-in continuation state, when present.
+
+AST/HIR/SSA locations must map back to bytecode resume anchors before native
+execution is allowed. For v1, resume resolves to bytecode PC and execution
+continues in the interpreter.
+
+### 10.2 Deep Deoptimization
+
+When JIT code must suspend, call unsupported runtime behavior, hit a guard
+failure, or abort:
+
+1. Trap to a C deoptimization runtime.
+2. Use the JIT deopt map for the current native location.
+3. Materialize each native frame into a normal `activation`.
+4. Populate `pc`, `error_pc`, resume metadata, `rt_env`, runtime stack, `temp`,
+   and ownership-correct `Var` values.
+5. Continue in the interpreter or serialize the VM if the operation suspended.
+
+Serialized activations preserve language state, not JIT state. JIT state is
+disposable and must be reconstructable from the canonical activation.
+
+### 10.3 Future Native Resume
+
+On database load, a future JIT may resume natively only if:
+
+* the relevant program/vector is compiled;
+* the compiled code advertises support for the activation's resume anchor;
+* the compiler has a native resume stub for that anchor;
+* the canonical activation can be converted into the native frame layout.
+
+If any condition fails, resume in the interpreter.
+
+## 11. Phase 8: Memory Safety and Reference Ownership
+
+LambdaMOO is reference-counted. The JIT should use deopt and ownership maps,
+not a tracing-GC model.
+
+### 11.1 Reference Count Elision
+
+SSA and escape analysis can eventually prove which values are purely local to
+compiled code. Until that proof exists, prefer conservative `var_ref()` and
+`free_var()` behavior at boundaries.
+
+Only elide refcount operations when the compiler can prove:
+
+* the value does not escape to an object property, list/string storage, another
+  activation, or the interpreter;
+* all bailout paths transfer ownership correctly;
+* all error paths free owned values exactly once.
+
+### 11.2 Deopt and Ownership Maps
+
+At every trapping or bailout-capable native instruction, the JIT must know how
+to reconstruct interpreter `Var` values:
+
+* which logical locals/stack slots are live;
+* whether each value is immediate, borrowed, owned, or needs `var_ref()`;
+* where each value currently lives: register, native stack slot, constant, or
+  materialized runtime object;
+* which cleanup actions are required if deopt aborts partway through.
+
+These maps are also the foundation for future native resume stubs.
+
+## 12. Optional Bytecode Frontend
+
+A bytecode decoder is no longer required for v1 HIR construction, but it may
+still be valuable later for:
+
+* compiling old programs when AST metadata is unavailable;
+* validating AST-derived resume mapping against bytecode PCs;
+* comparing interpreter bytecode behavior with HIR lowering;
+* compiling conservative bytecode-only regions.
+
+If added, the decoder should carry:
+
+* bytecode vector identity (`MAIN_VECTOR` or fork vector index);
+* bytecode PC;
+* opcode or extended opcode;
+* decoded operands using `numbytes_label`, `numbytes_literal`,
+  `numbytes_fork`, `numbytes_var_name`, and `numbytes_stack`;
+* stack delta and maximum stack requirements;
+* tick cost according to `COUNT_TICK()` and `COUNT_EOP_TICK()`;
+* whether the instruction is a resume/deopt/safepoint candidate.
+
+The decoder should be a secondary frontend into TAC/CFG, not the primary
+architecture for the current AST-first plan.
+
+## 13. Gotchas and Landmines
+
+* **Program snapshots:** Running activations hold refcounted `Program *`
+  snapshots. Suspended activations must serialize that running program, not
+  look up the current verb slot, because the verb may have been reprogrammed.
+* **Bytecode compatibility:** Legacy suspended tasks store source plus bytecode
+  PCs. If compiler bytecode layout changes, old PCs can become invalid. Resume
+  migration exists to make this boundary explicit and versioned.
+* **AST lifetime:** AST-derived JIT metadata must be generated before the AST
+  is freed, or the AST must become part of a deliberate program-lifetime
+  storage design.
+* **ASLR and serialization:** Never serialize a raw pointer, native frame
+  address, or native PC.
+* **setjmp/longjmp:** Generic exception helpers use `setjmp`/`longjmp`.
+  JIT-owned transient state must be released through explicit deopt/cleanup
+  paths before code can enter runtime paths that may longjmp.
+* **Phi lowering:** Destroy SSA before MIR lowering by inserting moves at
+  predecessor edges.
+* **Critical edges:** SSA destruction and some instrumentation may require CFG
+  edge splitting.
+* **`TYPE_ANY` fallback:** If type propagation cannot prove a specialized type,
+  emit a guard or stay in the interpreter.
+
+## 14. Near-Term Roadmap
+
+The next reviewable compiler milestones are:
+
+1. Complete full SSA register renaming if any remaining reads still use
+   pre-SSA locals or temps.
+2. Add SSA dumps behind a compile flag for debugging.
+3. Add critical-edge splitting support for future phi destruction.
+4. Implement SSA destruction into non-SSA TAC/MIR-like form.
+5. Add type lattice scaffolding and sparse conditional type propagation tests.
+6. Add bytecode resume-anchor mapping for AST-derived HIR operations.
+7. Define the first MIR/native boundary, initially with no runtime calls and
+   conservative interpreter fallback.
