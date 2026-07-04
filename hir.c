@@ -2,6 +2,7 @@
 
 #include "arena.h"
 #include "program.h"
+#include "my-stdio.h"
 #include "storage.h"
 
 #include <stddef.h>
@@ -230,6 +231,187 @@ hir_lower_to_tac(HIRContext *ctx, HIRProgram *program)
 	lower_stmt_list(ctx, tac, program->root);
     return tac;
 }
+
+#ifdef HIR_DUMP_TAC
+static const char *tac_kind_name(HIRTacKind);
+static const char *op_name(HIROp);
+static void dump_var(FILE *, Var);
+
+void
+hir_dump_tac(HIRTacProgram *program)
+{
+    HIRTacInstr *instr;
+
+    fprintf(stderr, "HIR TAC BEGIN\n");
+    if (!program) {
+	fprintf(stderr, "HIR TAC END\n");
+	return;
+    }
+
+    for (instr = program->first; instr; instr = instr->next) {
+	fprintf(stderr, "  %-14s", tac_kind_name(instr->kind));
+
+	switch (instr->kind) {
+	case HIR_TAC_CONST:
+	    fprintf(stderr, " t%d = ", instr->dst);
+	    dump_var(stderr, instr->literal);
+	    break;
+	case HIR_TAC_LOAD_LOCAL:
+	    fprintf(stderr, " t%d = local[%d]", instr->dst, instr->local_id);
+	    break;
+	case HIR_TAC_STORE_LOCAL:
+	    fprintf(stderr, " local[%d] = t%d", instr->local_id, instr->src1);
+	    break;
+	case HIR_TAC_UNARY:
+	    fprintf(stderr, " t%d = %s t%d", instr->dst,
+		    op_name(instr->op), instr->src1);
+	    break;
+	case HIR_TAC_BINARY:
+	    fprintf(stderr, " t%d = t%d %s t%d", instr->dst, instr->src1,
+		    op_name(instr->op), instr->src2);
+	    break;
+	case HIR_TAC_LABEL:
+	    fprintf(stderr, " L%d:", instr->label);
+	    break;
+	case HIR_TAC_JUMP:
+	    fprintf(stderr, " L%d", instr->label);
+	    break;
+	case HIR_TAC_BRANCH_FALSE:
+	    fprintf(stderr, " if_false t%d goto L%d", instr->src1,
+		    instr->label);
+	    break;
+	case HIR_TAC_RETURN:
+	    fprintf(stderr, " t%d", instr->src1);
+	    break;
+	case HIR_TAC_RETURN0:
+	    break;
+	case HIR_TAC_UNSUPPORTED:
+	    fprintf(stderr, " t%d", instr->dst);
+	    break;
+	}
+
+	fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "HIR TAC END\n");
+}
+
+static const char *
+tac_kind_name(HIRTacKind kind)
+{
+    switch (kind) {
+    case HIR_TAC_CONST:
+	return "const";
+    case HIR_TAC_LOAD_LOCAL:
+	return "load_local";
+    case HIR_TAC_STORE_LOCAL:
+	return "store_local";
+    case HIR_TAC_UNARY:
+	return "unary";
+    case HIR_TAC_BINARY:
+	return "binary";
+    case HIR_TAC_LABEL:
+	return "label";
+    case HIR_TAC_JUMP:
+	return "jump";
+    case HIR_TAC_BRANCH_FALSE:
+	return "branch_false";
+    case HIR_TAC_RETURN:
+	return "return";
+    case HIR_TAC_RETURN0:
+	return "return0";
+    case HIR_TAC_UNSUPPORTED:
+	return "unsupported";
+    }
+
+    return "unknown";
+}
+
+static const char *
+op_name(HIROp op)
+{
+    switch (op) {
+    case HIR_OP_NEGATE:
+	return "neg";
+    case HIR_OP_NOT:
+	return "not";
+    case HIR_OP_COMPLEMENT:
+	return "bitnot";
+    case HIR_OP_ADD:
+	return "+";
+    case HIR_OP_SUB:
+	return "-";
+    case HIR_OP_MUL:
+	return "*";
+    case HIR_OP_DIV:
+	return "/";
+    case HIR_OP_MOD:
+	return "%";
+    case HIR_OP_EXP:
+	return "^";
+    case HIR_OP_EQ:
+	return "==";
+    case HIR_OP_NE:
+	return "!=";
+    case HIR_OP_LT:
+	return "<";
+    case HIR_OP_LE:
+	return "<=";
+    case HIR_OP_GT:
+	return ">";
+    case HIR_OP_GE:
+	return ">=";
+    case HIR_OP_IN:
+	return "in";
+    case HIR_OP_AND:
+	return "&&";
+    case HIR_OP_OR:
+	return "||";
+    case HIR_OP_BITOR:
+	return "|";
+    case HIR_OP_BITXOR:
+	return "xor";
+    case HIR_OP_BITAND:
+	return "&";
+    case HIR_OP_SHL:
+	return "<<";
+    case HIR_OP_SHR:
+	return ">>";
+    case HIR_OP_LSHR:
+	return ">>>";
+    }
+
+    return "?";
+}
+
+static void
+dump_var(FILE *file, Var var)
+{
+    switch (var.type) {
+    case TYPE_INT:
+	fprintf(file, "%" PRIdN, var.v.num);
+	break;
+    case TYPE_OBJ:
+	fprintf(file, "#%" PRIdN, var.v.obj);
+	break;
+    case TYPE_STR:
+	fprintf(file, "\"%s\"", var.v.str);
+	break;
+    case TYPE_ERR:
+	fprintf(file, "error(%d)", var.v.err);
+	break;
+    case TYPE_FLOAT:
+	fprintf(file, "float");
+	break;
+    case TYPE_LIST:
+	fprintf(file, "list");
+	break;
+    default:
+	fprintf(file, "type(%d)", var.type);
+	break;
+    }
+}
+#endif
 
 static void *
 hir_alloc(HIRContext *ctx, size_t size)

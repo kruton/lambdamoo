@@ -102,4 +102,8 @@ extern const char *hir_context_error_message(HIRContext *);
 extern HIRProgram *hir_lift_ast(HIRContext *, Stmt *);
 extern HIRTacProgram *hir_lower_to_tac(HIRContext *, HIRProgram *);
 
+#ifdef HIR_DUMP_TAC
+extern void hir_dump_tac(HIRTacProgram *);
+#endif
+
 #endif /* !HIR_h */
