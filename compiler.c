@@ -33,6 +33,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     hir_ctx = hir_context_new(var_names);
     hir_program = hir_lift_ast(hir_ctx, ast);
     tac_program = hir_lower_to_tac(hir_ctx, hir_program);
+    (void) hir_verify_tac(hir_ctx, tac_program);
 #ifdef HIR_DUMP_TAC
     hir_dump_tac(tac_program);
 #endif

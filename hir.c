@@ -171,6 +171,7 @@ static HIRExpr *lift_expr(HIRContext *, Expr *);
 static HIRStmt *lift_stmt_list(HIRContext *, Stmt *);
 static int lower_expr(HIRContext *, HIRTacProgram *, HIRExpr *);
 static void lower_stmt_list(HIRContext *, HIRTacProgram *, HIRStmt *);
+static void record_unsupported(HIRContext *, const char *);
 
 HIRContext *
 hir_context_new(Names *var_names)
@@ -230,6 +231,144 @@ hir_lower_to_tac(HIRContext *ctx, HIRProgram *program)
     if (program)
 	lower_stmt_list(ctx, tac, program->root);
     return tac;
+}
+
+static void
+verify_local(HIRContext *ctx, int local_id)
+{
+    if (local_id < 0
+	|| (ctx->var_names && local_id >= (int) ctx->var_names->size))
+	record_unsupported(ctx, "Invalid local id in TAC");
+}
+
+static void
+verify_temp_use(HIRContext *ctx, int temp, unsigned char *defined,
+		int max_temp)
+{
+    if (temp <= 0 || temp > max_temp || !defined[temp])
+	record_unsupported(ctx, "TAC temp used before definition");
+}
+
+static void
+verify_temp_def(HIRContext *ctx, int temp, unsigned char *defined,
+		int max_temp)
+{
+    if (temp <= 0 || temp > max_temp) {
+	record_unsupported(ctx, "Invalid TAC temp definition");
+	return;
+    }
+
+    if (defined[temp])
+	record_unsupported(ctx, "Duplicate TAC temp definition");
+    defined[temp] = 1;
+}
+
+static void
+verify_label_def(HIRContext *ctx, int label, unsigned char *defined,
+		 int max_label)
+{
+    if (label <= 0 || label > max_label) {
+	record_unsupported(ctx, "Invalid TAC label definition");
+	return;
+    }
+
+    if (defined[label])
+	record_unsupported(ctx, "Duplicate TAC label definition");
+    defined[label] = 1;
+}
+
+static void
+verify_label_use(HIRContext *ctx, int label, unsigned char *referenced,
+		 int max_label)
+{
+    if (label <= 0 || label > max_label) {
+	record_unsupported(ctx, "Invalid TAC label reference");
+	return;
+    }
+
+    referenced[label] = 1;
+}
+
+int
+hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
+{
+    HIRTacInstr *instr;
+    unsigned char *defined_temps;
+    unsigned char *defined_labels;
+    unsigned char *referenced_labels;
+    int max_temp;
+    int max_label;
+    int errors_before;
+    int i;
+
+    if (!ctx || !program)
+	return 0;
+
+    errors_before = ctx->error_count;
+    max_temp = ctx->next_temp - 1;
+    max_label = ctx->next_label - 1;
+
+    defined_temps = hir_alloc(ctx, (size_t) max_temp + 1);
+    defined_labels = hir_alloc(ctx, (size_t) max_label + 1);
+    referenced_labels = hir_alloc(ctx, (size_t) max_label + 1);
+
+    for (i = 0; i <= max_temp; i++)
+	defined_temps[i] = 0;
+    for (i = 0; i <= max_label; i++) {
+	defined_labels[i] = 0;
+	referenced_labels[i] = 0;
+    }
+
+    for (instr = program->first; instr; instr = instr->next) {
+	switch (instr->kind) {
+	case HIR_TAC_CONST:
+	case HIR_TAC_LOAD_LOCAL:
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL)
+		verify_local(ctx, instr->local_id);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_STORE_LOCAL:
+	    verify_local(ctx, instr->local_id);
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_UNARY:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_BINARY:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_LABEL:
+	    verify_label_def(ctx, instr->label, defined_labels, max_label);
+	    break;
+	case HIR_TAC_JUMP:
+	    verify_label_use(ctx, instr->label, referenced_labels, max_label);
+	    break;
+	case HIR_TAC_BRANCH_FALSE:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_label_use(ctx, instr->label, referenced_labels, max_label);
+	    break;
+	case HIR_TAC_RETURN:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_RETURN0:
+	    break;
+	case HIR_TAC_UNSUPPORTED:
+	    record_unsupported(ctx, "Unsupported TAC instruction");
+	    if (instr->dst > 0)
+		verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	}
+    }
+
+    for (i = 1; i <= max_label; i++) {
+	if (referenced_labels[i] && !defined_labels[i])
+	    record_unsupported(ctx, "TAC label referenced but not defined");
+    }
+
+    return ctx->error_count == errors_before;
 }
 
 #ifdef HIR_DUMP_TAC
