@@ -19,6 +19,8 @@ typedef struct HIRDominatorTree HIRDominatorTree;
 typedef struct HIRSSAInstr HIRSSAInstr;
 typedef struct HIRSSABlock HIRSSABlock;
 typedef struct HIRPhiArg HIRPhiArg;
+typedef struct HIRParallelCopy HIRParallelCopy;
+typedef struct HIRSSADestructionMove HIRSSADestructionMove;
 
 struct HIRArg {
     enum Arg_Kind kind;
@@ -207,6 +209,21 @@ struct HIRPhiArg {
     HIRPhiArg *next;
 };
 
+struct HIRParallelCopy {
+    int dst;
+    int src;
+    HIRParallelCopy *next;
+};
+
+struct HIRSSADestructionMove {
+    int pred_block_id;
+    int target_block_id;
+    int dst;
+    int src;
+    unsigned source_lineno;
+    HIRSSADestructionMove *next;
+};
+
 struct HIRSSAInstr {
     HIRTacKind kind;
     unsigned source_lineno;
@@ -218,6 +235,7 @@ struct HIRSSAInstr {
     HIROp op;
     Var literal;
     HIRPhiArg *phi_args;
+    HIRParallelCopy *copies;
     HIRSSAInstr *next;
 };
 
@@ -231,6 +249,7 @@ struct HIRSSABlock {
 };
 
 struct HIRSSAProgram {
+    HIRForm form;
     HIRCFG *cfg;
     HIRSSABlock *blocks;
     HIRSSABlock *last_block;
@@ -454,6 +473,9 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    break;
 	case HIR_TAC_PHI:
 	    record_unsupported(ctx, "Phi node in TAC");
+	    break;
+	case HIR_TAC_PARALLEL_COPY:
+	    record_unsupported(ctx, "Parallel copy in TAC");
 	    break;
 	}
     }
@@ -725,6 +747,27 @@ static int
 cfg_edge_is_critical(HIRBasicBlock *from, HIRBasicBlock *to)
 {
     return from && to && from->num_successors > 1 && to->predecessor_count > 1;
+}
+
+static int
+cfg_critical_edge_count(HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int count = 0;
+
+    if (!cfg)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    if (cfg_edge_is_critical(block, block->successors[i]))
+		count++;
+	}
+    }
+
+    return count;
 }
 
 static HIRTacInstr *
@@ -1167,6 +1210,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->op = tac->op;
     instr->literal = tac->literal;
     instr->phi_args = 0;
+    instr->copies = 0;
     instr->next = 0;
 
     return instr;
@@ -1240,6 +1284,7 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	load->local_id = v;
 	load->op = HIR_OP_ADD;
 	load->phi_args = 0;
+	load->copies = 0;
 
 	/* Find last Phi node in entry block to insert after it. */
 	HIRSSAInstr *last_phi = 0;
@@ -1496,6 +1541,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			phi->op = HIR_OP_ADD;
 			phi->literal.type = TYPE_NONE;
 			phi->phi_args = 0;
+			phi->copies = 0;
 
 			/* Create Phi arguments for each predecessor of y */
 			HIRBlockList *p_node = preds[y->id];
@@ -1524,6 +1570,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 
     /* Build SSA Program and SSABlocks */
     ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    ssa->form = HIR_FORM_SSA;
     ssa->cfg = cfg;
     ssa->blocks = 0;
     ssa->last_block = 0;
@@ -1696,6 +1743,9 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	return 0;
 
     errors_before = ctx->error_count;
+    if (ssa->form != HIR_FORM_SSA)
+	record_unsupported(ctx, "SSA verifier requires SSA form");
+
     max_value = ctx->next_temp - 1;
     defined = hir_alloc(ctx, (size_t) max_value + 1);
     for (i = 0; i <= max_value; i++)
@@ -1757,6 +1807,9 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_JUMP:
 	    case HIR_TAC_RETURN0:
 		break;
+	    case HIR_TAC_PARALLEL_COPY:
+		record_unsupported(ctx, "Parallel copy in SSA form");
+		break;
 	    }
 
 	    if (instr->kind != HIR_TAC_PHI)
@@ -1790,6 +1843,443 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	record_unsupported(ctx, "SSA instruction count mismatch");
     if (value_count != ssa->num_values)
 	record_unsupported(ctx, "SSA value count mismatch");
+
+    return ctx->error_count == errors_before;
+}
+
+static HIRSSABlock *
+ssa_block_for_id(HIRSSAProgram *ssa, int block_id)
+{
+    HIRSSABlock *block;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	if (block->id == block_id)
+	    return block;
+    }
+
+    return 0;
+}
+
+static HIRSSABlock *
+new_ssa_block_for_cfg(HIRContext *ctx, HIRBasicBlock *cfg_block)
+{
+    HIRSSABlock *block = hir_alloc(ctx, sizeof(HIRSSABlock));
+
+    block->id = cfg_block->id;
+    block->first_lineno = cfg_block->first_lineno;
+    block->last_lineno = cfg_block->last_lineno;
+    block->first = 0;
+    block->last = 0;
+    block->next = 0;
+
+    return block;
+}
+
+static HIRSSADestructionMove *
+append_destruction_move(HIRContext *ctx, HIRSSADestructionMove **moves,
+			int pred_block_id, int target_block_id,
+			int dst, int src, unsigned source_lineno)
+{
+    HIRSSADestructionMove *move = hir_alloc(ctx, sizeof(HIRSSADestructionMove));
+    HIRSSADestructionMove *tail;
+
+    move->pred_block_id = pred_block_id;
+    move->target_block_id = target_block_id;
+    move->dst = dst;
+    move->src = src;
+    move->source_lineno = source_lineno;
+    move->next = 0;
+
+    if (!*moves) {
+	*moves = move;
+	return move;
+    }
+
+    for (tail = *moves; tail->next; tail = tail->next)
+	;
+    tail->next = move;
+    return move;
+}
+
+static HIRSSADestructionMove *
+plan_ssa_destruction(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRSSADestructionMove *moves = 0;
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    HIRPhiArg *arg;
+
+	    if (instr->kind != HIR_TAC_PHI)
+		break;
+
+	    for (arg = instr->phi_args; arg; arg = arg->next) {
+		append_destruction_move(ctx, &moves, arg->block_id, block->id,
+					instr->value, arg->value,
+					instr->source_lineno);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return moves;
+}
+
+static int
+cfg_has_edge(HIRBasicBlock *from, HIRBasicBlock *to)
+{
+    int i;
+
+    if (!from || !to)
+	return 0;
+
+    for (i = 0; i < from->num_successors; i++) {
+	if (from->successors[i] == to)
+	    return 1;
+    }
+
+    return 0;
+}
+
+static HIRBasicBlock *
+cfg_split_block_for_edge(HIRCFG *cfg, HIRBasicBlock *pred,
+			 HIRBasicBlock *target)
+{
+    int i;
+
+    if (!cfg || !pred || !target)
+	return 0;
+
+    if (cfg_has_edge(pred, target))
+	return pred;
+
+    for (i = 0; i < pred->num_successors; i++) {
+	HIRBasicBlock *candidate = pred->successors[i];
+
+	if (candidate && candidate->num_successors == 1
+	    && candidate->successors[0] == target)
+	    return candidate;
+    }
+
+    return 0;
+}
+
+static void
+ensure_ssa_blocks_for_cfg(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRBasicBlock *cfg_block;
+
+    for (cfg_block = ssa->cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
+	HIRSSABlock *block;
+
+	if (ssa_block_for_id(ssa, cfg_block->id))
+	    continue;
+
+	block = new_ssa_block_for_cfg(ctx, cfg_block);
+	append_ssa_block(ssa, block);
+	if (cfg_block->first) {
+	    HIRSSAInstr *instr = new_ssa_instr(ctx, cfg_block->first);
+	    emit_ssa_instr(ssa, block, instr);
+	}
+    }
+}
+
+static int
+ssa_instr_is_terminator(HIRSSAInstr *instr)
+{
+    return instr
+	&& (instr->kind == HIR_TAC_JUMP
+	    || instr->kind == HIR_TAC_BRANCH_FALSE
+	    || instr->kind == HIR_TAC_RETURN
+	    || instr->kind == HIR_TAC_RETURN0);
+}
+
+static HIRSSAInstr *
+ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
+		     unsigned source_lineno)
+{
+    HIRSSAInstr *copy;
+    HIRSSAInstr *prev = 0;
+    HIRSSAInstr *last = block->last;
+    HIRSSAInstr *curr;
+
+    if (last && ssa_instr_is_terminator(last)) {
+	for (curr = block->first; curr && curr != last; curr = curr->next)
+	    prev = curr;
+	if (prev && prev->kind == HIR_TAC_PARALLEL_COPY)
+	    return prev;
+    } else if (last && last->kind == HIR_TAC_PARALLEL_COPY) {
+	return last;
+    }
+
+    copy = hir_alloc(ctx, sizeof(HIRSSAInstr));
+    copy->kind = HIR_TAC_PARALLEL_COPY;
+    copy->source_lineno = source_lineno;
+    copy->value = 0;
+    copy->src1 = 0;
+    copy->src2 = 0;
+    copy->label = 0;
+    copy->local_id = -1;
+    copy->op = HIR_OP_ADD;
+    copy->literal.type = TYPE_NONE;
+    copy->phi_args = 0;
+    copy->copies = 0;
+    copy->next = 0;
+
+    if (last && ssa_instr_is_terminator(last)) {
+	if (prev)
+	    prev->next = copy;
+	else
+	    block->first = copy;
+	copy->next = last;
+    } else {
+	emit_ssa_instr(ssa, block, copy);
+	return copy;
+    }
+
+    ssa->num_instructions++;
+    return copy;
+}
+
+static void
+append_parallel_copy_pair(HIRContext *ctx, HIRSSAProgram *ssa,
+			  HIRSSAInstr *instr, int dst, int src)
+{
+    HIRParallelCopy *copy = hir_alloc(ctx, sizeof(HIRParallelCopy));
+    HIRParallelCopy *tail;
+
+    copy->dst = dst;
+    copy->src = src;
+    copy->next = 0;
+
+    if (!instr->copies) {
+	instr->copies = copy;
+    } else {
+	for (tail = instr->copies; tail->next; tail = tail->next)
+	    ;
+	tail->next = copy;
+    }
+
+    ssa->num_values++;
+}
+
+static void
+materialize_destruction_moves(HIRContext *ctx, HIRSSAProgram *ssa,
+			      HIRSSADestructionMove *moves)
+{
+    HIRSSADestructionMove *move;
+
+    hir_split_critical_edges(ctx, ssa->cfg);
+    ensure_ssa_blocks_for_cfg(ctx, ssa);
+
+    for (move = moves; move; move = move->next) {
+	HIRBasicBlock *pred = cfg_block_for_id(ssa->cfg, move->pred_block_id);
+	HIRBasicBlock *target = cfg_block_for_id(ssa->cfg, move->target_block_id);
+	HIRBasicBlock *copy_cfg_block = cfg_split_block_for_edge(ssa->cfg,
+								 pred, target);
+	HIRSSABlock *copy_block;
+	HIRSSAInstr *copy_instr;
+
+	if (!copy_cfg_block) {
+	    record_unsupported(ctx, "SSA destruction could not find copy edge");
+	    continue;
+	}
+
+	copy_block = ssa_block_for_id(ssa, copy_cfg_block->id);
+	if (!copy_block) {
+	    record_unsupported(ctx, "SSA destruction missing copy block");
+	    continue;
+	}
+
+	copy_instr = ensure_parallel_copy(ctx, ssa, copy_block,
+					  move->source_lineno);
+	append_parallel_copy_pair(ctx, ssa, copy_instr, move->dst, move->src);
+    }
+}
+
+static void
+remove_phi_nodes(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	while (block->first && block->first->kind == HIR_TAC_PHI) {
+	    HIRSSAInstr *phi = block->first;
+
+	    block->first = phi->next;
+	    if (block->last == phi)
+		block->last = block->first;
+	    ssa->num_instructions--;
+	    ssa->num_values--;
+	}
+    }
+}
+
+int
+hir_destroy_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRSSADestructionMove *moves;
+
+    if (!ctx || !ssa)
+	return 0;
+    if (ssa->form == HIR_FORM_OUT_OF_SSA)
+	return 1;
+    if (ssa->form != HIR_FORM_SSA) {
+	record_unsupported(ctx, "Cannot destroy unknown SSA form");
+	return 0;
+    }
+
+    moves = plan_ssa_destruction(ctx, ssa);
+    materialize_destruction_moves(ctx, ssa, moves);
+    remove_phi_nodes(ssa);
+    ssa->form = HIR_FORM_OUT_OF_SSA;
+
+    return hir_verify_out_of_ssa(ctx, ssa);
+}
+
+static void
+mark_out_ssa_def(int value, unsigned char *defined, int max_value)
+{
+    if (value > 0 && value <= max_value)
+	defined[value] = 1;
+}
+
+static void
+verify_out_ssa_use(HIRContext *ctx, int value, unsigned char *defined,
+		   int max_value)
+{
+    if (value <= 0 || value > max_value || !defined[value])
+	record_unsupported(ctx, "Out-of-SSA value used before definition");
+}
+
+int
+hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    unsigned char *defined;
+    int max_value;
+    int errors_before;
+    int block_count = 0;
+    int instruction_count = 0;
+    int value_count = 0;
+    int i;
+
+    if (!ctx || !ssa)
+	return 0;
+
+    errors_before = ctx->error_count;
+    if (ssa->form != HIR_FORM_OUT_OF_SSA)
+	record_unsupported(ctx, "Out-of-SSA verifier requires out-of-SSA form");
+    (void) hir_verify_cfg(ctx, ssa->cfg);
+
+    max_value = ctx->next_temp - 1;
+    defined = hir_alloc(ctx, (size_t) max_value + 1);
+    for (i = 0; i <= max_value; i++)
+	defined[i] = 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	block_count++;
+	if (!block->first || !block->last)
+	    record_unsupported(ctx, "Out-of-SSA block has no instructions");
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    instruction_count++;
+	    switch (instr->kind) {
+	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_UNARY:
+	    case HIR_TAC_BINARY:
+		mark_out_ssa_def(instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_UNSUPPORTED:
+		if (instr->value > 0) {
+		    mark_out_ssa_def(instr->value, defined, max_value);
+		    value_count++;
+		}
+		break;
+	    case HIR_TAC_PARALLEL_COPY:
+		{
+		    HIRParallelCopy *copy;
+		    for (copy = instr->copies; copy; copy = copy->next) {
+			mark_out_ssa_def(copy->dst, defined, max_value);
+			value_count++;
+		    }
+		}
+		break;
+	    case HIR_TAC_PHI:
+		record_unsupported(ctx, "Phi node in out-of-SSA form");
+		break;
+	    case HIR_TAC_STORE_LOCAL:
+	    case HIR_TAC_LABEL:
+	    case HIR_TAC_JUMP:
+	    case HIR_TAC_BRANCH_FALSE:
+	    case HIR_TAC_RETURN:
+	    case HIR_TAC_RETURN0:
+		break;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    switch (instr->kind) {
+	    case HIR_TAC_STORE_LOCAL:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_UNARY:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_BINARY:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
+		break;
+	    case HIR_TAC_BRANCH_FALSE:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_RETURN:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_PARALLEL_COPY:
+		{
+		    HIRParallelCopy *copy;
+		    for (copy = instr->copies; copy; copy = copy->next) {
+			verify_out_ssa_use(ctx, copy->src, defined, max_value);
+			if (copy->dst <= 0 || copy->dst > max_value)
+			    record_unsupported(ctx,
+					       "Invalid out-of-SSA copy destination");
+		    }
+		}
+		break;
+	    default:
+		break;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    if (block_count != ssa->num_blocks)
+	record_unsupported(ctx, "Out-of-SSA block count mismatch");
+    if (instruction_count != ssa->num_instructions)
+	record_unsupported(ctx, "Out-of-SSA instruction count mismatch");
+    if (value_count != ssa->num_values)
+	record_unsupported(ctx, "Out-of-SSA value count mismatch");
+    if (cfg_critical_edge_count(ssa->cfg) != 0)
+	record_unsupported(ctx, "Out-of-SSA CFG still has critical edges");
 
     return ctx->error_count == errors_before;
 }
@@ -1855,6 +2345,9 @@ hir_dump_tac(HIRTacProgram *program)
 	    break;
 	case HIR_TAC_PHI:
 	    fprintf(stderr, " t%d = phi(...)", instr->dst);
+	    break;
+	case HIR_TAC_PARALLEL_COPY:
+	    fprintf(stderr, " parallel_copy");
 	    break;
 	}
 
@@ -1953,7 +2446,8 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 	return;
     }
 
-    fprintf(file, "blocks=%d instructions=%d values=%d\n",
+    fprintf(file, "form=%s blocks=%d instructions=%d values=%d\n",
+	    ssa->form == HIR_FORM_OUT_OF_SSA ? "out-of-ssa" : "ssa",
 	    ssa->num_blocks, ssa->num_instructions, ssa->num_values);
 
     for (block = ssa->blocks; block; block = block->next) {
@@ -2015,6 +2509,20 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 			instr->local_id);
 		dump_ssa_phi_args(file, ssa, instr);
 		break;
+	    case HIR_TAC_PARALLEL_COPY:
+		{
+		    HIRParallelCopy *copy;
+		    int printed = 0;
+
+		    fprintf(file, " [");
+		    for (copy = instr->copies; copy; copy = copy->next) {
+			fprintf(file, "%st%d=t%d", printed ? ", " : "",
+				copy->dst, copy->src);
+			printed = 1;
+		    }
+		    fprintf(file, "]");
+		}
+		break;
 	    }
 
 	    fprintf(file, "\n");
@@ -2062,6 +2570,8 @@ tac_kind_name(HIRTacKind kind)
 	    return "unsupported";
     case HIR_TAC_PHI:
 	    return "phi";
+    case HIR_TAC_PARALLEL_COPY:
+	    return "parallel_copy";
     }
 
     return "unknown";
@@ -2252,22 +2762,7 @@ hir_cfg_unsupported_block_count(HIRCFG *cfg)
 int
 hir_cfg_critical_edge_count(HIRCFG *cfg)
 {
-    HIRBasicBlock *block;
-    int count = 0;
-
-    if (!cfg)
-	return 0;
-
-    for (block = cfg->blocks; block; block = block->next) {
-	int i;
-
-	for (i = 0; i < block->num_successors; i++) {
-	    if (cfg_edge_is_critical(block, block->successors[i]))
-		count++;
-	}
-    }
-
-    return count;
+    return cfg_critical_edge_count(cfg);
 }
 
 int
@@ -2491,6 +2986,57 @@ hir_ssa_binary_uses_phi_count(HIRSSAProgram *ssa, HIROp op)
     }
 
     return count;
+}
+
+int
+hir_ssa_parallel_copy_pair_count(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_PARALLEL_COPY) {
+		HIRParallelCopy *copy;
+
+		for (copy = instr->copies; copy; copy = copy->next)
+		    count++;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+int
+hir_ssa_form(HIRSSAProgram *ssa)
+{
+    return ssa ? ssa->form : -1;
+}
+
+int
+hir_ssa_cfg_block_count(HIRSSAProgram *ssa)
+{
+    return ssa ? hir_cfg_block_count(ssa->cfg) : 0;
+}
+
+int
+hir_ssa_cfg_edge_count(HIRSSAProgram *ssa)
+{
+    return ssa ? hir_cfg_edge_count(ssa->cfg) : 0;
+}
+
+int
+hir_ssa_cfg_critical_edge_count(HIRSSAProgram *ssa)
+{
+    return ssa ? hir_cfg_critical_edge_count(ssa->cfg) : 0;
 }
 #endif
 
@@ -3427,6 +3973,7 @@ new_test_ssa_program(HIRContext *ctx, HIRSSAInstr *first, HIRSSAInstr *last,
     block->last = last;
     block->next = 0;
 
+    ssa->form = HIR_FORM_SSA;
     ssa->cfg = 0;
     ssa->blocks = block;
     ssa->last_block = block;
@@ -3586,6 +4133,7 @@ hir_test_ssa_with_bad_phi_shape(HIRContext *ctx)
     def->local_id = -1;
     def->op = HIR_OP_ADD;
     def->phi_args = 0;
+    def->copies = 0;
     def->next = 0;
 
     first_arg->block_id = 1;
@@ -3604,6 +4152,7 @@ hir_test_ssa_with_bad_phi_shape(HIRContext *ctx)
     phi->local_id = 16;
     phi->op = HIR_OP_ADD;
     phi->phi_args = first_arg;
+    phi->copies = 0;
     phi->next = 0;
 
     entry_block->id = 1;
@@ -3620,6 +4169,7 @@ hir_test_ssa_with_bad_phi_shape(HIRContext *ctx)
     join_block->last = phi;
     join_block->next = 0;
 
+    ssa->form = HIR_FORM_SSA;
     ssa->cfg = cfg;
     ssa->blocks = entry_block;
     ssa->last_block = join_block;
@@ -3745,6 +4295,119 @@ hir_test_ssa_with_nonpred_phi_arg(HIRContext *ctx)
     ssa->num_blocks = 3;
     ssa->num_instructions = 3;
     ssa->num_values = 3;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_critical_phi_edge(HIRContext *ctx)
+{
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *then_block = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_BRANCH_FALSE, 1024);
+    HIRTacInstr *then_tac = new_tac(ctx, HIR_TAC_JUMP, 1025);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN, 1026);
+    HIRSSAProgram *ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    HIRSSAInstr *entry_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1024, 1);
+    HIRSSAInstr *entry_branch =
+	new_test_ssa_instr(ctx, HIR_TAC_BRANCH_FALSE, 1024, 0);
+    HIRSSAInstr *then_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1025, 2);
+    HIRSSAInstr *then_jump = new_test_ssa_instr(ctx, HIR_TAC_JUMP, 1025, 0);
+    HIRSSAInstr *phi = new_test_ssa_instr(ctx, HIR_TAC_PHI, 1026, 3);
+    HIRSSAInstr *ret = new_test_ssa_instr(ctx, HIR_TAC_RETURN, 1026, 0);
+    HIRSSABlock *entry_block;
+    HIRSSABlock *then_ssa_block;
+    HIRSSABlock *join_block;
+
+    ctx->next_temp = 4;
+    entry_tac->src1 = 1;
+    entry_tac->label = 1;
+    then_tac->label = 1;
+    join_tac->src1 = 3;
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = join;
+    cfg->num_blocks = 3;
+    cfg->num_edges = 3;
+
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(then_block, 2, then_tac);
+    init_test_block(join, 3, join_tac);
+    entry->next = then_block;
+    then_block->next = join;
+    entry->successors[0] = join;
+    entry->successors[1] = then_block;
+    entry->num_successors = 2;
+    then_block->successors[0] = join;
+    then_block->num_successors = 1;
+    then_block->predecessor_count = 1;
+    join->predecessor_count = 2;
+
+    entry_def->next = entry_branch;
+    entry_branch->src1 = 1;
+    entry_branch->label = 1;
+    then_def->next = then_jump;
+    then_jump->label = 1;
+    phi->local_id = 16;
+    phi->phi_args = new_test_phi_arg(ctx, 1, 1,
+				     new_test_phi_arg(ctx, 2, 2, 0));
+    phi->next = ret;
+    ret->src1 = 3;
+
+    entry_block = new_test_ssa_block(ctx, 1, entry_def, entry_branch);
+    then_ssa_block = new_test_ssa_block(ctx, 2, then_def, then_jump);
+    join_block = new_test_ssa_block(ctx, 3, phi, ret);
+    entry_block->next = then_ssa_block;
+    then_ssa_block->next = join_block;
+
+    ssa->form = HIR_FORM_SSA;
+    ssa->cfg = cfg;
+    ssa->blocks = entry_block;
+    ssa->last_block = join_block;
+    ssa->num_blocks = 3;
+    ssa->num_instructions = 6;
+    ssa->num_values = 3;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_out_ssa_with_phi(HIRContext *ctx)
+{
+    HIRSSAInstr *def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1027, 1);
+    HIRSSAInstr *phi = new_test_ssa_instr(ctx, HIR_TAC_PHI, 1028, 2);
+    HIRSSAProgram *ssa;
+
+    ctx->next_temp = 3;
+    def->next = phi;
+    phi->local_id = 16;
+    ssa = new_test_ssa_program(ctx, def, phi, 2, 2);
+    ssa->form = HIR_FORM_OUT_OF_SSA;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_out_ssa_with_bad_copy_source(HIRContext *ctx)
+{
+    HIRSSAInstr *def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1029, 1);
+    HIRSSAInstr *copy_instr =
+	new_test_ssa_instr(ctx, HIR_TAC_PARALLEL_COPY, 1030, 0);
+    HIRParallelCopy *copy = hir_alloc(ctx, sizeof(HIRParallelCopy));
+    HIRSSAProgram *ssa;
+
+    ctx->next_temp = 3;
+    copy->dst = 2;
+    copy->src = 99;
+    copy->next = 0;
+    copy_instr->copies = copy;
+    def->next = copy_instr;
+
+    ssa = new_test_ssa_program(ctx, def, copy_instr, 2, 2);
+    ssa->form = HIR_FORM_OUT_OF_SSA;
 
     return ssa;
 }

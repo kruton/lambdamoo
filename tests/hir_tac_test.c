@@ -440,6 +440,22 @@ test_negative_ssa_verifier_cases(void)
     check_rejected("negative ssa nonpred phi arg", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_out_ssa_with_phi(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_out_of_ssa(ctx, ssa);
+    check_rejected("negative out ssa remaining phi", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_out_ssa_with_bad_copy_source(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_out_of_ssa(ctx, ssa);
+    check_rejected("negative out ssa bad copy source", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
 }
 
 static Stmt
@@ -750,6 +766,163 @@ test_cfg_critical_edge_splitting(void)
 }
 
 static void
+test_if_else_ssa_destruction(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Cond_Arm arm;
+    Expr one = int_expr(1, 100);
+    Expr two = int_expr(2, 100);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+    Expr then_value = int_expr(3, 101);
+    Expr then_lhs = id_expr(16, 101);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+    Expr else_value = int_expr(4, 102);
+    Expr else_lhs = id_expr(16, 102);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+    Expr ret_expr = id_expr(16, 103);
+    Stmt ret = return_stmt(&ret_expr);
+    Stmt if_stmt_node;
+    int before_errors;
+    int accepted;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 100;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    (void) lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+    check_int("ifelse destroy initial form", hir_ssa_form(ssa), HIR_FORM_SSA);
+    check_int("ifelse destroy initial phi",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+
+    accepted = hir_destroy_ssa(ctx, ssa);
+    check_int("ifelse destroy accepted", accepted, 1);
+    check_int("ifelse destroy form", hir_ssa_form(ssa),
+	      HIR_FORM_OUT_OF_SSA);
+    check_int("ifelse destroy phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("ifelse destroy copy instrs",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PARALLEL_COPY), 2);
+    check_int("ifelse destroy copy pairs",
+	      hir_ssa_parallel_copy_pair_count(ssa), 2);
+    check_int("ifelse destroy critical edges",
+	      hir_cfg_critical_edge_count(cfg), 0);
+    check_int("ifelse destroy out verify",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    before_errors = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("ifelse destroy strict ssa rejected", accepted,
+		   before_errors, hir_context_error_count(ctx));
+
+    hir_context_free(ctx);
+}
+
+static void
+test_loop_ssa_destruction(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Expr one_init = int_expr(1, 110);
+    Expr local_x_init = id_expr(16, 110);
+    Expr assign_init = binary_expr(EXPR_ASGN, &local_x_init, &one_init);
+    Stmt init_stmt = expr_stmt(&assign_init);
+    Expr ten = int_expr(10, 111);
+    Expr local_x_cond = id_expr(16, 111);
+    Expr cond = binary_expr(EXPR_LT, &local_x_cond, &ten);
+    Expr local_x_lhs = id_expr(16, 112);
+    Expr local_x_rhs = id_expr(16, 112);
+    Expr one = int_expr(1, 112);
+    Expr add = binary_expr(EXPR_PLUS, &local_x_rhs, &one);
+    Expr assign = binary_expr(EXPR_ASGN, &local_x_lhs, &add);
+    Stmt body_stmt = expr_stmt(&assign);
+    Stmt loop = while_stmt(&cond, &body_stmt, 1, 111);
+    Expr local_x_ret = id_expr(16, 113);
+    Stmt ret = return_stmt(&local_x_ret);
+
+    init_stmt.next = &loop;
+    loop.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    (void) lower_stmt(&names, &init_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("loop destroy initial phi",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+
+    check_int("loop destroy accepted", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("loop destroy form", hir_ssa_form(ssa),
+	      HIR_FORM_OUT_OF_SSA);
+    check_int("loop destroy phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("loop destroy copy pairs",
+	      hir_ssa_parallel_copy_pair_count(ssa), 2);
+    check_int("loop destroy out verify",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_critical_edge_ssa_destruction(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRSSAProgram *ssa;
+    int before_blocks;
+    int before_edges;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_critical_phi_edge(ctx);
+
+    check_int("critical destroy initial verify", hir_verify_ssa(ctx, ssa), 1);
+    check_int("critical destroy initial edges",
+	      hir_ssa_cfg_critical_edge_count(ssa), 1);
+    before_blocks = hir_ssa_cfg_block_count(ssa);
+    before_edges = hir_ssa_cfg_edge_count(ssa);
+
+    check_int("critical destroy accepted", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("critical destroy form", hir_ssa_form(ssa),
+	      HIR_FORM_OUT_OF_SSA);
+    check_int("critical destroy phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("critical destroy copy instrs",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PARALLEL_COPY), 2);
+    check_int("critical destroy copy pairs",
+	      hir_ssa_parallel_copy_pair_count(ssa), 2);
+    check_int("critical destroy split blocks",
+	      hir_ssa_cfg_block_count(ssa), before_blocks + 1);
+    check_int("critical destroy split edges",
+	      hir_ssa_cfg_edge_count(ssa), before_edges + 1);
+    check_int("critical destroy final edges",
+	      hir_ssa_cfg_critical_edge_count(ssa), 0);
+    check_int("critical destroy out verify",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+    check_int("critical destroy idempotent", hir_destroy_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_repeated_local_assignment_ssa(void)
 {
     Names names;
@@ -809,6 +982,9 @@ main(void)
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
     test_cfg_critical_edge_splitting();
+    test_if_else_ssa_destruction();
+    test_loop_ssa_destruction();
+    test_critical_edge_ssa_destruction();
     test_repeated_local_assignment_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();

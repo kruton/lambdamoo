@@ -96,8 +96,14 @@ typedef enum {
     HIR_TAC_RETURN,
     HIR_TAC_RETURN0,
     HIR_TAC_UNSUPPORTED,
-    HIR_TAC_PHI
+    HIR_TAC_PHI,
+    HIR_TAC_PARALLEL_COPY
 } HIRTacKind;
+
+typedef enum {
+    HIR_FORM_SSA,
+    HIR_FORM_OUT_OF_SSA
+} HIRForm;
 
 extern HIRContext *hir_context_new(Names *);
 extern void hir_context_free(HIRContext *);
@@ -115,6 +121,8 @@ extern int hir_verify_dominator_tree(HIRContext *, HIRCFG *,
 				     HIRDominatorTree *);
 extern HIRSSAProgram *hir_build_ssa(HIRContext *, HIRCFG *);
 extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
+extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
+extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
 
 #ifdef HIR_DUMP_TAC
 extern void hir_dump_tac(HIRTacProgram *);
@@ -145,6 +153,11 @@ extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_return_uses_phi_count(HIRSSAProgram *);
 extern int hir_ssa_branch_uses_phi_count(HIRSSAProgram *);
 extern int hir_ssa_binary_uses_phi_count(HIRSSAProgram *, HIROp);
+extern int hir_ssa_parallel_copy_pair_count(HIRSSAProgram *);
+extern int hir_ssa_form(HIRSSAProgram *);
+extern int hir_ssa_cfg_block_count(HIRSSAProgram *);
+extern int hir_ssa_cfg_edge_count(HIRSSAProgram *);
+extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern HIRTacProgram *hir_test_tac_with_undefined_return(HIRContext *);
 extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);
@@ -158,6 +171,9 @@ extern HIRSSAProgram *hir_test_ssa_with_bad_phi_shape(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_late_phi(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_missing_phi_arg(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_nonpred_phi_arg(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_critical_phi_edge(HIRContext *);
+extern HIRSSAProgram *hir_test_out_ssa_with_phi(HIRContext *);
+extern HIRSSAProgram *hir_test_out_ssa_with_bad_copy_source(HIRContext *);
 #endif
 
 #endif /* !HIR_h */
