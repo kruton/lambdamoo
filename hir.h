@@ -111,6 +111,7 @@ extern void hir_dump_tac(HIRTacProgram *);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
+extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
 #endif
 
 #endif /* !HIR_h */

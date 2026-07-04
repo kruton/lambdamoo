@@ -29,6 +29,7 @@
 #include "utils.h"
 
 static Arena *ast_arena = NULL;
+static unsigned ast_lineno = 1;
 
 static char **tracked_strings = NULL;
 static int tracked_strings_count = 0;
@@ -111,6 +112,13 @@ void
 begin_code_allocation(void)
 {
     ast_arena = arena_create(4096, M_AST_POOL);
+    ast_lineno = 1;
+}
+
+void
+set_code_allocation_lineno(unsigned lineno)
+{
+    ast_lineno = lineno;
 }
 
 void
@@ -202,6 +210,7 @@ alloc_stmt(enum Stmt_Kind kind)
     Stmt *result = allocate(sizeof(Stmt), M_AST);
 
     result->kind = kind;
+    result->lineno = ast_lineno;
     result->next = 0;
     return result;
 }
@@ -236,6 +245,7 @@ alloc_expr(enum Expr_Kind kind)
     Expr *result = allocate(sizeof(Expr), M_AST);
 
     result->kind = kind;
+    result->lineno = ast_lineno;
     return result;
 }
 
@@ -255,6 +265,8 @@ alloc_binary(enum Expr_Kind kind, Expr * lhs, Expr * rhs)
 
     result->e.bin.lhs = lhs;
     result->e.bin.rhs = rhs;
+    if (lhs)
+	result->lineno = lhs->lineno;
     return result;
 }
 
@@ -266,6 +278,8 @@ alloc_verb(Expr * obj, Expr * verb, Arg_List * args)
     result->e.verb.obj = obj;
     result->e.verb.verb = verb;
     result->e.verb.args = args;
+    if (obj)
+	result->lineno = obj->lineno;
     return result;
 }
 

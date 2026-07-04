@@ -19,12 +19,13 @@ check_int(const char *name, int actual, int expected)
 }
 
 static Expr
-int_expr(Num value)
+int_expr(Num value, unsigned lineno)
 {
     Expr expr;
 
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_VAR;
+    expr.lineno = lineno;
     expr.e.var.type = TYPE_INT;
     expr.e.var.v.num = value;
 
@@ -32,12 +33,13 @@ int_expr(Num value)
 }
 
 static Expr
-id_expr(int id)
+id_expr(int id, unsigned lineno)
 {
     Expr expr;
 
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_ID;
+    expr.lineno = lineno;
     expr.e.id = id;
 
     return expr;
@@ -50,6 +52,7 @@ binary_expr(enum Expr_Kind kind, Expr *lhs, Expr *rhs)
 
     memset(&expr, 0, sizeof(expr));
     expr.kind = kind;
+    expr.lineno = lhs ? lhs->lineno : 0;
     expr.e.bin.lhs = lhs;
     expr.e.bin.rhs = rhs;
 
@@ -63,6 +66,7 @@ expr_stmt(Expr *expr)
 
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_EXPR;
+    stmt.lineno = expr ? expr->lineno : 0;
     stmt.s.expr = expr;
 
     return stmt;
@@ -75,6 +79,7 @@ return_stmt(Expr *expr)
 
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_RETURN;
+    stmt.lineno = expr ? expr->lineno : 0;
     stmt.s.expr = expr;
 
     return stmt;
@@ -99,11 +104,11 @@ test_arithmetic_and_local_tac(void)
     Names names;
     HIRContext *ctx;
     HIRTacProgram *tac;
-    Expr one = int_expr(1);
-    Expr two = int_expr(2);
-    Expr three = int_expr(3);
-    Expr local_x_lhs = id_expr(16);
-    Expr local_x_rhs = id_expr(16);
+    Expr one = int_expr(1, 10);
+    Expr two = int_expr(2, 10);
+    Expr three = int_expr(3, 11);
+    Expr local_x_lhs = id_expr(16, 10);
+    Expr local_x_rhs = id_expr(16, 11);
     Expr add = binary_expr(EXPR_PLUS, &one, &two);
     Expr assign = binary_expr(EXPR_ASGN, &local_x_lhs, &add);
     Expr mult = binary_expr(EXPR_TIMES, &local_x_rhs, &three);
@@ -122,6 +127,8 @@ test_arithmetic_and_local_tac(void)
     check_int("arith return count", hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("arith add count", hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("arith mul count", hir_tac_count_binary_op(tac, HIR_OP_MUL), 1);
+    check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 4);
+    check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 4);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -134,10 +141,10 @@ test_control_flow_tac(void)
     HIRContext *ctx;
     HIRTacProgram *tac;
     Cond_Arm arm;
-    Expr one = int_expr(1);
-    Expr two = int_expr(2);
+    Expr one = int_expr(1, 20);
+    Expr two = int_expr(2, 20);
     Expr cond = binary_expr(EXPR_LT, &one, &two);
-    Expr ret_val = int_expr(3);
+    Expr ret_val = int_expr(3, 21);
     Stmt ret = return_stmt(&ret_val);
     Stmt if_stmt_node;
 
@@ -149,6 +156,7 @@ test_control_flow_tac(void)
 
     memset(&if_stmt_node, 0, sizeof(if_stmt_node));
     if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 20;
     if_stmt_node.s.cond.arms = &arm;
     if_stmt_node.s.cond.otherwise = 0;
 
@@ -159,6 +167,8 @@ test_control_flow_tac(void)
     check_int("control jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
     check_int("control label count", hir_tac_count_kind(tac, HIR_TAC_LABEL), 2);
     check_int("control lt count", hir_tac_count_binary_op(tac, HIR_OP_LT), 1);
+    check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 7);
+    check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
     check_int("control verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -177,6 +187,7 @@ test_unsupported_tac(void)
     names.size = 32;
     memset(&list, 0, sizeof(list));
     list.kind = EXPR_LIST;
+    list.lineno = 30;
     list.e.list = 0;
     ret = return_stmt(&list);
 
@@ -185,6 +196,7 @@ test_unsupported_tac(void)
     check_int("unsupported tac count",
 	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 1);
     check_int("unsupported return count", hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("unsupported line 30 count", hir_tac_count_lineno(tac, 30), 2);
     if (hir_context_error_count(ctx) == 0) {
 	fprintf(stderr, "unsupported case should record HIR errors\n");
 	failures++;

@@ -871,7 +871,10 @@ start_over:
 
     do {
 	c = lex_getc();
-	if (c == '\n') lineno++;
+	if (c == '\n') {
+	    lineno++;
+	    set_code_allocation_lineno(lineno);
+	}
     } while (c != EOF && my_isspace(c));
 
     if (c == EOF)
@@ -1200,6 +1203,7 @@ parse_program(DB_Version version, Parser_Client c, void *data)
     nerrors = 0;
     must_rename_keywords = 0;
     lineno = 1;
+    set_code_allocation_lineno(lineno);
     client = c;
     client_data = data;
     local_names = new_builtin_names(version);

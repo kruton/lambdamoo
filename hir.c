@@ -23,6 +23,7 @@ struct HIRArg {
 struct HIRExpr {
     HIRExprKind kind;
     HIRTypeTag type;
+    unsigned source_lineno;
     union {
 	Var literal;
 	int local_id;
@@ -93,6 +94,7 @@ struct HIRExceptArm {
 
 struct HIRStmt {
     HIRStmtKind kind;
+    unsigned source_lineno;
     HIRStmt *next;
     union {
 	HIRStmt *sequence;
@@ -141,6 +143,7 @@ struct HIRProgram {
 
 struct HIRTacInstr {
     HIRTacKind kind;
+    unsigned source_lineno;
     int dst;
     int src1;
     int src2;
@@ -388,7 +391,8 @@ hir_dump_tac(HIRTacProgram *program)
     }
 
     for (instr = program->first; instr; instr = instr->next) {
-	fprintf(stderr, "  %-14s", tac_kind_name(instr->kind));
+	fprintf(stderr, "  line %-5u %-14s", instr->source_lineno,
+		tac_kind_name(instr->kind));
 
 	switch (instr->kind) {
 	case HIR_TAC_CONST:
@@ -601,6 +605,23 @@ hir_tac_instruction_count(HIRTacProgram *program)
 
     return count;
 }
+
+int
+hir_tac_count_lineno(HIRTacProgram *program, unsigned lineno)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	if (instr->source_lineno == lineno)
+	    count++;
+    }
+
+    return count;
+}
 #endif
 
 static void *
@@ -645,6 +666,7 @@ new_expr(HIRContext *ctx, HIRExprKind kind)
 
     expr->kind = kind;
     expr->type = HIR_TYPE_ANY;
+    expr->source_lineno = 0;
     return expr;
 }
 
@@ -654,6 +676,7 @@ new_stmt(HIRContext *ctx, HIRStmtKind kind)
     HIRStmt *stmt = hir_alloc(ctx, sizeof(HIRStmt));
 
     stmt->kind = kind;
+    stmt->source_lineno = 0;
     stmt->next = 0;
     return stmt;
 }
@@ -754,11 +777,12 @@ binary_op_for_expr(enum Expr_Kind kind, HIROp *op)
 }
 
 static HIRExpr *
-unsupported_expr(HIRContext *ctx, enum Expr_Kind kind)
+unsupported_expr(HIRContext *ctx, Expr *ast)
 {
     HIRExpr *expr = new_expr(ctx, HIR_EXPR_UNSUPPORTED);
 
-    expr->u.unsupported.expr_kind = kind;
+    expr->source_lineno = ast ? ast->lineno : 0;
+    expr->u.unsupported.expr_kind = ast ? ast->kind : SizeOf_Expr_Kind;
     record_unsupported(ctx, "Unsupported AST expression in HIR lift");
     return expr;
 }
@@ -770,9 +794,10 @@ lift_binary_expr(HIRContext *ctx, Expr *ast)
     HIRExpr *expr;
 
     if (!binary_op_for_expr(ast->kind, &op))
-	return unsupported_expr(ctx, ast->kind);
+	return unsupported_expr(ctx, ast);
 
     expr = new_expr(ctx, HIR_EXPR_BINARY);
+    expr->source_lineno = ast->lineno;
     expr->u.binary.op = op;
     expr->u.binary.lhs = lift_expr(ctx, ast->e.bin.lhs);
     expr->u.binary.rhs = lift_expr(ctx, ast->e.bin.rhs);
@@ -786,13 +811,14 @@ lift_assignment(HIRContext *ctx, Expr *ast)
     if (ast->e.bin.lhs->kind == EXPR_ID) {
 	HIRExpr *expr = new_expr(ctx, HIR_EXPR_LOCAL_STORE);
 
+	expr->source_lineno = ast->lineno;
 	expr->u.local_store.local_id = ast->e.bin.lhs->e.id;
 	expr->u.local_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
 
     record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
-    return unsupported_expr(ctx, ast->kind);
+    return unsupported_expr(ctx, ast);
 }
 
 static HIRExpr *
@@ -806,11 +832,13 @@ lift_expr(HIRContext *ctx, Expr *ast)
     switch (ast->kind) {
     case EXPR_VAR:
 	expr = new_expr(ctx, HIR_EXPR_LITERAL);
+	expr->source_lineno = ast->lineno;
 	expr->type = type_tag_for_var_type(ast->e.var.type);
 	expr->u.literal = ast->e.var;
 	return expr;
     case EXPR_ID:
 	expr = new_expr(ctx, HIR_EXPR_LOCAL_LOAD);
+	expr->source_lineno = ast->lineno;
 	expr->u.local_id = ast->e.id;
 	return expr;
     case EXPR_ASGN:
@@ -819,6 +847,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_NOT:
     case EXPR_COMPLEMENT:
 	expr = new_expr(ctx, HIR_EXPR_UNARY);
+	expr->source_lineno = ast->lineno;
 	expr->u.unary.op = (ast->kind == EXPR_NEGATE
 			    ? HIR_OP_NEGATE
 			    : (ast->kind == EXPR_NOT
@@ -849,12 +878,14 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	return lift_binary_expr(ctx, ast);
     case EXPR_COND:
 	expr = new_expr(ctx, HIR_EXPR_COND);
+	expr->source_lineno = ast->lineno;
 	expr->u.cond.condition = lift_expr(ctx, ast->e.cond.condition);
 	expr->u.cond.consequent = lift_expr(ctx, ast->e.cond.consequent);
 	expr->u.cond.alternate = lift_expr(ctx, ast->e.cond.alternate);
 	return expr;
     case EXPR_CALL:
 	expr = new_expr(ctx, HIR_EXPR_CALL);
+	expr->source_lineno = ast->lineno;
 	expr->u.call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.call.resume_key.site = ast->e.call.resume_site;
 	expr->u.call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
@@ -864,6 +895,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	return expr;
     case EXPR_VERB:
 	expr = new_expr(ctx, HIR_EXPR_VERB_CALL);
+	expr->source_lineno = ast->lineno;
 	expr->u.verb_call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.verb_call.resume_key.site = ast->e.verb.resume_site;
 	expr->u.verb_call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
@@ -874,18 +906,21 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	return expr;
     case EXPR_PROP:
 	expr = new_expr(ctx, HIR_EXPR_PROP);
+	expr->source_lineno = ast->lineno;
 	expr->u.pair.lhs = lift_expr(ctx, ast->e.bin.lhs);
 	expr->u.pair.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	record_unsupported(ctx, "Property expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_INDEX:
 	expr = new_expr(ctx, HIR_EXPR_INDEX);
+	expr->source_lineno = ast->lineno;
 	expr->u.pair.lhs = lift_expr(ctx, ast->e.bin.lhs);
 	expr->u.pair.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	record_unsupported(ctx, "Index expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_RANGE:
 	expr = new_expr(ctx, HIR_EXPR_RANGE);
+	expr->source_lineno = ast->lineno;
 	expr->u.range.base = lift_expr(ctx, ast->e.range.base);
 	expr->u.range.from = lift_expr(ctx, ast->e.range.from);
 	expr->u.range.to = lift_expr(ctx, ast->e.range.to);
@@ -893,22 +928,24 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	return expr;
     case EXPR_LIST:
 	expr = new_expr(ctx, HIR_EXPR_LIST);
+	expr->source_lineno = ast->lineno;
 	expr->u.list.items = lift_arg_list(ctx, ast->e.list);
 	record_unsupported(ctx, "List expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_CATCH:
 	expr = new_expr(ctx, HIR_EXPR_CATCH);
+	expr->source_lineno = ast->lineno;
 	expr->u.catch_expr.body = lift_expr(ctx, ast->e.catch.try);
 	expr->u.catch_expr.codes = lift_arg_list(ctx, ast->e.catch.codes);
 	expr->u.catch_expr.handler = lift_expr(ctx, ast->e.catch.except);
 	record_unsupported(ctx, "Catch expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_SCATTER:
-	return unsupported_expr(ctx, ast->kind);
+	return unsupported_expr(ctx, ast);
     case EXPR_LENGTH:
-	return unsupported_expr(ctx, ast->kind);
+	return unsupported_expr(ctx, ast);
     default:
-	return unsupported_expr(ctx, ast->kind);
+	return unsupported_expr(ctx, ast);
     }
 }
 
@@ -960,11 +997,12 @@ lift_except_arms(HIRContext *ctx, Except_Arm *excepts)
 }
 
 static HIRStmt *
-unsupported_stmt(HIRContext *ctx, enum Stmt_Kind kind)
+unsupported_stmt(HIRContext *ctx, Stmt *ast)
 {
     HIRStmt *stmt = new_stmt(ctx, HIR_STMT_UNSUPPORTED);
 
-    stmt->u.stmt_kind = kind;
+    stmt->source_lineno = ast ? ast->lineno : 0;
+    stmt->u.stmt_kind = ast ? ast->kind : STMT_EXPR;
     record_unsupported(ctx, "Unsupported AST statement in HIR lift");
     return stmt;
 }
@@ -977,25 +1015,30 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     switch (ast->kind) {
     case STMT_EXPR:
 	stmt = new_stmt(ctx, HIR_STMT_EXPR);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.expr = lift_expr(ctx, ast->s.expr);
 	return stmt;
     case STMT_RETURN:
 	stmt = new_stmt(ctx, HIR_STMT_RETURN);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.expr = lift_expr(ctx, ast->s.expr);
 	return stmt;
     case STMT_COND:
 	stmt = new_stmt(ctx, HIR_STMT_IF);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.if_stmt.arms = lift_cond_arms(ctx, ast->s.cond.arms);
 	stmt->u.if_stmt.otherwise = lift_stmt_list(ctx, ast->s.cond.otherwise);
 	return stmt;
     case STMT_WHILE:
 	stmt = new_stmt(ctx, HIR_STMT_WHILE);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.loop.loop_id = ast->s.loop.id;
 	stmt->u.loop.condition = lift_expr(ctx, ast->s.loop.condition);
 	stmt->u.loop.body = lift_stmt_list(ctx, ast->s.loop.body);
 	return stmt;
     case STMT_LIST:
 	stmt = new_stmt(ctx, HIR_STMT_FOR_LIST);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.for_list.local_id = ast->s.list.id;
 	stmt->u.for_list.iterable = lift_expr(ctx, ast->s.list.expr);
 	stmt->u.for_list.body = lift_stmt_list(ctx, ast->s.list.body);
@@ -1003,6 +1046,7 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	return stmt;
     case STMT_RANGE:
 	stmt = new_stmt(ctx, HIR_STMT_FOR_RANGE);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.for_range.local_id = ast->s.range.id;
 	stmt->u.for_range.from = lift_expr(ctx, ast->s.range.from);
 	stmt->u.for_range.to = lift_expr(ctx, ast->s.range.to);
@@ -1014,6 +1058,7 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	    unsigned enclosing_code_unit = ctx->current_code_unit;
 
 	    stmt = new_stmt(ctx, HIR_STMT_FORK);
+	    stmt->source_lineno = ast->lineno;
 	    stmt->u.fork.local_id = ast->s.fork.id;
 	    stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
 	    ctx->current_code_unit = ast->s.fork.code_unit;
@@ -1024,28 +1069,32 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	}
     case STMT_TRY_EXCEPT:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_EXCEPT);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.try_except.body = lift_stmt_list(ctx, ast->s.catch.body);
 	stmt->u.try_except.excepts = lift_except_arms(ctx, ast->s.catch.excepts);
 	record_unsupported(ctx, "Try-except statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_TRY_FINALLY:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_FINALLY);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.try_finally.body = lift_stmt_list(ctx, ast->s.finally.body);
 	stmt->u.try_finally.handler = lift_stmt_list(ctx, ast->s.finally.handler);
 	record_unsupported(ctx, "Try-finally statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_BREAK:
 	stmt = new_stmt(ctx, HIR_STMT_BREAK);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.exit_id = ast->s.exit;
 	record_unsupported(ctx, "Break statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_CONTINUE:
 	stmt = new_stmt(ctx, HIR_STMT_CONTINUE);
+	stmt->source_lineno = ast->lineno;
 	stmt->u.exit_id = ast->s.exit;
 	record_unsupported(ctx, "Continue statement is not yet lowerable to TAC");
 	return stmt;
     default:
-	return unsupported_stmt(ctx, ast->kind);
+	return unsupported_stmt(ctx, ast);
     }
 }
 
@@ -1055,6 +1104,9 @@ lift_stmt_list(HIRContext *ctx, Stmt *ast)
     HIRStmt *sequence = new_stmt(ctx, HIR_STMT_SEQUENCE);
     HIRStmt *first = 0;
     HIRStmt *last = 0;
+
+    if (ast)
+	sequence->source_lineno = ast->lineno;
 
     for (; ast; ast = ast->next) {
 	HIRStmt *stmt = lift_stmt(ctx, ast);
@@ -1083,11 +1135,12 @@ new_label(HIRContext *ctx)
 }
 
 static HIRTacInstr *
-new_tac(HIRContext *ctx, HIRTacKind kind)
+new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
 {
     HIRTacInstr *instr = hir_alloc(ctx, sizeof(HIRTacInstr));
 
     instr->kind = kind;
+    instr->source_lineno = source_lineno;
     instr->dst = 0;
     instr->src1 = 0;
     instr->src2 = 0;
@@ -1109,27 +1162,30 @@ append_tac(HIRTacProgram *program, HIRTacInstr *instr)
 }
 
 static void
-append_label(HIRContext *ctx, HIRTacProgram *program, int label)
+append_label(HIRContext *ctx, HIRTacProgram *program, int label,
+	     unsigned source_lineno)
 {
-    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_LABEL);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_LABEL, source_lineno);
 
     instr->label = label;
     append_tac(program, instr);
 }
 
 static void
-append_jump(HIRContext *ctx, HIRTacProgram *program, int label)
+append_jump(HIRContext *ctx, HIRTacProgram *program, int label,
+	    unsigned source_lineno)
 {
-    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_JUMP);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_JUMP, source_lineno);
 
     instr->label = label;
     append_tac(program, instr);
 }
 
 static void
-append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label)
+append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
+		    unsigned source_lineno)
 {
-    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE, source_lineno);
 
     instr->src1 = src;
     instr->label = label;
@@ -1138,9 +1194,9 @@ append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label)
 
 static int
 append_unsupported_tac(HIRContext *ctx, HIRTacProgram *program,
-		       const char *message)
+		       const char *message, unsigned source_lineno)
 {
-    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_UNSUPPORTED);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_UNSUPPORTED, source_lineno);
 
     instr->dst = new_temp(ctx);
     record_unsupported(ctx, message);
@@ -1160,20 +1216,20 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 
     switch (expr->kind) {
     case HIR_EXPR_LITERAL:
-	instr = new_tac(ctx, HIR_TAC_CONST);
+	instr = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->literal = expr->u.literal;
 	append_tac(program, instr);
 	return instr->dst;
     case HIR_EXPR_LOCAL_LOAD:
-	instr = new_tac(ctx, HIR_TAC_LOAD_LOCAL);
+	instr = new_tac(ctx, HIR_TAC_LOAD_LOCAL, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->local_id = expr->u.local_id;
 	append_tac(program, instr);
 	return instr->dst;
     case HIR_EXPR_LOCAL_STORE:
 	rhs = lower_expr(ctx, program, expr->u.local_store.rhs);
-	instr = new_tac(ctx, HIR_TAC_STORE_LOCAL);
+	instr = new_tac(ctx, HIR_TAC_STORE_LOCAL, expr->source_lineno);
 	instr->dst = rhs;
 	instr->src1 = rhs;
 	instr->local_id = expr->u.local_store.local_id;
@@ -1181,7 +1237,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	return rhs;
     case HIR_EXPR_UNARY:
 	lhs = lower_expr(ctx, program, expr->u.unary.expr);
-	instr = new_tac(ctx, HIR_TAC_UNARY);
+	instr = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;
 	instr->op = expr->u.unary.op;
@@ -1190,7 +1246,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     case HIR_EXPR_BINARY:
 	lhs = lower_expr(ctx, program, expr->u.binary.lhs);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
-	instr = new_tac(ctx, HIR_TAC_BINARY);
+	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;
 	instr->src2 = rhs;
@@ -1199,10 +1255,12 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	return instr->dst;
     case HIR_EXPR_COND:
 	return append_unsupported_tac(ctx, program,
-				      "Conditional expression is not yet lowerable to TAC");
+				      "Conditional expression is not yet lowerable to TAC",
+				      expr->source_lineno);
     default:
 	return append_unsupported_tac(ctx, program,
-				      "Unsupported HIR expression in TAC lowering");
+				      "Unsupported HIR expression in TAC lowering",
+				      expr->source_lineno);
     }
 }
 
@@ -1216,14 +1274,14 @@ lower_if(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	int next_label = new_label(ctx);
 	int cond = lower_expr(ctx, program, arm->condition);
 
-	append_branch_false(ctx, program, cond, next_label);
+	append_branch_false(ctx, program, cond, next_label, stmt->source_lineno);
 	lower_stmt_list(ctx, program, arm->body);
-	append_jump(ctx, program, done_label);
-	append_label(ctx, program, next_label);
+	append_jump(ctx, program, done_label, stmt->source_lineno);
+	append_label(ctx, program, next_label, stmt->source_lineno);
     }
 
     lower_stmt_list(ctx, program, stmt->u.if_stmt.otherwise);
-    append_label(ctx, program, done_label);
+    append_label(ctx, program, done_label, stmt->source_lineno);
 }
 
 static void
@@ -1233,12 +1291,12 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int done_label = new_label(ctx);
     int cond;
 
-    append_label(ctx, program, top_label);
+    append_label(ctx, program, top_label, stmt->source_lineno);
     cond = lower_expr(ctx, program, stmt->u.loop.condition);
-    append_branch_false(ctx, program, cond, done_label);
+    append_branch_false(ctx, program, cond, done_label, stmt->source_lineno);
     lower_stmt_list(ctx, program, stmt->u.loop.body);
-    append_jump(ctx, program, top_label);
-    append_label(ctx, program, done_label);
+    append_jump(ctx, program, top_label, stmt->source_lineno);
+    append_label(ctx, program, done_label, stmt->source_lineno);
 }
 
 static void
@@ -1255,7 +1313,8 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	(void) lower_expr(ctx, program, stmt->u.expr);
 	break;
     case HIR_STMT_RETURN:
-	instr = new_tac(ctx, stmt->u.expr ? HIR_TAC_RETURN : HIR_TAC_RETURN0);
+	instr = new_tac(ctx, stmt->u.expr ? HIR_TAC_RETURN : HIR_TAC_RETURN0,
+			stmt->source_lineno);
 	if (stmt->u.expr) {
 	    result = lower_expr(ctx, program, stmt->u.expr);
 	    instr->src1 = result;
@@ -1270,7 +1329,8 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	break;
     default:
 	(void) append_unsupported_tac(ctx, program,
-				      "Unsupported HIR statement in TAC lowering");
+				      "Unsupported HIR statement in TAC lowering",
+				      stmt->source_lineno);
 	break;
     }
 }
