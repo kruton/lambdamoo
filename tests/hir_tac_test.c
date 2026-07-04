@@ -384,6 +384,30 @@ test_negative_ssa_verifier_cases(void)
     check_rejected("negative ssa bad phi shape", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_late_phi(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa late phi", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_missing_phi_arg(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa missing phi arg", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_nonpred_phi_arg(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa nonpred phi arg", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
 }
 
 static Stmt

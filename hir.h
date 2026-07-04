@@ -143,6 +143,9 @@ extern HIRCFG *hir_test_cfg_with_duplicate_block_id(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_use_before_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_duplicate_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_bad_phi_shape(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_late_phi(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_missing_phi_arg(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_nonpred_phi_arg(HIRContext *);
 #endif
 
 #endif /* !HIR_h */

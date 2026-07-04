@@ -2970,6 +2970,46 @@ new_test_ssa_program(HIRContext *ctx, HIRSSAInstr *first, HIRSSAInstr *last,
     return ssa;
 }
 
+static HIRSSAInstr *
+new_test_ssa_instr(HIRContext *ctx, HIRTacKind kind, unsigned lineno, int value)
+{
+    HIRSSAInstr *instr = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+    memset(instr, 0, sizeof(HIRSSAInstr));
+    instr->kind = kind;
+    instr->source_lineno = lineno;
+    instr->value = value;
+    instr->local_id = -1;
+    instr->op = HIR_OP_ADD;
+    return instr;
+}
+
+static HIRPhiArg *
+new_test_phi_arg(HIRContext *ctx, int block_id, int value, HIRPhiArg *next)
+{
+    HIRPhiArg *arg = hir_alloc(ctx, sizeof(HIRPhiArg));
+
+    arg->block_id = block_id;
+    arg->value = value;
+    arg->next = next;
+    return arg;
+}
+
+static HIRSSABlock *
+new_test_ssa_block(HIRContext *ctx, int id, HIRSSAInstr *first,
+		   HIRSSAInstr *last)
+{
+    HIRSSABlock *block = hir_alloc(ctx, sizeof(HIRSSABlock));
+
+    block->id = id;
+    block->first_lineno = first ? first->source_lineno : 0;
+    block->last_lineno = last ? last->source_lineno : block->first_lineno;
+    block->first = first;
+    block->last = last;
+    block->next = 0;
+    return block;
+}
+
 HIRSSAProgram *
 hir_test_ssa_with_use_before_def(HIRContext *ctx)
 {
@@ -3119,6 +3159,125 @@ hir_test_ssa_with_bad_phi_shape(HIRContext *ctx)
     ssa->num_blocks = 2;
     ssa->num_instructions = 2;
     ssa->num_values = 2;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_late_phi(HIRContext *ctx)
+{
+    HIRSSAInstr *def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1016, 1);
+    HIRSSAInstr *phi = new_test_ssa_instr(ctx, HIR_TAC_PHI, 1017, 2);
+
+    ctx->next_temp = 3;
+    def->next = phi;
+    phi->local_id = 16;
+    phi->phi_args = 0;
+
+    return new_test_ssa_program(ctx, def, phi, 2, 2);
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_missing_phi_arg(HIRContext *ctx)
+{
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *first = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *second = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRTacInstr *first_tac = new_tac(ctx, HIR_TAC_JUMP, 1018);
+    HIRTacInstr *second_tac = new_tac(ctx, HIR_TAC_JUMP, 1019);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN, 1020);
+    HIRSSAProgram *ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    HIRSSAInstr *first_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1018, 1);
+    HIRSSAInstr *second_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1019, 2);
+    HIRSSAInstr *phi = new_test_ssa_instr(ctx, HIR_TAC_PHI, 1020, 3);
+    HIRSSABlock *first_block = new_test_ssa_block(ctx, 1, first_def, first_def);
+    HIRSSABlock *second_block =
+	new_test_ssa_block(ctx, 2, second_def, second_def);
+    HIRSSABlock *join_block = new_test_ssa_block(ctx, 3, phi, phi);
+
+    ctx->next_temp = 4;
+    join_tac->src1 = 3;
+
+    cfg->entry = first;
+    cfg->blocks = first;
+    cfg->last_block = join;
+    cfg->num_blocks = 3;
+    cfg->num_edges = 2;
+
+    init_test_block(first, 1, first_tac);
+    init_test_block(second, 2, second_tac);
+    init_test_block(join, 3, join_tac);
+    first->next = second;
+    second->next = join;
+    first->successors[0] = join;
+    first->num_successors = 1;
+    second->successors[0] = join;
+    second->num_successors = 1;
+    join->predecessor_count = 2;
+
+    phi->local_id = 16;
+    phi->phi_args = new_test_phi_arg(ctx, 1, 1, 0);
+
+    first_block->next = second_block;
+    second_block->next = join_block;
+    ssa->cfg = cfg;
+    ssa->blocks = first_block;
+    ssa->last_block = join_block;
+    ssa->num_blocks = 3;
+    ssa->num_instructions = 3;
+    ssa->num_values = 3;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_nonpred_phi_arg(HIRContext *ctx)
+{
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *extra = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_JUMP, 1021);
+    HIRTacInstr *extra_tac = new_tac(ctx, HIR_TAC_RETURN0, 1022);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN, 1023);
+    HIRSSAProgram *ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    HIRSSAInstr *entry_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1021, 1);
+    HIRSSAInstr *extra_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1022, 2);
+    HIRSSAInstr *phi = new_test_ssa_instr(ctx, HIR_TAC_PHI, 1023, 3);
+    HIRSSABlock *entry_block = new_test_ssa_block(ctx, 1, entry_def, entry_def);
+    HIRSSABlock *extra_block = new_test_ssa_block(ctx, 2, extra_def, extra_def);
+    HIRSSABlock *join_block = new_test_ssa_block(ctx, 3, phi, phi);
+
+    ctx->next_temp = 4;
+    join_tac->src1 = 3;
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = join;
+    cfg->num_blocks = 3;
+    cfg->num_edges = 1;
+
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(extra, 2, extra_tac);
+    init_test_block(join, 3, join_tac);
+    entry->next = extra;
+    extra->next = join;
+    entry->successors[0] = join;
+    entry->num_successors = 1;
+    join->predecessor_count = 1;
+
+    phi->local_id = 16;
+    phi->phi_args = new_test_phi_arg(ctx, 2, 2, 0);
+
+    entry_block->next = extra_block;
+    extra_block->next = join_block;
+    ssa->cfg = cfg;
+    ssa->blocks = entry_block;
+    ssa->last_block = join_block;
+    ssa->num_blocks = 3;
+    ssa->num_instructions = 3;
+    ssa->num_values = 3;
 
     return ssa;
 }
