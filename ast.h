@@ -116,6 +116,7 @@ union Expr_Data {
 
 struct Expr {
     enum Expr_Kind kind;
+    unsigned lineno;
     union Expr_Data e;
 };
 
@@ -195,12 +196,14 @@ struct Stmt {
     Stmt *next;
     enum Stmt_Kind kind;
     unsigned loop_ordinal;
+    unsigned lineno;
     union Stmt_Data s;
 };
 
 
 extern void begin_code_allocation(void);
 extern void end_code_allocation(int);
+extern void set_code_allocation_lineno(unsigned);
 
 extern Stmt *alloc_stmt(enum Stmt_Kind);
 extern void *alloc_ast(int);
