@@ -10,6 +10,7 @@ typedef struct HIRProgram HIRProgram;
 typedef struct HIRTacProgram HIRTacProgram;
 typedef struct HIRCFG HIRCFG;
 typedef struct HIRDominatorTree HIRDominatorTree;
+typedef struct HIRBlockList HIRBlockList;
 typedef struct HIRSSAProgram HIRSSAProgram;
 
 typedef enum {
@@ -94,7 +95,8 @@ typedef enum {
     HIR_TAC_BRANCH_FALSE,
     HIR_TAC_RETURN,
     HIR_TAC_RETURN0,
-    HIR_TAC_UNSUPPORTED
+    HIR_TAC_UNSUPPORTED,
+    HIR_TAC_PHI
 } HIRTacKind;
 
 extern HIRContext *hir_context_new(Names *);
@@ -127,6 +129,7 @@ extern int hir_cfg_edge_count(HIRCFG *);
 extern int hir_cfg_unsupported_block_count(HIRCFG *);
 extern int hir_dom_reachable_block_count(HIRDominatorTree *);
 extern int hir_dom_idom_block(HIRDominatorTree *, int);
+extern int hir_dom_df_count(HIRDominatorTree *, int);
 extern int hir_ssa_block_count(HIRSSAProgram *);
 extern int hir_ssa_instruction_count(HIRSSAProgram *);
 extern int hir_ssa_value_count(HIRSSAProgram *);
@@ -136,6 +139,7 @@ extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_use_before_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_duplicate_def(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_bad_phi_shape(HIRContext *);
 #endif
 
 #endif /* !HIR_h */

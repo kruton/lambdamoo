@@ -166,8 +166,8 @@ test_arithmetic_and_local_tac(void)
 	      hir_dom_reachable_block_count(dom), 1);
     check_int("arith dom entry idom", hir_dom_idom_block(dom, 1), 1);
     check_int("arith ssa blocks", hir_ssa_block_count(ssa), 1);
-    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 8);
-    check_int("arith ssa values", hir_ssa_value_count(ssa), 6);
+    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 6);
+    check_int("arith ssa values", hir_ssa_value_count(ssa), 5);
     check_int("arith ssa binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
@@ -352,6 +352,14 @@ test_negative_ssa_verifier_cases(void)
     check_rejected("negative ssa duplicate def", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_bad_phi_shape(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa bad phi shape", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
 }
 
 static Stmt
@@ -417,12 +425,115 @@ test_loop_dominator_tree(void)
 
     hir_context_free(ctx);
 }
+
+static void
+test_dominance_frontier_tac(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+
+    Expr one_init = int_expr(1, 9);
+    Expr local_x_init = id_expr(16, 9);
+    Expr assign_init = binary_expr(EXPR_ASGN, &local_x_init, &one_init);
+    Stmt init_stmt = expr_stmt(&assign_init);
+
+    Expr ten = int_expr(10, 10);
+    Expr local_x_cond = id_expr(16, 10);
+    Expr cond = binary_expr(EXPR_LT, &local_x_cond, &ten);
+
+    Expr local_x_lhs = id_expr(16, 11);
+    Expr local_x_rhs = id_expr(16, 11);
+    Expr one = int_expr(1, 11);
+    Expr add = binary_expr(EXPR_PLUS, &local_x_rhs, &one);
+    Expr assign = binary_expr(EXPR_ASGN, &local_x_lhs, &add);
+    Stmt body_stmt = expr_stmt(&assign);
+
+    Stmt loop = while_stmt(&cond, &body_stmt, 1, 10);
+    init_stmt.next = &loop;
+
+    Expr local_x_ret = id_expr(16, 12);
+    Stmt ret = return_stmt(&local_x_ret);
+    loop.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    (void) lower_stmt(&names, &init_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("loop cfg blocks", hir_cfg_block_count(cfg), 4);
+    check_int("loop dom reachable blocks",
+	      hir_dom_reachable_block_count(dom), 4);
+
+    check_int("df block 1 count", hir_dom_df_count(dom, 1), 0);
+    check_int("df block 2 count", hir_dom_df_count(dom, 2), 1);
+    check_int("df block 3 count", hir_dom_df_count(dom, 3), 1);
+    check_int("df block 4 count", hir_dom_df_count(dom, 4), 0);
+
+    check_int("loop ssa blocks", hir_ssa_block_count(ssa), 4);
+    check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 11);
+    check_int("loop ssa values", hir_ssa_value_count(ssa), 6);
+    check_int("loop ssa phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_repeated_local_assignment_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr values[6];
+    Expr lhs[6];
+    Expr assigns[6];
+    Stmt stmts[6];
+    Expr ret_expr;
+    Stmt ret;
+    int i;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    for (i = 0; i < 6; i++) {
+	values[i] = int_expr(i + 1, 40 + (unsigned) i);
+	lhs[i] = id_expr(16, 40 + (unsigned) i);
+	assigns[i] = binary_expr(EXPR_ASGN, &lhs[i], &values[i]);
+	stmts[i] = expr_stmt(&assigns[i]);
+	if (i > 0)
+	    stmts[i - 1].next = &stmts[i];
+    }
+
+    ret_expr = id_expr(16, 50);
+    ret = return_stmt(&ret_expr);
+    stmts[5].next = &ret;
+
+    tac = lower_stmt(&names, &stmts[0], &ctx, &cfg, &dom, &ssa);
+
+    check_int("repeat assign tac stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 6);
+    check_int("repeat assign cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("repeat assign ssa instructions",
+	      hir_ssa_instruction_count(ssa), 7);
+    check_int("repeat assign ssa values", hir_ssa_value_count(ssa), 6);
+    check_int("repeat assign verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_loop_dominator_tree();
+    test_dominance_frontier_tac();
+    test_repeated_local_assignment_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
     test_negative_cfg_verifier_cases();
