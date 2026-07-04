@@ -18,6 +18,21 @@ check_int(const char *name, int actual, int expected)
     }
 }
 
+static void
+check_rejected(const char *name, int accepted, int before_errors,
+	       int after_errors)
+{
+    if (accepted) {
+	fprintf(stderr, "%s: verifier unexpectedly accepted malformed IR\n",
+		name);
+	failures++;
+    }
+    if (after_errors <= before_errors) {
+	fprintf(stderr, "%s: verifier did not record an error\n", name);
+	failures++;
+    }
+}
+
 static Expr
 int_expr(Num value, unsigned lineno)
 {
@@ -241,12 +256,94 @@ test_unsupported_tac(void)
     hir_context_free(ctx);
 }
 
+static void
+test_negative_tac_verifier_cases(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRTacProgram *tac;
+    int before;
+    int accepted;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    ctx = hir_context_new(&names);
+    tac = hir_test_tac_with_undefined_return(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_tac(ctx, tac);
+    check_rejected("negative tac undefined return", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    tac = hir_test_tac_with_duplicate_temp(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_tac(ctx, tac);
+    check_rejected("negative tac duplicate temp", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+}
+
+static void
+test_negative_cfg_verifier_cases(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    int before;
+    int accepted;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    ctx = hir_context_new(&names);
+    cfg = hir_test_cfg_with_missing_successor(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_cfg(ctx, cfg);
+    check_rejected("negative cfg missing successor", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+}
+
+static void
+test_negative_ssa_verifier_cases(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRSSAProgram *ssa;
+    int before;
+    int accepted;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_use_before_def(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa use before def", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_duplicate_def(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa duplicate def", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_unsupported_tac();
+    test_negative_tac_verifier_cases();
+    test_negative_cfg_verifier_cases();
+    test_negative_ssa_verifier_cases();
 
     return failures ? 1 : 0;
 }

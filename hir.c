@@ -1910,3 +1910,141 @@ lower_stmt_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     for (; item; item = item->next)
 	lower_stmt(ctx, program, item);
 }
+
+#ifdef HIR_TESTING
+static HIRTacProgram *
+new_test_tac_program(HIRContext *ctx)
+{
+    HIRTacProgram *program = hir_alloc(ctx, sizeof(HIRTacProgram));
+
+    program->first = 0;
+    program->last = 0;
+    return program;
+}
+
+HIRTacProgram *
+hir_test_tac_with_undefined_return(HIRContext *ctx)
+{
+    HIRTacProgram *program = new_test_tac_program(ctx);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_RETURN, 1001);
+
+    instr->src1 = 1;
+    append_tac(program, instr);
+    return program;
+}
+
+HIRTacProgram *
+hir_test_tac_with_duplicate_temp(HIRContext *ctx)
+{
+    HIRTacProgram *program = new_test_tac_program(ctx);
+    HIRTacInstr *first = new_tac(ctx, HIR_TAC_CONST, 1002);
+    HIRTacInstr *second = new_tac(ctx, HIR_TAC_CONST, 1003);
+
+    ctx->next_temp = 2;
+    first->dst = 1;
+    second->dst = 1;
+    append_tac(program, first);
+    append_tac(program, second);
+    return program;
+}
+
+HIRCFG *
+hir_test_cfg_with_missing_successor(HIRContext *ctx)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_RETURN0, 1004);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *block = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    cfg->entry = block;
+    cfg->blocks = block;
+    cfg->last_block = block;
+    cfg->num_blocks = 1;
+    cfg->num_edges = 1;
+
+    block->id = 1;
+    block->first = instr;
+    block->last = instr;
+    block->next = 0;
+    block->successors[0] = 0;
+    block->successors[1] = 0;
+    block->num_successors = 1;
+    block->predecessor_count = 0;
+    block->first_lineno = instr->source_lineno;
+    block->last_lineno = instr->source_lineno;
+    block->contains_unsupported = 0;
+
+    return cfg;
+}
+
+static HIRSSAProgram *
+new_test_ssa_program(HIRContext *ctx, HIRSSAInstr *first, HIRSSAInstr *last,
+		     int instruction_count, int value_count)
+{
+    HIRSSAProgram *ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    HIRSSABlock *block = hir_alloc(ctx, sizeof(HIRSSABlock));
+
+    block->id = 1;
+    block->first_lineno = first ? first->source_lineno : 0;
+    block->last_lineno = last ? last->source_lineno : block->first_lineno;
+    block->first = first;
+    block->last = last;
+    block->next = 0;
+
+    ssa->blocks = block;
+    ssa->last_block = block;
+    ssa->num_blocks = 1;
+    ssa->num_instructions = instruction_count;
+    ssa->num_values = value_count;
+
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_use_before_def(HIRContext *ctx)
+{
+    HIRSSAInstr *instr = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+    ctx->next_temp = 2;
+    instr->kind = HIR_TAC_RETURN;
+    instr->source_lineno = 1005;
+    instr->value = 0;
+    instr->src1 = 1;
+    instr->src2 = 0;
+    instr->label = 0;
+    instr->local_id = -1;
+    instr->op = HIR_OP_ADD;
+    instr->next = 0;
+
+    return new_test_ssa_program(ctx, instr, instr, 1, 0);
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_duplicate_def(HIRContext *ctx)
+{
+    HIRSSAInstr *first = hir_alloc(ctx, sizeof(HIRSSAInstr));
+    HIRSSAInstr *second = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+    ctx->next_temp = 2;
+    first->kind = HIR_TAC_CONST;
+    first->source_lineno = 1006;
+    first->value = 1;
+    first->src1 = 0;
+    first->src2 = 0;
+    first->label = 0;
+    first->local_id = -1;
+    first->op = HIR_OP_ADD;
+    first->next = second;
+
+    second->kind = HIR_TAC_CONST;
+    second->source_lineno = 1007;
+    second->value = 1;
+    second->src1 = 0;
+    second->src2 = 0;
+    second->label = 0;
+    second->local_id = -1;
+    second->op = HIR_OP_ADD;
+    second->next = 0;
+
+    return new_test_ssa_program(ctx, first, second, 2, 2);
+}
+#endif

@@ -125,6 +125,11 @@ extern int hir_ssa_block_count(HIRSSAProgram *);
 extern int hir_ssa_instruction_count(HIRSSAProgram *);
 extern int hir_ssa_value_count(HIRSSAProgram *);
 extern int hir_ssa_count_kind(HIRSSAProgram *, HIRTacKind);
+extern HIRTacProgram *hir_test_tac_with_undefined_return(HIRContext *);
+extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
+extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_use_before_def(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_duplicate_def(HIRContext *);
 #endif
 
 #endif /* !HIR_h */
