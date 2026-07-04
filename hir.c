@@ -1,6 +1,7 @@
 #include "hir.h"
 
 #include "arena.h"
+#include "program.h"
 #include "storage.h"
 
 #include <stddef.h>
@@ -43,12 +44,12 @@ struct HIRExpr {
 	    HIRExpr *alternate;
 	} cond;
 	struct {
-	    ResumeID resume_id;
+	    ResumeKey resume_key;
 	    unsigned func;
 	    HIRArg *args;
 	} call;
 	struct {
-	    ResumeID resume_id;
+	    ResumeKey resume_key;
 	    HIRExpr *obj;
 	    HIRExpr *verb;
 	    HIRArg *args;
@@ -161,6 +162,7 @@ struct HIRContext {
     const char *error_msg;
     int next_temp;
     int next_label;
+    unsigned current_code_unit;
 };
 
 static void *hir_alloc(HIRContext *, size_t);
@@ -180,6 +182,7 @@ hir_context_new(Names *var_names)
     ctx->error_msg = 0;
     ctx->next_temp = 1;
     ctx->next_label = 1;
+    ctx->current_code_unit = 0;
 
     return ctx;
 }
@@ -480,14 +483,18 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	return expr;
     case EXPR_CALL:
 	expr = new_expr(ctx, HIR_EXPR_CALL);
-	expr->u.call.resume_id = ast->e.call.resume_id;
+	expr->u.call.resume_key.code_unit = ctx->current_code_unit;
+	expr->u.call.resume_key.site = ast->e.call.resume_site;
+	expr->u.call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.call.func = ast->e.call.func;
 	expr->u.call.args = lift_arg_list(ctx, ast->e.call.args);
 	record_unsupported(ctx, "Call expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_VERB:
 	expr = new_expr(ctx, HIR_EXPR_VERB_CALL);
-	expr->u.verb_call.resume_id = ast->e.verb.resume_id;
+	expr->u.verb_call.resume_key.code_unit = ctx->current_code_unit;
+	expr->u.verb_call.resume_key.site = ast->e.verb.resume_site;
+	expr->u.verb_call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.verb_call.obj = lift_expr(ctx, ast->e.verb.obj);
 	expr->u.verb_call.verb = lift_expr(ctx, ast->e.verb.verb);
 	expr->u.verb_call.args = lift_arg_list(ctx, ast->e.verb.args);
@@ -631,12 +638,18 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	record_unsupported(ctx, "For-range statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_FORK:
-	stmt = new_stmt(ctx, HIR_STMT_FORK);
-	stmt->u.fork.local_id = ast->s.fork.id;
-	stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
-	stmt->u.fork.body = lift_stmt_list(ctx, ast->s.fork.body);
-	record_unsupported(ctx, "Fork statement is not yet lowerable to TAC");
-	return stmt;
+	{
+	    unsigned enclosing_code_unit = ctx->current_code_unit;
+
+	    stmt = new_stmt(ctx, HIR_STMT_FORK);
+	    stmt->u.fork.local_id = ast->s.fork.id;
+	    stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
+	    ctx->current_code_unit = ast->s.fork.code_unit;
+	    stmt->u.fork.body = lift_stmt_list(ctx, ast->s.fork.body);
+	    ctx->current_code_unit = enclosing_code_unit;
+	    record_unsupported(ctx, "Fork statement is not yet lowerable to TAC");
+	    return stmt;
+	}
     case STMT_TRY_EXCEPT:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_EXCEPT);
 	stmt->u.try_except.body = lift_stmt_list(ctx, ast->s.catch.body);

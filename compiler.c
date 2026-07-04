@@ -18,12 +18,23 @@
 #include "compiler.h"
 
 #include "code_gen.h"
+#include "hir.h"
 #include "storage.h"
 
 Program *
 compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 {
+    HIRContext *hir_ctx;
+    HIRProgram *hir_program;
+    HIRTacProgram *tac_program;
     Program *program;
+
+    assign_resume_ids(ast);
+    hir_ctx = hir_context_new(var_names);
+    hir_program = hir_lift_ast(hir_ctx, ast);
+    tac_program = hir_lower_to_tac(hir_ctx, hir_program);
+    (void) tac_program;
+    hir_context_free(hir_ctx);
 
     program = generate_code(ast, version);
 
