@@ -552,6 +552,57 @@ dump_var(FILE *file, Var var)
 }
 #endif
 
+#ifdef HIR_TESTING
+int
+hir_tac_count_kind(HIRTacProgram *program, HIRTacKind kind)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	if (instr->kind == kind)
+	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_tac_count_binary_op(HIRTacProgram *program, HIROp op)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	if (instr->kind == HIR_TAC_BINARY && instr->op == op)
+	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_tac_instruction_count(HIRTacProgram *program)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next)
+	count++;
+
+    return count;
+}
+#endif
+
 static void *
 hir_alloc(HIRContext *ctx, size_t size)
 {

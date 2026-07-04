@@ -113,10 +113,28 @@ OBJS = $(COBJS) $(YOBJS) keywords.o bf_register.o
 
 DFILES = $(OBJS:.o=.d) $(CLIENT_CSRCS:.c=.d)
 
+HIR_TAC_TEST_OBJS = tests/hir_tac_test.o tests/hir_test_hir.o \
+	tests/hir_test_stubs.o arena.o
+
 all: moo
 
 moo:	$(OBJS) $(XT_LOBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@
+
+tests/hir_test_hir.o: hir.c hir.h
+	$(COMPILE.c) -DHIR_TESTING -o $@ hir.c
+
+tests/hir_tac_test.o: tests/hir_tac_test.c hir.h ast.h structures.h
+	$(COMPILE.c) -DHIR_TESTING -o $@ tests/hir_tac_test.c
+
+tests/hir_test_stubs.o: tests/hir_test_stubs.c storage.h
+	$(COMPILE.c) -o $@ tests/hir_test_stubs.c
+
+tests/hir_tac_test: $(HIR_TAC_TEST_OBJS)
+	$(CC) $(LDFLAGS) $(HIR_TAC_TEST_OBJS) $(LIBS) -o $@
+
+test-hir-tac: tests/hir_tac_test
+	./tests/hir_tac_test
 
 pure_moo: moo
 	purify $(CC) $(CFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@

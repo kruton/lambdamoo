@@ -107,4 +107,10 @@ extern int hir_verify_tac(HIRContext *, HIRTacProgram *);
 extern void hir_dump_tac(HIRTacProgram *);
 #endif
 
+#ifdef HIR_TESTING
+extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
+extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
+extern int hir_tac_instruction_count(HIRTacProgram *);
+#endif
+
 #endif /* !HIR_h */

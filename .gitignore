@@ -34,3 +34,4 @@ moo
 *.bak
 *.d
 configure~
+tests/hir_tac_test
