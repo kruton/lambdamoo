@@ -86,14 +86,18 @@ return_stmt(Expr *expr)
 }
 
 static HIRTacProgram *
-lower_stmt(Names *names, Stmt *stmt, HIRContext **ctx_out)
+lower_stmt(Names *names, Stmt *stmt, HIRContext **ctx_out, HIRCFG **cfg_out)
 {
     HIRContext *ctx = hir_context_new(names);
     HIRProgram *program = hir_lift_ast(ctx, stmt);
     HIRTacProgram *tac = hir_lower_to_tac(ctx, program);
+    HIRCFG *cfg;
 
     (void) hir_verify_tac(ctx, tac);
+    cfg = hir_build_cfg(ctx, tac);
+    (void) hir_verify_cfg(ctx, cfg);
     *ctx_out = ctx;
+    *cfg_out = cfg;
 
     return tac;
 }
@@ -103,6 +107,7 @@ test_arithmetic_and_local_tac(void)
 {
     Names names;
     HIRContext *ctx;
+    HIRCFG *cfg;
     HIRTacProgram *tac;
     Expr one = int_expr(1, 10);
     Expr two = int_expr(2, 10);
@@ -119,7 +124,7 @@ test_arithmetic_and_local_tac(void)
     names.size = 32;
     assign_stmt_node.next = &return_stmt_node;
 
-    tac = lower_stmt(&names, &assign_stmt_node, &ctx);
+    tac = lower_stmt(&names, &assign_stmt_node, &ctx, &cfg);
 
     check_int("arith const count", hir_tac_count_kind(tac, HIR_TAC_CONST), 3);
     check_int("arith load count", hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
@@ -129,6 +134,8 @@ test_arithmetic_and_local_tac(void)
     check_int("arith mul count", hir_tac_count_binary_op(tac, HIR_OP_MUL), 1);
     check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 4);
     check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 4);
+    check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("arith cfg edges", hir_cfg_edge_count(cfg), 0);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -139,6 +146,7 @@ test_control_flow_tac(void)
 {
     Names names;
     HIRContext *ctx;
+    HIRCFG *cfg;
     HIRTacProgram *tac;
     Cond_Arm arm;
     Expr one = int_expr(1, 20);
@@ -160,7 +168,7 @@ test_control_flow_tac(void)
     if_stmt_node.s.cond.arms = &arm;
     if_stmt_node.s.cond.otherwise = 0;
 
-    tac = lower_stmt(&names, &if_stmt_node, &ctx);
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg);
 
     check_int("control branch count",
 	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
@@ -169,6 +177,8 @@ test_control_flow_tac(void)
     check_int("control lt count", hir_tac_count_binary_op(tac, HIR_OP_LT), 1);
     check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 7);
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
+    check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
+    check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
     check_int("control verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -179,6 +189,7 @@ test_unsupported_tac(void)
 {
     Names names;
     HIRContext *ctx;
+    HIRCFG *cfg;
     HIRTacProgram *tac;
     Expr list;
     Stmt ret;
@@ -191,12 +202,15 @@ test_unsupported_tac(void)
     list.e.list = 0;
     ret = return_stmt(&list);
 
-    tac = lower_stmt(&names, &ret, &ctx);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg);
 
     check_int("unsupported tac count",
 	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 1);
     check_int("unsupported return count", hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("unsupported line 30 count", hir_tac_count_lineno(tac, 30), 2);
+    check_int("unsupported cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("unsupported cfg unsupported blocks",
+	      hir_cfg_unsupported_block_count(cfg), 1);
     if (hir_context_error_count(ctx) == 0) {
 	fprintf(stderr, "unsupported case should record HIR errors\n");
 	failures++;

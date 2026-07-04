@@ -8,6 +8,7 @@
 typedef struct HIRContext HIRContext;
 typedef struct HIRProgram HIRProgram;
 typedef struct HIRTacProgram HIRTacProgram;
+typedef struct HIRCFG HIRCFG;
 
 typedef enum {
     HIR_TYPE_INT,
@@ -102,6 +103,8 @@ extern const char *hir_context_error_message(HIRContext *);
 extern HIRProgram *hir_lift_ast(HIRContext *, Stmt *);
 extern HIRTacProgram *hir_lower_to_tac(HIRContext *, HIRProgram *);
 extern int hir_verify_tac(HIRContext *, HIRTacProgram *);
+extern HIRCFG *hir_build_cfg(HIRContext *, HIRTacProgram *);
+extern int hir_verify_cfg(HIRContext *, HIRCFG *);
 
 #ifdef HIR_DUMP_TAC
 extern void hir_dump_tac(HIRTacProgram *);
@@ -112,6 +115,9 @@ extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
+extern int hir_cfg_block_count(HIRCFG *);
+extern int hir_cfg_edge_count(HIRCFG *);
+extern int hir_cfg_unsupported_block_count(HIRCFG *);
 #endif
 
 #endif /* !HIR_h */

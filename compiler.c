@@ -27,6 +27,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     HIRContext *hir_ctx;
     HIRProgram *hir_program;
     HIRTacProgram *tac_program;
+    HIRCFG *cfg;
     Program *program;
 
     assign_resume_ids(ast);
@@ -34,9 +35,12 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     hir_program = hir_lift_ast(hir_ctx, ast);
     tac_program = hir_lower_to_tac(hir_ctx, hir_program);
     (void) hir_verify_tac(hir_ctx, tac_program);
+    cfg = hir_build_cfg(hir_ctx, tac_program);
+    (void) hir_verify_cfg(hir_ctx, cfg);
 #ifdef HIR_DUMP_TAC
     hir_dump_tac(tac_program);
 #endif
+    (void) cfg;
     (void) tac_program;
     hir_context_free(hir_ctx);
 

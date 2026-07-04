@@ -13,6 +13,7 @@ typedef struct HIRArg HIRArg;
 typedef struct HIRCondArm HIRCondArm;
 typedef struct HIRExceptArm HIRExceptArm;
 typedef struct HIRTacInstr HIRTacInstr;
+typedef struct HIRBasicBlock HIRBasicBlock;
 
 struct HIRArg {
     enum Arg_Kind kind;
@@ -159,6 +160,27 @@ struct HIRTacProgram {
     HIRTacInstr *last;
 };
 
+struct HIRBasicBlock {
+    int id;
+    HIRTacInstr *first;
+    HIRTacInstr *last;
+    HIRBasicBlock *next;
+    HIRBasicBlock *successors[2];
+    int num_successors;
+    int predecessor_count;
+    unsigned first_lineno;
+    unsigned last_lineno;
+    int contains_unsupported;
+};
+
+struct HIRCFG {
+    HIRBasicBlock *entry;
+    HIRBasicBlock *blocks;
+    HIRBasicBlock *last_block;
+    int num_blocks;
+    int num_edges;
+};
+
 struct HIRContext {
     Arena *arena;
     Names *var_names;
@@ -175,6 +197,7 @@ static HIRStmt *lift_stmt_list(HIRContext *, Stmt *);
 static int lower_expr(HIRContext *, HIRTacProgram *, HIRExpr *);
 static void lower_stmt_list(HIRContext *, HIRTacProgram *, HIRStmt *);
 static void record_unsupported(HIRContext *, const char *);
+static int tac_is_terminator(HIRTacInstr *);
 
 HIRContext *
 hir_context_new(Names *var_names)
@@ -369,6 +392,239 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
     for (i = 1; i <= max_label; i++) {
 	if (referenced_labels[i] && !defined_labels[i])
 	    record_unsupported(ctx, "TAC label referenced but not defined");
+    }
+
+    return ctx->error_count == errors_before;
+}
+
+static int
+tac_is_terminator(HIRTacInstr *instr)
+{
+    return instr
+	&& (instr->kind == HIR_TAC_JUMP
+	    || instr->kind == HIR_TAC_BRANCH_FALSE
+	    || instr->kind == HIR_TAC_RETURN
+	    || instr->kind == HIR_TAC_RETURN0);
+}
+
+static HIRBasicBlock *
+new_block(HIRContext *ctx, int id, HIRTacInstr *first)
+{
+    HIRBasicBlock *block = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    block->id = id;
+    block->first = first;
+    block->last = 0;
+    block->next = 0;
+    block->successors[0] = 0;
+    block->successors[1] = 0;
+    block->num_successors = 0;
+    block->predecessor_count = 0;
+    block->first_lineno = first ? first->source_lineno : 0;
+    block->last_lineno = block->first_lineno;
+    block->contains_unsupported = 0;
+
+    return block;
+}
+
+static void
+append_block(HIRCFG *cfg, HIRBasicBlock *block)
+{
+    if (cfg->last_block)
+	cfg->last_block->next = block;
+    else
+	cfg->blocks = block;
+    cfg->last_block = block;
+    if (!cfg->entry)
+	cfg->entry = block;
+    cfg->num_blocks++;
+}
+
+static void
+add_edge(HIRCFG *cfg, HIRBasicBlock *from, HIRBasicBlock *to)
+{
+    int i;
+
+    if (!from || !to)
+	return;
+
+    for (i = 0; i < from->num_successors; i++) {
+	if (from->successors[i] == to)
+	    return;
+    }
+
+    if (from->num_successors >= 2)
+	return;
+
+    from->successors[from->num_successors++] = to;
+    to->predecessor_count++;
+    cfg->num_edges++;
+}
+
+static void
+finish_block(HIRBasicBlock *block, HIRTacInstr **instrs, int first_index,
+	     int last_index)
+{
+    int i;
+
+    block->last = instrs[last_index];
+    for (i = first_index; i <= last_index; i++) {
+	if (instrs[i]->kind == HIR_TAC_UNSUPPORTED)
+	    block->contains_unsupported = 1;
+	if (instrs[i]->source_lineno != 0) {
+	    if (block->first_lineno == 0
+		|| instrs[i]->source_lineno < block->first_lineno)
+		block->first_lineno = instrs[i]->source_lineno;
+	    if (instrs[i]->source_lineno > block->last_lineno)
+		block->last_lineno = instrs[i]->source_lineno;
+	}
+    }
+}
+
+static HIRBasicBlock *
+block_for_label(HIRContext *ctx, HIRBasicBlock **label_blocks, int max_label,
+		int label)
+{
+    if (label <= 0 || label > max_label || !label_blocks[label]) {
+	record_unsupported(ctx, "CFG edge target label has no block");
+	return 0;
+    }
+
+    return label_blocks[label];
+}
+
+HIRCFG *
+hir_build_cfg(HIRContext *ctx, HIRTacProgram *program)
+{
+    HIRCFG *cfg;
+    HIRTacInstr *instr;
+    HIRTacInstr **instrs;
+    unsigned char *leaders;
+    HIRBasicBlock **label_blocks;
+    HIRBasicBlock *block;
+    int count = 0;
+    int max_label = 0;
+    int i;
+    int block_id = 0;
+
+    if (!ctx || !program)
+	return 0;
+
+    cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    cfg->entry = 0;
+    cfg->blocks = 0;
+    cfg->last_block = 0;
+    cfg->num_blocks = 0;
+    cfg->num_edges = 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	count++;
+	if (instr->label > max_label)
+	    max_label = instr->label;
+    }
+
+    if (count == 0)
+	return cfg;
+
+    instrs = hir_alloc(ctx, sizeof(HIRTacInstr *) * ((size_t) count + 2));
+    leaders = hir_alloc(ctx, (size_t) count + 2);
+    label_blocks = hir_alloc(ctx, sizeof(HIRBasicBlock *) * ((size_t) max_label + 1));
+
+    for (i = 0; i <= count + 1; i++) {
+	leaders[i] = 0;
+    }
+    for (i = 0; i <= max_label; i++)
+	label_blocks[i] = 0;
+
+    i = 1;
+    for (instr = program->first; instr; instr = instr->next)
+	instrs[i++] = instr;
+
+    leaders[1] = 1;
+    leaders[count + 1] = 1;
+    for (i = 1; i <= count; i++) {
+	if (instrs[i]->kind == HIR_TAC_LABEL)
+	    leaders[i] = 1;
+	if (tac_is_terminator(instrs[i]) && i < count)
+	    leaders[i + 1] = 1;
+    }
+
+    i = 1;
+    while (i <= count) {
+	int first_index = i;
+	int last_index;
+
+	block = new_block(ctx, ++block_id, instrs[first_index]);
+	append_block(cfg, block);
+	last_index = first_index;
+	while (last_index < count && !leaders[last_index + 1])
+	    last_index++;
+	finish_block(block, instrs, first_index, last_index);
+
+	if (block->first->kind == HIR_TAC_LABEL
+	    && block->first->label > 0
+	    && block->first->label <= max_label)
+	    label_blocks[block->first->label] = block;
+
+	i = last_index + 1;
+    }
+
+    for (block = cfg->blocks; block; block = block->next) {
+	HIRTacInstr *last = block->last;
+
+	switch (last->kind) {
+	case HIR_TAC_JUMP:
+	    add_edge(cfg, block,
+		     block_for_label(ctx, label_blocks, max_label, last->label));
+	    break;
+	case HIR_TAC_BRANCH_FALSE:
+	    add_edge(cfg, block,
+		     block_for_label(ctx, label_blocks, max_label, last->label));
+	    add_edge(cfg, block, block->next);
+	    break;
+	case HIR_TAC_RETURN:
+	case HIR_TAC_RETURN0:
+	    break;
+	default:
+	    add_edge(cfg, block, block->next);
+	    break;
+	}
+    }
+
+    return cfg;
+}
+
+int
+hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int errors_before;
+
+    if (!ctx || !cfg)
+	return 0;
+
+    errors_before = ctx->error_count;
+
+    if (cfg->num_blocks == 0)
+	return 1;
+
+    if (!cfg->entry || cfg->entry != cfg->blocks)
+	record_unsupported(ctx, "CFG has invalid entry block");
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	if (!block->first || !block->last)
+	    record_unsupported(ctx, "CFG block has missing TAC bounds");
+
+	if (block->num_successors < 0 || block->num_successors > 2)
+	    record_unsupported(ctx, "CFG block has invalid successor count");
+
+	for (i = 0; i < block->num_successors; i++) {
+	    if (!block->successors[i])
+		record_unsupported(ctx, "CFG block has missing successor");
+	}
+
     }
 
     return ctx->error_count == errors_before;
@@ -617,6 +873,35 @@ hir_tac_count_lineno(HIRTacProgram *program, unsigned lineno)
 
     for (instr = program->first; instr; instr = instr->next) {
 	if (instr->source_lineno == lineno)
+	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_cfg_block_count(HIRCFG *cfg)
+{
+    return cfg ? cfg->num_blocks : 0;
+}
+
+int
+hir_cfg_edge_count(HIRCFG *cfg)
+{
+    return cfg ? cfg->num_edges : 0;
+}
+
+int
+hir_cfg_unsupported_block_count(HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int count = 0;
+
+    if (!cfg)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	if (block->contains_unsupported)
 	    count++;
     }
 
