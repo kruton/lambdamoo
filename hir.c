@@ -1409,8 +1409,14 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			/* Insert Phi node at y for variable i */
 			HIRSSAInstr *phi = hir_alloc(ctx, sizeof(HIRSSAInstr));
 			phi->kind = HIR_TAC_PHI;
+			phi->source_lineno = y->first_lineno;
 			phi->value = 0; /* filled in renaming */
+			phi->src1 = 0;
+			phi->src2 = 0;
+			phi->label = 0;
 			phi->local_id = i;
+			phi->op = HIR_OP_ADD;
+			phi->literal.type = TYPE_NONE;
 			phi->phi_args = 0;
 
 			/* Create Phi arguments for each predecessor of y */
@@ -2056,6 +2062,157 @@ hir_ssa_count_kind(HIRSSAProgram *ssa, HIRTacKind kind)
 
 	for (instr = block->first; instr; instr = instr->next) {
 	    if (instr->kind == kind)
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+int
+hir_ssa_phi_arg_count(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_PHI) {
+		HIRPhiArg *arg;
+
+		for (arg = instr->phi_args; arg; arg = arg->next)
+		    count++;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+int
+hir_ssa_zero_phi_arg_count(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_PHI) {
+		HIRPhiArg *arg;
+
+		for (arg = instr->phi_args; arg; arg = arg->next) {
+		    if (arg->value == 0)
+			count++;
+		}
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+static int
+ssa_value_is_phi(HIRSSAProgram *ssa, int value)
+{
+    HIRSSABlock *block;
+
+    if (!ssa || value <= 0)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_PHI && instr->value == value)
+		return 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return 0;
+}
+
+int
+hir_ssa_return_uses_phi_count(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_RETURN
+		&& ssa_value_is_phi(ssa, instr->src1))
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+int
+hir_ssa_branch_uses_phi_count(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_BRANCH_FALSE
+		&& ssa_value_is_phi(ssa, instr->src1))
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    return count;
+}
+
+int
+hir_ssa_binary_uses_phi_count(HIRSSAProgram *ssa, HIROp op)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_BINARY && instr->op == op
+		&& (ssa_value_is_phi(ssa, instr->src1)
+		    || ssa_value_is_phi(ssa, instr->src2)))
 		count++;
 	    if (instr == block->last)
 		break;

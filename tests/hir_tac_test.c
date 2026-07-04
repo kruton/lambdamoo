@@ -524,6 +524,19 @@ test_while_loop_phi_ssa(void)
     check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 11);
     check_int("loop ssa values", hir_ssa_value_count(ssa), 6);
     check_int("loop ssa phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("loop ssa loads", hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("loop ssa stores",
+	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
+    check_int("loop ssa phi args", hir_ssa_phi_arg_count(ssa), 2);
+    check_int("loop ssa zero phi args", hir_ssa_zero_phi_arg_count(ssa), 0);
+    check_int("loop ssa branch uses phi",
+	      hir_ssa_branch_uses_phi_count(ssa), 0);
+    check_int("loop ssa lt uses phi",
+	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_LT), 1);
+    check_int("loop ssa add uses phi",
+	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_ADD), 1);
+    check_int("loop ssa return uses phi",
+	      hir_ssa_return_uses_phi_count(ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -581,7 +594,71 @@ test_if_else_phi_ssa(void)
     check_int("ifelse ssa blocks", hir_ssa_block_count(ssa), 4);
     check_int("ifelse ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("ifelse ssa loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("ifelse ssa stores",
+	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
+    check_int("ifelse ssa phi args", hir_ssa_phi_arg_count(ssa), 2);
+    check_int("ifelse ssa zero phi args", hir_ssa_zero_phi_arg_count(ssa), 0);
+    check_int("ifelse ssa return uses phi",
+	      hir_ssa_return_uses_phi_count(ssa), 1);
     check_int("ifelse verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_if_then_phi_uses_entry_local_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Cond_Arm arm;
+
+    Expr one = int_expr(1, 80);
+    Expr two = int_expr(2, 80);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+
+    Expr then_value = int_expr(3, 81);
+    Expr then_lhs = id_expr(16, 81);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+
+    Expr ret_expr = id_expr(16, 82);
+    Stmt ret = return_stmt(&ret_expr);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 80;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = 0;
+    if_stmt_node.next = &ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("ifthen tac stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 1);
+    check_int("ifthen ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("ifthen ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("ifthen ssa stores",
+	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
+    check_int("ifthen ssa phi args", hir_ssa_phi_arg_count(ssa), 2);
+    check_int("ifthen ssa zero phi args", hir_ssa_zero_phi_arg_count(ssa), 0);
+    check_int("ifthen ssa return uses phi",
+	      hir_ssa_return_uses_phi_count(ssa), 1);
+    check_int("ifthen verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
 }
@@ -627,6 +704,10 @@ test_repeated_local_assignment_ssa(void)
     check_int("repeat assign ssa instructions",
 	      hir_ssa_instruction_count(ssa), 7);
     check_int("repeat assign ssa values", hir_ssa_value_count(ssa), 6);
+    check_int("repeat assign ssa loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("repeat assign ssa stores",
+	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
     check_int("repeat assign verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -640,6 +721,7 @@ main(void)
     test_loop_dominator_tree();
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
+    test_if_then_phi_uses_entry_local_ssa();
     test_repeated_local_assignment_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
