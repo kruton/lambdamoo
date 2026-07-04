@@ -323,6 +323,30 @@ test_negative_cfg_verifier_cases(void)
     check_rejected("negative cfg missing successor", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    cfg = hir_test_cfg_with_external_successor(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_cfg(ctx, cfg);
+    check_rejected("negative cfg external successor", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    cfg = hir_test_cfg_with_predecessor_mismatch(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_cfg(ctx, cfg);
+    check_rejected("negative cfg predecessor mismatch", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
+    cfg = hir_test_cfg_with_duplicate_block_id(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_cfg(ctx, cfg);
+    check_rejected("negative cfg duplicate block id", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
 }
 
 static void

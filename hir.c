@@ -663,11 +663,68 @@ hir_build_cfg(HIRContext *ctx, HIRTacProgram *program)
     return cfg;
 }
 
+static int
+cfg_contains_block_ptr(HIRCFG *cfg, HIRBasicBlock *target)
+{
+    HIRBasicBlock *block;
+
+    if (!cfg || !target)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	if (block == target)
+	    return 1;
+    }
+
+    return 0;
+}
+
+static int
+cfg_actual_predecessor_count(HIRCFG *cfg, HIRBasicBlock *target)
+{
+    HIRBasicBlock *block;
+    int count = 0;
+
+    if (!cfg || !target)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    if (block->successors[i] == target)
+		count++;
+	}
+    }
+
+    return count;
+}
+
+static int
+cfg_expected_successors(HIRTacInstr *last)
+{
+    if (!last)
+	return -1;
+
+    switch (last->kind) {
+    case HIR_TAC_JUMP:
+	return 1;
+    case HIR_TAC_BRANCH_FALSE:
+	return 2;
+    case HIR_TAC_RETURN:
+    case HIR_TAC_RETURN0:
+	return 0;
+    default:
+	return -1;
+    }
+}
+
 int
 hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 {
     HIRBasicBlock *block;
     int errors_before;
+    int block_count = 0;
 
     if (!ctx || !cfg)
 	return 0;
@@ -681,7 +738,17 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 	record_unsupported(ctx, "CFG has invalid entry block");
 
     for (block = cfg->blocks; block; block = block->next) {
+	HIRBasicBlock *other;
+	int expected_successors;
 	int i;
+
+	block_count++;
+	if (block->id <= 0)
+	    record_unsupported(ctx, "CFG block has invalid id");
+	for (other = cfg->blocks; other && other != block; other = other->next) {
+	    if (other->id == block->id)
+		record_unsupported(ctx, "CFG has duplicate block id");
+	}
 
 	if (!block->first || !block->last)
 	    record_unsupported(ctx, "CFG block has missing TAC bounds");
@@ -692,9 +759,25 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 	for (i = 0; i < block->num_successors; i++) {
 	    if (!block->successors[i])
 		record_unsupported(ctx, "CFG block has missing successor");
+	    else if (!cfg_contains_block_ptr(cfg, block->successors[i]))
+		record_unsupported(ctx, "CFG successor is not in CFG block list");
 	}
 
+	expected_successors = cfg_expected_successors(block->last);
+	if (expected_successors >= 0
+	    && block->num_successors != expected_successors)
+	    record_unsupported(ctx, "CFG block has invalid terminator successors");
+
+	if (block->predecessor_count
+	    != cfg_actual_predecessor_count(cfg, block))
+	    record_unsupported(ctx, "CFG predecessor count mismatch");
+
     }
+
+    if (block_count != cfg->num_blocks)
+	record_unsupported(ctx, "CFG block count mismatch");
+    if (cfg->last_block && cfg->last_block->next)
+	record_unsupported(ctx, "CFG last block is not terminal");
 
     return ctx->error_count == errors_before;
 }
@@ -2772,6 +2855,93 @@ hir_test_cfg_with_missing_successor(HIRContext *ctx)
     block->first_lineno = instr->source_lineno;
     block->last_lineno = instr->source_lineno;
     block->contains_unsupported = 0;
+
+    return cfg;
+}
+
+static void
+init_test_block(HIRBasicBlock *block, int id, HIRTacInstr *instr)
+{
+    block->id = id;
+    block->first = instr;
+    block->last = instr;
+    block->next = 0;
+    block->successors[0] = 0;
+    block->successors[1] = 0;
+    block->num_successors = 0;
+    block->predecessor_count = 0;
+    block->first_lineno = instr ? instr->source_lineno : 0;
+    block->last_lineno = block->first_lineno;
+    block->contains_unsupported = 0;
+}
+
+HIRCFG *
+hir_test_cfg_with_external_successor(HIRContext *ctx)
+{
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_JUMP, 1010);
+    HIRTacInstr *external_tac = new_tac(ctx, HIR_TAC_RETURN0, 1011);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *external = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = entry;
+    cfg->num_blocks = 1;
+    cfg->num_edges = 1;
+
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(external, 2, external_tac);
+    entry->successors[0] = external;
+    entry->num_successors = 1;
+    external->predecessor_count = 1;
+
+    return cfg;
+}
+
+HIRCFG *
+hir_test_cfg_with_predecessor_mismatch(HIRContext *ctx)
+{
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_JUMP, 1012);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN0, 1013);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = join;
+    cfg->num_blocks = 2;
+    cfg->num_edges = 1;
+
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(join, 2, join_tac);
+    entry->next = join;
+    entry->successors[0] = join;
+    entry->num_successors = 1;
+    join->predecessor_count = 0;
+
+    return cfg;
+}
+
+HIRCFG *
+hir_test_cfg_with_duplicate_block_id(HIRContext *ctx)
+{
+    HIRTacInstr *first_tac = new_tac(ctx, HIR_TAC_RETURN0, 1014);
+    HIRTacInstr *second_tac = new_tac(ctx, HIR_TAC_RETURN0, 1015);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *first = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *second = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    cfg->entry = first;
+    cfg->blocks = first;
+    cfg->last_block = second;
+    cfg->num_blocks = 2;
+    cfg->num_edges = 0;
+
+    init_test_block(first, 1, first_tac);
+    init_test_block(second, 1, second_tac);
+    first->next = second;
 
     return cfg;
 }
