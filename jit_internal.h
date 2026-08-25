@@ -66,6 +66,7 @@ struct JITProgram {
     JITBlock *last_block;
     void *mir_context;
     void *native_function;
+    Num *deopt_values;
 };
 
 #endif /* !JIT_Internal_H */

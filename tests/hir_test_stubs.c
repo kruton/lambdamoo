@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,4 +39,10 @@ myfree(const void *where, Memory_Type type)
 {
     (void) type;
     free((void *) where);
+}
+
+void
+complex_free_var(Var value)
+{
+    (void) value;
 }

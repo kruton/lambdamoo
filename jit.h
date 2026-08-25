@@ -41,7 +41,7 @@ extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
-					enum error *, JITDeoptState *);
+					enum error *, JITDeoptState *, Var *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 

@@ -915,7 +915,8 @@ do {								\
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
-					     &jit_error, &deopt);
+					     &jit_error, &deopt,
+					     RUN_ACTIV.base_rt_stack);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		STORE_STATE_VARIABLES();
 		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
@@ -938,10 +939,11 @@ do {								\
 		error_bv = bv;
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
-	    } else if (jit_result == JIT_RUN_FALLBACK
-		       && deopt.stack_depth == 0) {
+	    } else if (jit_result == JIT_RUN_FALLBACK) {
+		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;
+		rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
 	    }
 	}
 #endif

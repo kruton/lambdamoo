@@ -149,6 +149,53 @@ guard_program(void)
 }
 
 static JITProgram *
+deep_guard_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 12;
+    map->stack_depth = 1;
+    map->ticks_charged = 1;
+    map->num_locals = 2;
+    map->local_values = allocate(sizeof(int) * 2);
+    map->local_values[0] = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_values[0] = 1;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    constant->value = 1;
+    constant->literal = 42;
+    constant->next = tick;
+    tick->next = load;
+    load->value = 2;
+    load->local_id = 1;
+    load->deopt_map = 1;
+    load->next = ret;
+    ret->src1 = 2;
+    block->first = constant;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 branch_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -352,7 +399,7 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 
     native_status = jit_program_execute(program, env, &native_result,
 					&native_ticks, &timed_out,
-					&native_error, 0);
+					&native_error, 0, 0);
     reference_status = reference_execute(program, env, &reference_result,
 					 &reference_ticks, &timed_out,
 					 &reference_error);
@@ -387,6 +434,7 @@ main(void)
 {
     JITProgram *program = arithmetic_program();
     JITProgram *guard = guard_program();
+    JITProgram *deep_guard = deep_guard_program();
     JITProgram *branch = branch_program();
     JITProgram *divide = binary_program(20, 4, HIR_OP_DIV);
     JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
@@ -406,6 +454,8 @@ main(void)
     JITProgram *bit_xor = binary_program(0x55, 0x0f, HIR_OP_BITXOR);
     JITProgram *bit_or = binary_program(0x55, 0x0f, HIR_OP_BITOR);
     Var env[1];
+    Var deep_env[2];
+    Var deopt_stack[1];
     Var result;
     int ticks = 10;
     int timed_out = 0;
@@ -421,7 +471,7 @@ main(void)
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0) == JIT_RUN_RETURNED,
+			      &error, 0, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
     check(result.type == TYPE_INT && result.v.num == 3,
 	  "native execution returned the wrong value");
@@ -430,13 +480,13 @@ main(void)
 	  "native execution did not compile lazily");
     ticks = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0)
+			      &error, 0, 0)
 	  == JIT_RUN_ABORT_TICKS, "tick exhaustion did not abort");
     check(ticks == 0, "tick exhaustion left the wrong tick count");
     ticks = 10;
     timed_out = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0)
+			      &error, 0, 0)
 	  == JIT_RUN_ABORT_SECONDS, "seconds exhaustion did not abort");
     check(ticks == 9, "seconds exhaustion consumed the wrong tick count");
     timed_out = 0;
@@ -489,7 +539,7 @@ main(void)
     env[0].v.str = "not an integer";
     ticks = 10;
     check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
-			      &error, &deopt)
+			      &error, &deopt, 0)
 	  == JIT_RUN_FALLBACK, "type guard did not request fallback");
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
@@ -497,8 +547,26 @@ main(void)
     check_differential(branch, env, 10, 0,
 		       "guard fallback differed from reference execution");
 
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 7;
+    deep_env[1].type = TYPE_STR;
+    deep_env[1].v.str = "not an integer";
+    ticks = 10;
+    check(jit_program_execute(deep_guard, deep_env, &result, &ticks,
+			      &timed_out, &error, &deopt, deopt_stack)
+	  == JIT_RUN_FALLBACK, "deep guard did not request fallback");
+    check(ticks == 9 && deopt.ticks_charged == 1,
+	  "deep guard returned the wrong tick credit");
+    check(deopt.bytecode_pc == 12 && deopt.error_pc == 12
+	  && deopt.stack_depth == 1, "deep guard returned the wrong frame state");
+    check(deep_env[0].type == TYPE_INT && deep_env[0].v.num == 42,
+	  "deep guard did not materialize an updated local");
+    check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 42,
+	  "deep guard did not materialize the operand stack");
+
     jit_program_free(program);
     jit_program_free(guard);
+    jit_program_free(deep_guard);
     jit_program_free(branch);
     jit_program_free(divide);
     jit_program_free(divide_zero);
