@@ -3235,6 +3235,53 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
     return 1;
 }
 
+static int
+jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
+		  Bytecodes *bytecodes)
+{
+    JITDeoptMap *map;
+    int i;
+
+    if (instr->bytecode_pc == NO_BYTECODE_PC)
+	return 0;
+    if (instr->num_stack_values < 0
+	|| (unsigned) instr->num_stack_values > bytecodes->max_stack
+	|| instr->num_local_values != program->num_vars)
+	return -1;
+    for (i = 0; i < instr->num_stack_values; i++)
+	if (instr->stack_values[i] <= 0
+	    || instr->stack_values[i] >= program->num_values)
+	    return -1;
+    for (i = 0; i < instr->num_local_values; i++)
+	if (instr->local_values[i] < 0
+	    || instr->local_values[i] >= program->num_values)
+	    return -1;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap)
+				    * (program->num_deopt_maps + 1), M_PROGRAM);
+    map = &program->deopt_maps[program->num_deopt_maps];
+    memset(map, 0, sizeof(JITDeoptMap));
+    map->bytecode_pc = instr->bytecode_pc;
+    map->error_pc = instr->bytecode_pc;
+    map->stack_depth = instr->num_stack_values;
+    map->ticks_charged = instr->kind == HIR_TAC_UNARY
+	|| instr->kind == HIR_TAC_BINARY
+	|| instr->kind == HIR_TAC_BRANCH_FALSE;
+    map->num_locals = instr->num_local_values;
+    if (map->num_locals) {
+	map->local_values = mymalloc(sizeof(int) * map->num_locals, M_PROGRAM);
+	memcpy(map->local_values, instr->local_values,
+	       sizeof(int) * map->num_locals);
+    }
+    if (map->stack_depth) {
+	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
+	memcpy(map->stack_values, instr->stack_values,
+	       sizeof(int) * map->stack_depth);
+    }
+    return program->num_deopt_maps++;
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -3259,6 +3306,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].stack_depth = 0;
+    program->deopt_maps[0].ticks_charged = 0;
+    program->deopt_maps[0].num_locals = program->num_vars;
+    program->deopt_maps[0].local_values = program->num_vars
+	? mymalloc(sizeof(int) * program->num_vars, M_PROGRAM) : 0;
+    if (program->num_vars)
+	memset(program->deopt_maps[0].local_values, 0,
+	       sizeof(int) * program->num_vars);
+    program->deopt_maps[0].stack_values = 0;
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRBasicBlock *cfg_block = cfg_block_for_id(ssa->cfg, ssa_block->id);
@@ -3296,6 +3351,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
+						  &bytecode_program->main_vector);
+	    if (instr->deopt_map < 0) {
+		myfree(instr, M_PROGRAM);
+		jit_program_free(program);
+		return jit_program_unsupported("invalid-deopt-map");
+	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL

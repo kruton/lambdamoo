@@ -15,6 +15,10 @@ struct JITDeoptMap {
     unsigned bytecode_pc;
     unsigned error_pc;
     unsigned stack_depth;
+    int ticks_charged;
+    int num_locals;
+    int *local_values;
+    int *stack_values;
 };
 
 struct JITCopy {
@@ -33,6 +37,7 @@ struct JITInstruction {
     int local_id;
     HIROp op;
     Num literal;
+    int deopt_map;
     JITCopy *copies;
     JITInstruction *next;
 };

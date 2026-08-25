@@ -577,7 +577,17 @@ jit_program_free(JITProgram *program)
 	MIR_finish((MIR_context_t) program->mir_context);
     }
     if (program->deopt_maps)
-	myfree(program->deopt_maps, M_PROGRAM);
+	{
+	    int i;
+
+	    for (i = 0; i < program->num_deopt_maps; i++) {
+		if (program->deopt_maps[i].local_values)
+		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
+		if (program->deopt_maps[i].stack_values)
+		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
+	    }
+	    myfree(program->deopt_maps, M_PROGRAM);
+	}
     block = program->blocks;
     while (block) {
 	JITBlock *next_block = block->next;
@@ -603,12 +613,16 @@ int
 jit_program_bytes(JITProgram *program)
 {
     int bytes = 0;
+    int i;
     JITBlock *block;
 
     if (!program)
 	return 0;
     bytes = sizeof(JITProgram);
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
+    for (i = 0; i < program->num_deopt_maps; i++)
+	bytes += sizeof(int) * (program->deopt_maps[i].num_locals
+			      + program->deopt_maps[i].stack_depth);
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 	bytes += sizeof(JITBlock);
@@ -718,6 +732,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	deopt->error_pc = program->deopt_maps[0].error_pc;
 	deopt->stack_depth = program->deopt_maps[0].stack_depth;
+	deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
@@ -729,6 +744,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	deopt->bytecode_pc = program->deopt_maps[deopt_map].bytecode_pc;
 	deopt->error_pc = program->deopt_maps[deopt_map].error_pc;
 	deopt->stack_depth = program->deopt_maps[deopt_map].stack_depth;
+	deopt->ticks_charged = program->deopt_maps[deopt_map].ticks_charged;
     }
     return native_result;
 }

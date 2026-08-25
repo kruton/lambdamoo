@@ -26,6 +26,7 @@ typedef struct {
     unsigned bytecode_pc;
     unsigned error_pc;
     unsigned stack_depth;
+    int ticks_charged;
 } JITDeoptState;
 
 extern JITProgram *jit_program_unsupported(const char *);
