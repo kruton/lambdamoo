@@ -102,6 +102,12 @@ arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
     case HIR_OP_ADD:
 	*operation = INTEGER_ADD;
 	return 1;
+    case HIR_OP_SUB:
+	*operation = INTEGER_SUBTRACT;
+	return 1;
+    case HIR_OP_MUL:
+	*operation = INTEGER_MULTIPLY;
+	return 1;
     case HIR_OP_DIV:
 	*operation = INTEGER_DIVIDE;
 	return 1;
@@ -148,6 +154,96 @@ guard_program(void)
     ret->src1 = 1;
     block->first = load;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+local_arithmetic_program(Num constant_val, HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *binary = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load->value = 1;
+    load->local_id = 0;
+    constant->value = 2;
+    constant->literal = constant_val;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 11;
+    binary->source_lineno = 7;
+    binary->bytecode_pc = 11;
+    binary->value = 3;
+    binary->src1 = 1;
+    binary->src2 = 2;
+    binary->op = op;
+    ret->src1 = 3;
+    load->next = constant;
+    constant->next = tick;
+    tick->next = binary;
+    binary->next = ret;
+    block->first = load;
+    block->last = ret;
+    program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
+	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
+	|| op == HIR_OP_LSHR;
+    return program;
+}
+
+static JITProgram *
+two_local_program(HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load0 = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load1 = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *binary = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load0->value = 1;
+    load0->local_id = 0;
+    load1->value = 2;
+    load1->local_id = 1;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 11;
+    binary->source_lineno = 7;
+    binary->bytecode_pc = 11;
+    binary->value = 3;
+    binary->src1 = 1;
+    binary->src2 = 2;
+    binary->op = op;
+    ret->src1 = 3;
+    load0->next = load1;
+    load1->next = tick;
+    tick->next = binary;
+    binary->next = ret;
+    block->first = load0;
+    block->last = ret;
+    program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
+	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
+	|| op == HIR_OP_LSHR;
     return program;
 }
 
@@ -447,6 +543,8 @@ main(void)
     JITProgram *power_wrap = binary_program(2, 63, HIR_OP_EXP);
     JITProgram *power_negative = binary_program(-1, -3, HIR_OP_EXP);
     JITProgram *power_error = binary_program(0, -1, HIR_OP_EXP);
+    JITProgram *local_arith = local_arithmetic_program(5, HIR_OP_ADD);
+    JITProgram *two_locals = two_local_program(HIR_OP_MUL);
     JITProgram *shift_left = binary_program(NUM_MIN, 1, HIR_OP_SHL);
     JITProgram *shift_right = binary_program(NUM_MIN, 63, HIR_OP_SHR);
     JITProgram *logical_shift = binary_program(NUM_MIN, 63, HIR_OP_LSHR);
@@ -556,6 +654,76 @@ main(void)
     check_differential(branch, env, 10, 1,
 		       "seconds abort differed from reference execution");
 
+    env[0].type = TYPE_INT;
+    env[0].v.num = 42;
+    ticks = 10;
+    check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "entry guard int execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "entry guard returned the wrong value");
+    check_differential(guard, env, 10, 0,
+		       "entry guard differed from reference execution");
+
+    env[0].type = TYPE_INT;
+    env[0].v.num = 10;
+    ticks = 10;
+    check(jit_program_execute(local_arith, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "local arithmetic execution failed");
+    check(result.type == TYPE_INT && result.v.num == 15,
+	  "local arithmetic returned the wrong value");
+    check_differential(local_arith, env, 10, 0,
+		       "local arithmetic differed from reference execution");
+
+    env[0].type = TYPE_STR;
+    env[0].v.str = "not an integer";
+    ticks = 10;
+    check(jit_program_execute(local_arith, env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "local arithmetic guard did not fallback");
+    check(ticks == 10 && deopt.bytecode_pc == 0,
+	  "local arithmetic guard fallback had wrong state");
+    check_differential(local_arith, env, 10, 0,
+		       "local arithmetic fallback differed from reference execution");
+
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 6;
+    deep_env[1].type = TYPE_INT;
+    deep_env[1].v.num = 7;
+    ticks = 10;
+    check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "two locals execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "two locals returned the wrong value");
+    check_differential(two_locals, deep_env, 10, 0,
+		       "two locals differed from reference execution");
+
+    deep_env[0].type = TYPE_STR;
+    deep_env[0].v.str = "not an integer";
+    ticks = 10;
+    check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "two locals first guard did not fallback");
+    check(ticks == 10 && deopt.bytecode_pc == 0,
+	  "two locals first guard fallback had wrong state");
+    check_differential(two_locals, deep_env, 10, 0,
+		       "two locals first guard fallback differed from reference");
+
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 6;
+    deep_env[1].type = TYPE_STR;
+    deep_env[1].v.str = "not an integer";
+    ticks = 10;
+    check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "two locals second guard did not fallback");
+    check(ticks == 10 && deopt.bytecode_pc == 0,
+	  "two locals second guard fallback had wrong state");
+    check_differential(two_locals, deep_env, 10, 0,
+		       "two locals second guard fallback differed from reference");
+
     env[0].type = TYPE_STR;
     env[0].v.str = "not an integer";
     ticks = 10;
@@ -585,8 +753,23 @@ main(void)
     check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 42,
 	  "deep guard did not materialize the operand stack");
 
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 7;
+    deep_env[1].type = TYPE_INT;
+    deep_env[1].v.num = 8;
+    ticks = 10;
+    check(jit_program_execute(deep_guard, deep_env, &result, &ticks,
+			      &timed_out, &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "deep guard success execution failed");
+    check(result.type == TYPE_INT && result.v.num == 8,
+	  "deep guard success returned the wrong value");
+    check_differential(deep_guard, deep_env, 10, 0,
+		       "deep guard success differed from reference execution");
+
     jit_program_free(program);
     jit_program_free(guard);
+    jit_program_free(local_arith);
+    jit_program_free(two_locals);
     jit_program_free(deep_guard);
     jit_program_free(branch);
     jit_program_free(divide);
