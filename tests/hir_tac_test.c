@@ -267,6 +267,55 @@ test_control_flow_tac(void)
 }
 
 static void
+test_short_circuit_tac(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr zero = int_expr(0, 25);
+    Expr nine = int_expr(9, 25);
+    Expr and_expr = binary_expr(EXPR_AND, &zero, &nine);
+    Expr or_expr = binary_expr(EXPR_OR, &zero, &nine);
+    Stmt ret = return_stmt(&and_expr);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("and binary count", hir_tac_count_binary_op(tac, HIR_OP_AND), 0);
+    check_int("and branch count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("and jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 0);
+    check_int("and tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("and synthetic stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("and synthetic loads",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("and phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("and verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+
+    ret = return_stmt(&or_expr);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("or binary count", hir_tac_count_binary_op(tac, HIR_OP_OR), 0);
+    check_int("or branch count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("or jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+    check_int("or tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("or synthetic stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("or synthetic loads",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("or phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("or verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
 test_unsupported_tac(void)
 {
     Names names;
@@ -987,6 +1036,7 @@ main(void)
 {
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
+    test_short_circuit_tac();
     test_loop_dominator_tree();
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();

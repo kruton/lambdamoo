@@ -272,6 +272,7 @@ struct HIRContext {
     const char *error_msg;
     int next_temp;
     int next_label;
+    int next_local;
     unsigned current_code_unit;
 };
 
@@ -302,6 +303,7 @@ hir_context_new(Names *var_names)
     ctx->error_msg = 0;
     ctx->next_temp = 1;
     ctx->next_label = 1;
+    ctx->next_local = var_names ? (int) var_names->size : 0;
     ctx->current_code_unit = 0;
 
     return ctx;
@@ -354,8 +356,7 @@ hir_lower_to_tac(HIRContext *ctx, HIRProgram *program)
 static void
 verify_local(HIRContext *ctx, int local_id)
 {
-    if (local_id < 0
-	|| (ctx->var_names && local_id >= (int) ctx->var_names->size))
+    if (local_id < 0 || local_id >= ctx->next_local)
 	record_unsupported(ctx, "Invalid local id in TAC");
 }
 
@@ -1466,7 +1467,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	return 0;
 
     max_block_id = dom->max_block_id;
-    num_locals = ctx->var_names ? (int) ctx->var_names->size : 0;
+    num_locals = ctx->next_local;
 
     /* Build predecessors lists */
     preds = hir_calloc(ctx, max_block_id + 1, sizeof(HIRBlockList *));
@@ -3892,6 +3893,64 @@ append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
     append_tac(program, instr);
 }
 
+static void
+append_internal_store(HIRContext *ctx, HIRTacProgram *program, int local_id,
+		      int src, unsigned source_lineno)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_STORE_LOCAL, source_lineno);
+
+    instr->dst = src;
+    instr->src1 = src;
+    instr->local_id = local_id;
+    append_tac(program, instr);
+}
+
+static int
+append_internal_load(HIRContext *ctx, HIRTacProgram *program, int local_id,
+		     unsigned source_lineno)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_LOAD_LOCAL, source_lineno);
+
+    instr->dst = new_temp(ctx);
+    instr->local_id = local_id;
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+lower_short_circuit(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    int lhs = lower_expr(ctx, program, expr->u.binary.lhs);
+    int result_local = ctx->next_local++;
+    int done_label = new_label(ctx);
+
+    append_internal_store(ctx, program, result_local, lhs,
+			  expr->source_lineno);
+    if (expr->u.binary.op == HIR_OP_AND) {
+	int rhs;
+
+	append_branch_false(ctx, program, lhs, done_label,
+			    expr->source_lineno);
+	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
+	append_internal_store(ctx, program, result_local, rhs,
+			      expr->source_lineno);
+    } else {
+	int rhs_label = new_label(ctx);
+	int rhs;
+
+	append_branch_false(ctx, program, lhs, rhs_label,
+			    expr->source_lineno);
+	append_jump(ctx, program, done_label, expr->source_lineno);
+	append_label(ctx, program, rhs_label, expr->source_lineno);
+	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
+	append_internal_store(ctx, program, result_local, rhs,
+			      expr->source_lineno);
+    }
+    append_label(ctx, program, done_label, expr->source_lineno);
+    return append_internal_load(ctx, program, result_local,
+				expr->source_lineno);
+}
+
 static int
 append_unsupported_tac(HIRContext *ctx, HIRTacProgram *program,
 		       const char *message, unsigned source_lineno)
@@ -3946,6 +4005,9 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	append_tac(program, instr);
 	return instr->dst;
     case HIR_EXPR_BINARY:
+	if (expr->u.binary.op == HIR_OP_AND
+	    || expr->u.binary.op == HIR_OP_OR)
+	    return lower_short_circuit(ctx, program, expr);
 	lhs = lower_expr(ctx, program, expr->u.binary.lhs);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
 	append_tick(ctx, program, expr->source_lineno);

@@ -401,16 +401,19 @@ architecture for the current AST-first plan.
 
 ## 14. Near-Term Roadmap
 
+Completed in the first native-code milestone:
+
+* short-circuit `&&` and `||` lowering without eager right-operand evaluation;
+* definition-dominates-use SSA verification with focused negative tests; and
+* differential native/reference recipe tests for branching, phi copies,
+  guards, and resource-limit aborts.
+
 The next reviewable compiler milestones are:
 
-1. Lower short-circuit `&&` and `||` control flow without eagerly evaluating
-   the right operand.
-2. Strengthen SSA verification with definition-dominates-use checks and
-   focused negative tests.
-3. Add a sparse integer type/constant lattice and constant-folding tests.
-4. Model arithmetic error and overflow behavior explicitly before expanding
+1. Add a sparse integer type/constant lattice and constant-folding tests.
+2. Model arithmetic error and overflow behavior explicitly before expanding
    the integer tier to division, modulo, exponentiation, or shifts.
-5. Add bytecode resume-anchor mapping for AST-derived HIR operations.
-6. Add deoptimization maps before allowing guard failure after the first
+3. Add bytecode resume-anchor mapping for AST-derived HIR operations.
+4. Add deoptimization maps before allowing guard failure after the first
    tick or any operation that mutates interpreter-visible state.
-7. Add native source-line tracking for tick and seconds abort tracebacks.
+5. Add native source-line tracking for tick and seconds abort tracebacks.
