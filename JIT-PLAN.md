@@ -426,10 +426,13 @@ Completed in the first native-code milestone:
   carry source lines without adding location stores to tick hot paths;
 * guarded integer locals whose values enter through the runtime environment; and
 * checked native list and argument-list indexing with bounds checking and
-  element-type guards.
+  element-type guards; and
+* list destructuring (scatter assignment) and list construction/splicing lowered
+  to TAC/SSA with bytecode anchors and native destructuring execution.
 
 The next reviewable compiler milestones are:
 
-1. Lower list destructuring and splicing.
-2. Add deopt-before-call boundaries for built-ins such as `toint()`, before
+1. Add deopt-before-call boundaries for built-ins such as `toint()`, before
    considering selected continuation-free built-ins for direct lowering.
+2. Direct lowering for pure continuation-free built-ins (`toint()`, `typeof()`,
+   `length()`, `abs()`, `min()`, `max()`).
