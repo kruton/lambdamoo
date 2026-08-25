@@ -413,12 +413,13 @@ Completed in the first native-code milestone:
 * explicit wrapping integer arithmetic and error semantics shared by the
   interpreter and compiler; and
 * checked native integer division and modulo, including division by zero and
-  the minimum-integer divided by negative-one case.
+  the minimum-integer divided by negative-one case; and
+* checked native integer exponentiation and shifts, plus bitwise integer
+  operators.
 
 The next reviewable compiler milestones are:
 
-1. Extend checked native integer arithmetic to exponentiation and shifts.
-2. Add bytecode resume-anchor mapping for AST-derived HIR operations.
-3. Add deoptimization maps before allowing guard failure after the first
+1. Add bytecode resume-anchor mapping for AST-derived HIR operations.
+2. Add deoptimization maps before allowing guard failure after the first
    tick or any operation that mutates interpreter-visible state.
-4. Add native source-line tracking for tick and seconds abort tracebacks.
+3. Add native source-line tracking for tick and seconds abort tracebacks.

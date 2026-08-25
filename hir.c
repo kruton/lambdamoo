@@ -2998,6 +2998,13 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_MUL:
     case HIR_OP_DIV:
     case HIR_OP_MOD:
+    case HIR_OP_EXP:
+    case HIR_OP_BITOR:
+    case HIR_OP_BITXOR:
+    case HIR_OP_BITAND:
+    case HIR_OP_SHL:
+    case HIR_OP_SHR:
+    case HIR_OP_LSHR:
     case HIR_OP_EQ:
     case HIR_OP_NE:
     case HIR_OP_LT:
@@ -3104,7 +3111,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa)
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
 	    if (ssa_instr->kind == HIR_TAC_BINARY
-		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD))
+		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
+		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
+		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR))
 		program->may_error = 1;
 	    instr->literal = ssa_instr->kind == HIR_TAC_CONST
 		? ssa_instr->literal.v.num : 0;

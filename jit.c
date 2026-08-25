@@ -11,6 +11,7 @@
 #include "mir.h"
 #include "mir-gen.h"
 
+#include <limits.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -49,6 +50,18 @@ binary_code(HIROp op)
 	return MIR_DIV;
     case HIR_OP_MOD:
 	return MIR_MOD;
+    case HIR_OP_BITOR:
+	return MIR_OR;
+    case HIR_OP_BITXOR:
+	return MIR_XOR;
+    case HIR_OP_BITAND:
+	return MIR_AND;
+    case HIR_OP_SHL:
+	return MIR_LSH;
+    case HIR_OP_SHR:
+	return MIR_RSH;
+    case HIR_OP_LSHR:
+	return MIR_URSH;
     case HIR_OP_EQ:
 	return MIR_EQ;
     case HIR_OP_NE:
@@ -92,7 +105,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
-    MIR_label_t fallback, arithmetic_error, tick_abort, seconds_abort;
+    MIR_label_t fallback, arithmetic_error, invalid_argument;
+    MIR_label_t tick_abort, seconds_abort;
     MIR_label_t common_return;
     JITBlock *block;
     int max_block_id = 0;
@@ -119,6 +133,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     status = new_reg(build, "status");
     fallback = MIR_new_label(build->context);
     arithmetic_error = MIR_new_label(build->context);
+    invalid_argument = MIR_new_label(build->context);
     tick_abort = MIR_new_label(build->context);
     seconds_abort = MIR_new_label(build->context);
     common_return = MIR_new_label(build->context);
@@ -229,7 +244,108 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_int_op(build->context, -1)));
 		    break;
 		case HIR_TAC_BINARY:
-		    if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
+		    if (instr->op == HIR_OP_EXP) {
+			MIR_label_t nonnegative = MIR_new_label(build->context);
+			MIR_label_t negative_one = MIR_new_label(build->context);
+			MIR_label_t loop = MIR_new_label(build->context);
+			MIR_label_t skip_multiply = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			MIR_reg_t base, power, low_bit;
+			char name[32];
+
+			sprintf(name, "power_base%d", copy_serial);
+			base = new_reg(build, name);
+			sprintf(name, "power_exp%d", copy_serial);
+			power = new_reg(build, name);
+			sprintf(name, "power_bit%d", copy_serial++);
+			low_bit = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_BGE,
+				MIR_new_label_op(build->context, nonnegative),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2]),
+				MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_BF,
+				MIR_new_label_op(build->context,
+						 arithmetic_error),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1])));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, negative_one),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_int_op(build->context, -1)));
+			append(build, MIR_new_insn(build->context, MIR_EQ,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			append(build, negative_one);
+			append(build, MIR_new_insn(build->context, MIR_AND,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2]),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_int_op(build->context, 2)));
+			append(build, MIR_new_insn(build->context, MIR_SUB,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			append(build, nonnegative);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1])));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, power),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_int_op(build->context, 1)));
+			append(build, loop);
+			append(build, MIR_new_insn(build->context, MIR_BF,
+				MIR_new_label_op(build->context, done),
+				MIR_new_reg_op(build->context, power)));
+			append(build, MIR_new_insn(build->context, MIR_AND,
+				MIR_new_reg_op(build->context, low_bit),
+				MIR_new_reg_op(build->context, power),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BF,
+				MIR_new_label_op(build->context, skip_multiply),
+				MIR_new_reg_op(build->context, low_bit)));
+			append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context, base)));
+			append(build, skip_multiply);
+			append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base)));
+			append(build, MIR_new_insn(build->context, MIR_URSH,
+				MIR_new_reg_op(build->context, power),
+				MIR_new_reg_op(build->context, power),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, loop)));
+			append(build, done);
+		    } else if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
 			MIR_label_t normal = MIR_new_label(build->context);
 			MIR_label_t done = MIR_new_label(build->context);
 
@@ -265,7 +381,23 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_reg_op(build->context,
 						 values[instr->src2])));
 			append(build, done);
-		    } else
+		    } else {
+			if (instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
+			    || instr->op == HIR_OP_LSHR) {
+			    append(build, MIR_new_insn(build->context, MIR_BLT,
+				MIR_new_label_op(build->context,
+						 invalid_argument),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2]),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, MIR_new_insn(build->context, MIR_BGE,
+				MIR_new_label_op(build->context,
+						 invalid_argument),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2]),
+				MIR_new_int_op(build->context,
+						 sizeof(Num) * CHAR_BIT)));
+			}
 			append(build, MIR_new_insn(build->context,
 						      binary_code(instr->op),
 				MIR_new_reg_op(build->context,
@@ -274,6 +406,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 						 values[instr->src1]),
 				MIR_new_reg_op(build->context,
 						 values[instr->src2])));
+		    }
 		    break;
 		case HIR_TAC_PARALLEL_COPY:
 		    {
@@ -379,6 +512,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 			      MIR_new_mem_op(build->context, MIR_T_I32,
 					     0, error_out, 0, 1),
 			      MIR_new_int_op(build->context, E_DIV)));
+    return_status(build, status, common_return, JIT_RUN_ERROR);
+    append(build, invalid_argument);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+			      MIR_new_mem_op(build->context, MIR_T_I32,
+					     0, error_out, 0, 1),
+			      MIR_new_int_op(build->context, E_INVARG)));
     return_status(build, status, common_return, JIT_RUN_ERROR);
     append(build, tick_abort);
     return_status(build, status, common_return, JIT_RUN_ABORT_TICKS);

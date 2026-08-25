@@ -5,6 +5,7 @@
 #include "integer_arithmetic.h"
 #include "storage.h"
 
+#include <limits.h>
 #include <string.h>
 
 static int failures;
@@ -67,7 +68,7 @@ arithmetic_program(void)
 }
 
 static JITProgram *
-division_program(Num lhs, Num rhs, HIROp op)
+binary_program(Num lhs, Num rhs, HIROp op)
 {
     JITProgram *program = arithmetic_program();
     JITInstruction *one = program->blocks->first;
@@ -77,8 +78,40 @@ division_program(Num lhs, Num rhs, HIROp op)
     one->literal = lhs;
     two->literal = rhs;
     binary->op = op;
-    program->may_error = 1;
+    program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
+	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
+	|| op == HIR_OP_LSHR;
     return program;
+}
+
+static int
+arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
+{
+    switch (op) {
+    case HIR_OP_ADD:
+	*operation = INTEGER_ADD;
+	return 1;
+    case HIR_OP_DIV:
+	*operation = INTEGER_DIVIDE;
+	return 1;
+    case HIR_OP_MOD:
+	*operation = INTEGER_MODULUS;
+	return 1;
+    case HIR_OP_EXP:
+	*operation = INTEGER_POWER;
+	return 1;
+    case HIR_OP_SHL:
+	*operation = INTEGER_SHIFT_LEFT;
+	return 1;
+    case HIR_OP_SHR:
+	*operation = INTEGER_SHIFT_RIGHT;
+	return 1;
+    case HIR_OP_LSHR:
+	*operation = INTEGER_LOGICAL_SHIFT_RIGHT;
+	return 1;
+    default:
+	return 0;
+    }
 }
 
 static JITProgram *
@@ -224,25 +257,32 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		values[instr->value] = env[instr->local_id].v.num;
 		break;
 	    case HIR_TAC_BINARY:
-		if (instr->op == HIR_OP_ADD)
-		    values[instr->value] = values[instr->src1]
-			+ values[instr->src2];
-		else if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
-		    IntegerArithmeticResult arithmetic = integer_arithmetic(
-			instr->op == HIR_OP_DIV ? INTEGER_DIVIDE
-			: INTEGER_MODULUS, values[instr->src1],
-			values[instr->src2]);
+		{
+		    IntegerArithmeticOperation operation;
 
-		    if (!arithmetic.succeeded) {
-			*error = arithmetic.error;
+		    if (arithmetic_operation(instr->op, &operation)) {
+			IntegerArithmeticResult arithmetic = integer_arithmetic(
+			    operation, values[instr->src1], values[instr->src2]);
+
+			if (!arithmetic.succeeded) {
+			    *error = arithmetic.error;
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_ERROR;
+			}
+			values[instr->value] = arithmetic.value;
+		    } else if (instr->op == HIR_OP_BITOR)
+			values[instr->value] = values[instr->src1]
+			    | values[instr->src2];
+		    else if (instr->op == HIR_OP_BITXOR)
+			values[instr->value] = values[instr->src1]
+			    ^ values[instr->src2];
+		    else if (instr->op == HIR_OP_BITAND)
+			values[instr->value] = values[instr->src1]
+			    & values[instr->src2];
+		    else {
 			myfree(values, M_PROGRAM);
-			return JIT_RUN_ERROR;
+			return JIT_RUN_FALLBACK;
 		    }
-		    values[instr->value] = arithmetic.value;
-		}
-		else {
-		    myfree(values, M_PROGRAM);
-		    return JIT_RUN_FALLBACK;
 		}
 		break;
 	case HIR_TAC_PARALLEL_COPY:
@@ -338,10 +378,23 @@ main(void)
     JITProgram *program = arithmetic_program();
     JITProgram *guard = guard_program();
     JITProgram *branch = branch_program();
-    JITProgram *divide = division_program(20, 4, HIR_OP_DIV);
-    JITProgram *divide_zero = division_program(20, 0, HIR_OP_DIV);
-    JITProgram *divide_overflow = division_program(NUM_MIN, -1, HIR_OP_DIV);
-    JITProgram *modulus_overflow = division_program(NUM_MIN, -1, HIR_OP_MOD);
+    JITProgram *divide = binary_program(20, 4, HIR_OP_DIV);
+    JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
+    JITProgram *divide_overflow = binary_program(NUM_MIN, -1, HIR_OP_DIV);
+    JITProgram *modulus_overflow = binary_program(NUM_MIN, -1, HIR_OP_MOD);
+    JITProgram *power = binary_program(3, 13, HIR_OP_EXP);
+    JITProgram *power_wrap = binary_program(2, 63, HIR_OP_EXP);
+    JITProgram *power_negative = binary_program(-1, -3, HIR_OP_EXP);
+    JITProgram *power_error = binary_program(0, -1, HIR_OP_EXP);
+    JITProgram *shift_left = binary_program(NUM_MIN, 1, HIR_OP_SHL);
+    JITProgram *shift_right = binary_program(NUM_MIN, 63, HIR_OP_SHR);
+    JITProgram *logical_shift = binary_program(NUM_MIN, 63, HIR_OP_LSHR);
+    JITProgram *shift_error = binary_program(1, sizeof(Num) * CHAR_BIT,
+					     HIR_OP_SHL);
+    JITProgram *negative_shift = binary_program(1, -1, HIR_OP_SHL);
+    JITProgram *bit_and = binary_program(0x55, 0x0f, HIR_OP_BITAND);
+    JITProgram *bit_xor = binary_program(0x55, 0x0f, HIR_OP_BITXOR);
+    JITProgram *bit_or = binary_program(0x55, 0x0f, HIR_OP_BITOR);
     Var env[1];
     Var result;
     int ticks = 10;
@@ -382,6 +435,30 @@ main(void)
 		       "division overflow differed from reference execution");
     check_differential(modulus_overflow, env, 10, 0,
 		       "modulus overflow differed from reference execution");
+    check_differential(power, env, 10, 0,
+		       "power differed from reference execution");
+    check_differential(power_wrap, env, 10, 0,
+		       "wrapping power differed from reference execution");
+    check_differential(power_negative, env, 10, 0,
+		       "negative power differed from reference execution");
+    check_differential(power_error, env, 10, 0,
+		       "power error differed from reference execution");
+    check_differential(shift_left, env, 10, 0,
+		       "left shift differed from reference execution");
+    check_differential(shift_right, env, 10, 0,
+		       "right shift differed from reference execution");
+    check_differential(logical_shift, env, 10, 0,
+		       "logical shift differed from reference execution");
+    check_differential(shift_error, env, 10, 0,
+		       "shift error differed from reference execution");
+    check_differential(negative_shift, env, 10, 0,
+		       "negative shift differed from reference execution");
+    check_differential(bit_and, env, 10, 0,
+		       "bitwise and differed from reference execution");
+    check_differential(bit_xor, env, 10, 0,
+		       "bitwise xor differed from reference execution");
+    check_differential(bit_or, env, 10, 0,
+		       "bitwise or differed from reference execution");
 
     env[0].type = TYPE_INT;
     env[0].v.num = 0;
@@ -410,5 +487,17 @@ main(void)
     jit_program_free(divide_zero);
     jit_program_free(divide_overflow);
     jit_program_free(modulus_overflow);
+    jit_program_free(power);
+    jit_program_free(power_wrap);
+    jit_program_free(power_negative);
+    jit_program_free(power_error);
+    jit_program_free(shift_left);
+    jit_program_free(shift_right);
+    jit_program_free(logical_shift);
+    jit_program_free(shift_error);
+    jit_program_free(negative_shift);
+    jit_program_free(bit_and);
+    jit_program_free(bit_xor);
+    jit_program_free(bit_or);
     return failures != 0;
 }
