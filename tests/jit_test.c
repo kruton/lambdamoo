@@ -353,6 +353,53 @@ scatter_destructure_program(void)
 }
 
 static JITProgram *
+call_boundary_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *call = instruction(HIR_TAC_CALL);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 25;
+    map->stack_depth = 1;
+    map->ticks_charged = 0;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int) * 1);
+    map->local_values[0] = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_values[0] = 1;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c1->value = 1;
+    c1->literal = 99;
+
+    call->value = 2;
+    call->src1 = 1;
+    call->deopt_map = 1;
+    call->bytecode_pc = 25;
+
+    c1->next = call;
+
+    block->first = c1;
+    block->last = call;
+    return program;
+}
+
+static JITProgram *
 deep_guard_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -965,6 +1012,21 @@ main(void)
 	  "scatter destructure returned the wrong value");
     check_differential(scatter, env, 10, 0,
 		       "scatter destructure differed from reference execution");
+
+    /* Call boundary deopt test */
+    {
+	JITProgram *call_prog = call_boundary_program();
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 0;
+	ticks = 10;
+	check(jit_program_execute(call_prog, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK, "call boundary did not return fallback");
+	check(deopt.bytecode_pc == 25, "call boundary wrong bytecode_pc");
+	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
+	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
+	jit_program_free(call_prog);
+    }
 
     jit_program_free(program);
     jit_program_free(guard);

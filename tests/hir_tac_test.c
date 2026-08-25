@@ -1315,6 +1315,53 @@ test_list_construction_and_splicing_tac_ssa(void)
 }
 
 static void
+test_builtin_call_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List arg;
+    Expr call_arg, call_expr;
+    Stmt ret;
+
+    call_arg = int_expr(123, 10);
+    memset(&arg, 0, sizeof(arg));
+    arg.kind = ARG_NORMAL;
+    arg.expr = &call_arg;
+    arg.next = 0;
+
+    memset(&call_expr, 0, sizeof(call_expr));
+    call_expr.kind = EXPR_CALL;
+    call_expr.lineno = 10;
+    call_expr.e.call.func = 1;
+    call_expr.e.call.args = &arg;
+
+    ret = return_stmt(&call_expr);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    call_arg.bytecode_pc = 1;
+    arg.bytecode_pc = 2;
+    call_expr.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("builtin call tac not null", tac != 0, 1);
+    check_int("builtin call tac count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    check_int("builtin call singleton count",
+	      hir_tac_count_unary_op(tac, HIR_OP_MAKE_SINGLETON_LIST), 1);
+    check_int("builtin call verify errors", hir_context_error_count(ctx), 0);
+
+    check_int("builtin call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1582,6 +1629,7 @@ main(void)
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_list_construction_and_splicing_tac_ssa();
+    test_builtin_call_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
