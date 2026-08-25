@@ -229,6 +229,8 @@ test_arithmetic_and_local_tac(void)
 	      hir_ssa_count_bytecode_pc(ssa, 5), 2);
     check_int("arith SSA add stack depth",
 	      hir_ssa_stack_depth_at_bytecode_pc(ssa, 5), 2);
+    check_int("arith SSA updated local",
+	      hir_ssa_local_value_at_bytecode_pc(ssa, 9, 16) > 0, 1);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
     analysis = hir_analyze_ssa_values(ctx, ssa);
     check_int("arith return fact",

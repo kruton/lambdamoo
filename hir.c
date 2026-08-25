@@ -267,6 +267,8 @@ struct HIRSSAInstr {
     Var literal;
     int num_stack_values;
     int *stack_values;
+    int num_local_values;
+    int *local_values;
     HIRPhiArg *phi_args;
     HIRParallelCopy *copies;
     HIRSSAInstr *next;
@@ -1260,6 +1262,8 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->literal = tac->literal;
     instr->num_stack_values = tac->num_stack_values;
     instr->stack_values = tac->stack_values;
+    instr->num_local_values = 0;
+    instr->local_values = 0;
     instr->phi_args = 0;
     instr->copies = 0;
     instr->next = 0;
@@ -1337,6 +1341,8 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	load->op = HIR_OP_ADD;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
+	load->num_local_values = 0;
+	load->local_values = 0;
 	load->phi_args = 0;
 	load->copies = 0;
 
@@ -1435,6 +1441,15 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 			(value > 0 && value < temp_map_size)
 			? temp_map[value] : value;
 		}
+	    }
+	    ssa_inst->num_local_values = ctx->var_names
+		? ctx->var_names->size : 0;
+	    if (ssa_inst->num_local_values) {
+		ssa_inst->local_values = hir_alloc(ctx,
+				 sizeof(int) * ssa_inst->num_local_values);
+		for (j = 0; j < ssa_inst->num_local_values; j++)
+		    ssa_inst->local_values[j] = stack_tops[j]
+			? stacks[j * max_depth + stack_tops[j] - 1] : 0;
 	    }
 	    if (tac->dst > 0 && tac->dst < temp_map_size)
 		temp_map[tac->dst] = tac->dst;
@@ -1603,6 +1618,8 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			phi->value = 0; /* filled in renaming */
 			phi->num_stack_values = 0;
 			phi->stack_values = 0;
+			phi->num_local_values = 0;
+			phi->local_values = 0;
 			phi->src1 = 0;
 			phi->src2 = 0;
 			phi->label = 0;
@@ -2769,6 +2786,8 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     copy->op = HIR_OP_ADD;
     copy->num_stack_values = 0;
     copy->stack_values = 0;
+    copy->num_local_values = 0;
+    copy->local_values = 0;
     copy->literal.type = TYPE_NONE;
     copy->phi_args = 0;
     copy->copies = 0;
@@ -3816,6 +3835,26 @@ hir_ssa_stack_depth_at_bytecode_pc(HIRSSAProgram *program,
 	for (instr = block->first; instr; instr = instr->next) {
 	    if (instr->bytecode_pc == bytecode_pc)
 		return instr->num_stack_values;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return -1;
+}
+
+int
+hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *program,
+				   unsigned bytecode_pc, int local_id)
+{
+    HIRSSABlock *block;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->bytecode_pc == bytecode_pc
+		&& local_id >= 0 && local_id < instr->num_local_values)
+		return instr->local_values[local_id];
 	    if (instr == block->last)
 		break;
 	}
