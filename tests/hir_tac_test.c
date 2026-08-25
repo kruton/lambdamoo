@@ -1088,6 +1088,103 @@ test_conditional_local_assignment_with_entry_local_analysis(void)
 }
 
 static void
+test_list_index_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_args = id_expr(0, 10);
+    Expr one = int_expr(1, 10);
+    Expr index_node = binary_expr(EXPR_INDEX, &local_args, &one);
+    Stmt ret = return_stmt(&index_node);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    local_args.bytecode_pc = 1;
+    one.bytecode_pc = 2;
+    index_node.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("list index tac load count",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("list index tac const count",
+	      hir_tac_count_kind(tac, HIR_TAC_CONST), 1);
+    check_int("list index tac binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 1);
+    check_int("list index ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("list index ssa binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("list index verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("list index return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("list index destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("list index out of ssa binary",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_list_index_in_arithmetic_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_args1 = id_expr(0, 10);
+    Expr one = int_expr(1, 10);
+    Expr idx1 = binary_expr(EXPR_INDEX, &local_args1, &one);
+    Expr local_args2 = id_expr(0, 10);
+    Expr two = int_expr(2, 10);
+    Expr idx2 = binary_expr(EXPR_INDEX, &local_args2, &two);
+    Expr add = binary_expr(EXPR_PLUS, &idx1, &idx2);
+    Stmt ret = return_stmt(&add);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    local_args1.bytecode_pc = 1;
+    one.bytecode_pc = 2;
+    idx1.bytecode_pc = 3;
+    local_args2.bytecode_pc = 4;
+    two.bytecode_pc = 5;
+    idx2.bytecode_pc = 6;
+    add.bytecode_pc = 7;
+    ret.bytecode_pc = 8;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("arith index tac binary index count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 2);
+    check_int("arith index tac binary add count",
+	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
+    check_int("arith index verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("arith index return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("arith index destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1351,6 +1448,8 @@ main(void)
     test_guarded_environment_local_tac_ssa();
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
+    test_list_index_tac_ssa();
+    test_list_index_in_arithmetic_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

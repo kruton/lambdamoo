@@ -86,7 +86,8 @@ typedef enum {
     HIR_OP_BITAND,
     HIR_OP_SHL,
     HIR_OP_SHR,
-    HIR_OP_LSHR
+    HIR_OP_LSHR,
+    HIR_OP_INDEX
 } HIROp;
 
 typedef enum {

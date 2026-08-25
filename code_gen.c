@@ -884,6 +884,7 @@ generate_expr(Expr * expr, State * state)
 	    old = save_stack_top(state);
 	    generate_expr(expr->e.bin.rhs, state);
 	    restore_stack_top(old, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_REF, state);
 	    pop_stack(1, state);
 	}

@@ -3066,6 +3066,7 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_SHL:
     case HIR_OP_SHR:
     case HIR_OP_LSHR:
+    case HIR_OP_INDEX:
     case HIR_OP_EQ:
     case HIR_OP_NE:
     case HIR_OP_LT:
@@ -3150,6 +3151,7 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	case HIR_OP_MOD: return op == OP_MOD;
 	case HIR_OP_EXP:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
+	case HIR_OP_INDEX: return op == OP_REF;
 	case HIR_OP_EQ: return op == OP_EQ;
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT: return op == OP_LT;
@@ -3365,7 +3367,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
-		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR))
+		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
+		    || ssa_instr->op == HIR_OP_INDEX))
 		program->may_error = 1;
 	    instr->literal = ssa_instr->kind == HIR_TAC_CONST
 		? ssa_instr->literal.v.num : 0;
@@ -3745,6 +3748,8 @@ op_name(HIROp op)
 	return ">>";
     case HIR_OP_LSHR:
 	return ">>>";
+    case HIR_OP_INDEX:
+	return "INDEX";
     }
 
     return "?";
@@ -4216,7 +4221,7 @@ hir_ssa_parallel_copy_pair_count(HIRSSAProgram *ssa)
 int
 hir_ssa_form(HIRSSAProgram *ssa)
 {
-    return ssa ? ssa->form : -1;
+    return ssa ? (int) ssa->form : -1;
 }
 
 int
@@ -4589,9 +4594,9 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_INDEX:
 	expr = new_expr(ctx, HIR_EXPR_INDEX);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.pair.lhs = lift_expr(ctx, ast->e.bin.lhs);
 	expr->u.pair.rhs = lift_expr(ctx, ast->e.bin.rhs);
-	record_unsupported(ctx, "Index expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_RANGE:
 	expr = new_expr(ctx, HIR_EXPR_RANGE);
@@ -5058,6 +5063,21 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	instr->src1 = lhs;
 	instr->src2 = rhs;
 	instr->op = expr->u.binary.op;
+	snapshot_lower_stack(ctx, instr);
+	append_tac(program, instr);
+	ctx->lower_stack_depth -= 2;
+	push_lower_stack(ctx, instr->dst);
+	return instr->dst;
+    case HIR_EXPR_INDEX:
+	lhs = lower_expr(ctx, program, expr->u.pair.lhs);
+	rhs = lower_expr(ctx, program, expr->u.pair.rhs);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
+	instr->dst = new_temp(ctx);
+	instr->src1 = lhs;
+	instr->src2 = rhs;
+	instr->op = HIR_OP_INDEX;
 	snapshot_lower_stack(ctx, instr);
 	append_tac(program, instr);
 	ctx->lower_stack_depth -= 2;
