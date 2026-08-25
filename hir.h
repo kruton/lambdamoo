@@ -87,7 +87,11 @@ typedef enum {
     HIR_OP_SHL,
     HIR_OP_SHR,
     HIR_OP_LSHR,
-    HIR_OP_INDEX
+    HIR_OP_INDEX,
+    HIR_OP_MAKE_SINGLETON_LIST,
+    HIR_OP_CHECK_LIST_FOR_SPLICE,
+    HIR_OP_LIST_ADD_TAIL,
+    HIR_OP_LIST_APPEND
 } HIROp;
 
 typedef enum {
@@ -157,6 +161,7 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 
 #ifdef HIR_TESTING
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
+extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);

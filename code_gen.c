@@ -654,6 +654,7 @@ generate_arg_list(Arg_List * args, State * state)
 
 	for (; args; args = args->next) {
 	    generate_expr(args->expr, state);
+	    record_code_anchor(state, &args->bytecode_pc);
 	    emit_byte(args->kind == ARG_NORMAL ? normal_op : splice_op, state);
 	    pop_stack(pop, state);
 	    normal_op = OP_LIST_ADD_TAIL;
@@ -915,6 +916,7 @@ generate_expr(Expr * expr, State * state)
 	}
 	break;
     case EXPR_LIST:
+	record_code_anchor(state, &expr->bytecode_pc);
 	generate_arg_list(expr->e.list, state);
 	break;
     case EXPR_CALL:
@@ -973,6 +975,7 @@ generate_expr(Expr * expr, State * state)
 		}
 		if (rest == -1)
 		    rest = nargs + 1;
+		record_code_anchor(state, &expr->bytecode_pc);
 		emit_extended_byte(EOP_SCATTER, state);
 		emit_byte(nargs, state);
 		emit_byte(nreq, state);

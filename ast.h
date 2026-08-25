@@ -43,6 +43,7 @@ struct Arg_List {
     Arg_List *next;
     enum Arg_Kind kind;
     Expr *expr;
+    unsigned bytecode_pc;
 };
 
 enum Scatter_Kind {

@@ -49,7 +49,17 @@ typedef struct {
 struct HIRArg {
     enum Arg_Kind kind;
     HIRExpr *expr;
+    unsigned bytecode_pc;
     HIRArg *next;
+};
+
+typedef struct HIRScatter HIRScatter;
+
+struct HIRScatter {
+    enum Scatter_Kind kind;
+    int local_id;
+    HIRExpr *expr;
+    HIRScatter *next;
 };
 
 struct HIRExpr {
@@ -101,6 +111,10 @@ struct HIRExpr {
 	struct {
 	    HIRArg *items;
 	} list;
+	struct {
+	    HIRScatter *items;
+	    HIRExpr *rhs;
+	} scatter;
 	struct {
 	    HIRExpr *body;
 	    HIRArg *codes;
@@ -2148,6 +2162,9 @@ analyze_unary(HIROp op, HIRValueFact operand)
 	return constant_fact(!operand.constant);
     case HIR_OP_COMPLEMENT:
 	return arithmetic_fact(INTEGER_COMPLEMENT, operand.constant, 0);
+    case HIR_OP_MAKE_SINGLETON_LIST:
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	return unknown_fact();
     default:
 	return unknown_fact();
     }
@@ -2162,6 +2179,8 @@ analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
     }
     if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
 	|| rhs.kind == HIR_VALUE_FACT_UNKNOWN)
+	return unknown_fact();
+    if (op == HIR_OP_LIST_ADD_TAIL || op == HIR_OP_LIST_APPEND)
 	return unknown_fact();
     if (lhs.kind != HIR_VALUE_FACT_CONSTANT
 	|| rhs.kind != HIR_VALUE_FACT_CONSTANT)
@@ -3139,6 +3158,10 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_UNARY_MINUS;
 	if (instr->op == HIR_OP_NOT)
 	    return op == OP_NOT;
+	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return op == OP_MAKE_SINGLETON_LIST;
+	if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+	    return op == OP_CHECK_LIST_FOR_SPLICE;
 	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					   EOP_COMPLEMENT);
     }
@@ -3151,7 +3174,12 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	case HIR_OP_MOD: return op == OP_MOD;
 	case HIR_OP_EXP:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
-	case HIR_OP_INDEX: return op == OP_REF;
+	case HIR_OP_INDEX:
+	    return op == OP_REF
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
+	case HIR_OP_LIST_ADD_TAIL: return op == OP_LIST_ADD_TAIL;
+	case HIR_OP_LIST_APPEND: return op == OP_LIST_APPEND;
 	case HIR_OP_EQ: return op == OP_EQ;
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT: return op == OP_LT;
@@ -3750,6 +3778,14 @@ op_name(HIROp op)
 	return ">>>";
     case HIR_OP_INDEX:
 	return "INDEX";
+    case HIR_OP_MAKE_SINGLETON_LIST:
+	return "MAKE_SINGLETON_LIST";
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	return "CHECK_LIST_FOR_SPLICE";
+    case HIR_OP_LIST_ADD_TAIL:
+	return "LIST_ADD_TAIL";
+    case HIR_OP_LIST_APPEND:
+	return "LIST_APPEND";
     }
 
     return "?";
@@ -3796,6 +3832,23 @@ hir_tac_count_kind(HIRTacProgram *program, HIRTacKind kind)
 
     for (instr = program->first; instr; instr = instr->next) {
 	if (instr->kind == kind)
+	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_tac_count_unary_op(HIRTacProgram *program, HIROp op)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	if (instr->kind == HIR_TAC_UNARY && instr->op == op)
 	    count++;
     }
 
@@ -4367,6 +4420,7 @@ lift_arg_list(HIRContext *ctx, Arg_List *args)
 
 	arg->kind = args->kind;
 	arg->expr = lift_expr(ctx, args->expr);
+	arg->bytecode_pc = args->bytecode_pc;
 	arg->next = 0;
 
 	if (last)
@@ -4493,6 +4547,30 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.local_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
+    if (ast->e.bin.lhs->kind == EXPR_SCATTER) {
+	HIRScatter *first = 0;
+	HIRScatter *last = 0;
+	Scatter *sc;
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_SCATTER);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.scatter.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	for (sc = ast->e.bin.lhs->e.scatter; sc; sc = sc->next) {
+	    HIRScatter *item = hir_alloc(ctx, sizeof(HIRScatter));
+	    item->kind = sc->kind;
+	    item->local_id = sc->id;
+	    item->expr = sc->expr ? lift_expr(ctx, sc->expr) : 0;
+	    item->next = 0;
+	    if (last)
+		last->next = item;
+	    else
+		first = item;
+	    last = item;
+	}
+	expr->u.scatter.items = first;
+	return expr;
+    }
 
     record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
     return unsupported_expr(ctx, ast);
@@ -4609,8 +4687,8 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_LIST:
 	expr = new_expr(ctx, HIR_EXPR_LIST);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.list.items = lift_arg_list(ctx, ast->e.list);
-	record_unsupported(ctx, "List expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_CATCH:
 	expr = new_expr(ctx, HIR_EXPR_CATCH);
@@ -5083,6 +5161,104 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	ctx->lower_stack_depth -= 2;
 	push_lower_stack(ctx, instr->dst);
 	return instr->dst;
+    case HIR_EXPR_SCATTER:
+	{
+	    HIRScatter *item;
+	    int rhs_temp = lower_expr(ctx, program, expr->u.scatter.rhs);
+	    int index = 1;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    for (item = expr->u.scatter.items; item; item = item->next) {
+		if (item->kind == SCAT_REQUIRED) {
+		    int idx_temp = new_temp(ctx);
+		    int elem_temp = new_temp(ctx);
+		    HIRTacInstr *const_tac = new_tac(ctx, HIR_TAC_CONST,
+						     expr->source_lineno);
+		    HIRTacInstr *idx_tac = new_tac(ctx, HIR_TAC_BINARY,
+						   expr->source_lineno);
+		    HIRTacInstr *store_tac = new_tac(ctx, HIR_TAC_STORE_LOCAL,
+						     expr->source_lineno);
+
+		    const_tac->dst = idx_temp;
+		    const_tac->literal.type = TYPE_INT;
+		    const_tac->literal.v.num = index;
+		    const_tac->bytecode_pc = expr->bytecode_pc;
+		    append_tac(program, const_tac);
+
+		    idx_tac->dst = elem_temp;
+		    idx_tac->src1 = rhs_temp;
+		    idx_tac->src2 = idx_temp;
+		    idx_tac->op = HIR_OP_INDEX;
+		    idx_tac->bytecode_pc = expr->bytecode_pc;
+		    snapshot_lower_stack(ctx, idx_tac);
+		    append_tac(program, idx_tac);
+
+		    store_tac->local_id = item->local_id;
+		    store_tac->src1 = elem_temp;
+		    store_tac->bytecode_pc = expr->bytecode_pc;
+		    append_tac(program, store_tac);
+		    index++;
+		} else {
+		    return append_unsupported_tac(ctx, program,
+						  "Optional/rest scatter is not yet supported",
+						  expr->source_lineno);
+		}
+	    }
+	    return rhs_temp;
+	}
+    case HIR_EXPR_LIST:
+	{
+	    HIRArg *item = expr->u.list.items;
+	    int list_temp;
+
+	    if (!item) {
+		HIRTacInstr *empty_tac = new_tac(ctx, HIR_TAC_CONST,
+						 expr->source_lineno);
+		list_temp = new_temp(ctx);
+		empty_tac->dst = list_temp;
+		empty_tac->literal.type = TYPE_LIST;
+		empty_tac->literal.v.list = 0;
+		empty_tac->bytecode_pc = expr->bytecode_pc;
+		append_tac(program, empty_tac);
+		push_lower_stack(ctx, list_temp);
+		return list_temp;
+	    }
+	    /* First element */
+	    int elem_temp = lower_expr(ctx, program, item->expr);
+	    append_tick(ctx, program, expr->source_lineno, item->bytecode_pc);
+	    list_temp = new_temp(ctx);
+	    HIRTacInstr *first_tac = new_tac(ctx, HIR_TAC_UNARY,
+					     expr->source_lineno);
+	    first_tac->dst = list_temp;
+	    first_tac->src1 = elem_temp;
+	    first_tac->op = (item->kind == ARG_NORMAL
+			     ? HIR_OP_MAKE_SINGLETON_LIST
+			     : HIR_OP_CHECK_LIST_FOR_SPLICE);
+	    first_tac->bytecode_pc = item->bytecode_pc;
+	    snapshot_lower_stack(ctx, first_tac);
+	    append_tac(program, first_tac);
+	    ctx->lower_stack[ctx->lower_stack_depth - 1] = list_temp;
+
+	    for (item = item->next; item; item = item->next) {
+		elem_temp = lower_expr(ctx, program, item->expr);
+		int next_list_temp = new_temp(ctx);
+		HIRTacInstr *tail_tac = new_tac(ctx, HIR_TAC_BINARY,
+						expr->source_lineno);
+		tail_tac->dst = next_list_temp;
+		tail_tac->src1 = list_temp;
+		tail_tac->src2 = elem_temp;
+		tail_tac->op = (item->kind == ARG_NORMAL
+				? HIR_OP_LIST_ADD_TAIL
+				: HIR_OP_LIST_APPEND);
+		tail_tac->bytecode_pc = item->bytecode_pc;
+		snapshot_lower_stack(ctx, tail_tac);
+		append_tac(program, tail_tac);
+		ctx->lower_stack_depth -= 2;
+		push_lower_stack(ctx, next_list_temp);
+		list_temp = next_list_temp;
+	    }
+	    return list_temp;
+	}
     case HIR_EXPR_COND:
 	return append_unsupported_tac(ctx, program,
 				      "Conditional expression is not yet lowerable to TAC",
