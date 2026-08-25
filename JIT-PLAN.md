@@ -423,11 +423,13 @@ Completed in the first native-code milestone:
   operand stacks, bytecode and error PCs, and exact tick accounting from SSA
   values on post-entry guard failure;
 * cold native abort and error exits that restore exact bytecode/error PCs and
-  carry source lines without adding location stores to tick hot paths; and
-* guarded integer locals whose values enter through the runtime environment.
+  carry source lines without adding location stores to tick hot paths;
+* guarded integer locals whose values enter through the runtime environment; and
+* checked native list and argument-list indexing with bounds checking and
+  element-type guards.
 
 The next reviewable compiler milestones are:
 
-1. Lower simple argument-list indexing, then list destructuring and splicing.
+1. Lower list destructuring and splicing.
 2. Add deopt-before-call boundaries for built-ins such as `toint()`, before
    considering selected continuation-free built-ins for direct lowering.
