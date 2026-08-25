@@ -17,13 +17,24 @@
 #include <string.h>
 
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
-				   int *, Num *);
+				   JITSourceLocation *, int *, Num *);
 
 typedef struct {
     MIR_context_t context;
     MIR_module_t module;
     MIR_item_t function;
 } MIRBuild;
+
+typedef struct JITStatusExit JITStatusExit;
+
+struct JITStatusExit {
+    MIR_label_t label;
+    JITRunResult status;
+    enum error error;
+    unsigned bytecode_pc;
+    unsigned source_lineno;
+    JITStatusExit *next;
+};
 
 static void
 append(MIRBuild *build, MIR_insn_t instruction)
@@ -99,6 +110,62 @@ return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
 			      MIR_new_label_op(build->context, common_return)));
 }
 
+static MIR_label_t
+new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
+		JITRunResult status, enum error error, unsigned bytecode_pc,
+		unsigned source_lineno)
+{
+    JITStatusExit *exit = mymalloc(sizeof(JITStatusExit), M_PROGRAM);
+
+    exit->label = MIR_new_label(build->context);
+    exit->status = status;
+    exit->error = error;
+    exit->bytecode_pc = bytecode_pc;
+    exit->source_lineno = source_lineno;
+    exit->next = 0;
+    if (*last)
+	(*last)->next = exit;
+    else
+	*first = exit;
+    *last = exit;
+    return exit->label;
+}
+
+static void
+append_status_exits(MIRBuild *build, JITStatusExit *exit,
+		    MIR_reg_t source_location, MIR_reg_t error_out,
+		    MIR_reg_t status, MIR_label_t common_return)
+{
+    while (exit) {
+	JITStatusExit *next = exit->next;
+
+	append(build, exit->label);
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context, MIR_T_I32,
+			   offsetof(JITSourceLocation, bytecode_pc),
+			   source_location, 0, 1),
+	    MIR_new_int_op(build->context, exit->bytecode_pc)));
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context, MIR_T_I32,
+			   offsetof(JITSourceLocation, error_pc),
+			   source_location, 0, 1),
+	    MIR_new_int_op(build->context, exit->bytecode_pc)));
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context, MIR_T_I32,
+			   offsetof(JITSourceLocation, source_lineno),
+			   source_location, 0, 1),
+	    MIR_new_int_op(build->context, exit->source_lineno)));
+	if (exit->error != E_NONE)
+	    append(build, MIR_new_insn(build->context, MIR_MOV,
+		MIR_new_mem_op(build->context, MIR_T_I32,
+			       0, error_out, 0, 1),
+		MIR_new_int_op(build->context, exit->error)));
+	return_status(build, status, common_return, exit->status);
+	myfree(exit, M_PROGRAM);
+	exit = next;
+    }
+}
+
 static void
 append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
 		  MIR_reg_t *values, MIR_reg_t deopt_map_out,
@@ -135,13 +202,15 @@ build_mir(JITProgram *program, MIRBuild *build)
 {
     MIR_type_t result_type = MIR_T_I64;
     MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
-    MIR_reg_t deopt_values;
+    MIR_reg_t source_location, deopt_values;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
-    MIR_label_t fallback, arithmetic_error, invalid_argument;
+    MIR_label_t fallback;
     MIR_label_t tick_abort, seconds_abort;
     MIR_label_t common_return;
+    JITStatusExit *status_exits = 0;
+    JITStatusExit *last_status_exit = 0;
     JITBlock *block;
     int max_block_id = 0;
     int copy_serial = 0;
@@ -153,16 +222,18 @@ build_mir(JITProgram *program, MIRBuild *build)
 	return 0;
     build->module = MIR_new_module(build->context, "lambda_moo_jit");
     build->function = MIR_new_func(build->context, "jit_verb", 1,
-				   &result_type, 7,
+				   &result_type, 8,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
-				   MIR_T_P, "error_out", MIR_T_P, "deopt_map_out",
-				   MIR_T_P, "deopt_values");
+				   MIR_T_P, "error_out", MIR_T_P, "source_location",
+				   MIR_T_P, "deopt_map_out", MIR_T_P, "deopt_values");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
     timed_out = MIR_reg(build->context, "timed_out", build->function->u.func);
     error_out = MIR_reg(build->context, "error_out", build->function->u.func);
+    source_location = MIR_reg(build->context, "source_location",
+			      build->function->u.func);
     deopt_map_out = MIR_reg(build->context, "deopt_map_out",
 			    build->function->u.func);
     deopt_values = MIR_reg(build->context, "deopt_values",
@@ -171,10 +242,6 @@ build_mir(JITProgram *program, MIRBuild *build)
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
     fallback = MIR_new_label(build->context);
-    arithmetic_error = MIR_new_label(build->context);
-    invalid_argument = MIR_new_label(build->context);
-    tick_abort = MIR_new_label(build->context);
-    seconds_abort = MIR_new_label(build->context);
     common_return = MIR_new_label(build->context);
 
     values = mymalloc(sizeof(MIR_reg_t) * program->num_values, M_PROGRAM);
@@ -199,6 +266,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 	    for (instr = block->first; instr; instr = instr->next) {
 		switch (instr->kind) {
 		case HIR_TAC_TICK:
+		    tick_abort = new_status_exit(build, &status_exits,
+			&last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
+			instr->bytecode_pc, instr->source_lineno);
+		    seconds_abort = new_status_exit(build, &status_exits,
+			&last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
+			instr->bytecode_pc, instr->source_lineno);
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 tick_result),
@@ -291,6 +364,20 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_int_op(build->context, -1)));
 		    break;
 		case HIR_TAC_BINARY:
+		    {
+			MIR_label_t arithmetic_error = 0;
+			MIR_label_t invalid_argument = 0;
+
+			if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD
+			    || instr->op == HIR_OP_EXP)
+			    arithmetic_error = new_status_exit(build, &status_exits,
+				&last_status_exit, JIT_RUN_ERROR, E_DIV,
+				instr->bytecode_pc, instr->source_lineno);
+			if (instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
+			    || instr->op == HIR_OP_LSHR)
+			    invalid_argument = new_status_exit(build, &status_exits,
+				&last_status_exit, JIT_RUN_ERROR, E_INVARG,
+				instr->bytecode_pc, instr->source_lineno);
 		    if (instr->op == HIR_OP_EXP) {
 			MIR_label_t nonnegative = MIR_new_label(build->context);
 			MIR_label_t negative_one = MIR_new_label(build->context);
@@ -454,6 +541,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_reg_op(build->context,
 						 values[instr->src2])));
 		    }
+		    }
 		    break;
 		case HIR_TAC_PARALLEL_COPY:
 		    {
@@ -558,22 +646,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, 0)));
     return_status(build, status, common_return, JIT_RUN_FALLBACK);
-    append(build, arithmetic_error);
-    append(build, MIR_new_insn(build->context, MIR_MOV,
-			      MIR_new_mem_op(build->context, MIR_T_I32,
-					     0, error_out, 0, 1),
-			      MIR_new_int_op(build->context, E_DIV)));
-    return_status(build, status, common_return, JIT_RUN_ERROR);
-    append(build, invalid_argument);
-    append(build, MIR_new_insn(build->context, MIR_MOV,
-			      MIR_new_mem_op(build->context, MIR_T_I32,
-					     0, error_out, 0, 1),
-			      MIR_new_int_op(build->context, E_INVARG)));
-    return_status(build, status, common_return, JIT_RUN_ERROR);
-    append(build, tick_abort);
-    return_status(build, status, common_return, JIT_RUN_ABORT_TICKS);
-    append(build, seconds_abort);
-    return_status(build, status, common_return, JIT_RUN_ABORT_SECONDS);
+    append_status_exits(build, status_exits, source_location, error_out, status,
+			common_return);
     append(build, common_return);
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
@@ -756,12 +830,19 @@ jit_program_compile(JITProgram *program)
 JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
 		    int *ticks, int *timed_out, enum error *error,
-		    JITDeoptState *deopt, Var *deopt_stack)
+		    JITSourceLocation *source_location, JITDeoptState *deopt,
+		    Var *deopt_stack)
 {
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
+    JITSourceLocation ignored_location;
 
+    if (!source_location)
+	source_location = &ignored_location;
+    source_location->bytecode_pc = 0;
+    source_location->error_pc = 0;
+    source_location->source_lineno = 0;
     if (deopt && program && program->num_deopt_maps > 0) {
 	deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	deopt->error_pc = program->deopt_maps[0].error_pc;
@@ -771,7 +852,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
     function = (NativeFunction) program->native_function;
-    native_result = function(env, result, ticks, timed_out, error, &deopt_map,
+    native_result = function(env, result, ticks, timed_out, error,
+			     source_location, &deopt_map,
 			     program->deopt_values);
     if (native_result == JIT_RUN_FALLBACK) {
 	JITDeoptMap *map;

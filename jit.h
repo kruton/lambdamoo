@@ -29,6 +29,12 @@ typedef struct {
     int ticks_charged;
 } JITDeoptState;
 
+typedef struct {
+    unsigned bytecode_pc;
+    unsigned error_pc;
+    unsigned source_lineno;
+} JITSourceLocation;
+
 extern JITProgram *jit_program_unsupported(const char *);
 extern void jit_program_free(JITProgram *);
 extern int jit_program_bytes(JITProgram *);
@@ -41,7 +47,8 @@ extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
-					enum error *, JITDeoptState *, Var *);
+					enum error *, JITSourceLocation *,
+					JITDeoptState *, Var *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 

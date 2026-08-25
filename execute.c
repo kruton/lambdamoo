@@ -909,13 +909,14 @@ do {								\
 		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
 	    Var ret_val;
 	    JITRunResult jit_result;
+	    JITSourceLocation source_location;
 	    JITDeoptState deopt;
 	    enum error jit_error = E_NONE;
 
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
-					     &jit_error, &deopt,
+					     &jit_error, &source_location, &deopt,
 					     RUN_ACTIV.base_rt_stack);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		STORE_STATE_VARIABLES();

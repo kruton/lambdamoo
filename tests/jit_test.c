@@ -61,6 +61,9 @@ arithmetic_program(void)
     two->value = 2;
     two->literal = 2;
     tick->source_lineno = 7;
+    tick->bytecode_pc = 11;
+    add->source_lineno = 7;
+    add->bytecode_pc = 11;
     add->value = 3;
     add->src1 = 1;
     add->src2 = 2;
@@ -399,7 +402,7 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 
     native_status = jit_program_execute(program, env, &native_result,
 					&native_ticks, &timed_out,
-					&native_error, 0, 0);
+					&native_error, 0, 0, 0);
     reference_status = reference_execute(program, env, &reference_result,
 					 &reference_ticks, &timed_out,
 					 &reference_error);
@@ -462,6 +465,7 @@ main(void)
     enum error error = E_NONE;
     int lines = 0;
     JITDeoptState deopt;
+    JITSourceLocation source_location;
 
     check(jit_program_dump_mir(program, count_line, &lines),
 	  "MIR dump failed");
@@ -471,7 +475,7 @@ main(void)
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0, 0) == JIT_RUN_RETURNED,
+			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
     check(result.type == TYPE_INT && result.v.num == 3,
 	  "native execution returned the wrong value");
@@ -480,15 +484,22 @@ main(void)
 	  "native execution did not compile lazily");
     ticks = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0, 0)
+			      &error, &source_location, 0, 0)
 	  == JIT_RUN_ABORT_TICKS, "tick exhaustion did not abort");
     check(ticks == 0, "tick exhaustion left the wrong tick count");
+    check(source_location.bytecode_pc == 11
+	  && source_location.error_pc == 11
+	  && source_location.source_lineno == 7,
+	  "tick exhaustion returned the wrong source location");
     ticks = 10;
     timed_out = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error, 0, 0)
+			      &error, &source_location, 0, 0)
 	  == JIT_RUN_ABORT_SECONDS, "seconds exhaustion did not abort");
     check(ticks == 9, "seconds exhaustion consumed the wrong tick count");
+    check(source_location.bytecode_pc == 11
+	  && source_location.source_lineno == 7,
+	  "seconds exhaustion returned the wrong source location");
     timed_out = 0;
     check_differential(divide, env, 10, 0,
 		       "division differed from reference execution");
@@ -506,6 +517,16 @@ main(void)
 		       "negative power differed from reference execution");
     check_differential(power_error, env, 10, 0,
 		       "power error differed from reference execution");
+    ticks = 10;
+    error = E_NONE;
+    check(jit_program_execute(power_error, env, &result, &ticks, &timed_out,
+			      &error, &source_location, 0, 0)
+	  == JIT_RUN_ERROR && error == E_DIV,
+	  "power error did not return its native error");
+    check(source_location.bytecode_pc == 11
+	  && source_location.error_pc == 11
+	  && source_location.source_lineno == 7,
+	  "power error returned the wrong source location");
     check_differential(shift_left, env, 10, 0,
 		       "left shift differed from reference execution");
     check_differential(shift_right, env, 10, 0,
@@ -539,7 +560,7 @@ main(void)
     env[0].v.str = "not an integer";
     ticks = 10;
     check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
-			      &error, &deopt, 0)
+			      &error, 0, &deopt, 0)
 	  == JIT_RUN_FALLBACK, "type guard did not request fallback");
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
@@ -553,7 +574,7 @@ main(void)
     deep_env[1].v.str = "not an integer";
     ticks = 10;
     check(jit_program_execute(deep_guard, deep_env, &result, &ticks,
-			      &timed_out, &error, &deopt, deopt_stack)
+			      &timed_out, &error, 0, &deopt, deopt_stack)
 	  == JIT_RUN_FALLBACK, "deep guard did not request fallback");
     check(ticks == 9 && deopt.ticks_charged == 1,
 	  "deep guard returned the wrong tick credit");
