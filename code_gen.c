@@ -1121,6 +1121,7 @@ generate_stmt(Stmt * stmt, State * state)
 		emit_byte(OPTIM_NUM_TO_OPCODE(1), state);	/* loop list index */
 		push_stack(1, state);
 		loop_top = capture_label(state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_byte(OP_FOR_LIST, state);
 		add_var_ref(stmt->s.list.id, state);
 		end_label = add_label(state);
@@ -1142,6 +1143,7 @@ generate_stmt(Stmt * stmt, State * state)
 		generate_expr(stmt->s.range.from, state);
 		generate_expr(stmt->s.range.to, state);
 		loop_top = capture_label(state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_byte(OP_FOR_RANGE, state);
 		add_var_ref(stmt->s.range.id, state);
 		end_label = add_label(state);
