@@ -3190,7 +3190,6 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_CONST:
-	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3217,6 +3216,11 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
 						    EOP_WHILE_ID))
+		    return 0;
+		break;
+	    case HIR_TAC_LOAD_LOCAL:
+		if (instr->bytecode_pc != NO_BYTECODE_PC
+		    && instr->bytecode_pc >= bc->size)
 		    return 0;
 		break;
 	    case HIR_TAC_LABEL:

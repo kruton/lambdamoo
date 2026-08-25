@@ -936,6 +936,158 @@ test_if_then_phi_uses_entry_local_ssa(void)
 }
 
 static void
+test_guarded_environment_local_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_x = id_expr(0, 10);
+    Expr one = int_expr(1, 10);
+    Expr add = binary_expr(EXPR_PLUS, &local_x, &one);
+    Stmt ret = return_stmt(&add);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    local_x.bytecode_pc = 1;
+    one.bytecode_pc = 2;
+    add.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("env local tac load count",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("env local tac const count",
+	      hir_tac_count_kind(tac, HIR_TAC_CONST), 1);
+    check_int("env local tac add count",
+	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
+    check_int("env local ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("env local ssa binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("env local verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("env local return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("env local destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("env local out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_multiple_guarded_environment_locals_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_x = id_expr(0, 10);
+    Expr local_y = id_expr(1, 10);
+    Expr mult = binary_expr(EXPR_TIMES, &local_x, &local_y);
+    Stmt ret = return_stmt(&mult);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    local_x.bytecode_pc = 1;
+    local_y.bytecode_pc = 2;
+    mult.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("multi env local tac load count",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("multi env local ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("multi env local ssa binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("multi env local verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("multi env local return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("multi env local destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("multi env local out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_conditional_local_assignment_with_entry_local_analysis(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+    Cond_Arm arm;
+
+    Expr cond_x = id_expr(0, 80);
+    Expr then_value = int_expr(3, 81);
+    Expr then_lhs = id_expr(1, 81);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+
+    Expr ret_local = id_expr(1, 82);
+    Expr two = int_expr(2, 82);
+    Expr ret_add = binary_expr(EXPR_PLUS, &ret_local, &two);
+    Stmt ret = return_stmt(&ret_add);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond_x;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 80;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = 0;
+    if_stmt_node.next = &ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("cond assign tac not null", tac != 0, 1);
+    check_int("cond assign ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("cond assign ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("cond assign verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("cond assign return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("cond assign destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("cond assign out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1196,6 +1348,9 @@ main(void)
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
+    test_guarded_environment_local_tac_ssa();
+    test_multiple_guarded_environment_locals_ssa();
+    test_conditional_local_assignment_with_entry_local_analysis();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
