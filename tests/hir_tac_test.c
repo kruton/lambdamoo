@@ -2,8 +2,10 @@
 
 #include "hir.h"
 
+#include "integer_arithmetic.h"
 #include "storage.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -347,13 +349,72 @@ test_constant_analysis_overflow(void)
     analysis = hir_analyze_ssa_values(ctx, ssa);
 
     check_int("overflow return fact",
-	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("overflow wrapped constant",
+	      hir_ssa_return_constant(ssa, analysis) == NUM_MIN, 1);
     check_int("overflow optimization changed",
-	      hir_optimize_ssa_constants(ctx, ssa), 0);
+	      hir_optimize_ssa_constants(ctx, ssa), 1);
     check_int("overflow binary retained",
-	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
     check_int("overflow optimized verify", hir_verify_ssa(ctx, ssa), 1);
     check_int("overflow verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+test_integer_arithmetic_model(void)
+{
+    IntegerArithmeticResult result;
+
+    result = integer_arithmetic(INTEGER_NEGATE, NUM_MIN, 0);
+    check_int("model negate minimum succeeds", result.succeeded, 1);
+    check_int("model negate minimum wraps", result.value == NUM_MIN, 1);
+    result = integer_arithmetic(INTEGER_MULTIPLY, NUM_MAX, 2);
+    check_int("model multiply wraps", result.value == -2, 1);
+    result = integer_arithmetic(INTEGER_DIVIDE, NUM_MIN, -1);
+    check_int("model divide overflow succeeds", result.succeeded, 1);
+    check_int("model divide overflow wraps", result.value == NUM_MIN, 1);
+    result = integer_arithmetic(INTEGER_MODULUS, NUM_MIN, -1);
+    check_int("model modulus overflow succeeds", result.succeeded, 1);
+    check_int("model modulus overflow value", result.value, 0);
+    result = integer_arithmetic(INTEGER_DIVIDE, 1, 0);
+    check_int("model divide zero fails", result.succeeded, 0);
+    check_int("model divide zero error", result.error, E_DIV);
+    result = integer_arithmetic(INTEGER_POWER, 0, -1);
+    check_int("model power zero negative fails", result.succeeded, 0);
+    check_int("model power zero negative error", result.error, E_DIV);
+    result = integer_arithmetic(INTEGER_SHIFT_LEFT, 1,
+				sizeof(Num) * CHAR_BIT);
+    check_int("model invalid shift fails", result.succeeded, 0);
+    check_int("model invalid shift error", result.error, E_INVARG);
+}
+
+static void
+test_constant_analysis_error(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    Expr one = int_expr(1, 27);
+    Expr zero = int_expr(0, 27);
+    Expr divide = binary_expr(EXPR_DIVIDE, &one, &zero);
+    Stmt ret = return_stmt(&divide);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+
+    check_int("constant error return fact",
+	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_ERROR);
+    check_int("constant error return value",
+	      hir_ssa_return_error(ssa, analysis), E_DIV);
+    check_int("constant error is not folded",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
     hir_context_free(ctx);
 }
 
@@ -1104,6 +1165,8 @@ main(void)
     test_control_flow_tac();
     test_short_circuit_tac();
     test_constant_analysis_overflow();
+    test_integer_arithmetic_model();
+    test_constant_analysis_error();
     test_loop_dominator_tree();
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();

@@ -113,7 +113,8 @@ typedef enum {
 typedef enum {
     HIR_VALUE_UNKNOWN,
     HIR_VALUE_INT,
-    HIR_VALUE_INT_CONSTANT
+    HIR_VALUE_INT_CONSTANT,
+    HIR_VALUE_ERROR
 } HIRValueKind;
 
 extern HIRContext *hir_context_new(Names *);
@@ -135,6 +136,7 @@ extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
 extern HIRValueAnalysis *hir_analyze_ssa_values(HIRContext *, HIRSSAProgram *);
 extern HIRValueKind hir_value_kind(HIRValueAnalysis *, int);
 extern Num hir_value_constant(HIRValueAnalysis *, int);
+extern enum error hir_value_error(HIRValueAnalysis *, int);
 extern int hir_optimize_ssa_constants(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
@@ -179,6 +181,7 @@ extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
 					       HIRValueAnalysis *);
 extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);
+extern enum error hir_ssa_return_error(HIRSSAProgram *, HIRValueAnalysis *);
 extern HIRTacProgram *hir_test_tac_with_undefined_return(HIRContext *);
 extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);

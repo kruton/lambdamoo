@@ -8,6 +8,7 @@
 #endif
 
 #include "arena.h"
+#include "integer_arithmetic.h"
 #include "program.h"
 #include "my-stdio.h"
 #include "storage.h"
@@ -33,12 +34,14 @@ typedef enum {
     HIR_VALUE_BOTTOM,
     HIR_VALUE_FACT_UNKNOWN,
     HIR_VALUE_FACT_INT,
-    HIR_VALUE_FACT_CONSTANT
+    HIR_VALUE_FACT_CONSTANT,
+    HIR_VALUE_FACT_ERROR
 } HIRValueFactKind;
 
 typedef struct {
     HIRValueFactKind kind;
     Num constant;
+    enum error error;
 } HIRValueFact;
 
 struct HIRArg {
@@ -2001,8 +2004,16 @@ join_value_fact(HIRValueFact lhs, HIRValueFact rhs)
     if (rhs.kind == HIR_VALUE_BOTTOM)
 	return lhs;
     result.constant = 0;
+    result.error = E_NONE;
     if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
 	|| rhs.kind == HIR_VALUE_FACT_UNKNOWN)
+	result.kind = HIR_VALUE_FACT_UNKNOWN;
+    else if (lhs.kind == HIR_VALUE_FACT_ERROR
+	     && rhs.kind == HIR_VALUE_FACT_ERROR
+	     && lhs.error == rhs.error)
+	return lhs;
+    else if (lhs.kind == HIR_VALUE_FACT_ERROR
+	     || rhs.kind == HIR_VALUE_FACT_ERROR)
 	result.kind = HIR_VALUE_FACT_UNKNOWN;
     else if (lhs.kind == HIR_VALUE_FACT_CONSTANT
 	     && rhs.kind == HIR_VALUE_FACT_CONSTANT
@@ -2013,42 +2024,6 @@ join_value_fact(HIRValueFact lhs, HIRValueFact rhs)
     return result;
 }
 
-static int
-safe_add(Num lhs, Num rhs, Num *result)
-{
-    if ((rhs > 0 && lhs > NUM_MAX - rhs)
-	|| (rhs < 0 && lhs < NUM_MIN - rhs))
-	return 0;
-    *result = lhs + rhs;
-    return 1;
-}
-
-static int
-safe_subtract(Num lhs, Num rhs, Num *result)
-{
-    if ((rhs > 0 && lhs < NUM_MIN + rhs)
-	|| (rhs < 0 && lhs > NUM_MAX + rhs))
-	return 0;
-    *result = lhs - rhs;
-    return 1;
-}
-
-static int
-safe_multiply(Num lhs, Num rhs, Num *result)
-{
-    if (lhs == 0 || rhs == 0) {
-	*result = 0;
-	return 1;
-    }
-    if ((lhs > 0 && rhs > 0 && lhs > NUM_MAX / rhs)
-	|| (lhs > 0 && rhs < 0 && rhs < NUM_MIN / lhs)
-	|| (lhs < 0 && rhs > 0 && lhs < NUM_MIN / rhs)
-	|| (lhs < 0 && rhs < 0 && lhs < NUM_MAX / rhs))
-	return 0;
-    *result = lhs * rhs;
-    return 1;
-}
-
 static HIRValueFact
 constant_fact(Num value)
 {
@@ -2056,6 +2031,7 @@ constant_fact(Num value)
 
     fact.kind = HIR_VALUE_FACT_CONSTANT;
     fact.constant = value;
+    fact.error = E_NONE;
     return fact;
 }
 
@@ -2066,6 +2042,7 @@ integer_fact(void)
 
     fact.kind = HIR_VALUE_FACT_INT;
     fact.constant = 0;
+    fact.error = E_NONE;
     return fact;
 }
 
@@ -2076,7 +2053,28 @@ unknown_fact(void)
 
     fact.kind = HIR_VALUE_FACT_UNKNOWN;
     fact.constant = 0;
+    fact.error = E_NONE;
     return fact;
+}
+
+static HIRValueFact
+error_fact(enum error error)
+{
+    HIRValueFact fact;
+
+    fact.kind = HIR_VALUE_FACT_ERROR;
+    fact.constant = 0;
+    fact.error = error;
+    return fact;
+}
+
+static HIRValueFact
+arithmetic_fact(IntegerArithmeticOperation operation, Num lhs, Num rhs)
+{
+    IntegerArithmeticResult result = integer_arithmetic(operation, lhs, rhs);
+
+    return result.succeeded
+	? constant_fact(result.value) : error_fact(result.error);
 }
 
 static HIRValueFact
@@ -2089,13 +2087,11 @@ analyze_unary(HIROp op, HIRValueFact operand)
 	return integer_fact();
     switch (op) {
     case HIR_OP_NEGATE:
-	if (operand.constant == NUM_MIN)
-	    return integer_fact();
-	return constant_fact(-operand.constant);
+	return arithmetic_fact(INTEGER_NEGATE, operand.constant, 0);
     case HIR_OP_NOT:
 	return constant_fact(!operand.constant);
     case HIR_OP_COMPLEMENT:
-	return constant_fact(~operand.constant);
+	return arithmetic_fact(INTEGER_COMPLEMENT, operand.constant, 0);
     default:
 	return unknown_fact();
     }
@@ -2104,10 +2100,8 @@ analyze_unary(HIROp op, HIRValueFact operand)
 static HIRValueFact
 analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
 {
-    Num result;
-
     if (lhs.kind == HIR_VALUE_BOTTOM || rhs.kind == HIR_VALUE_BOTTOM) {
-	HIRValueFact bottom = {HIR_VALUE_BOTTOM, 0};
+	HIRValueFact bottom = {HIR_VALUE_BOTTOM, 0, E_NONE};
 	return bottom;
     }
     if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
@@ -2118,14 +2112,24 @@ analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
 	return integer_fact();
     switch (op) {
     case HIR_OP_ADD:
-	return safe_add(lhs.constant, rhs.constant, &result)
-	    ? constant_fact(result) : integer_fact();
+	return arithmetic_fact(INTEGER_ADD, lhs.constant, rhs.constant);
     case HIR_OP_SUB:
-	return safe_subtract(lhs.constant, rhs.constant, &result)
-	    ? constant_fact(result) : integer_fact();
+	return arithmetic_fact(INTEGER_SUBTRACT, lhs.constant, rhs.constant);
     case HIR_OP_MUL:
-	return safe_multiply(lhs.constant, rhs.constant, &result)
-	    ? constant_fact(result) : integer_fact();
+	return arithmetic_fact(INTEGER_MULTIPLY, lhs.constant, rhs.constant);
+    case HIR_OP_DIV:
+	return arithmetic_fact(INTEGER_DIVIDE, lhs.constant, rhs.constant);
+    case HIR_OP_MOD:
+	return arithmetic_fact(INTEGER_MODULUS, lhs.constant, rhs.constant);
+    case HIR_OP_EXP:
+	return arithmetic_fact(INTEGER_POWER, lhs.constant, rhs.constant);
+    case HIR_OP_SHL:
+	return arithmetic_fact(INTEGER_SHIFT_LEFT, lhs.constant, rhs.constant);
+    case HIR_OP_SHR:
+	return arithmetic_fact(INTEGER_SHIFT_RIGHT, lhs.constant, rhs.constant);
+    case HIR_OP_LSHR:
+	return arithmetic_fact(INTEGER_LOGICAL_SHIFT_RIGHT,
+			       lhs.constant, rhs.constant);
     case HIR_OP_EQ:
 	return constant_fact(lhs.constant == rhs.constant);
     case HIR_OP_NE:
@@ -2150,7 +2154,9 @@ update_value_fact(HIRValueFact *facts, int value, HIRValueFact candidate)
 
     if (joined.kind == facts[value].kind
 	&& (joined.kind != HIR_VALUE_FACT_CONSTANT
-	    || joined.constant == facts[value].constant))
+	    || joined.constant == facts[value].constant)
+	&& (joined.kind != HIR_VALUE_FACT_ERROR
+	    || joined.error == facts[value].error))
 	return 0;
     facts[value] = joined;
     return 1;
@@ -2192,7 +2198,7 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 	    if (!reachable[block->id])
 		continue;
 	    for (instr = block->first; instr; instr = instr->next) {
-		HIRValueFact fact = {HIR_VALUE_BOTTOM, 0};
+		HIRValueFact fact = {HIR_VALUE_BOTTOM, 0, E_NONE};
 
 		switch (instr->kind) {
 		case HIR_TAC_CONST:
@@ -2282,6 +2288,8 @@ hir_value_kind(HIRValueAnalysis *analysis, int value)
 	return HIR_VALUE_INT_CONSTANT;
     if (kind == HIR_VALUE_FACT_INT)
 	return HIR_VALUE_INT;
+    if (kind == HIR_VALUE_FACT_ERROR)
+	return HIR_VALUE_ERROR;
     return HIR_VALUE_UNKNOWN;
 }
 
@@ -2292,6 +2300,15 @@ hir_value_constant(HIRValueAnalysis *analysis, int value)
 	|| analysis->facts[value].kind != HIR_VALUE_FACT_CONSTANT)
 	return 0;
     return analysis->facts[value].constant;
+}
+
+enum error
+hir_value_error(HIRValueAnalysis *analysis, int value)
+{
+    if (!analysis || value <= 0 || value >= analysis->num_facts
+	|| analysis->facts[value].kind != HIR_VALUE_FACT_ERROR)
+	return E_NONE;
+    return analysis->facts[value].error;
 }
 
 static int
@@ -3906,6 +3923,24 @@ hir_ssa_return_constant(HIRSSAProgram *ssa, HIRValueAnalysis *analysis)
 	}
     }
     return 0;
+}
+
+enum error
+hir_ssa_return_error(HIRSSAProgram *ssa, HIRValueAnalysis *analysis)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa ? ssa->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_RETURN)
+		return hir_value_error(analysis, instr->src1);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return E_NONE;
 }
 #endif
 

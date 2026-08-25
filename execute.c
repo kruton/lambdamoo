@@ -30,6 +30,7 @@
 #include "eval_vm.h"
 #include "exceptions.h"
 #include "functions.h"
+#include "integer_arithmetic.h"
 #ifdef ENABLE_JIT
 #include "jit.h"
 #endif
@@ -2247,35 +2248,21 @@ do {								\
 		    {
 			Var rhs, lhs, ans;
 
-			rhs = POP();
-			lhs = POP();
-			if (lhs.type == TYPE_INT && rhs.type == TYPE_INT) {
-			    if (rhs.v.num < 0
-				|| (UNum)rhs.v.num >= sizeof(Num) * CHAR_BIT) {
-				ans.type = TYPE_ERR;
-				ans.v.err = E_INVARG;
-			    } else {
+		    rhs = POP();
+		    lhs = POP();
+		    if (lhs.type == TYPE_INT && rhs.type == TYPE_INT) {
+			IntegerArithmeticOperation operation = eop == EOP_SHL
+			    ? INTEGER_SHIFT_LEFT : (eop == EOP_SHR
+				? INTEGER_SHIFT_RIGHT
+				: INTEGER_LOGICAL_SHIFT_RIGHT);
+			IntegerArithmeticResult result = integer_arithmetic(
+			    operation, lhs.v.num, rhs.v.num);
 
-/*
- * Defines logical and arithmetic right shift behavior. Needed because
- * ANSI C doesn't define what happens when you right shift a negative
- * number.
- */
-#define HIGHONES(c)	((Num)(~(UNum)0 << (sizeof(Num) * CHAR_BIT - (c))))
-#define LOWONES(c)	(~HIGHONES(c))
-#define LOGSHIFTR(a,b)	((Num)((UNum)a >> b) & LOWONES(b))
-#define SHIFTR(a,b)	(LOGSHIFTR(a,b) ^ (a < 0 ? HIGHONES(b) : 0))
-
-				ans.type = TYPE_INT;
-				if (eop == EOP_SHL)
-				    ans.v.num = lhs.v.num << rhs.v.num;
-				else if (eop == EOP_SHR)
-				    ans.v.num = SHIFTR(lhs.v.num, rhs.v.num);
-				else if (eop == EOP_LSHR)
-				    ans.v.num = LOGSHIFTR(lhs.v.num, rhs.v.num);
-				else
-				    panic("Can't happen in EOP bitwise operators!");
-			    }
+			ans.type = result.succeeded ? TYPE_INT : TYPE_ERR;
+			if (result.succeeded)
+			    ans.v.num = result.value;
+			else
+			    ans.v.err = result.error;
 			} else {
 			    ans.type = TYPE_ERR;
 			    ans.v.err = E_TYPE;
