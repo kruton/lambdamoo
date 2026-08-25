@@ -931,11 +931,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     source_location->bytecode_pc = 0;
     source_location->error_pc = 0;
     source_location->source_lineno = 0;
-    if (deopt && program && program->num_deopt_maps > 0) {
-	deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
-	deopt->error_pc = program->deopt_maps[0].error_pc;
-	deopt->stack_depth = program->deopt_maps[0].stack_depth;
-	deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+    if (deopt) {
+	memset(deopt, 0, sizeof(*deopt));
+	if (program && program->num_deopt_maps > 0) {
+	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
+	    deopt->error_pc = program->deopt_maps[0].error_pc;
+	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
+	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+	}
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;

@@ -905,6 +905,7 @@ do {								\
 	if (bv == bc.vector
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
 	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit
+	    && jit_program_is_eligible(RUN_ACTIV.prog->jit)
 	    && (RUN_ACTIV.debug
 		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
 	    Var ret_val;
