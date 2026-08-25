@@ -433,9 +433,12 @@ Completed in the first native-code milestone:
   handoff at `OP_BI_FUNC_CALL`; and
 * direct native inlining for pure continuation-free built-ins (`abs()`, `min()`,
   `max()`, `toint()`, `typeof()`, `length()`) eliminating deopt boundaries for
-  pure operations.
+  pure operations; and
+* direct native lowering for property reads (`obj.prop`) and property assignments
+  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration.
 
 The next reviewable compiler milestones are:
 
-1. Direct native lowering for property reads/writes (`EXPR_PROP`).
-2. Range-based `for` loop lowering (`for i in [start..end]`).
+1. Range-based `for` loop lowering (`for i in [start..end]`).
+2. List iteration `for` loop lowering (`for x in (list)`).
+3. Conditional expressions (`EXPR_COND` `c ? t | f`).
