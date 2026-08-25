@@ -929,15 +929,20 @@ do {								\
 		}
 		LOAD_STATE_VARIABLES();
 	    } else if (jit_result == JIT_RUN_ABORT_TICKS) {
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
 		STORE_STATE_VARIABLES();
 		abort_task(ABORT_TICKS);
 		return OUTCOME_ABORTED;
 	    } else if (jit_result == JIT_RUN_ABORT_SECONDS) {
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
 		STORE_STATE_VARIABLES();
 		abort_task(ABORT_SECONDS);
 		return OUTCOME_ABORTED;
 	    } else if (jit_result == JIT_RUN_ERROR) {
-		error_bv = bv;
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK) {
