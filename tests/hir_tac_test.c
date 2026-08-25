@@ -664,6 +664,22 @@ while_stmt(Expr *condition, Stmt *body, int loop_id, unsigned lineno)
     return stmt;
 }
 
+static Stmt
+range_stmt(int id, Expr *from, Expr *to, Stmt *body, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_RANGE;
+    stmt.lineno = lineno;
+    stmt.s.range.id = id;
+    stmt.s.range.from = from;
+    stmt.s.range.to = to;
+    stmt.s.range.body = body;
+
+    return stmt;
+}
+
 static void
 test_loop_dominator_tree(void)
 {
@@ -1518,6 +1534,59 @@ test_property_read_and_write_tac_ssa(void)
 }
 
 static void
+test_for_range_loop_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /* sum = 0; */
+    Expr sum_lhs = id_expr(1, 10);
+    Expr zero = int_expr(0, 10);
+    Expr init_assign = binary_expr(EXPR_ASGN, &sum_lhs, &zero);
+    Stmt init_stmt = expr_stmt(&init_assign);
+
+    /* for i in [1..5] sum = sum + i; endfor */
+    Expr from = int_expr(1, 11);
+    Expr to = int_expr(5, 11);
+    Expr sum_body_lhs = id_expr(1, 12);
+    Expr sum_body_rhs = id_expr(1, 12);
+    Expr i_rhs = id_expr(2, 12);
+    Expr add = binary_expr(EXPR_PLUS, &sum_body_rhs, &i_rhs);
+    Expr body_assign = binary_expr(EXPR_ASGN, &sum_body_lhs, &add);
+    Stmt body_stmt = expr_stmt(&body_assign);
+
+    Stmt loop = range_stmt(2, &from, &to, &body_stmt, 11);
+
+    /* return sum; */
+    Expr sum_ret = id_expr(1, 13);
+    Stmt ret = return_stmt(&sum_ret);
+
+    init_stmt.next = &loop;
+    loop.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &init_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("for range tac not null", tac != 0, 1);
+    check_int("for range verify errors", hir_context_error_count(ctx), 0);
+    check_int("for range branch false count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 2);
+    check_int("for range jump count",
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+    check_int("for range ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+
+    check_int("for range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1788,6 +1857,7 @@ main(void)
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
     test_property_read_and_write_tac_ssa();
+    test_for_range_loop_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
