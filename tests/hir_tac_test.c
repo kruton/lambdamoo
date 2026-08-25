@@ -412,6 +412,14 @@ test_negative_ssa_verifier_cases(void)
     hir_context_free(ctx);
 
     ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_nondominating_use(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa nondominating use", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
     ssa = hir_test_ssa_with_bad_phi_shape(ctx);
     before = hir_context_error_count(ctx);
     accepted = hir_verify_ssa(ctx, ssa);

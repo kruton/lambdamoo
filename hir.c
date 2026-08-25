@@ -1736,6 +1736,119 @@ verify_phi_shape(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
 	record_unsupported(ctx, "SSA phi predecessor count mismatch");
 }
 
+static int
+dom_block_dominates(HIRDominatorTree *dom, int dominator_id, int block_id)
+{
+    HIRBasicBlock *block;
+    int steps = 0;
+
+    if (!dom || dominator_id <= 0 || block_id <= 0
+	|| dominator_id > dom->max_block_id || block_id > dom->max_block_id
+	|| dom->rpo_index[dominator_id] < 0 || dom->rpo_index[block_id] < 0)
+	return 0;
+
+    block = dom->block_by_id[block_id];
+    while (block && steps <= dom->num_reachable) {
+	if (block->id == dominator_id)
+	    return 1;
+	if (dom->idom[block->id] == block)
+	    break;
+	block = dom->idom[block->id];
+	steps++;
+    }
+    return 0;
+}
+
+static void
+verify_ssa_dominating_use(HIRContext *ctx, HIRDominatorTree *dom, int value,
+			   int use_block_id, int use_order, int phi_edge,
+			   int max_value, int *def_block, int *def_order)
+{
+    if (value <= 0 || value > max_value || def_block[value] == 0)
+	return;
+
+    if (def_block[value] == use_block_id) {
+	if (!phi_edge && def_order[value] >= use_order)
+	    record_unsupported(ctx, "SSA definition does not precede use");
+    } else if (!dom_block_dominates(dom, def_block[value], use_block_id)) {
+	record_unsupported(ctx, "SSA definition does not dominate use");
+    }
+}
+
+static void
+verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
+{
+    HIRDominatorTree *dom;
+    HIRSSABlock *block;
+    int *def_block;
+    int *def_order;
+
+    if (!ssa->cfg)
+	return;
+
+    dom = hir_build_dominator_tree(ctx, ssa->cfg);
+    if (!dom)
+	return;
+    def_block = hir_calloc(ctx, (size_t) max_value + 1, sizeof(int));
+    def_order = hir_calloc(ctx, (size_t) max_value + 1, sizeof(int));
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+	int order = 0;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (ssa_defines_value(instr) && instr->value > 0
+		&& instr->value <= max_value && def_block[instr->value] == 0) {
+		def_block[instr->value] = block->id;
+		def_order[instr->value] = order;
+	    }
+	    order++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+	int order = 0;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    switch (instr->kind) {
+	    case HIR_TAC_STORE_LOCAL:
+	    case HIR_TAC_UNARY:
+	    case HIR_TAC_BRANCH_FALSE:
+	    case HIR_TAC_RETURN:
+		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		break;
+	    case HIR_TAC_BINARY:
+		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		verify_ssa_dominating_use(ctx, dom, instr->src2, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		break;
+	    case HIR_TAC_PHI:
+		{
+		    HIRPhiArg *arg;
+		    for (arg = instr->phi_args; arg; arg = arg->next)
+			verify_ssa_dominating_use(ctx, dom, arg->value,
+					   arg->block_id, 0, 1, max_value,
+					   def_block, def_order);
+		}
+		break;
+	    default:
+		break;
+	    }
+	    order++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+}
+
 int
 hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 {
@@ -1847,6 +1960,8 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	}
     }
+
+    verify_ssa_dominance(ctx, ssa, max_value);
 
     if (block_count != ssa->num_blocks)
 	record_unsupported(ctx, "SSA block count mismatch");
@@ -4243,6 +4358,81 @@ hir_test_ssa_with_duplicate_def(HIRContext *ctx)
     second->next = 0;
 
     return new_test_ssa_program(ctx, first, second, 2, 2);
+}
+
+HIRSSAProgram *
+hir_test_ssa_with_nondominating_use(HIRContext *ctx)
+{
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *entry = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *left = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *right = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *join = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRSSABlock *entry_ssa;
+    HIRSSABlock *left_ssa;
+    HIRSSABlock *right_ssa;
+    HIRSSABlock *join_ssa;
+    HIRSSAProgram *ssa = hir_alloc(ctx, sizeof(HIRSSAProgram));
+    HIRTacInstr *entry_tac = new_tac(ctx, HIR_TAC_BRANCH_FALSE, 1030);
+    HIRTacInstr *left_tac = new_tac(ctx, HIR_TAC_JUMP, 1031);
+    HIRTacInstr *right_tac = new_tac(ctx, HIR_TAC_JUMP, 1032);
+    HIRTacInstr *join_tac = new_tac(ctx, HIR_TAC_RETURN, 1033);
+    HIRSSAInstr *condition = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1030, 1);
+    HIRSSAInstr *branch = new_test_ssa_instr(ctx, HIR_TAC_BRANCH_FALSE, 1030, 0);
+    HIRSSAInstr *left_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1031, 2);
+    HIRSSAInstr *left_jump = new_test_ssa_instr(ctx, HIR_TAC_JUMP, 1031, 0);
+    HIRSSAInstr *right_def = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1032, 3);
+    HIRSSAInstr *right_jump = new_test_ssa_instr(ctx, HIR_TAC_JUMP, 1032, 0);
+    HIRSSAInstr *ret = new_test_ssa_instr(ctx, HIR_TAC_RETURN, 1033, 0);
+
+    ctx->next_temp = 4;
+    entry_tac->src1 = 1;
+    join_tac->src1 = 2;
+    init_test_block(entry, 1, entry_tac);
+    init_test_block(left, 2, left_tac);
+    init_test_block(right, 3, right_tac);
+    init_test_block(join, 4, join_tac);
+    entry->next = left;
+    left->next = right;
+    right->next = join;
+    entry->successors[0] = right;
+    entry->successors[1] = left;
+    entry->num_successors = 2;
+    left->successors[0] = join;
+    left->num_successors = 1;
+    left->predecessor_count = 1;
+    right->successors[0] = join;
+    right->num_successors = 1;
+    right->predecessor_count = 1;
+    join->predecessor_count = 2;
+
+    cfg->entry = entry;
+    cfg->blocks = entry;
+    cfg->last_block = join;
+    cfg->num_blocks = 4;
+    cfg->num_edges = 4;
+
+    condition->next = branch;
+    branch->src1 = 1;
+    left_def->next = left_jump;
+    right_def->next = right_jump;
+    ret->src1 = 2;
+    entry_ssa = new_test_ssa_block(ctx, 1, condition, branch);
+    left_ssa = new_test_ssa_block(ctx, 2, left_def, left_jump);
+    right_ssa = new_test_ssa_block(ctx, 3, right_def, right_jump);
+    join_ssa = new_test_ssa_block(ctx, 4, ret, ret);
+    entry_ssa->next = left_ssa;
+    left_ssa->next = right_ssa;
+    right_ssa->next = join_ssa;
+
+    ssa->form = HIR_FORM_SSA;
+    ssa->cfg = cfg;
+    ssa->blocks = entry_ssa;
+    ssa->last_block = join_ssa;
+    ssa->num_blocks = 4;
+    ssa->num_instructions = 7;
+    ssa->num_values = 3;
+    return ssa;
 }
 
 HIRSSAProgram *
