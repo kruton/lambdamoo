@@ -10,6 +10,7 @@
 #include "my-stdio.h"
 
 #include "arena.h"
+#include "functions.h"
 #include "integer_arithmetic.h"
 #include "opcode.h"
 #include "program.h"
@@ -49,7 +50,17 @@ typedef struct {
 struct HIRArg {
     enum Arg_Kind kind;
     HIRExpr *expr;
+    unsigned bytecode_pc;
     HIRArg *next;
+};
+
+typedef struct HIRScatter HIRScatter;
+
+struct HIRScatter {
+    enum Scatter_Kind kind;
+    int local_id;
+    HIRExpr *expr;
+    HIRScatter *next;
 };
 
 struct HIRExpr {
@@ -101,6 +112,15 @@ struct HIRExpr {
 	struct {
 	    HIRArg *items;
 	} list;
+	struct {
+	    HIRScatter *items;
+	    HIRExpr *rhs;
+	} scatter;
+	struct {
+	    HIRExpr *obj;
+	    HIRExpr *prop;
+	    HIRExpr *rhs;
+	} prop_store;
 	struct {
 	    HIRExpr *body;
 	    HIRArg *codes;
@@ -187,6 +207,8 @@ struct HIRTacInstr {
     int local_id;
     HIROp op;
     Var literal;
+    unsigned func;
+    ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
     HIRTacInstr *next;
@@ -265,6 +287,8 @@ struct HIRSSAInstr {
     int local_id;
     HIROp op;
     Var literal;
+    unsigned func;
+    ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
     int num_local_values;
@@ -496,6 +520,15 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_BINARY:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_CALL:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_PUT_PROP:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
@@ -1216,6 +1249,8 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_LOAD_LOCAL
 	    || instr->kind == HIR_TAC_UNARY
 	    || instr->kind == HIR_TAC_BINARY
+	    || instr->kind == HIR_TAC_CALL
+	    || instr->kind == HIR_TAC_PUT_PROP
 	    || instr->kind == HIR_TAC_UNSUPPORTED
 	    || instr->kind == HIR_TAC_PHI);
 }
@@ -1260,6 +1295,8 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->local_id = tac->local_id;
     instr->op = tac->op;
     instr->literal = tac->literal;
+    instr->func = tac->func;
+    instr->resume_key = tac->resume_key;
     instr->num_stack_values = tac->num_stack_values;
     instr->stack_values = tac->stack_values;
     instr->num_local_values = 0;
@@ -1893,6 +1930,7 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 	    switch (instr->kind) {
 	    case HIR_TAC_STORE_LOCAL:
 	    case HIR_TAC_UNARY:
+	    case HIR_TAC_CALL:
 	    case HIR_TAC_BRANCH_FALSE:
 	    case HIR_TAC_RETURN:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
@@ -1900,6 +1938,7 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 					   def_block, def_order);
 		break;
 	    case HIR_TAC_BINARY:
+	    case HIR_TAC_PUT_PROP:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
 					   order, 0, max_value,
 					   def_block, def_order);
@@ -1981,8 +2020,14 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		value_count++;
 		break;
 	    case HIR_TAC_BINARY:
+	    case HIR_TAC_PUT_PROP:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_CALL:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -2148,6 +2193,18 @@ analyze_unary(HIROp op, HIRValueFact operand)
 	return constant_fact(!operand.constant);
     case HIR_OP_COMPLEMENT:
 	return arithmetic_fact(INTEGER_COMPLEMENT, operand.constant, 0);
+    case HIR_OP_ABS:
+	return operand.constant < 0
+	    ? arithmetic_fact(INTEGER_NEGATE, operand.constant, 0) : operand;
+    case HIR_OP_TOINT:
+	return operand;
+    case HIR_OP_TYPEOF:
+	return constant_fact(TYPE_INT);
+    case HIR_OP_LENGTH:
+	return integer_fact();
+    case HIR_OP_MAKE_SINGLETON_LIST:
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	return unknown_fact();
     default:
 	return unknown_fact();
     }
@@ -2162,6 +2219,8 @@ analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
     }
     if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
 	|| rhs.kind == HIR_VALUE_FACT_UNKNOWN)
+	return unknown_fact();
+    if (op == HIR_OP_LIST_ADD_TAIL || op == HIR_OP_LIST_APPEND)
 	return unknown_fact();
     if (lhs.kind != HIR_VALUE_FACT_CONSTANT
 	|| rhs.kind != HIR_VALUE_FACT_CONSTANT)
@@ -2186,6 +2245,12 @@ analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
     case HIR_OP_LSHR:
 	return arithmetic_fact(INTEGER_LOGICAL_SHIFT_RIGHT,
 			       lhs.constant, rhs.constant);
+    case HIR_OP_MIN:
+	return constant_fact(lhs.constant < rhs.constant
+			     ? lhs.constant : rhs.constant);
+    case HIR_OP_MAX:
+	return constant_fact(lhs.constant > rhs.constant
+			     ? lhs.constant : rhs.constant);
     case HIR_OP_EQ:
 	return constant_fact(lhs.constant == rhs.constant);
     case HIR_OP_NE:
@@ -2284,6 +2349,8 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 					analysis->facts[arg->value]);
 		    }
 		    break;
+		case HIR_TAC_CALL:
+		case HIR_TAC_PUT_PROP:
 		case HIR_TAC_UNSUPPORTED:
 		    fact = unknown_fact();
 		    break;
@@ -2960,6 +3027,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
+	    case HIR_TAC_CALL:
+	    case HIR_TAC_PUT_PROP:
 		mark_out_ssa_def(instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3003,9 +3072,11 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_UNARY:
+	    case HIR_TAC_CALL:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_BINARY:
+	    case HIR_TAC_PUT_PROP:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
 		break;
@@ -3066,6 +3137,18 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_SHL:
     case HIR_OP_SHR:
     case HIR_OP_LSHR:
+    case HIR_OP_INDEX:
+    case HIR_OP_MAKE_SINGLETON_LIST:
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+    case HIR_OP_LIST_ADD_TAIL:
+    case HIR_OP_LIST_APPEND:
+    case HIR_OP_ABS:
+    case HIR_OP_MIN:
+    case HIR_OP_MAX:
+    case HIR_OP_TOINT:
+    case HIR_OP_TYPEOF:
+    case HIR_OP_LENGTH:
+    case HIR_OP_GET_PROP:
     case HIR_OP_EQ:
     case HIR_OP_NE:
     case HIR_OP_LT:
@@ -3093,6 +3176,8 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_CALL:
+	    case HIR_TAC_PUT_PROP:
 	    case HIR_TAC_LABEL:
 	    case HIR_TAC_JUMP:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3101,8 +3186,6 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_CONST:
-		if (instr->literal.type != TYPE_INT)
-		    return 0;
 		break;
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
@@ -3138,6 +3221,15 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_UNARY_MINUS;
 	if (instr->op == HIR_OP_NOT)
 	    return op == OP_NOT;
+	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return op == OP_MAKE_SINGLETON_LIST;
+	if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+	    return op == OP_CHECK_LIST_FOR_SPLICE;
+	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
+	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_LENGTH)
+	    return instr->bytecode_pc + 1 < bc->size
+		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					   EOP_COMPLEMENT);
     }
@@ -3150,6 +3242,18 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	case HIR_OP_MOD: return op == OP_MOD;
 	case HIR_OP_EXP:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
+	case HIR_OP_INDEX:
+	    return op == OP_REF
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
+	case HIR_OP_LIST_ADD_TAIL: return op == OP_LIST_ADD_TAIL;
+	case HIR_OP_LIST_APPEND: return op == OP_LIST_APPEND;
+	case HIR_OP_GET_PROP: return op == OP_GET_PROP;
+	case HIR_OP_MIN:
+	case HIR_OP_MAX:
+	    return instr->bytecode_pc + 1 < bc->size
+		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	case HIR_OP_EQ: return op == OP_EQ;
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT: return op == OP_LT;
@@ -3218,6 +3322,20 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 						    EOP_WHILE_ID))
 		    return 0;
 		break;
+	    case HIR_TAC_CALL:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_BI_FUNC_CALL)
+		    return 0;
+		break;
+	    case HIR_TAC_PUT_PROP:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_PUT_PROP)
+		    return 0;
+		break;
 	    case HIR_TAC_LOAD_LOCAL:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
 		    && instr->bytecode_pc >= bc->size)
@@ -3241,7 +3359,7 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 
 static int
 jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
-		  Bytecodes *bytecodes)
+		  Bytecodes *bytecodes, var_type *value_types)
 {
     JITDeoptMap *map;
     int i;
@@ -3275,13 +3393,23 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->num_locals = instr->num_local_values;
     if (map->num_locals) {
 	map->local_values = mymalloc(sizeof(int) * map->num_locals, M_PROGRAM);
+	map->local_types = mymalloc(sizeof(var_type) * map->num_locals, M_PROGRAM);
 	memcpy(map->local_values, instr->local_values,
 	       sizeof(int) * map->num_locals);
+	for (i = 0; i < map->num_locals; i++)
+	    map->local_types[i] = (instr->local_values[i] > 0
+				   && instr->local_values[i] < program->num_values)
+		? value_types[instr->local_values[i]] : TYPE_INT;
     }
     if (map->stack_depth) {
 	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
+	map->stack_types = mymalloc(sizeof(var_type) * map->stack_depth, M_PROGRAM);
 	memcpy(map->stack_values, instr->stack_values,
 	       sizeof(int) * map->stack_depth);
+	for (i = 0; i < (int) map->stack_depth; i++)
+	    map->stack_types[i] = (instr->stack_values[i] > 0
+				   && instr->stack_values[i] < program->num_values)
+		? value_types[instr->stack_values[i]] : TYPE_INT;
     }
     return program->num_deopt_maps++;
 }
@@ -3292,6 +3420,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 {
     JITProgram *program;
     HIRSSABlock *ssa_block;
+    var_type *value_types;
+    int i;
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ssa))
 	return jit_program_unsupported("unsupported-program");
@@ -3314,10 +3444,37 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps[0].num_locals = program->num_vars;
     program->deopt_maps[0].local_values = program->num_vars
 	? mymalloc(sizeof(int) * program->num_vars, M_PROGRAM) : 0;
-    if (program->num_vars)
+    program->deopt_maps[0].local_types = program->num_vars
+	? mymalloc(sizeof(var_type) * program->num_vars, M_PROGRAM) : 0;
+    if (program->num_vars) {
 	memset(program->deopt_maps[0].local_values, 0,
 	       sizeof(int) * program->num_vars);
+	for (i = 0; i < program->num_vars; i++)
+	    program->deopt_maps[0].local_types[i] = TYPE_INT;
+    }
     program->deopt_maps[0].stack_values = 0;
+    program->deopt_maps[0].stack_types = 0;
+
+    value_types = mymalloc(sizeof(var_type) * (program->num_values > 0
+					       ? program->num_values : 1),
+			   M_PROGRAM);
+    for (i = 0; i < program->num_values; i++)
+	value_types[i] = TYPE_INT;
+
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+	for (si = ssa_block->first; si; si = si->next) {
+	    if (si->value > 0 && si->value < program->num_values) {
+		if (si->kind == HIR_TAC_CONST)
+		    value_types[si->value] = si->literal.type;
+		else if (si->kind == HIR_TAC_UNARY
+			 && si->op == HIR_OP_MAKE_SINGLETON_LIST)
+		    value_types[si->value] = TYPE_LIST;
+	    }
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRBasicBlock *cfg_block = cfg_block_for_id(ssa->cfg, ssa_block->id);
@@ -3327,7 +3484,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	memset(block, 0, sizeof(JITBlock));
 	block->id = ssa_block->id;
 	if (cfg_block) {
-	    int i;
 	    block->num_successors = cfg_block->num_successors;
 	    for (i = 0; i < cfg_block->num_successors; i++)
 		block->successors[i] = cfg_block->successors[i]->id;
@@ -3356,19 +3512,36 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
 	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
-						  &bytecode_program->main_vector);
+						  &bytecode_program->main_vector,
+						  value_types);
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
+		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
 		return jit_program_unsupported("invalid-deopt-map");
 	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
-		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR))
+		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
+		    || ssa_instr->op == HIR_OP_INDEX))
 		program->may_error = 1;
-	    instr->literal = ssa_instr->kind == HIR_TAC_CONST
-		? ssa_instr->literal.v.num : 0;
+	    instr->literal_type = ssa_instr->kind == HIR_TAC_CONST
+		? ssa_instr->literal.type : TYPE_INT;
+	    if (ssa_instr->kind == HIR_TAC_CONST) {
+		if (ssa_instr->literal.type == TYPE_STR) {
+		    const char *str = str_ref(ssa_instr->literal.v.str);
+		    instr->literal = (uintptr_t) str;
+		}
+		else if (ssa_instr->literal.type == TYPE_OBJ)
+		    instr->literal = ssa_instr->literal.v.obj;
+		else if (ssa_instr->literal.type == TYPE_ERR)
+		    instr->literal = ssa_instr->literal.v.err;
+		else if (ssa_instr->literal.type == TYPE_INT)
+		    instr->literal = ssa_instr->literal.v.num;
+		else
+		    instr->literal = 0;
+	    }
 	    for (ssa_copy = ssa_instr->copies; ssa_copy;
 		 ssa_copy = ssa_copy->next) {
 		JITCopy *copy = mymalloc(sizeof(JITCopy), M_PROGRAM);
@@ -3390,6 +3563,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	}
     }
 
+    myfree(value_types, M_PROGRAM);
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */
@@ -3451,6 +3625,14 @@ hir_dump_tac(HIRTacProgram *program)
 	    fprintf(stderr, " t%d", instr->src1);
 	    break;
 	case HIR_TAC_RETURN0:
+	    break;
+	case HIR_TAC_CALL:
+	    fprintf(stderr, " t%d = call func(%u) t%d", instr->dst,
+		    instr->func, instr->src1);
+	    break;
+	case HIR_TAC_PUT_PROP:
+	    fprintf(stderr, " t%d = prop_put(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
 	    break;
 	case HIR_TAC_UNSUPPORTED:
 	    fprintf(stderr, " t%d", instr->dst);
@@ -3614,6 +3796,14 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_RETURN0:
 		break;
+	    case HIR_TAC_CALL:
+		fprintf(file, " t%d = call func(%u) t%d", instr->value,
+			instr->func, instr->src1);
+		break;
+	    case HIR_TAC_PUT_PROP:
+		fprintf(file, " t%d = prop_put(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
 	    case HIR_TAC_UNSUPPORTED:
 		if (instr->value > 0)
 		    fprintf(file, " t%d", instr->value);
@@ -3682,6 +3872,10 @@ tac_kind_name(HIRTacKind kind)
 	return "return";
     case HIR_TAC_RETURN0:
 	return "return0";
+    case HIR_TAC_CALL:
+	return "call";
+    case HIR_TAC_PUT_PROP:
+	return "put_prop";
     case HIR_TAC_UNSUPPORTED:
 	    return "unsupported";
     case HIR_TAC_PHI:
@@ -3745,6 +3939,30 @@ op_name(HIROp op)
 	return ">>";
     case HIR_OP_LSHR:
 	return ">>>";
+    case HIR_OP_INDEX:
+	return "INDEX";
+    case HIR_OP_MAKE_SINGLETON_LIST:
+	return "MAKE_SINGLETON_LIST";
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	return "CHECK_LIST_FOR_SPLICE";
+    case HIR_OP_LIST_ADD_TAIL:
+	return "LIST_ADD_TAIL";
+    case HIR_OP_LIST_APPEND:
+	return "LIST_APPEND";
+    case HIR_OP_ABS:
+	return "ABS";
+    case HIR_OP_MIN:
+	return "MIN";
+    case HIR_OP_MAX:
+	return "MAX";
+    case HIR_OP_TOINT:
+	return "TOINT";
+    case HIR_OP_TYPEOF:
+	return "TYPEOF";
+    case HIR_OP_LENGTH:
+	return "LENGTH";
+    case HIR_OP_GET_PROP:
+	return "GET_PROP";
     }
 
     return "?";
@@ -3791,6 +4009,23 @@ hir_tac_count_kind(HIRTacProgram *program, HIRTacKind kind)
 
     for (instr = program->first; instr; instr = instr->next) {
 	if (instr->kind == kind)
+	    count++;
+    }
+
+    return count;
+}
+
+int
+hir_tac_count_unary_op(HIRTacProgram *program, HIROp op)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    if (!program)
+	return 0;
+
+    for (instr = program->first; instr; instr = instr->next) {
+	if (instr->kind == HIR_TAC_UNARY && instr->op == op)
 	    count++;
     }
 
@@ -4216,7 +4451,7 @@ hir_ssa_parallel_copy_pair_count(HIRSSAProgram *ssa)
 int
 hir_ssa_form(HIRSSAProgram *ssa)
 {
-    return ssa ? ssa->form : -1;
+    return ssa ? (int) ssa->form : -1;
 }
 
 int
@@ -4362,6 +4597,7 @@ lift_arg_list(HIRContext *ctx, Arg_List *args)
 
 	arg->kind = args->kind;
 	arg->expr = lift_expr(ctx, args->expr);
+	arg->bytecode_pc = args->bytecode_pc;
 	arg->next = 0;
 
 	if (last)
@@ -4488,6 +4724,40 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.local_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
+    if (ast->e.bin.lhs->kind == EXPR_SCATTER) {
+	HIRScatter *first = 0;
+	HIRScatter *last = 0;
+	Scatter *sc;
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_SCATTER);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.scatter.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	for (sc = ast->e.bin.lhs->e.scatter; sc; sc = sc->next) {
+	    HIRScatter *item = hir_alloc(ctx, sizeof(HIRScatter));
+	    item->kind = sc->kind;
+	    item->local_id = sc->id;
+	    item->expr = sc->expr ? lift_expr(ctx, sc->expr) : 0;
+	    item->next = 0;
+	    if (last)
+		last->next = item;
+	    else
+		first = item;
+	    last = item;
+	}
+	expr->u.scatter.items = first;
+	return expr;
+    }
+    if (ast->e.bin.lhs->kind == EXPR_PROP) {
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_PROP_STORE);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.prop_store.obj = lift_expr(ctx, ast->e.bin.lhs->e.bin.lhs);
+	expr->u.prop_store.prop = lift_expr(ctx, ast->e.bin.lhs->e.bin.rhs);
+	expr->u.prop_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	return expr;
+    }
 
     record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
     return unsupported_expr(ctx, ast);
@@ -4561,11 +4831,11 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_CALL:
 	expr = new_expr(ctx, HIR_EXPR_CALL);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.call.resume_key.site = ast->e.call.resume_site;
 	expr->u.call.func = ast->e.call.func;
 	expr->u.call.args = lift_arg_list(ctx, ast->e.call.args);
-	record_unsupported(ctx, "Call expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_VERB:
 	expr = new_expr(ctx, HIR_EXPR_VERB_CALL);
@@ -4580,16 +4850,16 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_PROP:
 	expr = new_expr(ctx, HIR_EXPR_PROP);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.pair.lhs = lift_expr(ctx, ast->e.bin.lhs);
 	expr->u.pair.rhs = lift_expr(ctx, ast->e.bin.rhs);
-	record_unsupported(ctx, "Property expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_INDEX:
 	expr = new_expr(ctx, HIR_EXPR_INDEX);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.pair.lhs = lift_expr(ctx, ast->e.bin.lhs);
 	expr->u.pair.rhs = lift_expr(ctx, ast->e.bin.rhs);
-	record_unsupported(ctx, "Index expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_RANGE:
 	expr = new_expr(ctx, HIR_EXPR_RANGE);
@@ -4602,8 +4872,8 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_LIST:
 	expr = new_expr(ctx, HIR_EXPR_LIST);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.list.items = lift_arg_list(ctx, ast->e.list);
-	record_unsupported(ctx, "List expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_CATCH:
 	expr = new_expr(ctx, HIR_EXPR_CATCH);
@@ -5061,6 +5331,227 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	ctx->lower_stack_depth -= 2;
 	push_lower_stack(ctx, instr->dst);
 	return instr->dst;
+    case HIR_EXPR_INDEX:
+	lhs = lower_expr(ctx, program, expr->u.pair.lhs);
+	rhs = lower_expr(ctx, program, expr->u.pair.rhs);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
+	instr->dst = new_temp(ctx);
+	instr->src1 = lhs;
+	instr->src2 = rhs;
+	instr->op = HIR_OP_INDEX;
+	snapshot_lower_stack(ctx, instr);
+	append_tac(program, instr);
+	ctx->lower_stack_depth -= 2;
+	push_lower_stack(ctx, instr->dst);
+	return instr->dst;
+    case HIR_EXPR_PROP:
+	lhs = lower_expr(ctx, program, expr->u.pair.lhs);
+	rhs = lower_expr(ctx, program, expr->u.pair.rhs);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
+	instr->dst = new_temp(ctx);
+	instr->src1 = lhs;
+	instr->src2 = rhs;
+	instr->op = HIR_OP_GET_PROP;
+	snapshot_lower_stack(ctx, instr);
+	append_tac(program, instr);
+	ctx->lower_stack_depth -= 2;
+	push_lower_stack(ctx, instr->dst);
+	return instr->dst;
+    case HIR_EXPR_PROP_STORE:
+	{
+	    int obj_temp = lower_expr(ctx, program, expr->u.prop_store.obj);
+	    int prop_temp = lower_expr(ctx, program, expr->u.prop_store.prop);
+	    int rhs_temp = lower_expr(ctx, program, expr->u.prop_store.rhs);
+	    int dst_temp = new_temp(ctx);
+	    (void) rhs_temp;
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    instr = new_tac(ctx, HIR_TAC_PUT_PROP, expr->source_lineno);
+	    instr->bytecode_pc = expr->bytecode_pc;
+	    instr->dst = dst_temp;
+	    instr->src1 = obj_temp;
+	    instr->src2 = prop_temp;
+	    snapshot_lower_stack(ctx, instr);
+	    append_tac(program, instr);
+	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, dst_temp);
+	    return dst_temp;
+	}
+    case HIR_EXPR_SCATTER:
+	{
+	    HIRScatter *item;
+	    int rhs_temp = lower_expr(ctx, program, expr->u.scatter.rhs);
+	    int index = 1;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    for (item = expr->u.scatter.items; item; item = item->next) {
+		if (item->kind == SCAT_REQUIRED) {
+		    int idx_temp = new_temp(ctx);
+		    int elem_temp = new_temp(ctx);
+		    HIRTacInstr *const_tac = new_tac(ctx, HIR_TAC_CONST,
+						     expr->source_lineno);
+		    HIRTacInstr *idx_tac = new_tac(ctx, HIR_TAC_BINARY,
+						   expr->source_lineno);
+		    HIRTacInstr *store_tac = new_tac(ctx, HIR_TAC_STORE_LOCAL,
+						     expr->source_lineno);
+
+		    const_tac->dst = idx_temp;
+		    const_tac->literal.type = TYPE_INT;
+		    const_tac->literal.v.num = index;
+		    const_tac->bytecode_pc = expr->bytecode_pc;
+		    append_tac(program, const_tac);
+
+		    idx_tac->dst = elem_temp;
+		    idx_tac->src1 = rhs_temp;
+		    idx_tac->src2 = idx_temp;
+		    idx_tac->op = HIR_OP_INDEX;
+		    idx_tac->bytecode_pc = expr->bytecode_pc;
+		    snapshot_lower_stack(ctx, idx_tac);
+		    append_tac(program, idx_tac);
+
+		    store_tac->local_id = item->local_id;
+		    store_tac->src1 = elem_temp;
+		    store_tac->bytecode_pc = expr->bytecode_pc;
+		    append_tac(program, store_tac);
+		    index++;
+		} else {
+		    return append_unsupported_tac(ctx, program,
+						  "Optional/rest scatter is not yet supported",
+						  expr->source_lineno);
+		}
+	    }
+	    return rhs_temp;
+	}
+    case HIR_EXPR_LIST:
+	{
+	    HIRArg *item = expr->u.list.items;
+	    int list_temp;
+
+	    if (!item) {
+		HIRTacInstr *empty_tac = new_tac(ctx, HIR_TAC_CONST,
+						 expr->source_lineno);
+		list_temp = new_temp(ctx);
+		empty_tac->dst = list_temp;
+		empty_tac->literal.type = TYPE_LIST;
+		empty_tac->literal.v.list = 0;
+		empty_tac->bytecode_pc = expr->bytecode_pc;
+		append_tac(program, empty_tac);
+		push_lower_stack(ctx, list_temp);
+		return list_temp;
+	    }
+	    /* First element */
+	    int elem_temp = lower_expr(ctx, program, item->expr);
+	    append_tick(ctx, program, expr->source_lineno, item->bytecode_pc);
+	    list_temp = new_temp(ctx);
+	    HIRTacInstr *first_tac = new_tac(ctx, HIR_TAC_UNARY,
+					     expr->source_lineno);
+	    first_tac->dst = list_temp;
+	    first_tac->src1 = elem_temp;
+	    first_tac->op = (item->kind == ARG_NORMAL
+			     ? HIR_OP_MAKE_SINGLETON_LIST
+			     : HIR_OP_CHECK_LIST_FOR_SPLICE);
+	    first_tac->bytecode_pc = item->bytecode_pc;
+	    snapshot_lower_stack(ctx, first_tac);
+	    append_tac(program, first_tac);
+	    ctx->lower_stack[ctx->lower_stack_depth - 1] = list_temp;
+
+	    for (item = item->next; item; item = item->next) {
+		elem_temp = lower_expr(ctx, program, item->expr);
+		int next_list_temp = new_temp(ctx);
+		HIRTacInstr *tail_tac = new_tac(ctx, HIR_TAC_BINARY,
+						expr->source_lineno);
+		tail_tac->dst = next_list_temp;
+		tail_tac->src1 = list_temp;
+		tail_tac->src2 = elem_temp;
+		tail_tac->op = (item->kind == ARG_NORMAL
+				? HIR_OP_LIST_ADD_TAIL
+				: HIR_OP_LIST_APPEND);
+		tail_tac->bytecode_pc = item->bytecode_pc;
+		snapshot_lower_stack(ctx, tail_tac);
+		append_tac(program, tail_tac);
+		ctx->lower_stack_depth -= 2;
+		push_lower_stack(ctx, next_list_temp);
+		list_temp = next_list_temp;
+	    }
+	    return list_temp;
+	}
+    case HIR_EXPR_CALL:
+	{
+	    const char *func_name = name_func_by_num(expr->u.call.func);
+	    HIRArg *args = expr->u.call.args;
+
+	    if (func_name && (!strcmp(func_name, "abs")
+			      || !strcmp(func_name, "toint")
+			      || !strcmp(func_name, "tonum")
+			      || !strcmp(func_name, "typeof")
+			      || !strcmp(func_name, "length"))
+		&& args && !args->next && args->kind == ARG_NORMAL) {
+		int arg_temp = lower_expr(ctx, program, args->expr);
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
+		tac->dst = dst_temp;
+		tac->src1 = arg_temp;
+		if (!strcmp(func_name, "abs"))
+		    tac->op = HIR_OP_ABS;
+		else if (!strcmp(func_name, "typeof"))
+		    tac->op = HIR_OP_TYPEOF;
+		else if (!strcmp(func_name, "length"))
+		    tac->op = HIR_OP_LENGTH;
+		else
+		    tac->op = HIR_OP_TOINT;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		ctx->lower_stack[ctx->lower_stack_depth - 1] = dst_temp;
+		return dst_temp;
+	    }
+	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max"))
+		&& args && args->kind == ARG_NORMAL
+		&& args->next && args->next->kind == ARG_NORMAL
+		&& !args->next->next) {
+		int arg1_temp = lower_expr(ctx, program, args->expr);
+		int arg2_temp = lower_expr(ctx, program, args->next->expr);
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+		tac->dst = dst_temp;
+		tac->src1 = arg1_temp;
+		tac->src2 = arg2_temp;
+		tac->op = (!strcmp(func_name, "min")) ? HIR_OP_MIN : HIR_OP_MAX;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		ctx->lower_stack_depth -= 2;
+		push_lower_stack(ctx, dst_temp);
+		return dst_temp;
+	    }
+
+	    HIRExpr list_expr;
+	    int args_temp;
+	    HIRTacInstr *call_tac;
+
+	    memset(&list_expr, 0, sizeof(list_expr));
+	    list_expr.kind = HIR_EXPR_LIST;
+	    list_expr.source_lineno = expr->source_lineno;
+	    list_expr.bytecode_pc = expr->bytecode_pc;
+	    list_expr.u.list.items = expr->u.call.args;
+	    args_temp = lower_expr(ctx, program, &list_expr);
+
+	    call_tac = new_tac(ctx, HIR_TAC_CALL, expr->source_lineno);
+	    call_tac->dst = new_temp(ctx);
+	    call_tac->src1 = args_temp;
+	    call_tac->func = expr->u.call.func;
+	    call_tac->resume_key = expr->u.call.resume_key;
+	    call_tac->bytecode_pc = expr->bytecode_pc;
+	    snapshot_lower_stack(ctx, call_tac);
+	    append_tac(program, call_tac);
+	    ctx->lower_stack[ctx->lower_stack_depth - 1] = call_tac->dst;
+	    return call_tac->dst;
+	}
     case HIR_EXPR_COND:
 	return append_unsupported_tac(ctx, program,
 				      "Conditional expression is not yet lowerable to TAC",

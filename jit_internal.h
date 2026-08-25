@@ -18,7 +18,9 @@ struct JITDeoptMap {
     int ticks_charged;
     int num_locals;
     int *local_values;
+    var_type *local_types;
     int *stack_values;
+    var_type *stack_types;
 };
 
 struct JITCopy {
@@ -37,6 +39,7 @@ struct JITInstruction {
     int local_id;
     HIROp op;
     Num literal;
+    var_type literal_type;
     int deopt_map;
     JITCopy *copies;
     JITInstruction *next;

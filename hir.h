@@ -43,6 +43,7 @@ typedef enum {
     HIR_EXPR_LIST,
     HIR_EXPR_CATCH,
     HIR_EXPR_SCATTER,
+    HIR_EXPR_PROP_STORE,
     HIR_EXPR_UNSUPPORTED
 } HIRExprKind;
 
@@ -86,7 +87,19 @@ typedef enum {
     HIR_OP_BITAND,
     HIR_OP_SHL,
     HIR_OP_SHR,
-    HIR_OP_LSHR
+    HIR_OP_LSHR,
+    HIR_OP_INDEX,
+    HIR_OP_MAKE_SINGLETON_LIST,
+    HIR_OP_CHECK_LIST_FOR_SPLICE,
+    HIR_OP_LIST_ADD_TAIL,
+    HIR_OP_LIST_APPEND,
+    HIR_OP_ABS,
+    HIR_OP_MIN,
+    HIR_OP_MAX,
+    HIR_OP_TOINT,
+    HIR_OP_TYPEOF,
+    HIR_OP_LENGTH,
+    HIR_OP_GET_PROP
 } HIROp;
 
 typedef enum {
@@ -101,6 +114,8 @@ typedef enum {
     HIR_TAC_BRANCH_FALSE,
     HIR_TAC_RETURN,
     HIR_TAC_RETURN0,
+    HIR_TAC_CALL,
+    HIR_TAC_PUT_PROP,
     HIR_TAC_UNSUPPORTED,
     HIR_TAC_PHI,
     HIR_TAC_PARALLEL_COPY
@@ -156,6 +171,7 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 
 #ifdef HIR_TESTING
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
+extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);

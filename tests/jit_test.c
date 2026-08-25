@@ -95,6 +95,42 @@ binary_program(Num lhs, Num rhs, HIROp op)
     return program;
 }
 
+static JITProgram *
+unary_program(Num operand, HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c = instruction(HIR_TAC_CONST);
+    JITInstruction *unary = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c->value = 1;
+    c->literal = operand;
+
+    unary->value = 2;
+    unary->src1 = 1;
+    unary->op = op;
+
+    ret->src1 = 2;
+
+    c->next = unary;
+    unary->next = ret;
+
+    block->first = c;
+    block->last = ret;
+    return program;
+}
+
 static int
 arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
 {
@@ -243,7 +279,214 @@ two_local_program(HIROp op)
     block->last = ret;
     program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
 	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
-	|| op == HIR_OP_LSHR;
+	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX;
+    return program;
+}
+
+static JITProgram *
+index_program(Num index_val)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *index = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->may_error = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load->value = 1;
+    load->local_id = 0;
+    constant->value = 2;
+    constant->literal = index_val;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 11;
+    index->source_lineno = 7;
+    index->bytecode_pc = 11;
+    index->value = 3;
+    index->src1 = 1;
+    index->src2 = 2;
+    index->op = HIR_OP_INDEX;
+    ret->src1 = 3;
+    load->next = constant;
+    constant->next = tick;
+    tick->next = index;
+    index->next = ret;
+    block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+scatter_destructure_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *idx1 = instruction(HIR_TAC_BINARY);
+    JITInstruction *c2 = instruction(HIR_TAC_CONST);
+    JITInstruction *idx2 = instruction(HIR_TAC_BINARY);
+    JITInstruction *add = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->may_error = 1;
+    program->num_values = 7;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load->value = 1;
+    load->local_id = 0;
+
+    c1->value = 2;
+    c1->literal = 1;
+
+    idx1->value = 3;
+    idx1->src1 = 1;
+    idx1->src2 = 2;
+    idx1->op = HIR_OP_INDEX;
+
+    c2->value = 4;
+    c2->literal = 2;
+
+    idx2->value = 5;
+    idx2->src1 = 1;
+    idx2->src2 = 4;
+    idx2->op = HIR_OP_INDEX;
+
+    add->value = 6;
+    add->src1 = 3;
+    add->src2 = 5;
+    add->op = HIR_OP_ADD;
+
+    ret->src1 = 6;
+
+    load->next = c1;
+    c1->next = idx1;
+    idx1->next = c2;
+    c2->next = idx2;
+    idx2->next = add;
+    add->next = ret;
+
+    block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+call_boundary_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *call = instruction(HIR_TAC_CALL);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 25;
+    map->stack_depth = 1;
+    map->ticks_charged = 0;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int) * 1);
+    map->local_values[0] = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_values[0] = 1;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c1->value = 1;
+    c1->literal = 99;
+
+    call->value = 2;
+    call->src1 = 1;
+    call->deopt_map = 1;
+    call->bytecode_pc = 25;
+
+    c1->next = call;
+
+    block->first = c1;
+    block->last = call;
+    return program;
+}
+
+static JITProgram *
+get_prop_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *c2 = instruction(HIR_TAC_CONST);
+    JITInstruction *get = instruction(HIR_TAC_BINARY);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 30;
+    map->stack_depth = 2;
+    map->ticks_charged = 0;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int) * 1);
+    map->local_values[0] = 1;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c1->value = 1;
+    c1->literal = 0;
+
+    c2->value = 2;
+    c2->literal = 123;
+
+    get->value = 3;
+    get->src1 = 1;
+    get->src2 = 2;
+    get->op = HIR_OP_GET_PROP;
+    get->deopt_map = 1;
+    get->bytecode_pc = 30;
+
+    c1->next = c2;
+    c2->next = get;
+
+    block->first = c1;
+    block->last = get;
     return program;
 }
 
@@ -406,17 +649,38 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		values[instr->value] = instr->literal;
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
-		if (env[instr->local_id].type != TYPE_INT) {
+		if (env[instr->local_id].type == TYPE_INT)
+		    values[instr->value] = env[instr->local_id].v.num;
+		else if (env[instr->local_id].type == TYPE_LIST)
+		    values[instr->value] = (Num) env[instr->local_id].v.list;
+		else {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_FALLBACK;
 		}
-		values[instr->value] = env[instr->local_id].v.num;
 		break;
 	    case HIR_TAC_BINARY:
 		{
 		    IntegerArithmeticOperation operation;
 
-		    if (arithmetic_operation(instr->op, &operation)) {
+		    if (instr->op == HIR_OP_INDEX) {
+			Var *list_ptr = (Var *) values[instr->src1];
+			Num index = values[instr->src2];
+
+			if (!list_ptr) {
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_FALLBACK;
+			}
+			if (index < 1 || index > list_ptr[0].v.num) {
+			    *error = E_RANGE;
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_ERROR;
+			}
+			if (list_ptr[index].type != TYPE_INT) {
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_FALLBACK;
+			}
+			values[instr->value] = list_ptr[index].v.num;
+		    } else if (arithmetic_operation(instr->op, &operation)) {
 			IntegerArithmeticResult arithmetic = integer_arithmetic(
 			    operation, values[instr->src1], values[instr->src2]);
 
@@ -545,6 +809,10 @@ main(void)
     JITProgram *power_error = binary_program(0, -1, HIR_OP_EXP);
     JITProgram *local_arith = local_arithmetic_program(5, HIR_OP_ADD);
     JITProgram *two_locals = two_local_program(HIR_OP_MUL);
+    JITProgram *list_index1 = index_program(1);
+    JITProgram *list_index2 = index_program(2);
+    JITProgram *list_index_low = index_program(0);
+    JITProgram *list_index_high = index_program(3);
     JITProgram *shift_left = binary_program(NUM_MIN, 1, HIR_OP_SHL);
     JITProgram *shift_right = binary_program(NUM_MIN, 63, HIR_OP_SHR);
     JITProgram *logical_shift = binary_program(NUM_MIN, 63, HIR_OP_LSHR);
@@ -554,9 +822,11 @@ main(void)
     JITProgram *bit_and = binary_program(0x55, 0x0f, HIR_OP_BITAND);
     JITProgram *bit_xor = binary_program(0x55, 0x0f, HIR_OP_BITXOR);
     JITProgram *bit_or = binary_program(0x55, 0x0f, HIR_OP_BITOR);
+    JITProgram *scatter = scatter_destructure_program();
     Var env[1];
     Var deep_env[2];
-    Var deopt_stack[1];
+    Var deopt_stack[4];
+    Var list_elems[3];
     Var result;
     int ticks = 10;
     int timed_out = 0;
@@ -766,10 +1036,164 @@ main(void)
     check_differential(deep_guard, deep_env, 10, 0,
 		       "deep guard success differed from reference execution");
 
+    /* List indexing tests */
+    list_elems[0].type = TYPE_INT;
+    list_elems[0].v.num = 2;
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 42;
+    list_elems[2].type = TYPE_INT;
+    list_elems[2].v.num = 99;
+    env[0].type = TYPE_LIST;
+    env[0].v.list = list_elems;
+
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "list index 1 execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "list index 1 returned the wrong value");
+    check_differential(list_index1, env, 10, 0,
+		       "list index 1 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index2, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "list index 2 execution failed");
+    check(result.type == TYPE_INT && result.v.num == 99,
+	  "list index 2 returned the wrong value");
+    check_differential(list_index2, env, 10, 0,
+		       "list index 2 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index_low, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_ERROR, "list index 0 did not error");
+    check(error == E_RANGE, "list index 0 gave wrong error code");
+    check_differential(list_index_low, env, 10, 0,
+		       "list index 0 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index_high, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_ERROR, "list index 3 did not error");
+    check(error == E_RANGE, "list index 3 gave wrong error code");
+    check_differential(list_index_high, env, 10, 0,
+		       "list index 3 differed from reference execution");
+
+    /* Non-integer element in list falls back to interpreter */
+    list_elems[1].type = TYPE_STR;
+    list_elems[1].v.str = "hello";
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "list non-int element did not fallback");
+    check_differential(list_index1, env, 10, 0,
+		       "list non-int element fallback differed from reference");
+
+    /* Scatter destructuring execution test */
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 10;
+    list_elems[2].type = TYPE_INT;
+    list_elems[2].v.num = 32;
+    ticks = 10;
+    check(jit_program_execute(scatter, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "scatter destructure execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "scatter destructure returned the wrong value");
+    check_differential(scatter, env, 10, 0,
+		       "scatter destructure differed from reference execution");
+
+    /* Call boundary deopt test */
+    {
+	JITProgram *call_prog = call_boundary_program();
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 0;
+	ticks = 10;
+	check(jit_program_execute(call_prog, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK, "call boundary did not return fallback");
+	check(deopt.bytecode_pc == 25, "call boundary wrong bytecode_pc");
+	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
+	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
+	jit_program_free(call_prog);
+    }
+
+    /* Property read deopt test */
+    {
+	JITProgram *get_prog = get_prop_program();
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 0;
+	deopt_stack[1].type = TYPE_INT;
+	deopt_stack[1].v.num = 0;
+	ticks = 10;
+	check(jit_program_execute(get_prog, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK, "get_prop did not return fallback");
+	check(deopt.bytecode_pc == 30, "get_prop wrong bytecode_pc");
+	check(deopt.stack_depth == 2, "get_prop wrong stack depth");
+	check(deopt_stack[0].v.num == 0, "get_prop wrong obj stack value");
+	check(deopt_stack[1].v.num == 123, "get_prop wrong prop stack value");
+	jit_program_free(get_prog);
+    }
+
+    /* Pure inlined built-ins execution tests */
+    {
+	JITProgram *abs_p = unary_program(-42, HIR_OP_ABS);
+	ticks = 10;
+	check(jit_program_execute(abs_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "abs execution failed");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "abs returned wrong value");
+	jit_program_free(abs_p);
+
+	JITProgram *min_p = binary_program(10, 20, HIR_OP_MIN);
+	ticks = 10;
+	check(jit_program_execute(min_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "min execution failed");
+	check(result.type == TYPE_INT && result.v.num == 10,
+	      "min returned wrong value");
+	jit_program_free(min_p);
+
+	JITProgram *max_p = binary_program(10, 20, HIR_OP_MAX);
+	ticks = 10;
+	check(jit_program_execute(max_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "max execution failed");
+	check(result.type == TYPE_INT && result.v.num == 20,
+	      "max returned wrong value");
+	jit_program_free(max_p);
+
+	JITProgram *toint_p = unary_program(123, HIR_OP_TOINT);
+	ticks = 10;
+	check(jit_program_execute(toint_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "toint execution failed");
+	check(result.type == TYPE_INT && result.v.num == 123,
+	      "toint returned wrong value");
+	jit_program_free(toint_p);
+
+	JITProgram *typeof_p = unary_program(123, HIR_OP_TYPEOF);
+	ticks = 10;
+	check(jit_program_execute(typeof_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "typeof execution failed");
+	check(result.type == TYPE_INT && result.v.num == TYPE_INT,
+	      "typeof returned wrong value");
+	jit_program_free(typeof_p);
+    }
+
     jit_program_free(program);
     jit_program_free(guard);
+    jit_program_free(scatter);
     jit_program_free(local_arith);
     jit_program_free(two_locals);
+    jit_program_free(list_index1);
+    jit_program_free(list_index2);
+    jit_program_free(list_index_low);
+    jit_program_free(list_index_high);
     jit_program_free(deep_guard);
     jit_program_free(branch);
     jit_program_free(divide);
