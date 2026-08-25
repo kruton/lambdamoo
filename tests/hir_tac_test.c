@@ -452,15 +452,20 @@ test_unsupported_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr prop, obj, name;
+    Expr verb_call, obj, name;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
     obj = id_expr(0, 30);
     name = id_expr(1, 30);
-    prop = binary_expr(EXPR_PROP, &obj, &name);
-    ret = return_stmt(&prop);
+    memset(&verb_call, 0, sizeof(verb_call));
+    verb_call.kind = EXPR_VERB;
+    verb_call.lineno = 30;
+    verb_call.e.verb.obj = &obj;
+    verb_call.e.verb.verb = &name;
+    verb_call.e.verb.args = 0;
+    ret = return_stmt(&verb_call);
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1466,6 +1471,53 @@ test_pure_builtin_inlining_tac_ssa(void)
 }
 
 static void
+test_property_read_and_write_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr obj, name, prop_read, val, prop_write;
+    Stmt asgn, ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    obj = id_expr(0, 10);
+    name = id_expr(1, 10);
+    prop_read = binary_expr(EXPR_PROP, &obj, &name);
+
+    val = int_expr(42, 10);
+    prop_write = binary_expr(EXPR_ASGN, &prop_read, &val);
+
+    asgn = expr_stmt(&prop_write);
+    ret = return_stmt(&prop_read);
+    asgn.next = &ret;
+
+    obj.bytecode_pc = 1;
+    name.bytecode_pc = 2;
+    prop_read.bytecode_pc = 3;
+    val.bytecode_pc = 4;
+    prop_write.bytecode_pc = 5;
+    asgn.bytecode_pc = 6;
+    ret.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &asgn, &ctx, &cfg, &dom, &ssa);
+
+    check_int("prop tac not null", tac != 0, 1);
+    check_int("prop get_prop count",
+	      hir_tac_count_binary_op(tac, HIR_OP_GET_PROP), 1);
+    check_int("prop put_prop count",
+	      hir_tac_count_kind(tac, HIR_TAC_PUT_PROP), 1);
+    check_int("prop verify errors", hir_context_error_count(ctx), 0);
+
+    check_int("prop destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1735,6 +1787,7 @@ main(void)
     test_list_construction_and_splicing_tac_ssa();
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
+    test_property_read_and_write_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

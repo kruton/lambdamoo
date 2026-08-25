@@ -61,3 +61,9 @@ name_func_by_num(unsigned id)
     default: return "unknown_func";
     }
 }
+
+const char *
+str_ref(const char *s)
+{
+    return s;
+}

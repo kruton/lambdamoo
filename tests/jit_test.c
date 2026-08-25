@@ -436,6 +436,61 @@ call_boundary_program(void)
 }
 
 static JITProgram *
+get_prop_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *c2 = instruction(HIR_TAC_CONST);
+    JITInstruction *get = instruction(HIR_TAC_BINARY);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 30;
+    map->stack_depth = 2;
+    map->ticks_charged = 0;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int) * 1);
+    map->local_values[0] = 1;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c1->value = 1;
+    c1->literal = 0;
+
+    c2->value = 2;
+    c2->literal = 123;
+
+    get->value = 3;
+    get->src1 = 1;
+    get->src2 = 2;
+    get->op = HIR_OP_GET_PROP;
+    get->deopt_map = 1;
+    get->bytecode_pc = 30;
+
+    c1->next = c2;
+    c2->next = get;
+
+    block->first = c1;
+    block->last = get;
+    return program;
+}
+
+static JITProgram *
 deep_guard_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -770,7 +825,7 @@ main(void)
     JITProgram *scatter = scatter_destructure_program();
     Var env[1];
     Var deep_env[2];
-    Var deopt_stack[1];
+    Var deopt_stack[4];
     Var list_elems[3];
     Var result;
     int ticks = 10;
@@ -1062,6 +1117,24 @@ main(void)
 	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
 	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
 	jit_program_free(call_prog);
+    }
+
+    /* Property read deopt test */
+    {
+	JITProgram *get_prog = get_prop_program();
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 0;
+	deopt_stack[1].type = TYPE_INT;
+	deopt_stack[1].v.num = 0;
+	ticks = 10;
+	check(jit_program_execute(get_prog, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK, "get_prop did not return fallback");
+	check(deopt.bytecode_pc == 30, "get_prop wrong bytecode_pc");
+	check(deopt.stack_depth == 2, "get_prop wrong stack depth");
+	check(deopt_stack[0].v.num == 0, "get_prop wrong obj stack value");
+	check(deopt_stack[1].v.num == 123, "get_prop wrong prop stack value");
+	jit_program_free(get_prog);
     }
 
     /* Pure inlined built-ins execution tests */
