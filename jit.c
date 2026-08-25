@@ -371,7 +371,54 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  status, common_return);
 			break;
 		    }
-		    if (instr->op == HIR_OP_NEGATE)
+		    if (instr->op == HIR_OP_TOINT) {
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context,
+								 values[instr->value]),
+						  MIR_new_reg_op(build->context,
+								 values[instr->src1])));
+		    } else if (instr->op == HIR_OP_TYPEOF) {
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context,
+								 values[instr->value]),
+						  MIR_new_int_op(build->context, TYPE_INT)));
+		    } else if (instr->op == HIR_OP_ABS) {
+			MIR_label_t is_pos = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			append(build, MIR_new_insn(build->context, MIR_BGE,
+						  MIR_new_label_op(build->context, is_pos),
+						  MIR_new_reg_op(build->context, values[instr->src1]),
+						  MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_NEG,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src1])));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+						  MIR_new_label_op(build->context, done)));
+			append(build, is_pos);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src1])));
+			append(build, done);
+		    } else if (instr->op == HIR_OP_LENGTH) {
+			MIR_reg_t list_ptr = values[instr->src1];
+			MIR_label_t deopt = MIR_new_label(build->context);
+			MIR_label_t loaded = MIR_new_label(build->context);
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+						  MIR_new_label_op(build->context, deopt),
+						  MIR_new_reg_op(build->context, list_ptr),
+						  MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_mem_op(build->context,
+								 sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+								 offsetof(Var, v.num), list_ptr, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+						  MIR_new_label_op(build->context, loaded)));
+			append(build, deopt);
+			append_deopt_exit(build, program, instr->deopt_map, values,
+					  deopt_map_out, deopt_values, status, common_return);
+			append(build, loaded);
+		    } else if (instr->op == HIR_OP_NEGATE)
 			append(build, MIR_new_insn(build->context, MIR_NEG,
 						      MIR_new_reg_op(build->context,
 								     values[instr->value]),
@@ -398,6 +445,44 @@ build_mir(JITProgram *program, MIRBuild *build)
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
 					  status, common_return);
+			break;
+		    }
+		    if (instr->op == HIR_OP_MIN) {
+			MIR_label_t is_lhs = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+						  MIR_new_label_op(build->context, is_lhs),
+						  MIR_new_reg_op(build->context, values[instr->src1]),
+						  MIR_new_reg_op(build->context, values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+						  MIR_new_label_op(build->context, done)));
+			append(build, is_lhs);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src1])));
+			append(build, done);
+			break;
+		    }
+		    if (instr->op == HIR_OP_MAX) {
+			MIR_label_t is_lhs = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			append(build, MIR_new_insn(build->context, MIR_BGT,
+						  MIR_new_label_op(build->context, is_lhs),
+						  MIR_new_reg_op(build->context, values[instr->src1]),
+						  MIR_new_reg_op(build->context, values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+						  MIR_new_label_op(build->context, done)));
+			append(build, is_lhs);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context, values[instr->value]),
+						  MIR_new_reg_op(build->context, values[instr->src1])));
+			append(build, done);
 			break;
 		    }
 		    {

@@ -10,6 +10,7 @@
 #include "my-stdio.h"
 
 #include "arena.h"
+#include "functions.h"
 #include "integer_arithmetic.h"
 #include "opcode.h"
 #include "program.h"
@@ -2179,6 +2180,15 @@ analyze_unary(HIROp op, HIRValueFact operand)
 	return constant_fact(!operand.constant);
     case HIR_OP_COMPLEMENT:
 	return arithmetic_fact(INTEGER_COMPLEMENT, operand.constant, 0);
+    case HIR_OP_ABS:
+	return operand.constant < 0
+	    ? arithmetic_fact(INTEGER_NEGATE, operand.constant, 0) : operand;
+    case HIR_OP_TOINT:
+	return operand;
+    case HIR_OP_TYPEOF:
+	return constant_fact(TYPE_INT);
+    case HIR_OP_LENGTH:
+	return integer_fact();
     case HIR_OP_MAKE_SINGLETON_LIST:
     case HIR_OP_CHECK_LIST_FOR_SPLICE:
 	return unknown_fact();
@@ -2222,6 +2232,12 @@ analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
     case HIR_OP_LSHR:
 	return arithmetic_fact(INTEGER_LOGICAL_SHIFT_RIGHT,
 			       lhs.constant, rhs.constant);
+    case HIR_OP_MIN:
+	return constant_fact(lhs.constant < rhs.constant
+			     ? lhs.constant : rhs.constant);
+    case HIR_OP_MAX:
+	return constant_fact(lhs.constant > rhs.constant
+			     ? lhs.constant : rhs.constant);
     case HIR_OP_EQ:
 	return constant_fact(lhs.constant == rhs.constant);
     case HIR_OP_NE:
@@ -3110,6 +3126,12 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_CHECK_LIST_FOR_SPLICE:
     case HIR_OP_LIST_ADD_TAIL:
     case HIR_OP_LIST_APPEND:
+    case HIR_OP_ABS:
+    case HIR_OP_MIN:
+    case HIR_OP_MAX:
+    case HIR_OP_TOINT:
+    case HIR_OP_TYPEOF:
+    case HIR_OP_LENGTH:
     case HIR_OP_EQ:
     case HIR_OP_NE:
     case HIR_OP_LT:
@@ -3187,6 +3209,11 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_MAKE_SINGLETON_LIST;
 	if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
 	    return op == OP_CHECK_LIST_FOR_SPLICE;
+	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
+	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_LENGTH)
+	    return instr->bytecode_pc + 1 < bc->size
+		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					   EOP_COMPLEMENT);
     }
@@ -3205,6 +3232,11 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 					       EOP_SCATTER);
 	case HIR_OP_LIST_ADD_TAIL: return op == OP_LIST_ADD_TAIL;
 	case HIR_OP_LIST_APPEND: return op == OP_LIST_APPEND;
+	case HIR_OP_MIN:
+	case HIR_OP_MAX:
+	    return instr->bytecode_pc + 1 < bc->size
+		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	case HIR_OP_EQ: return op == OP_EQ;
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT: return op == OP_LT;
@@ -3828,6 +3860,18 @@ op_name(HIROp op)
 	return "LIST_ADD_TAIL";
     case HIR_OP_LIST_APPEND:
 	return "LIST_APPEND";
+    case HIR_OP_ABS:
+	return "ABS";
+    case HIR_OP_MIN:
+	return "MIN";
+    case HIR_OP_MAX:
+	return "MAX";
+    case HIR_OP_TOINT:
+	return "TOINT";
+    case HIR_OP_TYPEOF:
+	return "TYPEOF";
+    case HIR_OP_LENGTH:
+	return "LENGTH";
     }
 
     return "?";
@@ -5303,6 +5347,56 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	}
     case HIR_EXPR_CALL:
 	{
+	    const char *func_name = name_func_by_num(expr->u.call.func);
+	    HIRArg *args = expr->u.call.args;
+
+	    if (func_name && (!strcmp(func_name, "abs")
+			      || !strcmp(func_name, "toint")
+			      || !strcmp(func_name, "tonum")
+			      || !strcmp(func_name, "typeof")
+			      || !strcmp(func_name, "length"))
+		&& args && !args->next && args->kind == ARG_NORMAL) {
+		int arg_temp = lower_expr(ctx, program, args->expr);
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
+		tac->dst = dst_temp;
+		tac->src1 = arg_temp;
+		if (!strcmp(func_name, "abs"))
+		    tac->op = HIR_OP_ABS;
+		else if (!strcmp(func_name, "typeof"))
+		    tac->op = HIR_OP_TYPEOF;
+		else if (!strcmp(func_name, "length"))
+		    tac->op = HIR_OP_LENGTH;
+		else
+		    tac->op = HIR_OP_TOINT;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		ctx->lower_stack[ctx->lower_stack_depth - 1] = dst_temp;
+		return dst_temp;
+	    }
+	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max"))
+		&& args && args->kind == ARG_NORMAL
+		&& args->next && args->next->kind == ARG_NORMAL
+		&& !args->next->next) {
+		int arg1_temp = lower_expr(ctx, program, args->expr);
+		int arg2_temp = lower_expr(ctx, program, args->next->expr);
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+		tac->dst = dst_temp;
+		tac->src1 = arg1_temp;
+		tac->src2 = arg2_temp;
+		tac->op = (!strcmp(func_name, "min")) ? HIR_OP_MIN : HIR_OP_MAX;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		ctx->lower_stack_depth -= 2;
+		push_lower_stack(ctx, dst_temp);
+		return dst_temp;
+	    }
+
 	    HIRExpr list_expr;
 	    int args_temp;
 	    HIRTacInstr *call_tac;
