@@ -421,14 +421,13 @@ Completed in the first native-code milestone:
 * canonical entry deoptimization maps; and
 * deep deoptimization maps that reconstruct updated integer locals, nested
   operand stacks, bytecode and error PCs, and exact tick accounting from SSA
-  values on post-entry guard failure; and
+  values on post-entry guard failure;
 * cold native abort and error exits that restore exact bytecode/error PCs and
-  carry source lines without adding location stores to tick hot paths.
+  carry source lines without adding location stores to tick hot paths; and
+* guarded integer locals whose values enter through the runtime environment.
 
 The next reviewable compiler milestones are:
 
-1. Allow guarded integer locals whose values enter through the runtime
-   environment.
-2. Lower simple argument-list indexing, then list destructuring and splicing.
-3. Add deopt-before-call boundaries for built-ins such as `toint()`, before
+1. Lower simple argument-list indexing, then list destructuring and splicing.
+2. Add deopt-before-call boundaries for built-ins such as `toint()`, before
    considering selected continuation-free built-ins for direct lowering.
