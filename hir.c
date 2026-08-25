@@ -7,10 +7,12 @@
 #include "jit_internal.h"
 #endif
 
+#include "my-stdio.h"
+
 #include "arena.h"
 #include "integer_arithmetic.h"
+#include "opcode.h"
 #include "program.h"
-#include "my-stdio.h"
 #include "storage.h"
 
 #include <stddef.h>
@@ -54,6 +56,7 @@ struct HIRExpr {
     HIRExprKind kind;
     HIRTypeTag type;
     unsigned source_lineno;
+    unsigned bytecode_pc;
     union {
 	Var literal;
 	int local_id;
@@ -112,6 +115,7 @@ struct HIRExpr {
 struct HIRCondArm {
     HIRExpr *condition;
     HIRStmt *body;
+    unsigned bytecode_pc;
     HIRCondArm *next;
 };
 
@@ -125,6 +129,7 @@ struct HIRExceptArm {
 struct HIRStmt {
     HIRStmtKind kind;
     unsigned source_lineno;
+    unsigned bytecode_pc;
     HIRStmt *next;
     union {
 	HIRStmt *sequence;
@@ -174,6 +179,7 @@ struct HIRProgram {
 struct HIRTacInstr {
     HIRTacKind kind;
     unsigned source_lineno;
+    unsigned bytecode_pc;
     int dst;
     int src1;
     int src2;
@@ -249,6 +255,7 @@ struct HIRSSADestructionMove {
 struct HIRSSAInstr {
     HIRTacKind kind;
     unsigned source_lineno;
+    unsigned bytecode_pc;
     int value;
     int src1;
     int src2;
@@ -807,6 +814,7 @@ new_cfg_split_jump(HIRContext *ctx, HIRBasicBlock *from, HIRBasicBlock *to)
 
     jump->kind = HIR_TAC_JUMP;
     jump->source_lineno = from && from->last ? from->last->source_lineno : 0;
+    jump->bytecode_pc = NO_BYTECODE_PC;
     if (jump->source_lineno == 0 && to)
 	jump->source_lineno = to->first_lineno;
     jump->dst = 0;
@@ -1232,6 +1240,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
 
     instr->kind = tac->kind;
     instr->source_lineno = tac->source_lineno;
+    instr->bytecode_pc = tac->bytecode_pc;
     instr->value = tac->dst;
     instr->src1 = tac->src1;
     instr->src2 = tac->src2;
@@ -1307,6 +1316,7 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	HIRSSAInstr *load = hir_alloc(ctx, sizeof(HIRSSAInstr));
 	load->kind = HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
+	load->bytecode_pc = NO_BYTECODE_PC;
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
@@ -1563,6 +1573,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			HIRSSAInstr *phi = hir_alloc(ctx, sizeof(HIRSSAInstr));
 			phi->kind = HIR_TAC_PHI;
 			phi->source_lineno = y->first_lineno;
+			phi->bytecode_pc = NO_BYTECODE_PC;
 			phi->value = 0; /* filled in renaming */
 			phi->src1 = 0;
 			phi->src2 = 0;
@@ -2721,6 +2732,7 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     copy = hir_alloc(ctx, sizeof(HIRSSAInstr));
     copy->kind = HIR_TAC_PARALLEL_COPY;
     copy->source_lineno = source_lineno;
+    copy->bytecode_pc = NO_BYTECODE_PC;
     copy->value = 0;
     copy->src1 = 0;
     copy->src2 = 0;
@@ -3060,14 +3072,131 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
     return 1;
 }
 
+static int
+jit_extended_anchor_matches(Bytecodes *bc, unsigned pc, Extended_Opcode op)
+{
+    return pc + 1 < bc->size && bc->vector[pc] == OP_EXTENDED
+	&& bc->vector[pc + 1] == op;
+}
+
+static int
+jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
+{
+    Byte op = bc->vector[instr->bytecode_pc];
+
+    if (instr->kind == HIR_TAC_UNARY) {
+	if (instr->op == HIR_OP_NEGATE)
+	    return op == OP_UNARY_MINUS;
+	if (instr->op == HIR_OP_NOT)
+	    return op == OP_NOT;
+	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					   EOP_COMPLEMENT);
+    }
+    if (instr->kind == HIR_TAC_BINARY) {
+	switch (instr->op) {
+	case HIR_OP_ADD: return op == OP_ADD;
+	case HIR_OP_SUB: return op == OP_MINUS;
+	case HIR_OP_MUL: return op == OP_MULT;
+	case HIR_OP_DIV: return op == OP_DIV;
+	case HIR_OP_MOD: return op == OP_MOD;
+	case HIR_OP_EXP:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
+	case HIR_OP_EQ: return op == OP_EQ;
+	case HIR_OP_NE: return op == OP_NE;
+	case HIR_OP_LT: return op == OP_LT;
+	case HIR_OP_LE: return op == OP_LE;
+	case HIR_OP_GT: return op == OP_GT;
+	case HIR_OP_GE: return op == OP_GE;
+	case HIR_OP_BITOR:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITOR);
+	case HIR_OP_BITXOR:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITXOR);
+	case HIR_OP_BITAND:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITAND);
+	case HIR_OP_SHL:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_SHL);
+	case HIR_OP_SHR:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_SHR);
+	case HIR_OP_LSHR:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_LSHR);
+	default: return 0;
+	}
+    }
+    return 1;
+}
+
+static int
+jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
+{
+    HIRSSABlock *block;
+    Bytecodes *bc;
+
+    if (!bytecode_program || !bytecode_program->main_vector.vector)
+	return 0;
+    bc = &bytecode_program->main_vector;
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    switch (instr->kind) {
+	    case HIR_TAC_TICK:
+	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_UNARY:
+	    case HIR_TAC_BINARY:
+	    case HIR_TAC_BRANCH_FALSE:
+	    case HIR_TAC_RETURN:
+	    case HIR_TAC_RETURN0:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if ((instr->kind == HIR_TAC_UNARY
+		     || instr->kind == HIR_TAC_BINARY)
+		    && !jit_operation_anchor_matches(bc, instr))
+		    return 0;
+		if (instr->kind == HIR_TAC_RETURN
+		    && bc->vector[instr->bytecode_pc] != OP_RETURN)
+		    return 0;
+		if (instr->kind == HIR_TAC_RETURN0
+		    && bc->vector[instr->bytecode_pc] != OP_RETURN0)
+		    return 0;
+		if (instr->kind == HIR_TAC_BRANCH_FALSE
+		    && bc->vector[instr->bytecode_pc] != OP_AND
+		    && bc->vector[instr->bytecode_pc] != OP_OR
+		    && bc->vector[instr->bytecode_pc] != OP_IF
+		    && bc->vector[instr->bytecode_pc] != OP_EIF
+		    && bc->vector[instr->bytecode_pc] != OP_WHILE
+		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
+						    EOP_WHILE_ID))
+		    return 0;
+		break;
+	    case HIR_TAC_LABEL:
+	    case HIR_TAC_JUMP:
+	    case HIR_TAC_PARALLEL_COPY:
+		break;
+	    case HIR_TAC_STORE_LOCAL:
+	    case HIR_TAC_UNSUPPORTED:
+	    case HIR_TAC_PHI:
+		return 0;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 1;
+}
+
 JITProgram *
-hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa)
+hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
+		       Program *bytecode_program)
 {
     JITProgram *program;
     HIRSSABlock *ssa_block;
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ssa))
 	return jit_program_unsupported("unsupported-program");
+    if (!jit_ssa_anchors_are_valid(ssa, bytecode_program))
+	return jit_program_unsupported("invalid-bytecode-anchor");
 
     program = mymalloc(sizeof(JITProgram), M_PROGRAM);
     memset(program, 0, sizeof(JITProgram));
@@ -3105,6 +3234,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa)
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
 	    instr->source_lineno = ssa_instr->source_lineno;
+	    instr->bytecode_pc = ssa_instr->bytecode_pc;
+	    if (ssa_instr->bytecode_pc != NO_BYTECODE_PC)
+		program->num_resume_anchors++;
 	    instr->value = ssa_instr->value;
 	    instr->src1 = ssa_instr->src1;
 	    instr->src2 = ssa_instr->src2;
@@ -3595,6 +3727,37 @@ hir_tac_count_lineno(HIRTacProgram *program, unsigned lineno)
 }
 
 int
+hir_tac_count_bytecode_pc(HIRTacProgram *program, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr;
+    int count = 0;
+
+    for (instr = program ? program->first : 0; instr; instr = instr->next)
+	if (instr->bytecode_pc == bytecode_pc)
+	    count++;
+    return count;
+}
+
+int
+hir_ssa_count_bytecode_pc(HIRSSAProgram *program, unsigned bytecode_pc)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->bytecode_pc == bytecode_pc)
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return count;
+}
+
+int
 hir_cfg_block_count(HIRCFG *cfg)
 {
     return cfg ? cfg->num_blocks : 0;
@@ -4001,6 +4164,7 @@ new_expr(HIRContext *ctx, HIRExprKind kind)
     expr->kind = kind;
     expr->type = HIR_TYPE_ANY;
     expr->source_lineno = 0;
+    expr->bytecode_pc = NO_BYTECODE_PC;
     return expr;
 }
 
@@ -4011,6 +4175,7 @@ new_stmt(HIRContext *ctx, HIRStmtKind kind)
 
     stmt->kind = kind;
     stmt->source_lineno = 0;
+    stmt->bytecode_pc = NO_BYTECODE_PC;
     stmt->next = 0;
     return stmt;
 }
@@ -4132,6 +4297,7 @@ lift_binary_expr(HIRContext *ctx, Expr *ast)
 
     expr = new_expr(ctx, HIR_EXPR_BINARY);
     expr->source_lineno = ast->lineno;
+    expr->bytecode_pc = ast->bytecode_pc;
     expr->u.binary.op = op;
     expr->u.binary.lhs = lift_expr(ctx, ast->e.bin.lhs);
     expr->u.binary.rhs = lift_expr(ctx, ast->e.bin.rhs);
@@ -4146,6 +4312,7 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	HIRExpr *expr = new_expr(ctx, HIR_EXPR_LOCAL_STORE);
 
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.local_store.local_id = ast->e.bin.lhs->e.id;
 	expr->u.local_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
@@ -4167,12 +4334,14 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_VAR:
 	expr = new_expr(ctx, HIR_EXPR_LITERAL);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->type = type_tag_for_var_type(ast->e.var.type);
 	expr->u.literal = ast->e.var;
 	return expr;
     case EXPR_ID:
 	expr = new_expr(ctx, HIR_EXPR_LOCAL_LOAD);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.local_id = ast->e.id;
 	return expr;
     case EXPR_ASGN:
@@ -4182,6 +4351,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_COMPLEMENT:
 	expr = new_expr(ctx, HIR_EXPR_UNARY);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.unary.op = (ast->kind == EXPR_NEGATE
 			    ? HIR_OP_NEGATE
 			    : (ast->kind == EXPR_NOT
@@ -4294,6 +4464,7 @@ lift_cond_arms(HIRContext *ctx, Cond_Arm *arms)
 
 	arm->condition = lift_expr(ctx, arms->condition);
 	arm->body = lift_stmt_list(ctx, arms->stmt);
+	arm->bytecode_pc = arms->bytecode_pc;
 	arm->next = 0;
 
 	if (last)
@@ -4355,6 +4526,7 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_RETURN:
 	stmt = new_stmt(ctx, HIR_STMT_RETURN);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.expr = lift_expr(ctx, ast->s.expr);
 	return stmt;
     case STMT_COND:
@@ -4366,6 +4538,7 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_WHILE:
 	stmt = new_stmt(ctx, HIR_STMT_WHILE);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.loop.loop_id = ast->s.loop.id;
 	stmt->u.loop.condition = lift_expr(ctx, ast->s.loop.condition);
 	stmt->u.loop.body = lift_stmt_list(ctx, ast->s.loop.body);
@@ -4475,6 +4648,7 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
 
     instr->kind = kind;
     instr->source_lineno = source_lineno;
+    instr->bytecode_pc = NO_BYTECODE_PC;
     instr->dst = 0;
     instr->src1 = 0;
     instr->src2 = 0;
@@ -4496,9 +4670,13 @@ append_tac(HIRTacProgram *program, HIRTacInstr *instr)
 }
 
 static void
-append_tick(HIRContext *ctx, HIRTacProgram *program, unsigned source_lineno)
+append_tick(HIRContext *ctx, HIRTacProgram *program, unsigned source_lineno,
+	    unsigned bytecode_pc)
 {
-    append_tac(program, new_tac(ctx, HIR_TAC_TICK, source_lineno));
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_TICK, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    append_tac(program, instr);
 }
 
 static void
@@ -4523,11 +4701,12 @@ append_jump(HIRContext *ctx, HIRTacProgram *program, int label,
 
 static void
 append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
-		    unsigned source_lineno)
+		    unsigned source_lineno, unsigned bytecode_pc)
 {
     HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE, source_lineno);
 
-    append_tick(ctx, program, source_lineno);
+    append_tick(ctx, program, source_lineno, bytecode_pc);
+    instr->bytecode_pc = bytecode_pc;
     instr->src1 = src;
     instr->label = label;
     append_tac(program, instr);
@@ -4570,7 +4749,7 @@ lower_short_circuit(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	int rhs;
 
 	append_branch_false(ctx, program, lhs, done_label,
-			    expr->source_lineno);
+			    expr->source_lineno, expr->bytecode_pc);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
 	append_internal_store(ctx, program, result_local, rhs,
 			      expr->source_lineno);
@@ -4579,7 +4758,7 @@ lower_short_circuit(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	int rhs;
 
 	append_branch_false(ctx, program, lhs, rhs_label,
-			    expr->source_lineno);
+			    expr->source_lineno, expr->bytecode_pc);
 	append_jump(ctx, program, done_label, expr->source_lineno);
 	append_label(ctx, program, rhs_label, expr->source_lineno);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
@@ -4616,20 +4795,23 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     switch (expr->kind) {
     case HIR_EXPR_LITERAL:
 	instr = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
 	instr->dst = new_temp(ctx);
 	instr->literal = expr->u.literal;
 	append_tac(program, instr);
 	return instr->dst;
     case HIR_EXPR_LOCAL_LOAD:
 	instr = new_tac(ctx, HIR_TAC_LOAD_LOCAL, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
 	instr->dst = new_temp(ctx);
 	instr->local_id = expr->u.local_id;
 	append_tac(program, instr);
 	return instr->dst;
     case HIR_EXPR_LOCAL_STORE:
 	rhs = lower_expr(ctx, program, expr->u.local_store.rhs);
-	append_tick(ctx, program, expr->source_lineno);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
 	instr = new_tac(ctx, HIR_TAC_STORE_LOCAL, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
 	instr->dst = rhs;
 	instr->src1 = rhs;
 	instr->local_id = expr->u.local_store.local_id;
@@ -4637,8 +4819,9 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	return rhs;
     case HIR_EXPR_UNARY:
 	lhs = lower_expr(ctx, program, expr->u.unary.expr);
-	append_tick(ctx, program, expr->source_lineno);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
 	instr = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;
 	instr->op = expr->u.unary.op;
@@ -4650,8 +4833,9 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    return lower_short_circuit(ctx, program, expr);
 	lhs = lower_expr(ctx, program, expr->u.binary.lhs);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
-	append_tick(ctx, program, expr->source_lineno);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
 	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;
 	instr->src2 = rhs;
@@ -4679,7 +4863,8 @@ lower_if(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	int next_label = new_label(ctx);
 	int cond = lower_expr(ctx, program, arm->condition);
 
-	append_branch_false(ctx, program, cond, next_label, stmt->source_lineno);
+	append_branch_false(ctx, program, cond, next_label, stmt->source_lineno,
+			    arm->bytecode_pc);
 	lower_stmt_list(ctx, program, arm->body);
 	append_jump(ctx, program, done_label, stmt->source_lineno);
 	append_label(ctx, program, next_label, stmt->source_lineno);
@@ -4698,7 +4883,8 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 
     append_label(ctx, program, top_label, stmt->source_lineno);
     cond = lower_expr(ctx, program, stmt->u.loop.condition);
-    append_branch_false(ctx, program, cond, done_label, stmt->source_lineno);
+    append_branch_false(ctx, program, cond, done_label, stmt->source_lineno,
+			stmt->bytecode_pc);
     lower_stmt_list(ctx, program, stmt->u.loop.body);
     append_jump(ctx, program, top_label, stmt->source_lineno);
     append_label(ctx, program, done_label, stmt->source_lineno);
@@ -4720,6 +4906,7 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     case HIR_STMT_RETURN:
 	instr = new_tac(ctx, stmt->u.expr ? HIR_TAC_RETURN : HIR_TAC_RETURN0,
 			stmt->source_lineno);
+	instr->bytecode_pc = stmt->bytecode_pc;
 	if (stmt->u.expr) {
 	    result = lower_expr(ctx, program, stmt->u.expr);
 	    instr->src1 = result;
@@ -4981,6 +5168,7 @@ new_test_ssa_instr(HIRContext *ctx, HIRTacKind kind, unsigned lineno, int value)
     memset(instr, 0, sizeof(HIRSSAInstr));
     instr->kind = kind;
     instr->source_lineno = lineno;
+    instr->bytecode_pc = NO_BYTECODE_PC;
     instr->value = value;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;

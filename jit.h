@@ -30,6 +30,7 @@ extern const char *jit_program_state_name(JITProgram *);
 extern const char *jit_program_reason(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
+extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 					enum error *);

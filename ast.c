@@ -211,6 +211,7 @@ alloc_stmt(enum Stmt_Kind kind)
 
     result->kind = kind;
     result->lineno = ast_lineno;
+    result->bytecode_pc = NO_BYTECODE_PC;
     result->next = 0;
     return result;
 }
@@ -222,6 +223,7 @@ alloc_cond_arm(Expr * condition, Stmt * stmt)
 
     result->condition = condition;
     result->stmt = stmt;
+    result->bytecode_pc = NO_BYTECODE_PC;
     result->next = 0;
     return result;
 }
@@ -246,6 +248,7 @@ alloc_expr(enum Expr_Kind kind)
 
     result->kind = kind;
     result->lineno = ast_lineno;
+    result->bytecode_pc = NO_BYTECODE_PC;
     return result;
 }
 

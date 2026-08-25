@@ -44,6 +44,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 #endif
 
     assign_resume_ids(ast);
+    program = generate_code(ast, version);
     hir_ctx = hir_context_new(var_names);
     hir_program = hir_lift_ast(hir_ctx, ast);
     tac_program = hir_lower_to_tac(hir_ctx, hir_program);
@@ -65,7 +66,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 	    && hir_verify_out_of_ssa(hir_ctx, ssa_program);
 #ifdef ENABLE_JIT
     if (hir_valid)
-	jit_program = hir_create_jit_program(hir_ctx, ssa_program);
+	jit_program = hir_create_jit_program(hir_ctx, ssa_program, program);
     else
 	jit_program = jit_program_unsupported(hir_supported
 					      ? "invalid-ir"
@@ -85,8 +86,6 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     (void) cfg;
     (void) tac_program;
     hir_context_free(hir_ctx);
-
-    program = generate_code(ast, version);
 
 #ifdef ENABLE_JIT
     program->jit = jit_program;

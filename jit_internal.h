@@ -19,6 +19,7 @@ struct JITCopy {
 struct JITInstruction {
     HIRTacKind kind;
     unsigned source_lineno;
+    unsigned bytecode_pc;
     int value;
     int src1;
     int src2;
@@ -46,6 +47,7 @@ struct JITProgram {
     int num_values;
     int num_vars;
     int num_blocks;
+    int num_resume_anchors;
     JITBlock *blocks;
     JITBlock *last_block;
     void *mir_context;

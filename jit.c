@@ -638,6 +638,12 @@ jit_program_may_error(JITProgram *program)
 }
 
 int
+jit_program_anchor_count(JITProgram *program)
+{
+    return program ? program->num_resume_anchors : 0;
+}
+
+int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;

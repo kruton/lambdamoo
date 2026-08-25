@@ -2,6 +2,7 @@
 #define HIR_h 1
 
 #include "ast.h"
+#include "program.h"
 #include "structures.h"
 #include "sym_table.h"
 
@@ -141,7 +142,8 @@ extern int hir_optimize_ssa_constants(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
-extern JITProgram *hir_create_jit_program(HIRContext *, HIRSSAProgram *);
+extern JITProgram *hir_create_jit_program(HIRContext *, HIRSSAProgram *,
+					  Program *);
 #endif
 
 #ifdef HIR_DUMP_TAC
@@ -157,6 +159,7 @@ extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
+extern int hir_tac_count_bytecode_pc(HIRTacProgram *, unsigned);
 extern int hir_cfg_block_count(HIRCFG *);
 extern int hir_cfg_edge_count(HIRCFG *);
 extern int hir_cfg_unsupported_block_count(HIRCFG *);
@@ -168,6 +171,7 @@ extern int hir_ssa_block_count(HIRSSAProgram *);
 extern int hir_ssa_instruction_count(HIRSSAProgram *);
 extern int hir_ssa_value_count(HIRSSAProgram *);
 extern int hir_ssa_count_kind(HIRSSAProgram *, HIRTacKind);
+extern int hir_ssa_count_bytecode_pc(HIRSSAProgram *, unsigned);
 extern int hir_ssa_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_return_uses_phi_count(HIRSSAProgram *);

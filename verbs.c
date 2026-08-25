@@ -281,7 +281,7 @@ jit_metadata_pair(const char *name, Var value)
 static Var
 jit_metadata(JITProgram *program)
 {
-    Var metadata = new_list(6);
+    Var metadata = new_list(7);
     Var value;
 
     value.type = TYPE_STR;
@@ -302,6 +302,9 @@ jit_metadata(JITProgram *program)
     value.type = TYPE_STR;
     value.v.str = str_dup(jit_program_reason(program));
     metadata.v.list[6] = jit_metadata_pair("reason", value);
+    value.type = TYPE_INT;
+    value.v.num = jit_program_anchor_count(program);
+    metadata.v.list[7] = jit_metadata_pair("anchors", value);
     return metadata;
 }
 #endif

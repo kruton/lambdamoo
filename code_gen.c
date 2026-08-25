@@ -69,6 +69,11 @@ struct loop {
 };
 typedef struct loop Loop;
 
+typedef struct {
+    unsigned pc;
+    unsigned *result;
+} CodeAnchor;
+
 struct state {
     unsigned max_literal, max_fork, max_var_ref;
     /* For telling how big the refs must be */
@@ -89,6 +94,8 @@ struct state {
     unsigned saved_stack;
     unsigned num_loops, max_loops;
     Loop *loops;
+    unsigned num_code_anchors, max_code_anchors;
+    CodeAnchor *code_anchors;
     unsigned code_unit;
     int vector;
     GState *gstate;
@@ -172,6 +179,11 @@ init_state(State * state, GState * gstate, unsigned code_unit, int vector)
     state->max_loops = 5;
     state->loops = mymalloc(sizeof(Loop) * state->max_loops, M_CODE_GEN);
 
+    state->num_code_anchors = 0;
+    state->max_code_anchors = 16;
+    state->code_anchors = mymalloc(sizeof(CodeAnchor)
+				   * state->max_code_anchors, M_CODE_GEN);
+
     state->code_unit = code_unit;
     state->vector = vector;
     state->gstate = gstate;
@@ -242,6 +254,23 @@ free_state(State state)
     myfree(state.trymap, M_BYTECODES);
 #endif				/* BYTECODE_REDUCE_REF */
     myfree(state.loops, M_CODE_GEN);
+    myfree(state.code_anchors, M_CODE_GEN);
+}
+
+static void
+record_code_anchor(State *state, unsigned *result)
+{
+    CodeAnchor *anchor;
+
+    if (state->num_code_anchors == state->max_code_anchors) {
+	state->max_code_anchors *= 2;
+	state->code_anchors = myrealloc(state->code_anchors,
+				       sizeof(CodeAnchor)
+				       * state->max_code_anchors, M_CODE_GEN);
+    }
+    anchor = &state->code_anchors[state->num_code_anchors++];
+    anchor->pc = state->num_bytes;
+    anchor->result = result;
 }
 
 static void
@@ -696,6 +725,7 @@ generate_expr(Expr * expr, State * state)
 	    Var v;
 
 	    v = expr->e.var;
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    if (v.type == TYPE_INT && IN_OPTIM_NUM_RANGE(v.v.num))
 		emit_byte(OPTIM_NUM_TO_OPCODE(v.v.num), state);
 	    else {
@@ -706,6 +736,7 @@ generate_expr(Expr * expr, State * state)
 	}
 	break;
     case EXPR_ID:
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_var_op(OP_PUSH, expr->e.id, state);
 	push_stack(1, state);
 	break;
@@ -715,6 +746,7 @@ generate_expr(Expr * expr, State * state)
 	    int end_label;
 
 	    generate_expr(expr->e.bin.lhs, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(expr->kind == EXPR_AND ? OP_AND : OP_OR, state);
 	    end_label = add_label(state);
 	    pop_stack(1, state);
@@ -725,10 +757,12 @@ generate_expr(Expr * expr, State * state)
     case EXPR_NEGATE:
     case EXPR_NOT:
 	generate_expr(expr->e.expr, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_byte(expr->kind == EXPR_NOT ? OP_NOT : OP_UNARY_MINUS, state);
 	break;
     case EXPR_COMPLEMENT:
 	generate_expr(expr->e.expr, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_extended_byte(EOP_COMPLEMENT, state);
 	break;
     case EXPR_EQ:
@@ -792,6 +826,7 @@ generate_expr(Expr * expr, State * state)
 	    default:
 		panic("Not a binary operator in GENERATE_EXPR()");
 	    }
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(op, state);
 	    pop_stack(1, state);
 	}
@@ -829,6 +864,7 @@ generate_expr(Expr * expr, State * state)
 	    default:
 		panic("Not a binary operator in GENERATE_EXPR()");
 	    }
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_extended_byte(op, state);
 	    pop_stack(1, state);
 	}
@@ -836,6 +872,7 @@ generate_expr(Expr * expr, State * state)
     case EXPR_EXP:
 	generate_expr(expr->e.bin.lhs, state);
 	generate_expr(expr->e.bin.rhs, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_extended_byte(EOP_EXP, state);
 	pop_stack(1, state);
 	break;
@@ -963,6 +1000,7 @@ generate_expr(Expr * expr, State * state)
 
 		push_lvalue(e, 0, state);
 		generate_expr(expr->e.bin.rhs, state);
+		record_code_anchor(state, &expr->bytecode_pc);
 		if (e->kind == EXPR_RANGE || e->kind == EXPR_INDEX)
 		    emit_byte(OP_PUT_TEMP, state);
 		while (1) {
@@ -1053,6 +1091,7 @@ generate_stmt(Stmt * stmt, State * state)
 		    int else_label;
 
 		    generate_expr(arms->condition, state);
+		    record_code_anchor(state, &arms->bytecode_pc);
 		    emit_byte(if_op, state);
 		    else_label = add_label(state);
 		    pop_stack(1, state);
@@ -1118,6 +1157,7 @@ generate_stmt(Stmt * stmt, State * state)
 
 		loop_top = capture_label(state);
 		generate_expr(stmt->s.loop.condition, state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		if (stmt->s.loop.id == -1)
 		    emit_byte(OP_WHILE, state);
 		else {
@@ -1164,10 +1204,13 @@ generate_stmt(Stmt * stmt, State * state)
 	case STMT_RETURN:
 	    if (stmt->s.expr) {
 		generate_expr(stmt->s.expr, state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_ending_op(OP_RETURN, state);
 		pop_stack(1, state);
-	    } else
+	    } else {
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_ending_op(OP_RETURN0, state);
+	    }
 	    break;
 	case STMT_TRY_EXCEPT:
 	    {
@@ -1342,6 +1385,18 @@ relocate_resume_points(State * state, Bytecodes bc)
 	}
 }
 
+static void
+relocate_code_anchors(State *state, Bytecodes bc)
+{
+    unsigned i;
+
+    for (i = 0; i < state->num_code_anchors; i++) {
+	CodeAnchor *anchor = &state->code_anchors[i];
+
+	*anchor->result = expanded_pc(state, bc, anchor->pc);
+    }
+}
+
 #ifdef BYTECODE_REDUCE_REF
 static int
 bbd_cmp(int *a, int *b)
@@ -1513,6 +1568,7 @@ stmt_to_code(Stmt * stmt, GState * gstate, unsigned code_unit, int vector)
     }
 
     relocate_resume_points(&state, bc);
+    relocate_code_anchors(&state, bc);
 
     free_state(state);
 

@@ -75,6 +75,7 @@ int_expr(Num value, unsigned lineno)
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_VAR;
     expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.var.type = TYPE_INT;
     expr.e.var.v.num = value;
 
@@ -89,6 +90,7 @@ id_expr(int id, unsigned lineno)
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_ID;
     expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.id = id;
 
     return expr;
@@ -102,6 +104,7 @@ binary_expr(enum Expr_Kind kind, Expr *lhs, Expr *rhs)
     memset(&expr, 0, sizeof(expr));
     expr.kind = kind;
     expr.lineno = lhs ? lhs->lineno : 0;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.bin.lhs = lhs;
     expr.e.bin.rhs = rhs;
 
@@ -116,6 +119,7 @@ expr_stmt(Expr *expr)
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_EXPR;
     stmt.lineno = expr ? expr->lineno : 0;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
     stmt.s.expr = expr;
 
     return stmt;
@@ -129,6 +133,7 @@ return_stmt(Expr *expr)
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_RETURN;
     stmt.lineno = expr ? expr->lineno : 0;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
     stmt.s.expr = expr;
 
     return stmt;
@@ -183,6 +188,14 @@ test_arithmetic_and_local_tac(void)
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
+    one.bytecode_pc = 1;
+    two.bytecode_pc = 2;
+    add.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    local_x_rhs.bytecode_pc = 7;
+    three.bytecode_pc = 8;
+    mult.bytecode_pc = 9;
+    return_stmt_node.bytecode_pc = 10;
     assign_stmt_node.next = &return_stmt_node;
 
     tac = lower_stmt(&names, &assign_stmt_node, &ctx, &cfg, &dom, &ssa);
@@ -196,6 +209,10 @@ test_arithmetic_and_local_tac(void)
     check_int("arith tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
     check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 6);
     check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 5);
+    check_int("arith add anchor count",
+	      hir_tac_count_bytecode_pc(tac, 5), 2);
+    check_int("arith return anchor count",
+	      hir_tac_count_bytecode_pc(tac, 10), 1);
     check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("arith cfg edges", hir_cfg_edge_count(cfg), 0);
     check_int("arith dom reachable blocks",
@@ -206,6 +223,8 @@ test_arithmetic_and_local_tac(void)
     check_int("arith ssa values", hir_ssa_value_count(ssa), 5);
     check_int("arith ssa binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
+    check_int("arith SSA add anchor count",
+	      hir_ssa_count_bytecode_pc(ssa, 5), 2);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
     analysis = hir_analyze_ssa_values(ctx, ssa);
     check_int("arith return fact",
