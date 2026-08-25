@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <string.h>
 
-typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *);
+typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *);
 
 typedef struct {
     MIR_context_t context;
@@ -45,6 +45,10 @@ binary_code(HIROp op)
 	return MIR_SUB;
     case HIR_OP_MUL:
 	return MIR_MUL;
+    case HIR_OP_DIV:
+	return MIR_DIV;
+    case HIR_OP_MOD:
+	return MIR_MOD;
     case HIR_OP_EQ:
 	return MIR_EQ;
     case HIR_OP_NE:
@@ -69,14 +73,27 @@ finish_build(MIRBuild *build)
     MIR_finish_module(build->context);
 }
 
+static void
+return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
+	      JITRunResult value)
+{
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+			      MIR_new_reg_op(build->context, status),
+			      MIR_new_int_op(build->context, value)));
+    append(build, MIR_new_insn(build->context, MIR_JMP,
+			      MIR_new_label_op(build->context, common_return)));
+}
+
 static int
 build_mir(JITProgram *program, MIRBuild *build)
 {
     MIR_type_t result_type = MIR_T_I64;
-    MIR_reg_t env, result, ticks, timed_out, tick_result, timeout_value;
+    MIR_reg_t env, result, ticks, timed_out, error_out;
+    MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
-    MIR_label_t fallback, tick_abort, seconds_abort;
+    MIR_label_t fallback, arithmetic_error, tick_abort, seconds_abort;
+    MIR_label_t common_return;
     JITBlock *block;
     int max_block_id = 0;
     int copy_serial = 0;
@@ -88,18 +105,23 @@ build_mir(JITProgram *program, MIRBuild *build)
 	return 0;
     build->module = MIR_new_module(build->context, "lambda_moo_jit");
     build->function = MIR_new_func(build->context, "jit_verb", 1,
-				   &result_type, 4,
+				   &result_type, 5,
 				   MIR_T_P, "env", MIR_T_P, "result",
-				   MIR_T_P, "ticks", MIR_T_P, "timed_out");
+				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
+				   MIR_T_P, "error_out");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
     timed_out = MIR_reg(build->context, "timed_out", build->function->u.func);
+    error_out = MIR_reg(build->context, "error_out", build->function->u.func);
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
+    status = new_reg(build, "status");
     fallback = MIR_new_label(build->context);
+    arithmetic_error = MIR_new_label(build->context);
     tick_abort = MIR_new_label(build->context);
     seconds_abort = MIR_new_label(build->context);
+    common_return = MIR_new_label(build->context);
 
     values = mymalloc(sizeof(MIR_reg_t) * program->num_values, M_PROGRAM);
     memset(values, 0, sizeof(MIR_reg_t) * program->num_values);
@@ -207,14 +229,51 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_int_op(build->context, -1)));
 		    break;
 		case HIR_TAC_BINARY:
-		    append(build, MIR_new_insn(build->context,
+		    if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
+			MIR_label_t normal = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+
+			append(build, MIR_new_insn(build->context, MIR_BF,
+				MIR_new_label_op(build->context,
+						 arithmetic_error),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
+			append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, normal),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2]),
+				MIR_new_int_op(build->context, -1)));
+			append(build, instr->op == HIR_OP_DIV
+			       ? MIR_new_insn(build->context, MIR_NEG,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]))
+			       : MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			append(build, normal);
+			append(build, MIR_new_insn(build->context,
 						  binary_code(instr->op),
-						  MIR_new_reg_op(build->context,
-								 values[instr->value]),
-						  MIR_new_reg_op(build->context,
-								 values[instr->src1]),
-						  MIR_new_reg_op(build->context,
-								 values[instr->src2])));
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
+			append(build, done);
+		    } else
+			append(build, MIR_new_insn(build->context,
+						      binary_code(instr->op),
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
 		    break;
 		case HIR_TAC_PARALLEL_COPY:
 		    {
@@ -279,9 +338,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_mem_op(build->context, MIR_T_I32,
 								 offsetof(Var, type), result, 0, 1),
 						  MIR_new_int_op(build->context, TYPE_INT)));
-		    append(build, MIR_new_ret_insn(build->context, 1,
-						      MIR_new_int_op(build->context,
-								     JIT_RUN_RETURNED)));
+		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_RETURN0:
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -294,9 +351,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_mem_op(build->context, MIR_T_I32,
 								 offsetof(Var, type), result, 0, 1),
 						  MIR_new_int_op(build->context, TYPE_INT)));
-		    append(build, MIR_new_ret_insn(build->context, 1,
-						      MIR_new_int_op(build->context,
-								     JIT_RUN_RETURNED)));
+		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
@@ -318,17 +373,20 @@ build_mir(JITProgram *program, MIRBuild *build)
     }
 
     append(build, fallback);
-    append(build, MIR_new_ret_insn(build->context, 1,
-				  MIR_new_int_op(build->context,
-						 JIT_RUN_FALLBACK)));
+    return_status(build, status, common_return, JIT_RUN_FALLBACK);
+    append(build, arithmetic_error);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+			      MIR_new_mem_op(build->context, MIR_T_I32,
+					     0, error_out, 0, 1),
+			      MIR_new_int_op(build->context, E_DIV)));
+    return_status(build, status, common_return, JIT_RUN_ERROR);
     append(build, tick_abort);
-    append(build, MIR_new_ret_insn(build->context, 1,
-				  MIR_new_int_op(build->context,
-						 JIT_RUN_ABORT_TICKS)));
+    return_status(build, status, common_return, JIT_RUN_ABORT_TICKS);
     append(build, seconds_abort);
+    return_status(build, status, common_return, JIT_RUN_ABORT_SECONDS);
+    append(build, common_return);
     append(build, MIR_new_ret_insn(build->context, 1,
-				  MIR_new_int_op(build->context,
-						 JIT_RUN_ABORT_SECONDS)));
+				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
     myfree(labels, M_PROGRAM);
     myfree(values, M_PROGRAM);
@@ -435,6 +493,12 @@ jit_program_is_eligible(JITProgram *program)
 }
 
 int
+jit_program_may_error(JITProgram *program)
+{
+    return program && program->may_error;
+}
+
+int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
@@ -467,7 +531,7 @@ jit_program_compile(JITProgram *program)
 
 JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
-		    int *ticks, int *timed_out)
+		    int *ticks, int *timed_out, enum error *error)
 {
     NativeFunction function;
     int64_t native_result;
@@ -475,7 +539,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
     function = (NativeFunction) program->native_function;
-    native_result = function(env, result, ticks, timed_out);
+    native_result = function(env, result, ticks, timed_out, error);
     return native_result;
 }
 

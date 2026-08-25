@@ -902,15 +902,19 @@ do {								\
     for (;;) {
       next_opcode:
 #ifdef ENABLE_JIT
-        if (bv == bc.vector
+	if (bv == bc.vector
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
-	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit) {
+	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit
+	    && (RUN_ACTIV.debug
+		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
 	    Var ret_val;
 	    JITRunResult jit_result;
+	    enum error jit_error = E_NONE;
 
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
-					     &ticks_remaining, &task_timed_out);
+					     &ticks_remaining, &task_timed_out,
+					     &jit_error);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		STORE_STATE_VARIABLES();
 		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
@@ -929,6 +933,10 @@ do {								\
 		STORE_STATE_VARIABLES();
 		abort_task(ABORT_SECONDS);
 		return OUTCOME_ABORTED;
+	    } else if (jit_result == JIT_RUN_ERROR) {
+		error_bv = bv;
+		PUSH_ERROR(jit_error);
+		goto next_opcode;
 	    }
 	}
 #endif

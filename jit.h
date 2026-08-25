@@ -17,6 +17,7 @@ typedef enum {
 typedef enum {
     JIT_RUN_FALLBACK,
     JIT_RUN_RETURNED,
+    JIT_RUN_ERROR,
     JIT_RUN_ABORT_TICKS,
     JIT_RUN_ABORT_SECONDS
 } JITRunResult;
@@ -28,8 +29,10 @@ extern JITState jit_program_state(JITProgram *);
 extern const char *jit_program_state_name(JITProgram *);
 extern const char *jit_program_reason(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
+extern int jit_program_may_error(JITProgram *);
 extern int jit_program_compile(JITProgram *);
-extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *);
+extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
+					enum error *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 

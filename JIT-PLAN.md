@@ -409,12 +409,15 @@ Completed in the first native-code milestone:
   guards, and resource-limit aborts;
 * sparse integer type and constant propagation; and
 * safe constant folding, constant-branch simplification, and unreachable-block
-  pruning.
+  pruning;
+* explicit wrapping integer arithmetic and error semantics shared by the
+  interpreter and compiler; and
+* checked native integer division and modulo, including division by zero and
+  the minimum-integer divided by negative-one case.
 
 The next reviewable compiler milestones are:
 
-1. Model arithmetic error and overflow behavior explicitly before expanding
-   the integer tier to division, modulo, exponentiation, or shifts.
+1. Extend checked native integer arithmetic to exponentiation and shifts.
 2. Add bytecode resume-anchor mapping for AST-derived HIR operations.
 3. Add deoptimization maps before allowing guard failure after the first
    tick or any operation that mutates interpreter-visible state.

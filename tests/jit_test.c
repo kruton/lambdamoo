@@ -2,6 +2,7 @@
 
 #include "my-stdio.h"
 
+#include "integer_arithmetic.h"
 #include "storage.h"
 
 #include <string.h>
@@ -62,6 +63,21 @@ arithmetic_program(void)
     add->next = ret;
     block->first = one;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+division_program(Num lhs, Num rhs, HIROp op)
+{
+    JITProgram *program = arithmetic_program();
+    JITInstruction *one = program->blocks->first;
+    JITInstruction *two = one->next;
+    JITInstruction *binary = two->next->next;
+
+    one->literal = lhs;
+    two->literal = rhs;
+    binary->op = op;
+    program->may_error = 1;
     return program;
 }
 
@@ -176,7 +192,7 @@ find_block(JITProgram *program, int id)
 
 static JITRunResult
 reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
-		  int *timed_out)
+		  int *timed_out, enum error *error)
 {
     Num *values = allocate(sizeof(Num) * (program->num_values + 1));
     JITBlock *block = program->blocks;
@@ -211,6 +227,19 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		if (instr->op == HIR_OP_ADD)
 		    values[instr->value] = values[instr->src1]
 			+ values[instr->src2];
+		else if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
+		    IntegerArithmeticResult arithmetic = integer_arithmetic(
+			instr->op == HIR_OP_DIV ? INTEGER_DIVIDE
+			: INTEGER_MODULUS, values[instr->src1],
+			values[instr->src2]);
+
+		    if (!arithmetic.succeeded) {
+			*error = arithmetic.error;
+			myfree(values, M_PROGRAM);
+			return JIT_RUN_ERROR;
+		    }
+		    values[instr->value] = arithmetic.value;
+		}
 		else {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_FALLBACK;
@@ -266,14 +295,20 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
     Var reference_result;
     int native_ticks = initial_ticks;
     int reference_ticks = initial_ticks;
+    enum error native_error = E_NONE;
+    enum error reference_error = E_NONE;
     JITRunResult native_status;
     JITRunResult reference_status;
 
     native_status = jit_program_execute(program, env, &native_result,
-					&native_ticks, &timed_out);
+					&native_ticks, &timed_out,
+					&native_error);
     reference_status = reference_execute(program, env, &reference_result,
-					 &reference_ticks, &timed_out);
+					 &reference_ticks, &timed_out,
+					 &reference_error);
     check(native_status == reference_status && native_ticks == reference_ticks
+	  && (native_status != JIT_RUN_ERROR
+	      || native_error == reference_error)
 	  && (native_status != JIT_RUN_RETURNED
 	      || (native_result.type == reference_result.type
 		  && native_result.v.num == reference_result.v.num)), message);
@@ -303,10 +338,15 @@ main(void)
     JITProgram *program = arithmetic_program();
     JITProgram *guard = guard_program();
     JITProgram *branch = branch_program();
+    JITProgram *divide = division_program(20, 4, HIR_OP_DIV);
+    JITProgram *divide_zero = division_program(20, 0, HIR_OP_DIV);
+    JITProgram *divide_overflow = division_program(NUM_MIN, -1, HIR_OP_DIV);
+    JITProgram *modulus_overflow = division_program(NUM_MIN, -1, HIR_OP_MOD);
     Var env[1];
     Var result;
     int ticks = 10;
     int timed_out = 0;
+    enum error error = E_NONE;
     int lines = 0;
 
     check(jit_program_dump_mir(program, count_line, &lines),
@@ -314,23 +354,34 @@ main(void)
     check(lines > 0, "MIR dump was empty");
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
-    check(jit_program_execute(program, env, &result, &ticks, &timed_out)
-	  == JIT_RUN_RETURNED, "native execution failed");
+    check(jit_program_execute(program, env, &result, &ticks, &timed_out,
+			      &error) == JIT_RUN_RETURNED,
+	  "native execution failed");
     check(result.type == TYPE_INT && result.v.num == 3,
 	  "native execution returned the wrong value");
     check(ticks == 9, "native execution consumed the wrong tick count");
     check(jit_program_state(program) == JIT_STATE_COMPILED,
 	  "native execution did not compile lazily");
     ticks = 1;
-    check(jit_program_execute(program, env, &result, &ticks, &timed_out)
+    check(jit_program_execute(program, env, &result, &ticks, &timed_out,
+			      &error)
 	  == JIT_RUN_ABORT_TICKS, "tick exhaustion did not abort");
     check(ticks == 0, "tick exhaustion left the wrong tick count");
     ticks = 10;
     timed_out = 1;
-    check(jit_program_execute(program, env, &result, &ticks, &timed_out)
+    check(jit_program_execute(program, env, &result, &ticks, &timed_out,
+			      &error)
 	  == JIT_RUN_ABORT_SECONDS, "seconds exhaustion did not abort");
     check(ticks == 9, "seconds exhaustion consumed the wrong tick count");
     timed_out = 0;
+    check_differential(divide, env, 10, 0,
+		       "division differed from reference execution");
+    check_differential(divide_zero, env, 10, 0,
+		       "division error differed from reference execution");
+    check_differential(divide_overflow, env, 10, 0,
+		       "division overflow differed from reference execution");
+    check_differential(modulus_overflow, env, 10, 0,
+		       "modulus overflow differed from reference execution");
 
     env[0].type = TYPE_INT;
     env[0].v.num = 0;
@@ -346,7 +397,8 @@ main(void)
 
     env[0].type = TYPE_STR;
     env[0].v.str = "not an integer";
-    check(jit_program_execute(guard, env, &result, &ticks, &timed_out)
+    check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
+			      &error)
 	  == JIT_RUN_FALLBACK, "type guard did not request fallback");
     check_differential(branch, env, 10, 0,
 		       "guard fallback differed from reference execution");
@@ -354,5 +406,9 @@ main(void)
     jit_program_free(program);
     jit_program_free(guard);
     jit_program_free(branch);
+    jit_program_free(divide);
+    jit_program_free(divide_zero);
+    jit_program_free(divide_overflow);
+    jit_program_free(modulus_overflow);
     return failures != 0;
 }

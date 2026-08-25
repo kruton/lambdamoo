@@ -42,6 +42,7 @@ struct JITProgram {
     JITState state;
     const char *reason;
     int eligible;
+    int may_error;
     int num_values;
     int num_vars;
     int num_blocks;
