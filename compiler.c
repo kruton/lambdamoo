@@ -18,9 +18,13 @@
 #include "compiler.h"
 
 #include "config.h"
+#include "options.h"
 
 #include "code_gen.h"
 #include "hir.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 
 Program *
 compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
@@ -32,18 +36,44 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     HIRDominatorTree *dom_tree;
     HIRSSAProgram *ssa_program;
     Program *program;
+    int hir_valid;
+    int hir_supported;
+#ifdef ENABLE_JIT
+    JITProgram *jit_program;
+#endif
 
     assign_resume_ids(ast);
+    program = generate_code(ast, version);
     hir_ctx = hir_context_new(var_names);
     hir_program = hir_lift_ast(hir_ctx, ast);
     tac_program = hir_lower_to_tac(hir_ctx, hir_program);
-    (void) hir_verify_tac(hir_ctx, tac_program);
+    hir_supported = hir_context_error_count(hir_ctx) == 0;
+    hir_valid = hir_supported;
+    hir_valid = hir_verify_tac(hir_ctx, tac_program) && hir_valid;
     cfg = hir_build_cfg(hir_ctx, tac_program);
-    (void) hir_verify_cfg(hir_ctx, cfg);
+    hir_valid = hir_verify_cfg(hir_ctx, cfg) && hir_valid;
     dom_tree = hir_build_dominator_tree(hir_ctx, cfg);
-    (void) hir_verify_dominator_tree(hir_ctx, cfg, dom_tree);
+    hir_valid = hir_verify_dominator_tree(hir_ctx, cfg, dom_tree) && hir_valid;
     ssa_program = hir_build_ssa(hir_ctx, cfg);
-    (void) hir_verify_ssa(hir_ctx, ssa_program);
+    hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
+    if (hir_valid) {
+	(void) hir_optimize_ssa_constants(hir_ctx, ssa_program);
+	hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
+    }
+    if (hir_valid)
+	hir_valid = hir_destroy_ssa(hir_ctx, ssa_program)
+	    && hir_verify_out_of_ssa(hir_ctx, ssa_program);
+#ifdef ENABLE_JIT
+    if (hir_valid)
+	jit_program = hir_create_jit_program(hir_ctx, ssa_program, program);
+    else
+	jit_program = jit_program_unsupported(hir_supported
+					      ? "invalid-ir"
+					      : "unsupported-program");
+#else
+    (void) hir_valid;
+    (void) hir_supported;
+#endif
 #ifdef HIR_DUMP_TAC
     hir_dump_tac(tac_program);
 #endif
@@ -56,7 +86,9 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     (void) tac_program;
     hir_context_free(hir_ctx);
 
-    program = generate_code(ast, version);
+#ifdef ENABLE_JIT
+    program->jit = jit_program;
+#endif
 
     program->num_var_names = var_names->size;
     program->var_names = take_names(var_names);

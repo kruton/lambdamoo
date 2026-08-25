@@ -1,6 +1,22 @@
 MOO_XT_DECLARE_EXTENSIONS([
 ### Everything above this line is boilerplate; do not edit.
 
+##==============
+%%extension jit
+##==============
+  %disabled
+  %? Native code generation:
+
+  --enable- jit
+    %?  compile eligible integer-only verbs with vendored MIR
+
+  %cdefine ENABLE_JIT
+
+  CPPFLAGS = -I$(abs_srcdir)/vendor/mir
+  XT_CSRCS = jit.c
+  XT_HDRS = jit.h jit_internal.h
+  XT_LOBJS = mir-vendor.o mir-gen-vendor.o
+
 ##==================
 %%extension unicode
 ##==================

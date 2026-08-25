@@ -31,6 +31,7 @@
 
 #include "exceptions.h"
 #include "functions.h"
+#include "integer_arithmetic.h"
 #include "log.h"
 #include "random.h"
 #include "storage.h"
@@ -628,7 +629,7 @@ numeric_lt_or_eq(int not, Var a, Var b)
  * coercions between integer and floating-point operands.
  */
 
-#define SIMPLE_BINARY(name, op)					\
+#define SIMPLE_BINARY(name, op, integer_op)			\
 		Var						\
 		do_ ## name(Var a, Var b)			\
 		{						\
@@ -638,8 +639,14 @@ numeric_lt_or_eq(int not, Var a, Var b)
 			ans.type = TYPE_ERR;			\
 			ans.v.err = E_TYPE;			\
 		    } else if (a.type == TYPE_INT) {		\
-			ans.type = TYPE_INT;			\
-			ans.v.num = a.v.num op b.v.num;		\
+			IntegerArithmeticResult r =		\
+			    integer_arithmetic(integer_op,	\
+					       a.v.num, b.v.num); \
+			ans.type = r.succeeded ? TYPE_INT : TYPE_ERR; \
+			if (r.succeeded)			\
+			    ans.v.num = r.value;		\
+			else					\
+			    ans.v.err = r.error;		\
 		    } else {					\
 			FlNum d =				\
 			    fl_unbox(a.v.fnum)			\
@@ -657,10 +664,10 @@ numeric_lt_or_eq(int not, Var a, Var b)
 		    return ans;					\
 		}
 
-SIMPLE_BINARY(add, +)
-SIMPLE_BINARY(subtract, -)
-SIMPLE_BINARY(multiply, *)
-#define DIVISION_OP(name, iop, fexpr)				\
+SIMPLE_BINARY(add, +, INTEGER_ADD)
+SIMPLE_BINARY(subtract, -, INTEGER_SUBTRACT)
+SIMPLE_BINARY(multiply, *, INTEGER_MULTIPLY)
+#define DIVISION_OP(name, integer_op, fexpr)			\
 		Var						\
 		do_ ## name(Var a, Var b)			\
 		{						\
@@ -669,17 +676,15 @@ SIMPLE_BINARY(multiply, *)
 		    if (a.type != b.type) {			\
 			ans.type = TYPE_ERR;			\
 			ans.v.err = E_TYPE;			\
-		    } else if (a.type == TYPE_INT		\
-			       && b.v.num != 0) {		\
-			if (a.v.num == NUM_MIN			\
-			    && b.v.num == -1) {			\
-			    /* undefined behavior; can trap */	\
-			    ans.type = TYPE_INT;		\
-			    ans.v.num = a.v.num iop 1;		\
-			} else {				\
-			    ans.type = TYPE_INT;		\
-			    ans.v.num = a.v.num iop b.v.num;	\
-			}					\
+		    } else if (a.type == TYPE_INT) {		\
+			IntegerArithmeticResult r =		\
+			    integer_arithmetic(integer_op,	\
+					       a.v.num, b.v.num); \
+			ans.type = r.succeeded ? TYPE_INT : TYPE_ERR; \
+			if (r.succeeded)			\
+			    ans.v.num = r.value;		\
+			else					\
+			    ans.v.err = r.error;		\
 		    } else if (a.type == TYPE_FLOAT		\
 			       && fl_unbox(b.v.fnum) != 0.0) {	\
 			FlNum d = fexpr;			\
@@ -699,47 +704,26 @@ SIMPLE_BINARY(multiply, *)
 		    return ans;					\
 		}
 
-DIVISION_OP(divide, /, fl_unbox(a.v.fnum) / fl_unbox(b.v.fnum))
-DIVISION_OP(modulus, %, fmod(fl_unbox(a.v.fnum), fl_unbox(b.v.fnum)))
+DIVISION_OP(divide, INTEGER_DIVIDE,
+	    fl_unbox(a.v.fnum) / fl_unbox(b.v.fnum))
+DIVISION_OP(modulus, INTEGER_MODULUS,
+	    fmod(fl_unbox(a.v.fnum), fl_unbox(b.v.fnum)))
 Var
 do_power(Var lhs, Var rhs)
 {				/* LHS ^ RHS */
     Var ans;
 
     if (lhs.type == TYPE_INT) {	/* integer exponentiation */
-	Num a = lhs.v.num, b, r;
+	IntegerArithmeticResult result;
 
 	if (rhs.type != TYPE_INT)
 	    goto type_error;
-
-	b = rhs.v.num;
-	ans.type = TYPE_INT;
-	if (b < 0) {
-	    switch (a) {
-	    case -1:
-		ans.v.num = (b & 1) ? 1 : -1;
-		break;
-	    case 0:
-		ans.type = TYPE_ERR;
-		ans.v.err = E_DIV;
-		break;
-	    case 1:
-		ans.v.num = 1;
-		break;
-	    default:
-		ans.v.num = 0;
-		break;
-	    }
-	} else {
-	    r = 1;
-	    while (b != 0) {
-		if (b & 1)
-		    r *= a;
-		a *= a;
-		b >>= 1;
-	    }
-	    ans.v.num = r;
-	}
+	result = integer_arithmetic(INTEGER_POWER, lhs.v.num, rhs.v.num);
+	ans.type = result.succeeded ? TYPE_INT : TYPE_ERR;
+	if (result.succeeded)
+	    ans.v.num = result.value;
+	else
+	    ans.v.err = result.error;
     } else if (lhs.type == TYPE_FLOAT) {	/* floating-point exponentiation */
 	FlNum d;
 

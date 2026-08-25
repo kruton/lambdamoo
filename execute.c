@@ -30,6 +30,10 @@
 #include "eval_vm.h"
 #include "exceptions.h"
 #include "functions.h"
+#include "integer_arithmetic.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "list.h"
 #include "log.h"
 #include "numbers.h"
@@ -801,30 +805,6 @@ call_verb2(Objid this, const char *vname
 
 /**** individual operation helpers ****/
 
-/* shifts:  caller is assumed to have verified
- *   0 <= by < INT_TYPE_BITSIZE
- * since, per C99, anything else is undefined behavior.
- */
-static inline Num
-shift_left(Num n, UNum by)
-{
-    return (Num)((UNum)n << by);
-}
-static inline Num
-logical_shift_right(Num n, UNum by)
-{
-    return (Num)((UNum)n >> by);
-}
-static inline Num
-arithmetic_shift_right(Num n, UNum by)
-{
-    /* C99: (signed negative)>>n is undefined behavior
-     * because it *might* be 1s-complement; bleah.
-     * ***FIX?: Can autoconf verify 2s-complement?
-     */
-    return (Num)(n >= 0 ? (UNum)n >> by : ~(~(UNum)n >> by));
-}
-
 static inline int
 int_or_float(Var v)
 {
@@ -972,6 +952,58 @@ do {								\
     }
     for (;;) {
       next_opcode:
+#ifdef ENABLE_JIT
+	if (bv == bc.vector
+	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
+	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit
+	    && (RUN_ACTIV.debug
+		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
+	    Var ret_val;
+	    JITRunResult jit_result;
+	    JITSourceLocation source_location;
+	    JITDeoptState deopt;
+	    enum error jit_error = E_NONE;
+
+	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
+					     RUN_ACTIV.rt_env, &ret_val,
+					     &ticks_remaining, &task_timed_out,
+					     &jit_error, &source_location, &deopt,
+					     RUN_ACTIV.base_rt_stack);
+	    if (jit_result == JIT_RUN_RETURNED) {
+		STORE_STATE_VARIABLES();
+		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
+		    if (result && outcome == OUTCOME_DONE)
+			*result = ret_val;
+		    else
+			free_var(ret_val);
+		    return outcome;
+		}
+		LOAD_STATE_VARIABLES();
+	    } else if (jit_result == JIT_RUN_ABORT_TICKS) {
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
+		STORE_STATE_VARIABLES();
+		abort_task(ABORT_TICKS);
+		return OUTCOME_ABORTED;
+	    } else if (jit_result == JIT_RUN_ABORT_SECONDS) {
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
+		STORE_STATE_VARIABLES();
+		abort_task(ABORT_SECONDS);
+		return OUTCOME_ABORTED;
+	    } else if (jit_result == JIT_RUN_ERROR) {
+		bv = bc.vector + source_location.bytecode_pc;
+		error_bv = bc.vector + source_location.error_pc;
+		PUSH_ERROR(jit_error);
+		goto next_opcode;
+	    } else if (jit_result == JIT_RUN_FALLBACK) {
+		ticks_remaining += deopt.ticks_charged;
+		bv = bc.vector + deopt.bytecode_pc;
+		error_bv = bc.vector + deopt.error_pc;
+		rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
+	    }
+	}
+#endif
 	error_bv = bv;
 	op = *bv++;
 
@@ -2291,27 +2323,19 @@ do {								\
 			rhs = POP();
 			lhs = POP();
 			if (lhs.type == TYPE_INT && rhs.type == TYPE_INT) {
-			    if (rhs.v.num < 0
-				|| (UNum)rhs.v.num >= sizeof(Num) * CHAR_BIT) {
-				ans.type = TYPE_ERR;
-				ans.v.err = E_INVARG;
-			    }
-			    else {
-				ans.type = TYPE_INT;
-				if (eop == EOP_SHL)
-				    ans.v.num = shift_left(lhs.v.num,
-							   (UNum)rhs.v.num);
-				else if (eop == EOP_SHR)
-				    ans.v.num = arithmetic_shift_right(lhs.v.num,
-								      (UNum)rhs.v.num);
-				else if (eop == EOP_LSHR)
-				    ans.v.num = logical_shift_right(lhs.v.num,
-								   (UNum)rhs.v.num);
-				else
-				    panic("Can't happen in EOP bitwise operators!");
-			    }
-			}
-			else {
+			    IntegerArithmeticOperation operation = eop == EOP_SHL
+				? INTEGER_SHIFT_LEFT : (eop == EOP_SHR
+				? INTEGER_SHIFT_RIGHT
+				: INTEGER_LOGICAL_SHIFT_RIGHT);
+			    IntegerArithmeticResult result = integer_arithmetic(
+				operation, lhs.v.num, rhs.v.num);
+
+			    ans.type = result.succeeded ? TYPE_INT : TYPE_ERR;
+			    if (result.succeeded)
+				ans.v.num = result.value;
+			    else
+				ans.v.err = result.error;
+			} else {
 			    ans.type = TYPE_ERR;
 			    ans.v.err = E_TYPE;
 			}

@@ -117,6 +117,7 @@ union Expr_Data {
 struct Expr {
     enum Expr_Kind kind;
     unsigned lineno;
+    unsigned bytecode_pc;
     union Expr_Data e;
 };
 
@@ -124,6 +125,7 @@ struct Cond_Arm {
     Cond_Arm *next;
     Expr *condition;
     Stmt *stmt;
+    unsigned bytecode_pc;
 };
 
 struct Except_Arm {
@@ -197,8 +199,11 @@ struct Stmt {
     enum Stmt_Kind kind;
     unsigned loop_ordinal;
     unsigned lineno;
+    unsigned bytecode_pc;
     union Stmt_Data s;
 };
+
+#define NO_BYTECODE_PC ((unsigned) -1)
 
 
 extern void begin_code_allocation(void);

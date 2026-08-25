@@ -57,7 +57,15 @@ The current branch has already established the first compiler backbone:
 * dominance frontier computation;
 * initial SSA construction over CFG;
 * SSA verifier, including phi-shape negative tests;
-* positive SSA phi tests for `if`/`else` joins and `while` loop backedges.
+* positive SSA phi tests for `if`/`else` joins and `while` loop backedges;
+* critical-edge splitting and SSA destruction;
+* explicit tick operations retained through native lowering;
+* an optional `--enable-jit` extension using vendored MIR 1.0.0 at O0;
+* lazy, per-program native generation for a guarded integer-only tier;
+* native entry and return through the existing activation unwinder;
+* JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
+* read-only MIR output through `disassemble(..., "mir")`;
+* disposable JIT state that is rebuilt from source after database reload.
 
 ## 4. Phase 1: AST to HIR
 
@@ -79,10 +87,9 @@ HIR should model:
 * unsupported or bailout-first expressions/statements;
 * source line information on every lowered operation.
 
-The v1 supported subset should remain intentionally conservative:
+The initial supported subset is intentionally conservative:
 
-* integer and float arithmetic;
-* comparisons;
+* integer addition, subtraction, multiplication, and comparisons;
 * local loads and stores;
 * simple `if`/`else`;
 * simple `while`;
@@ -394,14 +401,33 @@ architecture for the current AST-first plan.
 
 ## 14. Near-Term Roadmap
 
+Completed in the first native-code milestone:
+
+* short-circuit `&&` and `||` lowering without eager right-operand evaluation;
+* definition-dominates-use SSA verification with focused negative tests; and
+* differential native/reference recipe tests for branching, phi copies,
+  guards, and resource-limit aborts;
+* sparse integer type and constant propagation; and
+* safe constant folding, constant-branch simplification, and unreachable-block
+  pruning;
+* explicit wrapping integer arithmetic and error semantics shared by the
+  interpreter and compiler; and
+* checked native integer division and modulo, including division by zero and
+  the minimum-integer divided by negative-one case; and
+* checked native integer exponentiation and shifts, plus bitwise integer
+  operators; and
+* validated bytecode resume anchors carried from AST code generation through
+  HIR, SSA, optimization, and native recipes; and
+* canonical entry deoptimization maps; and
+* deep deoptimization maps that reconstruct updated integer locals, nested
+  operand stacks, bytecode and error PCs, and exact tick accounting from SSA
+  values on post-entry guard failure;
+* cold native abort and error exits that restore exact bytecode/error PCs and
+  carry source lines without adding location stores to tick hot paths; and
+* guarded integer locals whose values enter through the runtime environment.
+
 The next reviewable compiler milestones are:
 
-1. Complete full SSA register renaming if any remaining reads still use
-   pre-SSA locals or temps.
-2. Add SSA dumps behind a compile flag for debugging.
-3. Add critical-edge splitting support for future phi destruction.
-4. Implement SSA destruction into non-SSA TAC/MIR-like form.
-5. Add type lattice scaffolding and sparse conditional type propagation tests.
-6. Add bytecode resume-anchor mapping for AST-derived HIR operations.
-7. Define the first MIR/native boundary, initially with no runtime calls and
-   conservative interpreter fallback.
+1. Lower simple argument-list indexing, then list destructuring and splicing.
+2. Add deopt-before-call boundaries for built-ins such as `toint()`, before
+   considering selected continuation-free built-ins for direct lowering.

@@ -2,8 +2,10 @@
 
 #include "hir.h"
 
+#include "integer_arithmetic.h"
 #include "storage.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -73,6 +75,7 @@ int_expr(Num value, unsigned lineno)
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_VAR;
     expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.var.type = TYPE_INT;
     expr.e.var.v.num = value;
 
@@ -87,6 +90,7 @@ id_expr(int id, unsigned lineno)
     memset(&expr, 0, sizeof(expr));
     expr.kind = EXPR_ID;
     expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.id = id;
 
     return expr;
@@ -100,6 +104,7 @@ binary_expr(enum Expr_Kind kind, Expr *lhs, Expr *rhs)
     memset(&expr, 0, sizeof(expr));
     expr.kind = kind;
     expr.lineno = lhs ? lhs->lineno : 0;
+    expr.bytecode_pc = NO_BYTECODE_PC;
     expr.e.bin.lhs = lhs;
     expr.e.bin.rhs = rhs;
 
@@ -114,6 +119,7 @@ expr_stmt(Expr *expr)
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_EXPR;
     stmt.lineno = expr ? expr->lineno : 0;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
     stmt.s.expr = expr;
 
     return stmt;
@@ -127,6 +133,7 @@ return_stmt(Expr *expr)
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = STMT_RETURN;
     stmt.lineno = expr ? expr->lineno : 0;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
     stmt.s.expr = expr;
 
     return stmt;
@@ -166,6 +173,7 @@ test_arithmetic_and_local_tac(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
     HIRTacProgram *tac;
     Expr one = int_expr(1, 10);
     Expr two = int_expr(2, 10);
@@ -180,6 +188,14 @@ test_arithmetic_and_local_tac(void)
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
+    one.bytecode_pc = 1;
+    two.bytecode_pc = 2;
+    add.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    local_x_rhs.bytecode_pc = 7;
+    three.bytecode_pc = 8;
+    mult.bytecode_pc = 9;
+    return_stmt_node.bytecode_pc = 10;
     assign_stmt_node.next = &return_stmt_node;
 
     tac = lower_stmt(&names, &assign_stmt_node, &ctx, &cfg, &dom, &ssa);
@@ -190,19 +206,43 @@ test_arithmetic_and_local_tac(void)
     check_int("arith return count", hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("arith add count", hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("arith mul count", hir_tac_count_binary_op(tac, HIR_OP_MUL), 1);
-    check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 4);
-    check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 4);
+    check_int("arith tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
+    check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 6);
+    check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 5);
+    check_int("arith add anchor count",
+	      hir_tac_count_bytecode_pc(tac, 5), 2);
+    check_int("arith add stack depth",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 5), 2);
+    check_int("arith return anchor count",
+	      hir_tac_count_bytecode_pc(tac, 10), 1);
     check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("arith cfg edges", hir_cfg_edge_count(cfg), 0);
     check_int("arith dom reachable blocks",
 	      hir_dom_reachable_block_count(dom), 1);
     check_int("arith dom entry idom", hir_dom_idom_block(dom, 1), 1);
     check_int("arith ssa blocks", hir_ssa_block_count(ssa), 1);
-    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 6);
+    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 9);
     check_int("arith ssa values", hir_ssa_value_count(ssa), 5);
     check_int("arith ssa binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
+    check_int("arith SSA add anchor count",
+	      hir_ssa_count_bytecode_pc(ssa, 5), 2);
+    check_int("arith SSA add stack depth",
+	      hir_ssa_stack_depth_at_bytecode_pc(ssa, 5), 2);
+    check_int("arith SSA updated local",
+	      hir_ssa_local_value_at_bytecode_pc(ssa, 9, 16) > 0, 1);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("arith return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("arith return constant",
+	      (int) hir_ssa_return_constant(ssa, analysis), 9);
+    check_int("arith constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 2);
+    check_int("arith optimized binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
+    check_int("arith optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -243,7 +283,8 @@ test_control_flow_tac(void)
     check_int("control jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
     check_int("control label count", hir_tac_count_kind(tac, HIR_TAC_LABEL), 2);
     check_int("control lt count", hir_tac_count_binary_op(tac, HIR_OP_LT), 1);
-    check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 7);
+    check_int("control tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 2);
+    check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 9);
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
     check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
     check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
@@ -255,12 +296,150 @@ test_control_flow_tac(void)
     check_int("control dom else-label idom", hir_dom_idom_block(dom, 4), 1);
     check_int("control dom done idom", hir_dom_idom_block(dom, 5), 4);
     check_int("control ssa blocks", hir_ssa_block_count(ssa), 5);
-    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 9);
+    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 11);
     check_int("control ssa values", hir_ssa_value_count(ssa), 4);
     check_int("control ssa branch count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
     check_int("control verify errors", hir_context_error_count(ctx), 0);
 
+    hir_context_free(ctx);
+}
+
+static void
+test_short_circuit_tac(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr zero = int_expr(0, 25);
+    Expr nine = int_expr(9, 25);
+    Expr and_expr = binary_expr(EXPR_AND, &zero, &nine);
+    Expr or_expr = binary_expr(EXPR_OR, &zero, &nine);
+    Stmt ret = return_stmt(&and_expr);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("and binary count", hir_tac_count_binary_op(tac, HIR_OP_AND), 0);
+    check_int("and branch count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("and jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 0);
+    check_int("and tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("and synthetic stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("and synthetic loads",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("and phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("and verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+
+    ret = return_stmt(&or_expr);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("or binary count", hir_tac_count_binary_op(tac, HIR_OP_OR), 0);
+    check_int("or branch count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("or jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+    check_int("or tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("or synthetic stores",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("or synthetic loads",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("or phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("or verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+test_constant_analysis_overflow(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    Expr maximum = int_expr(NUM_MAX, 26);
+    Expr one = int_expr(1, 26);
+    Expr add = binary_expr(EXPR_PLUS, &maximum, &one);
+    Stmt ret = return_stmt(&add);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+
+    check_int("overflow return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("overflow wrapped constant",
+	      hir_ssa_return_constant(ssa, analysis) == NUM_MIN, 1);
+    check_int("overflow optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 1);
+    check_int("overflow binary retained",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
+    check_int("overflow optimized verify", hir_verify_ssa(ctx, ssa), 1);
+    check_int("overflow verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+test_integer_arithmetic_model(void)
+{
+    IntegerArithmeticResult result;
+
+    result = integer_arithmetic(INTEGER_NEGATE, NUM_MIN, 0);
+    check_int("model negate minimum succeeds", result.succeeded, 1);
+    check_int("model negate minimum wraps", result.value == NUM_MIN, 1);
+    result = integer_arithmetic(INTEGER_MULTIPLY, NUM_MAX, 2);
+    check_int("model multiply wraps", result.value == -2, 1);
+    result = integer_arithmetic(INTEGER_DIVIDE, NUM_MIN, -1);
+    check_int("model divide overflow succeeds", result.succeeded, 1);
+    check_int("model divide overflow wraps", result.value == NUM_MIN, 1);
+    result = integer_arithmetic(INTEGER_MODULUS, NUM_MIN, -1);
+    check_int("model modulus overflow succeeds", result.succeeded, 1);
+    check_int("model modulus overflow value", result.value, 0);
+    result = integer_arithmetic(INTEGER_DIVIDE, 1, 0);
+    check_int("model divide zero fails", result.succeeded, 0);
+    check_int("model divide zero error", result.error, E_DIV);
+    result = integer_arithmetic(INTEGER_POWER, 0, -1);
+    check_int("model power zero negative fails", result.succeeded, 0);
+    check_int("model power zero negative error", result.error, E_DIV);
+    result = integer_arithmetic(INTEGER_SHIFT_LEFT, 1,
+				sizeof(Num) * CHAR_BIT);
+    check_int("model invalid shift fails", result.succeeded, 0);
+    check_int("model invalid shift error", result.error, E_INVARG);
+}
+
+static void
+test_constant_analysis_error(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    Expr one = int_expr(1, 27);
+    Expr zero = int_expr(0, 27);
+    Expr divide = binary_expr(EXPR_DIVIDE, &one, &zero);
+    Stmt ret = return_stmt(&divide);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+
+    check_int("constant error return fact",
+	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_ERROR);
+    check_int("constant error return value",
+	      hir_ssa_return_error(ssa, analysis), E_DIV);
+    check_int("constant error is not folded",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
     hir_context_free(ctx);
 }
 
@@ -410,6 +589,14 @@ test_negative_ssa_verifier_cases(void)
     hir_context_free(ctx);
 
     ctx = hir_context_new(&names);
+    ssa = hir_test_ssa_with_nondominating_use(ctx);
+    before = hir_context_error_count(ctx);
+    accepted = hir_verify_ssa(ctx, ssa);
+    check_rejected("negative ssa nondominating use", accepted, before,
+		   hir_context_error_count(ctx));
+    hir_context_free(ctx);
+
+    ctx = hir_context_new(&names);
     ssa = hir_test_ssa_with_bad_phi_shape(ctx);
     before = hir_context_error_count(ctx);
     accepted = hir_verify_ssa(ctx, ssa);
@@ -530,6 +717,7 @@ test_while_loop_phi_ssa(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
 
     Expr one_init = int_expr(1, 9);
     Expr local_x_init = id_expr(16, 9);
@@ -569,7 +757,7 @@ test_while_loop_phi_ssa(void)
     check_int("df block 4 count", hir_dom_df_count(dom, 4), 0);
 
     check_int("loop ssa blocks", hir_ssa_block_count(ssa), 4);
-    check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 11);
+    check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 16);
     check_int("loop ssa values", hir_ssa_value_count(ssa), 6);
     check_int("loop ssa phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
     check_int("loop ssa loads", hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
@@ -585,6 +773,13 @@ test_while_loop_phi_ssa(void)
 	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_ADD), 1);
     check_int("loop ssa return uses phi",
 	      hir_ssa_return_uses_phi_count(ssa), 1);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("loop return fact",
+	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
+    check_int("loop constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
+    check_int("loop optimized blocks", hir_ssa_block_count(ssa), 4);
+    check_int("loop optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -598,6 +793,7 @@ test_if_else_phi_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
+    HIRValueAnalysis *analysis;
     Cond_Arm arm;
 
     Expr one = int_expr(1, 70);
@@ -664,6 +860,21 @@ test_if_else_phi_ssa(void)
     check_ssa_dump_contains("ifelse ssa dump footer", ssa, "HIR SSA END");
 #endif
     check_int("ifelse verify errors", hir_context_error_count(ctx), 0);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("ifelse sparse return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("ifelse sparse return constant",
+	      (int) hir_ssa_return_constant(ssa, analysis), 3);
+    check_int("ifelse constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 3);
+    check_int("ifelse optimized blocks", hir_ssa_block_count(ssa), 3);
+    check_int("ifelse optimized edges", hir_ssa_cfg_edge_count(ssa), 2);
+    check_int("ifelse optimized binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
+    check_int("ifelse optimized phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("ifelse optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -720,6 +931,158 @@ test_if_then_phi_uses_entry_local_ssa(void)
     check_int("ifthen ssa return uses phi",
 	      hir_ssa_return_uses_phi_count(ssa), 1);
     check_int("ifthen verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_guarded_environment_local_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_x = id_expr(0, 10);
+    Expr one = int_expr(1, 10);
+    Expr add = binary_expr(EXPR_PLUS, &local_x, &one);
+    Stmt ret = return_stmt(&add);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    local_x.bytecode_pc = 1;
+    one.bytecode_pc = 2;
+    add.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("env local tac load count",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("env local tac const count",
+	      hir_tac_count_kind(tac, HIR_TAC_CONST), 1);
+    check_int("env local tac add count",
+	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
+    check_int("env local ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+    check_int("env local ssa binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("env local verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("env local return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("env local destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("env local out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_multiple_guarded_environment_locals_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+
+    Expr local_x = id_expr(0, 10);
+    Expr local_y = id_expr(1, 10);
+    Expr mult = binary_expr(EXPR_TIMES, &local_x, &local_y);
+    Stmt ret = return_stmt(&mult);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    local_x.bytecode_pc = 1;
+    local_y.bytecode_pc = 2;
+    mult.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("multi env local tac load count",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("multi env local ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("multi env local ssa binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("multi env local verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("multi env local return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("multi env local destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("multi env local out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_conditional_local_assignment_with_entry_local_analysis(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+    Cond_Arm arm;
+
+    Expr cond_x = id_expr(0, 80);
+    Expr then_value = int_expr(3, 81);
+    Expr then_lhs = id_expr(1, 81);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+
+    Expr ret_local = id_expr(1, 82);
+    Expr two = int_expr(2, 82);
+    Expr ret_add = binary_expr(EXPR_PLUS, &ret_local, &two);
+    Stmt ret = return_stmt(&ret_add);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond_x;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 80;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = 0;
+    if_stmt_node.next = &ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("cond assign tac not null", tac != 0, 1);
+    check_int("cond assign ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("cond assign ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
+    check_int("cond assign verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("cond assign return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("cond assign destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("cond assign out of ssa entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 2);
 
     hir_context_free(ctx);
 }
@@ -961,7 +1324,7 @@ test_repeated_local_assignment_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 6);
     check_int("repeat assign cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("repeat assign ssa instructions",
-	      hir_ssa_instruction_count(ssa), 7);
+	      hir_ssa_instruction_count(ssa), 13);
     check_int("repeat assign ssa values", hir_ssa_value_count(ssa), 6);
     check_int("repeat assign ssa loads",
 	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
@@ -977,10 +1340,17 @@ main(void)
 {
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
+    test_short_circuit_tac();
+    test_constant_analysis_overflow();
+    test_integer_arithmetic_model();
+    test_constant_analysis_error();
     test_loop_dominator_tree();
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
+    test_guarded_environment_local_tac_ssa();
+    test_multiple_guarded_environment_locals_ssa();
+    test_conditional_local_assignment_with_entry_local_analysis();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

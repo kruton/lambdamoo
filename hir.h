@@ -2,6 +2,7 @@
 #define HIR_h 1
 
 #include "ast.h"
+#include "program.h"
 #include "structures.h"
 #include "sym_table.h"
 
@@ -12,6 +13,10 @@ typedef struct HIRCFG HIRCFG;
 typedef struct HIRDominatorTree HIRDominatorTree;
 typedef struct HIRBlockList HIRBlockList;
 typedef struct HIRSSAProgram HIRSSAProgram;
+typedef struct HIRValueAnalysis HIRValueAnalysis;
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+typedef struct JITProgram JITProgram;
+#endif
 
 typedef enum {
     HIR_TYPE_INT,
@@ -85,6 +90,7 @@ typedef enum {
 } HIROp;
 
 typedef enum {
+    HIR_TAC_TICK,
     HIR_TAC_CONST,
     HIR_TAC_LOAD_LOCAL,
     HIR_TAC_STORE_LOCAL,
@@ -105,6 +111,13 @@ typedef enum {
     HIR_FORM_OUT_OF_SSA
 } HIRForm;
 
+typedef enum {
+    HIR_VALUE_UNKNOWN,
+    HIR_VALUE_INT,
+    HIR_VALUE_INT_CONSTANT,
+    HIR_VALUE_ERROR
+} HIRValueKind;
+
 extern HIRContext *hir_context_new(Names *);
 extern void hir_context_free(HIRContext *);
 extern int hir_context_error_count(HIRContext *);
@@ -121,8 +134,17 @@ extern int hir_verify_dominator_tree(HIRContext *, HIRCFG *,
 				     HIRDominatorTree *);
 extern HIRSSAProgram *hir_build_ssa(HIRContext *, HIRCFG *);
 extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
+extern HIRValueAnalysis *hir_analyze_ssa_values(HIRContext *, HIRSSAProgram *);
+extern HIRValueKind hir_value_kind(HIRValueAnalysis *, int);
+extern Num hir_value_constant(HIRValueAnalysis *, int);
+extern enum error hir_value_error(HIRValueAnalysis *, int);
+extern int hir_optimize_ssa_constants(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+extern JITProgram *hir_create_jit_program(HIRContext *, HIRSSAProgram *,
+					  Program *);
+#endif
 
 #ifdef HIR_DUMP_TAC
 extern void hir_dump_tac(HIRTacProgram *);
@@ -137,6 +159,8 @@ extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
+extern int hir_tac_count_bytecode_pc(HIRTacProgram *, unsigned);
+extern int hir_tac_stack_depth_at_bytecode_pc(HIRTacProgram *, unsigned);
 extern int hir_cfg_block_count(HIRCFG *);
 extern int hir_cfg_edge_count(HIRCFG *);
 extern int hir_cfg_unsupported_block_count(HIRCFG *);
@@ -148,6 +172,9 @@ extern int hir_ssa_block_count(HIRSSAProgram *);
 extern int hir_ssa_instruction_count(HIRSSAProgram *);
 extern int hir_ssa_value_count(HIRSSAProgram *);
 extern int hir_ssa_count_kind(HIRSSAProgram *, HIRTacKind);
+extern int hir_ssa_count_bytecode_pc(HIRSSAProgram *, unsigned);
+extern int hir_ssa_stack_depth_at_bytecode_pc(HIRSSAProgram *, unsigned);
+extern int hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
 extern int hir_ssa_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_return_uses_phi_count(HIRSSAProgram *);
@@ -158,6 +185,10 @@ extern int hir_ssa_form(HIRSSAProgram *);
 extern int hir_ssa_cfg_block_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_edge_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
+extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
+					       HIRValueAnalysis *);
+extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);
+extern enum error hir_ssa_return_error(HIRSSAProgram *, HIRValueAnalysis *);
 extern HIRTacProgram *hir_test_tac_with_undefined_return(HIRContext *);
 extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);
@@ -167,6 +198,7 @@ extern HIRCFG *hir_test_cfg_with_duplicate_block_id(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_critical_edge(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_use_before_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_duplicate_def(HIRContext *);
+extern HIRSSAProgram *hir_test_ssa_with_nondominating_use(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_bad_phi_shape(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_late_phi(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_missing_phi_arg(HIRContext *);

@@ -21,6 +21,10 @@
 #include "structures.h"
 #include "version.h"
 
+#ifdef ENABLE_JIT
+typedef struct JITProgram JITProgram;
+#endif
+
 typedef uint8_t Byte;
 
 #define RESUME_SCHEMA 1
@@ -113,6 +117,9 @@ typedef struct {
     ResumePoint *resume_points;
     unsigned num_resume_loops;
     ResumeLoop *resume_loops;
+#ifdef ENABLE_JIT
+    JITProgram *jit;
+#endif
 } Program;
 #define BQM_DESCRIBE_Program(B,F,V,X)   ((9 * F) + (12 * V))
 
