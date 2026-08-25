@@ -9,6 +9,13 @@
 typedef struct JITCopy JITCopy;
 typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
+typedef struct JITDeoptMap JITDeoptMap;
+
+struct JITDeoptMap {
+    unsigned bytecode_pc;
+    unsigned error_pc;
+    unsigned stack_depth;
+};
 
 struct JITCopy {
     int dst;
@@ -48,6 +55,8 @@ struct JITProgram {
     int num_vars;
     int num_blocks;
     int num_resume_anchors;
+    int num_deopt_maps;
+    JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;
     void *mir_context;

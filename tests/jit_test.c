@@ -30,6 +30,13 @@ instruction(HIRTacKind kind)
     return result;
 }
 
+static void
+add_entry_deopt_map(JITProgram *program)
+{
+    program->num_deopt_maps = 1;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap));
+}
+
 static JITProgram *
 arithmetic_program(void)
 {
@@ -46,6 +53,7 @@ arithmetic_program(void)
     program->eligible = 1;
     program->num_values = 4;
     program->num_blocks = 1;
+    add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
     one->value = 1;
@@ -128,6 +136,7 @@ guard_program(void)
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
+    add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
     load->value = 1;
@@ -166,6 +175,7 @@ branch_program(void)
     program->num_values = 5;
     program->num_vars = 1;
     program->num_blocks = 4;
+    add_entry_deopt_map(program);
     program->blocks = entry;
     program->last_block = join;
     entry->id = 1;
@@ -342,7 +352,7 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 
     native_status = jit_program_execute(program, env, &native_result,
 					&native_ticks, &timed_out,
-					&native_error);
+					&native_error, 0);
     reference_status = reference_execute(program, env, &reference_result,
 					 &reference_ticks, &timed_out,
 					 &reference_error);
@@ -401,14 +411,17 @@ main(void)
     int timed_out = 0;
     enum error error = E_NONE;
     int lines = 0;
+    JITDeoptState deopt;
 
     check(jit_program_dump_mir(program, count_line, &lines),
 	  "MIR dump failed");
     check(lines > 0, "MIR dump was empty");
+    check(jit_program_deopt_map_count(program) == 1,
+	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error) == JIT_RUN_RETURNED,
+			      &error, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
     check(result.type == TYPE_INT && result.v.num == 3,
 	  "native execution returned the wrong value");
@@ -417,13 +430,13 @@ main(void)
 	  "native execution did not compile lazily");
     ticks = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error)
+			      &error, 0)
 	  == JIT_RUN_ABORT_TICKS, "tick exhaustion did not abort");
     check(ticks == 0, "tick exhaustion left the wrong tick count");
     ticks = 10;
     timed_out = 1;
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
-			      &error)
+			      &error, 0)
 	  == JIT_RUN_ABORT_SECONDS, "seconds exhaustion did not abort");
     check(ticks == 9, "seconds exhaustion consumed the wrong tick count");
     timed_out = 0;
@@ -474,9 +487,13 @@ main(void)
 
     env[0].type = TYPE_STR;
     env[0].v.str = "not an integer";
+    ticks = 10;
     check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
-			      &error)
+			      &error, &deopt)
 	  == JIT_RUN_FALLBACK, "type guard did not request fallback");
+    check(ticks == 10, "entry guard fallback consumed ticks");
+    check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
+	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
     check_differential(branch, env, 10, 0,
 		       "guard fallback differed from reference execution");
 

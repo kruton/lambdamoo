@@ -3205,6 +3205,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->eligible = 1;
     program->num_values = ctx->next_temp;
     program->num_vars = ctx->var_names ? ctx->var_names->size : 0;
+    program->num_deopt_maps = 1;
+    program->deopt_maps = mymalloc(sizeof(JITDeoptMap), M_PROGRAM);
+    program->deopt_maps[0].bytecode_pc = 0;
+    program->deopt_maps[0].error_pc = 0;
+    program->deopt_maps[0].stack_depth = 0;
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRBasicBlock *cfg_block = cfg_block_for_id(ssa->cfg, ssa_block->id);

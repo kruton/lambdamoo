@@ -15,7 +15,8 @@
 #include <stddef.h>
 #include <string.h>
 
-typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *);
+typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
+				   int *);
 
 typedef struct {
     MIR_context_t context;
@@ -101,7 +102,7 @@ static int
 build_mir(JITProgram *program, MIRBuild *build)
 {
     MIR_type_t result_type = MIR_T_I64;
-    MIR_reg_t env, result, ticks, timed_out, error_out;
+    MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
@@ -112,6 +113,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     int max_block_id = 0;
     int copy_serial = 0;
     int i;
+    unsigned char *guarded_locals;
 
     memset(build, 0, sizeof(MIRBuild));
     build->context = MIR_init();
@@ -119,15 +121,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 	return 0;
     build->module = MIR_new_module(build->context, "lambda_moo_jit");
     build->function = MIR_new_func(build->context, "jit_verb", 1,
-				   &result_type, 5,
+				   &result_type, 6,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
-				   MIR_T_P, "error_out");
+				   MIR_T_P, "error_out", MIR_T_P, "deopt_map_out");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
     timed_out = MIR_reg(build->context, "timed_out", build->function->u.func);
     error_out = MIR_reg(build->context, "error_out", build->function->u.func);
+    deopt_map_out = MIR_reg(build->context, "deopt_map_out",
+			    build->function->u.func);
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -152,6 +156,30 @@ build_mir(JITProgram *program, MIRBuild *build)
     memset(labels, 0, sizeof(MIR_label_t) * (max_block_id + 1));
     for (block = program->blocks; block; block = block->next)
 	labels[block->id] = MIR_new_label(build->context);
+
+    guarded_locals = mymalloc(program->num_vars ? program->num_vars : 1,
+			      M_PROGRAM);
+    memset(guarded_locals, 0, program->num_vars ? program->num_vars : 1);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL
+		&& instr->local_id >= 0 && instr->local_id < program->num_vars
+		&& !guarded_locals[instr->local_id]) {
+		guarded_locals[instr->local_id] = 1;
+		append(build, MIR_new_insn(build->context, MIR_BNE,
+				      MIR_new_label_op(build->context, fallback),
+				      MIR_new_mem_op(build->context, MIR_T_I32,
+					instr->local_id * sizeof(Var)
+					+ offsetof(Var, type), env, 0, 1),
+				      MIR_new_int_op(build->context, TYPE_INT)));
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    myfree(guarded_locals, M_PROGRAM);
 
     for (block = program->blocks; block; block = block->next) {
 	    JITInstruction *instr;
@@ -201,16 +229,6 @@ build_mir(JITProgram *program, MIRBuild *build)
 								 instr->literal)));
 		    break;
 		case HIR_TAC_LOAD_LOCAL:
-		    append(build, MIR_new_insn(build->context, MIR_BNE,
-						  MIR_new_label_op(build->context,
-								   fallback),
-						  MIR_new_mem_op(build->context,
-								 MIR_T_I32,
-								 instr->local_id * sizeof(Var)
-								 + offsetof(Var, type),
-								 env, 0, 1),
-						  MIR_new_int_op(build->context,
-								 TYPE_INT)));
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
@@ -506,6 +524,10 @@ build_mir(JITProgram *program, MIRBuild *build)
     }
 
     append(build, fallback);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+			      MIR_new_mem_op(build->context, MIR_T_I32,
+					     0, deopt_map_out, 0, 1),
+			      MIR_new_int_op(build->context, 0)));
     return_status(build, status, common_return, JIT_RUN_FALLBACK);
     append(build, arithmetic_error);
     append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -554,6 +576,8 @@ jit_program_free(JITProgram *program)
 	MIR_gen_finish((MIR_context_t) program->mir_context);
 	MIR_finish((MIR_context_t) program->mir_context);
     }
+    if (program->deopt_maps)
+	myfree(program->deopt_maps, M_PROGRAM);
     block = program->blocks;
     while (block) {
 	JITBlock *next_block = block->next;
@@ -584,6 +608,7 @@ jit_program_bytes(JITProgram *program)
     if (!program)
 	return 0;
     bytes = sizeof(JITProgram);
+    bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 	bytes += sizeof(JITBlock);
@@ -644,6 +669,12 @@ jit_program_anchor_count(JITProgram *program)
 }
 
 int
+jit_program_deopt_map_count(JITProgram *program)
+{
+    return program ? program->num_deopt_maps : 0;
+}
+
+int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
@@ -676,15 +707,29 @@ jit_program_compile(JITProgram *program)
 
 JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
-		    int *ticks, int *timed_out, enum error *error)
+		    int *ticks, int *timed_out, enum error *error,
+		    JITDeoptState *deopt)
 {
     NativeFunction function;
     int64_t native_result;
+    int deopt_map = -1;
 
+    if (deopt && program && program->num_deopt_maps > 0) {
+	deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
+	deopt->error_pc = program->deopt_maps[0].error_pc;
+	deopt->stack_depth = program->deopt_maps[0].stack_depth;
+    }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
     function = (NativeFunction) program->native_function;
-    native_result = function(env, result, ticks, timed_out, error);
+    native_result = function(env, result, ticks, timed_out, error, &deopt_map);
+    if (native_result == JIT_RUN_FALLBACK && deopt) {
+	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
+	    return JIT_RUN_FALLBACK;
+	deopt->bytecode_pc = program->deopt_maps[deopt_map].bytecode_pc;
+	deopt->error_pc = program->deopt_maps[deopt_map].error_pc;
+	deopt->stack_depth = program->deopt_maps[deopt_map].stack_depth;
+    }
     return native_result;
 }
 
