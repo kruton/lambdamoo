@@ -418,12 +418,11 @@ Completed in the first native-code milestone:
   operators; and
 * validated bytecode resume anchors carried from AST code generation through
   HIR, SSA, optimization, and native recipes; and
-* canonical entry deoptimization maps and preflight local guards that fall
-  back before native execution consumes ticks or changes visible state.
+* canonical entry deoptimization maps; and
+* deep deoptimization maps that reconstruct updated integer locals, nested
+  operand stacks, bytecode and error PCs, and exact tick accounting from SSA
+  values on post-entry guard failure.
 
 The next reviewable compiler milestones are:
 
-1. Extend deoptimization maps with SSA local and operand-stack locations before
-   allowing guard failure after the first tick or any operation that mutates
-   interpreter-visible state.
-2. Add native source-line tracking for tick and seconds abort tracebacks.
+1. Add native source-line tracking for tick and seconds abort tracebacks.
