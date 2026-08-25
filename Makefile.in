@@ -103,6 +103,23 @@ DISTFILES = $(ALL_SRCS) Makefile.in config.h.in options.h.in \
 	options.ac aclocal.m4 \
 	restart restart.sh Minimal.db README.Minimal
 
+MIR_VENDOR_FILES = vendor/mir/LICENSE vendor/mir/README.lambdamoo \
+	vendor/mir/mir.c vendor/mir/mir.h vendor/mir/mir-gen.c \
+	vendor/mir/mir-gen.h vendor/mir/mir-aarch64.c \
+	vendor/mir/mir-aarch64.h vendor/mir/mir-gen-aarch64.c \
+	vendor/mir/mir-ppc64.c vendor/mir/mir-ppc64.h \
+	vendor/mir/mir-gen-ppc64.c vendor/mir/mir-riscv64.c \
+	vendor/mir/mir-riscv64.h vendor/mir/mir-gen-riscv64.c \
+	vendor/mir/mir-s390x.c vendor/mir/mir-s390x.h \
+	vendor/mir/mir-gen-s390x.c vendor/mir/mir-x86_64.c \
+	vendor/mir/mir-x86_64.h vendor/mir/mir-gen-x86_64.c \
+	vendor/mir/mir-gen-stub.c vendor/mir/mir-bitmap.h \
+	vendor/mir/mir-dlist.h vendor/mir/mir-hash.h vendor/mir/mir-htab.h \
+	vendor/mir/mir-reduce.h vendor/mir/mir-varr.h \
+	vendor/mir/mir-interp.c vendor/mir/real-time.h
+
+DISTFILES += $(MIR_VENDOR_FILES)
+
 DISTGENS = configure keywords.c $(YSRCS:.y=.c) y.tab.h
 
 COBJS = $(COMMON_CSRCS:.c=.o) $(XT_CSRCS:.c=.o)
@@ -116,10 +133,19 @@ DFILES = $(OBJS:.o=.d) $(CLIENT_CSRCS:.c=.d)
 HIR_TAC_TEST_OBJS = tests/hir_tac_test.o tests/hir_test_hir.o \
 	tests/hir_test_stubs.o arena.o
 
+JIT_TEST_OBJS = tests/jit_test.o tests/jit_test_jit.o \
+	tests/hir_test_stubs.o mir-vendor.o mir-gen-vendor.o
+
 all: moo
 
 moo:	$(OBJS) $(XT_LOBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@
+
+mir-vendor.o: $(abs_srcdir)/vendor/mir/mir.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c -o $@ $<
+
+mir-gen-vendor.o: $(abs_srcdir)/vendor/mir/mir-gen.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c -o $@ $<
 
 tests/hir_test_hir.o: hir.c hir.h
 	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ hir.c
@@ -135,6 +161,18 @@ tests/hir_tac_test: $(HIR_TAC_TEST_OBJS)
 
 test-hir-tac: tests/hir_tac_test
 	./tests/hir_tac_test
+
+tests/jit_test.o: tests/jit_test.c jit.h jit_internal.h
+	$(COMPILE.c) -o $@ tests/jit_test.c
+
+tests/jit_test_jit.o: jit.c jit.h jit_internal.h
+	$(COMPILE.c) -I$(abs_srcdir)/vendor/mir -o $@ jit.c
+
+tests/jit_test: $(JIT_TEST_OBJS)
+	$(CC) $(LDFLAGS) $(JIT_TEST_OBJS) $(LIBS) -o $@
+
+test-jit: tests/jit_test
+	./tests/jit_test
 
 pure_moo: moo
 	purify $(CC) $(CFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@

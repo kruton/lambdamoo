@@ -288,6 +288,9 @@
  |  Extension settings  |
  *----------------------*/
 
+/* compile eligible verbs to native code using MIR */
+#undef ENABLE_JIT
+
 /*
  * --enable-unicode core implementation is present
  * (we are using general UTF-8 in strings)

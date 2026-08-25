@@ -12,6 +12,9 @@ typedef struct HIRCFG HIRCFG;
 typedef struct HIRDominatorTree HIRDominatorTree;
 typedef struct HIRBlockList HIRBlockList;
 typedef struct HIRSSAProgram HIRSSAProgram;
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+typedef struct JITProgram JITProgram;
+#endif
 
 typedef enum {
     HIR_TYPE_INT,
@@ -85,6 +88,7 @@ typedef enum {
 } HIROp;
 
 typedef enum {
+    HIR_TAC_TICK,
     HIR_TAC_CONST,
     HIR_TAC_LOAD_LOCAL,
     HIR_TAC_STORE_LOCAL,
@@ -123,6 +127,9 @@ extern HIRSSAProgram *hir_build_ssa(HIRContext *, HIRCFG *);
 extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+extern JITProgram *hir_create_jit_program(HIRContext *, HIRSSAProgram *);
+#endif
 
 #ifdef HIR_DUMP_TAC
 extern void hir_dump_tac(HIRTacProgram *);

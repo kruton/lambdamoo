@@ -1,5 +1,12 @@
 #include "hir.h"
 
+#include "config.h"
+#include "options.h"
+
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+#include "jit_internal.h"
+#endif
+
 #include "arena.h"
 #include "program.h"
 #include "my-stdio.h"
@@ -432,6 +439,8 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 
     for (instr = program->first; instr; instr = instr->next) {
 	switch (instr->kind) {
+	case HIR_TAC_TICK:
+	    break;
 	case HIR_TAC_CONST:
 	case HIR_TAC_LOAD_LOCAL:
 	    if (instr->kind == HIR_TAC_LOAD_LOCAL)
@@ -1763,6 +1772,8 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    instruction_count++;
 
 	    switch (instr->kind) {
+	    case HIR_TAC_TICK:
+		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
 		if (instr->kind == HIR_TAC_LOAD_LOCAL)
@@ -2194,6 +2205,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	for (instr = block->first; instr; instr = instr->next) {
 	    instruction_count++;
 	    switch (instr->kind) {
+	    case HIR_TAC_TICK:
+		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_UNARY:
@@ -2284,6 +2297,149 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     return ctx->error_count == errors_before;
 }
 
+#if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+static int
+jit_op_is_supported(HIROp op)
+{
+    switch (op) {
+    case HIR_OP_NEGATE:
+    case HIR_OP_NOT:
+    case HIR_OP_COMPLEMENT:
+    case HIR_OP_ADD:
+    case HIR_OP_SUB:
+    case HIR_OP_MUL:
+    case HIR_OP_EQ:
+    case HIR_OP_NE:
+    case HIR_OP_LT:
+    case HIR_OP_LE:
+    case HIR_OP_GT:
+    case HIR_OP_GE:
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static int
+jit_ssa_is_supported(HIRSSAProgram *ssa)
+{
+    HIRSSABlock *block;
+
+    if (!ssa || ssa->form != HIR_FORM_OUT_OF_SSA)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    switch (instr->kind) {
+	    case HIR_TAC_TICK:
+	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_LABEL:
+	    case HIR_TAC_JUMP:
+	    case HIR_TAC_BRANCH_FALSE:
+	    case HIR_TAC_RETURN:
+	    case HIR_TAC_RETURN0:
+	    case HIR_TAC_PARALLEL_COPY:
+		break;
+	    case HIR_TAC_CONST:
+		if (instr->literal.type != TYPE_INT)
+		    return 0;
+		break;
+	    case HIR_TAC_UNARY:
+	    case HIR_TAC_BINARY:
+		if (!jit_op_is_supported(instr->op))
+		    return 0;
+		break;
+	    case HIR_TAC_STORE_LOCAL:
+	    case HIR_TAC_UNSUPPORTED:
+	    case HIR_TAC_PHI:
+		return 0;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 1;
+}
+
+JITProgram *
+hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    JITProgram *program;
+    HIRSSABlock *ssa_block;
+
+    if (!ctx || ctx->error_count || !jit_ssa_is_supported(ssa))
+	return jit_program_unsupported("unsupported-program");
+
+    program = mymalloc(sizeof(JITProgram), M_PROGRAM);
+    memset(program, 0, sizeof(JITProgram));
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = ctx->next_temp;
+    program->num_vars = ctx->var_names ? ctx->var_names->size : 0;
+
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRBasicBlock *cfg_block = cfg_block_for_id(ssa->cfg, ssa_block->id);
+	HIRSSAInstr *ssa_instr;
+	JITBlock *block = mymalloc(sizeof(JITBlock), M_PROGRAM);
+
+	memset(block, 0, sizeof(JITBlock));
+	block->id = ssa_block->id;
+	if (cfg_block) {
+	    int i;
+	    block->num_successors = cfg_block->num_successors;
+	    for (i = 0; i < cfg_block->num_successors; i++)
+		block->successors[i] = cfg_block->successors[i]->id;
+	}
+	if (program->last_block)
+	    program->last_block->next = block;
+	else
+	    program->blocks = block;
+	program->last_block = block;
+	program->num_blocks++;
+
+	for (ssa_instr = ssa_block->first; ssa_instr;
+	     ssa_instr = ssa_instr->next) {
+	    HIRParallelCopy *ssa_copy;
+	    JITInstruction *instr = mymalloc(sizeof(JITInstruction), M_PROGRAM);
+
+	    memset(instr, 0, sizeof(JITInstruction));
+	    instr->kind = ssa_instr->kind;
+	    instr->source_lineno = ssa_instr->source_lineno;
+	    instr->value = ssa_instr->value;
+	    instr->src1 = ssa_instr->src1;
+	    instr->src2 = ssa_instr->src2;
+	    instr->local_id = ssa_instr->local_id;
+	    instr->op = ssa_instr->op;
+	    instr->literal = ssa_instr->kind == HIR_TAC_CONST
+		? ssa_instr->literal.v.num : 0;
+	    for (ssa_copy = ssa_instr->copies; ssa_copy;
+		 ssa_copy = ssa_copy->next) {
+		JITCopy *copy = mymalloc(sizeof(JITCopy), M_PROGRAM);
+		JITCopy **tail = &instr->copies;
+		copy->dst = ssa_copy->dst;
+		copy->src = ssa_copy->src;
+		copy->next = 0;
+		while (*tail)
+		    tail = &(*tail)->next;
+		*tail = copy;
+	    }
+	    if (block->last)
+		block->last->next = instr;
+	    else
+		block->first = instr;
+	    block->last = instr;
+	    if (ssa_instr == ssa_block->last)
+		break;
+	}
+    }
+
+    return program;
+}
+#endif /* ENABLE_JIT && !HIR_TESTING */
+
 #if defined(HIR_DUMP_TAC) || defined(HIR_DUMP_SSA)
 static const char *tac_kind_name(HIRTacKind);
 static const char *op_name(HIROp);
@@ -2307,6 +2463,8 @@ hir_dump_tac(HIRTacProgram *program)
 		tac_kind_name(instr->kind));
 
 	switch (instr->kind) {
+	case HIR_TAC_TICK:
+	    break;
 	case HIR_TAC_CONST:
 	    fprintf(stderr, " t%d = ", instr->dst);
 	    dump_var(stderr, instr->literal);
@@ -2465,6 +2623,8 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		    tac_kind_name(instr->kind));
 
 	    switch (instr->kind) {
+	    case HIR_TAC_TICK:
+		break;
 	    case HIR_TAC_CONST:
 		fprintf(file, " t%d = ", instr->value);
 		dump_var(file, instr->literal);
@@ -2546,6 +2706,8 @@ static const char *
 tac_kind_name(HIRTacKind kind)
 {
     switch (kind) {
+    case HIR_TAC_TICK:
+	return "tick";
     case HIR_TAC_CONST:
 	return "const";
     case HIR_TAC_LOAD_LOCAL:
@@ -3578,6 +3740,12 @@ append_tac(HIRTacProgram *program, HIRTacInstr *instr)
 }
 
 static void
+append_tick(HIRContext *ctx, HIRTacProgram *program, unsigned source_lineno)
+{
+    append_tac(program, new_tac(ctx, HIR_TAC_TICK, source_lineno));
+}
+
+static void
 append_label(HIRContext *ctx, HIRTacProgram *program, int label,
 	     unsigned source_lineno)
 {
@@ -3603,6 +3771,7 @@ append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
 {
     HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE, source_lineno);
 
+    append_tick(ctx, program, source_lineno);
     instr->src1 = src;
     instr->label = label;
     append_tac(program, instr);
@@ -3645,6 +3814,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	return instr->dst;
     case HIR_EXPR_LOCAL_STORE:
 	rhs = lower_expr(ctx, program, expr->u.local_store.rhs);
+	append_tick(ctx, program, expr->source_lineno);
 	instr = new_tac(ctx, HIR_TAC_STORE_LOCAL, expr->source_lineno);
 	instr->dst = rhs;
 	instr->src1 = rhs;
@@ -3653,6 +3823,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	return rhs;
     case HIR_EXPR_UNARY:
 	lhs = lower_expr(ctx, program, expr->u.unary.expr);
+	append_tick(ctx, program, expr->source_lineno);
 	instr = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;
@@ -3662,6 +3833,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     case HIR_EXPR_BINARY:
 	lhs = lower_expr(ctx, program, expr->u.binary.lhs);
 	rhs = lower_expr(ctx, program, expr->u.binary.rhs);
+	append_tick(ctx, program, expr->source_lineno);
 	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
 	instr->dst = new_temp(ctx);
 	instr->src1 = lhs;

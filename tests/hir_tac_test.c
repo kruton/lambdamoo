@@ -190,15 +190,16 @@ test_arithmetic_and_local_tac(void)
     check_int("arith return count", hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("arith add count", hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("arith mul count", hir_tac_count_binary_op(tac, HIR_OP_MUL), 1);
-    check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 4);
-    check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 4);
+    check_int("arith tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
+    check_int("arith line 10 count", hir_tac_count_lineno(tac, 10), 6);
+    check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 5);
     check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("arith cfg edges", hir_cfg_edge_count(cfg), 0);
     check_int("arith dom reachable blocks",
 	      hir_dom_reachable_block_count(dom), 1);
     check_int("arith dom entry idom", hir_dom_idom_block(dom, 1), 1);
     check_int("arith ssa blocks", hir_ssa_block_count(ssa), 1);
-    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 6);
+    check_int("arith ssa instructions", hir_ssa_instruction_count(ssa), 9);
     check_int("arith ssa values", hir_ssa_value_count(ssa), 5);
     check_int("arith ssa binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
@@ -243,7 +244,8 @@ test_control_flow_tac(void)
     check_int("control jump count", hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
     check_int("control label count", hir_tac_count_kind(tac, HIR_TAC_LABEL), 2);
     check_int("control lt count", hir_tac_count_binary_op(tac, HIR_OP_LT), 1);
-    check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 7);
+    check_int("control tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 2);
+    check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 9);
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
     check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
     check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
@@ -255,7 +257,7 @@ test_control_flow_tac(void)
     check_int("control dom else-label idom", hir_dom_idom_block(dom, 4), 1);
     check_int("control dom done idom", hir_dom_idom_block(dom, 5), 4);
     check_int("control ssa blocks", hir_ssa_block_count(ssa), 5);
-    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 9);
+    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 11);
     check_int("control ssa values", hir_ssa_value_count(ssa), 4);
     check_int("control ssa branch count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
@@ -569,7 +571,7 @@ test_while_loop_phi_ssa(void)
     check_int("df block 4 count", hir_dom_df_count(dom, 4), 0);
 
     check_int("loop ssa blocks", hir_ssa_block_count(ssa), 4);
-    check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 11);
+    check_int("loop ssa instructions", hir_ssa_instruction_count(ssa), 16);
     check_int("loop ssa values", hir_ssa_value_count(ssa), 6);
     check_int("loop ssa phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
     check_int("loop ssa loads", hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
@@ -961,7 +963,7 @@ test_repeated_local_assignment_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 6);
     check_int("repeat assign cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("repeat assign ssa instructions",
-	      hir_ssa_instruction_count(ssa), 7);
+	      hir_ssa_instruction_count(ssa), 13);
     check_int("repeat assign ssa values", hir_ssa_value_count(ssa), 6);
     check_int("repeat assign ssa loads",
 	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);

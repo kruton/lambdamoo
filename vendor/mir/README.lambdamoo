@@ -1,0 +1,9 @@
+MIR 1.0.0 is vendored from:
+
+    https://github.com/vnmakarov/mir/tree/v1.0.0
+
+Upstream commit: 477d820838a2f884f494f33a02a01b040781c81a
+
+Only the core MIR runtime and generator sources are included.  LambdaMOO uses
+the generator at optimization level zero when configured with --enable-jit.
+See LICENSE for MIR's MIT license.

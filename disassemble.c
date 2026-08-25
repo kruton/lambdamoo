@@ -21,9 +21,15 @@
 #include "config.h"
 
 #include "my-stdio.h"
+#ifdef ENABLE_JIT
+#include "my-string.h"
+#endif
 
 #include "db.h"
 #include "functions.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "list.h"
 #include "opcode.h"
 #include "program.h"
@@ -420,6 +426,19 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     Var r;
     int i;
     enum error e;
+#ifdef ENABLE_JIT
+    int mir = 0;
+
+    if (arglist.v.list[0].v.num == 3) {
+	const char *format = arglist.v.list[3].v.str;
+	if (!strcmp(format, "mir"))
+	    mir = 1;
+	else if (strcmp(format, "bytecode") && strcmp(format, "current")) {
+	    free_var(arglist);
+	    return make_error_pack(E_INVARG);
+	}
+    }
+#endif
 
     if ((e = validate_verb_descriptor(desc)) != E_NONE
 	|| (e = E_INVARG, !valid(oid))) {
@@ -436,6 +455,12 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 
     data.lines = 0;
     data.used = data.max = 0;
+#ifdef ENABLE_JIT
+    if (mir) {
+	if (!jit_program_dump_mir(db_verb_program(h)->jit, add_line, &data))
+	    return make_error_pack(E_INVARG);
+    } else
+#endif
     disassemble(db_verb_program(h), add_line, &data);
     r = new_list(data.used);
     for (i = 1; i <= data.used; i++) {
@@ -450,7 +475,12 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 void
 register_disassemble(void)
 {
+#ifdef ENABLE_JIT
+    register_function("disassemble", 2, 3, bf_disassemble,
+		      TYPE_OBJ, TYPE_ANY, TYPE_STR);
+#else
     register_function("disassemble", 2, 2, bf_disassemble, TYPE_OBJ, TYPE_ANY);
+#endif
 }
 
 

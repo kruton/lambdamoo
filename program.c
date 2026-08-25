@@ -21,6 +21,9 @@
 #include "opcode.h"
 #include "parser.h"
 #include "program.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "storage.h"
 #include "structures.h"
 #include "utils.h"
@@ -219,6 +222,10 @@ program_bytes(Program * p)
 	count += BQM_SIZEOF(ResumeStackSlot)
 	    * p->resume_points[i].stack_depth;
 
+#ifdef ENABLE_JIT
+    count += jit_program_bytes(p->jit);
+#endif
+
     return count;
 }
 
@@ -252,6 +259,10 @@ free_program(Program * p)
 		myfree(p->resume_points[i].stack_slots, M_PROGRAM);
 	if (p->resume_points)
 	    myfree(p->resume_points, M_PROGRAM);
+
+#ifdef ENABLE_JIT
+	jit_program_free(p->jit);
+#endif
 
 	myfree(p, M_PROGRAM);
     }

@@ -30,6 +30,9 @@
 #include "eval_vm.h"
 #include "exceptions.h"
 #include "functions.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "list.h"
 #include "log.h"
 #include "numbers.h"
@@ -897,6 +900,37 @@ do {								\
     }
     for (;;) {
       next_opcode:
+#ifdef ENABLE_JIT
+        if (bv == bc.vector
+	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
+	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit) {
+	    Var ret_val;
+	    JITRunResult jit_result;
+
+	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
+					     RUN_ACTIV.rt_env, &ret_val,
+					     &ticks_remaining, &task_timed_out);
+	    if (jit_result == JIT_RUN_RETURNED) {
+		STORE_STATE_VARIABLES();
+		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
+		    if (result && outcome == OUTCOME_DONE)
+			*result = ret_val;
+		    else
+			free_var(ret_val);
+		    return outcome;
+		}
+		LOAD_STATE_VARIABLES();
+	    } else if (jit_result == JIT_RUN_ABORT_TICKS) {
+		STORE_STATE_VARIABLES();
+		abort_task(ABORT_TICKS);
+		return OUTCOME_ABORTED;
+	    } else if (jit_result == JIT_RUN_ABORT_SECONDS) {
+		STORE_STATE_VARIABLES();
+		abort_task(ABORT_SECONDS);
+		return OUTCOME_ABORTED;
+	    }
+	}
+#endif
 	error_bv = bv;
 	op = *bv++;
 

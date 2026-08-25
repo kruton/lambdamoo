@@ -57,7 +57,15 @@ The current branch has already established the first compiler backbone:
 * dominance frontier computation;
 * initial SSA construction over CFG;
 * SSA verifier, including phi-shape negative tests;
-* positive SSA phi tests for `if`/`else` joins and `while` loop backedges.
+* positive SSA phi tests for `if`/`else` joins and `while` loop backedges;
+* critical-edge splitting and SSA destruction;
+* explicit tick operations retained through native lowering;
+* an optional `--enable-jit` extension using vendored MIR 1.0.0 at O0;
+* lazy, per-program native generation for a guarded integer-only tier;
+* native entry and return through the existing activation unwinder;
+* JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
+* read-only MIR output through `disassemble(..., "mir")`;
+* disposable JIT state that is rebuilt from source after database reload.
 
 ## 4. Phase 1: AST to HIR
 
@@ -79,10 +87,9 @@ HIR should model:
 * unsupported or bailout-first expressions/statements;
 * source line information on every lowered operation.
 
-The v1 supported subset should remain intentionally conservative:
+The initial supported subset is intentionally conservative:
 
-* integer and float arithmetic;
-* comparisons;
+* integer addition, subtraction, multiplication, and comparisons;
 * local loads and stores;
 * simple `if`/`else`;
 * simple `while`;
@@ -396,12 +403,14 @@ architecture for the current AST-first plan.
 
 The next reviewable compiler milestones are:
 
-1. Complete full SSA register renaming if any remaining reads still use
-   pre-SSA locals or temps.
-2. Add SSA dumps behind a compile flag for debugging.
-3. Add critical-edge splitting support for future phi destruction.
-4. Implement SSA destruction into non-SSA TAC/MIR-like form.
-5. Add type lattice scaffolding and sparse conditional type propagation tests.
-6. Add bytecode resume-anchor mapping for AST-derived HIR operations.
-7. Define the first MIR/native boundary, initially with no runtime calls and
-   conservative interpreter fallback.
+1. Lower short-circuit `&&` and `||` control flow without eagerly evaluating
+   the right operand.
+2. Strengthen SSA verification with definition-dominates-use checks and
+   focused negative tests.
+3. Add a sparse integer type/constant lattice and constant-folding tests.
+4. Model arithmetic error and overflow behavior explicitly before expanding
+   the integer tier to division, modulo, exponentiation, or shifts.
+5. Add bytecode resume-anchor mapping for AST-derived HIR operations.
+6. Add deoptimization maps before allowing guard failure after the first
+   tick or any operation that mutates interpreter-visible state.
+7. Add native source-line tracking for tick and seconds abort tracebacks.

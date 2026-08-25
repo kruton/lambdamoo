@@ -26,6 +26,9 @@
 #include "exceptions.h"
 #include "execute.h"
 #include "functions.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "list.h"
 #include "log.h"
 #include "match.h"
@@ -263,6 +266,46 @@ bf_delete_verb(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 	return make_error_pack(e);
 }
 
+#ifdef ENABLE_JIT
+static Var
+jit_metadata_pair(const char *name, Var value)
+{
+    Var pair = new_list(2);
+
+    pair.v.list[1].type = TYPE_STR;
+    pair.v.list[1].v.str = str_dup(name);
+    pair.v.list[2] = value;
+    return pair;
+}
+
+static Var
+jit_metadata(JITProgram *program)
+{
+    Var metadata = new_list(6);
+    Var value;
+
+    value.type = TYPE_STR;
+    value.v.str = str_dup(jit_program_state_name(program));
+    metadata.v.list[1] = jit_metadata_pair("state", value);
+    value.type = TYPE_INT;
+    value.v.num = jit_program_is_eligible(program);
+    metadata.v.list[2] = jit_metadata_pair("eligible", value);
+    value.type = TYPE_STR;
+    value.v.str = str_dup("mir");
+    metadata.v.list[3] = jit_metadata_pair("backend", value);
+    value.type = TYPE_STR;
+    value.v.str = str_dup("1.0.0");
+    metadata.v.list[4] = jit_metadata_pair("backend_version", value);
+    value.type = TYPE_STR;
+    value.v.str = str_dup("integer-v1");
+    metadata.v.list[5] = jit_metadata_pair("tier", value);
+    value.type = TYPE_STR;
+    value.v.str = str_dup(jit_program_reason(program));
+    metadata.v.list[6] = jit_metadata_pair("reason", value);
+    return metadata;
+}
+#endif
+
 static package
 bf_verb_info(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 {				/* (object, verb-desc) */
@@ -273,6 +316,10 @@ bf_verb_info(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     unsigned flags;
     char perms[5], *s;
     enum error e;
+#ifdef ENABLE_JIT
+    int include_jit = arglist.v.list[0].v.num == 3
+	&& is_true(arglist.v.list[3]);
+#endif
 
     if ((e = validate_verb_descriptor(desc)) != E_NONE
 	|| (e = E_INVARG, !valid(oid))) {
@@ -287,7 +334,11 @@ bf_verb_info(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     else if (!db_verb_allows(h, progr, VF_READ))
 	return make_error_pack(E_PERM);
 
-    r = new_list(3);
+    r = new_list(
+#ifdef ENABLE_JIT
+		 include_jit ? 4 :
+#endif
+		 3);
     r.v.list[1].type = TYPE_OBJ;
     r.v.list[1].v.obj = db_verb_owner(h);
     r.v.list[2].type = TYPE_STR;
@@ -305,6 +356,10 @@ bf_verb_info(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     r.v.list[2].v.str = str_dup(perms);
     r.v.list[3].type = TYPE_STR;
     r.v.list[3].v.str = str_ref(db_verb_names(h));
+#ifdef ENABLE_JIT
+    if (include_jit)
+	r.v.list[4] = jit_metadata(db_verb_program(h)->jit);
+#endif
 
     return make_var_pack(r);
 }
@@ -562,11 +617,48 @@ bf_eval(Var arglist, Byte next, void *data UNUSED_, Objid progr)
     return p;
 }
 
+#ifdef ENABLE_JIT
+static package
+bf_jit_compile(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
+{
+    Objid oid = arglist.v.list[1].v.obj;
+    Var desc = arglist.v.list[2];
+    db_verb_handle h;
+    enum error e;
+    Var metadata;
+
+    if (!is_wizard(progr)) {
+	free_var(arglist);
+	return make_error_pack(E_PERM);
+    }
+    if ((e = validate_verb_descriptor(desc)) != E_NONE
+	|| (e = E_INVARG, !valid(oid))) {
+	free_var(arglist);
+	return make_error_pack(e);
+    }
+    h = find_described_verb(oid, desc);
+    free_var(arglist);
+    if (!h.ptr)
+	return make_error_pack(E_VERBNF);
+
+    (void) jit_program_compile(db_verb_program(h)->jit);
+    metadata = jit_metadata(db_verb_program(h)->jit);
+    return make_var_pack(metadata);
+}
+#endif
+
 void
 register_verbs(void)
 {
     register_function("verbs", 1, 1, bf_verbs, TYPE_OBJ);
+#ifdef ENABLE_JIT
+    register_function("verb_info", 2, 3, bf_verb_info,
+		      TYPE_OBJ, TYPE_ANY, TYPE_ANY);
+    register_function("jit_compile", 2, 2, bf_jit_compile,
+		      TYPE_OBJ, TYPE_ANY);
+#else
     register_function("verb_info", 2, 2, bf_verb_info, TYPE_OBJ, TYPE_ANY);
+#endif
     register_function("set_verb_info", 3, 3, bf_set_verb_info,
 		      TYPE_OBJ, TYPE_ANY, TYPE_LIST);
     register_function("verb_args", 2, 2, bf_verb_args, TYPE_OBJ, TYPE_ANY);
