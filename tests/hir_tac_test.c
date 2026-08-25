@@ -166,6 +166,7 @@ test_arithmetic_and_local_tac(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
     HIRTacProgram *tac;
     Expr one = int_expr(1, 10);
     Expr two = int_expr(2, 10);
@@ -204,6 +205,12 @@ test_arithmetic_and_local_tac(void)
     check_int("arith ssa binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("arith return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("arith return constant",
+	      (int) hir_ssa_return_constant(ssa, analysis), 9);
 
     hir_context_free(ctx);
 }
@@ -312,6 +319,31 @@ test_short_circuit_tac(void)
 	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
     check_int("or phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
     check_int("or verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+test_constant_analysis_overflow(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    Expr maximum = int_expr(NUM_MAX, 26);
+    Expr one = int_expr(1, 26);
+    Expr add = binary_expr(EXPR_PLUS, &maximum, &one);
+    Stmt ret = return_stmt(&add);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+
+    check_int("overflow return fact",
+	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
+    check_int("overflow verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 }
 
@@ -589,6 +621,7 @@ test_while_loop_phi_ssa(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
 
     Expr one_init = int_expr(1, 9);
     Expr local_x_init = id_expr(16, 9);
@@ -644,6 +677,9 @@ test_while_loop_phi_ssa(void)
 	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_ADD), 1);
     check_int("loop ssa return uses phi",
 	      hir_ssa_return_uses_phi_count(ssa), 1);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("loop return fact",
+	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
 
     hir_context_free(ctx);
 }
@@ -657,6 +693,7 @@ test_if_else_phi_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
+    HIRValueAnalysis *analysis;
     Cond_Arm arm;
 
     Expr one = int_expr(1, 70);
@@ -723,6 +760,12 @@ test_if_else_phi_ssa(void)
     check_ssa_dump_contains("ifelse ssa dump footer", ssa, "HIR SSA END");
 #endif
     check_int("ifelse verify errors", hir_context_error_count(ctx), 0);
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("ifelse sparse return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("ifelse sparse return constant",
+	      (int) hir_ssa_return_constant(ssa, analysis), 3);
 
     hir_context_free(ctx);
 }
@@ -1037,6 +1080,7 @@ main(void)
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();
+    test_constant_analysis_overflow();
     test_loop_dominator_tree();
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();

@@ -29,6 +29,18 @@ typedef struct HIRPhiArg HIRPhiArg;
 typedef struct HIRParallelCopy HIRParallelCopy;
 typedef struct HIRSSADestructionMove HIRSSADestructionMove;
 
+typedef enum {
+    HIR_VALUE_BOTTOM,
+    HIR_VALUE_FACT_UNKNOWN,
+    HIR_VALUE_FACT_INT,
+    HIR_VALUE_FACT_CONSTANT
+} HIRValueFactKind;
+
+typedef struct {
+    HIRValueFactKind kind;
+    Num constant;
+} HIRValueFact;
+
 struct HIRArg {
     enum Arg_Kind kind;
     HIRExpr *expr;
@@ -263,6 +275,11 @@ struct HIRSSAProgram {
     int num_blocks;
     int num_instructions;
     int num_values;
+};
+
+struct HIRValueAnalysis {
+    HIRValueFact *facts;
+    int num_facts;
 };
 
 struct HIRContext {
@@ -1974,6 +1991,309 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     return ctx->error_count == errors_before;
 }
 
+static HIRValueFact
+join_value_fact(HIRValueFact lhs, HIRValueFact rhs)
+{
+    HIRValueFact result;
+
+    if (lhs.kind == HIR_VALUE_BOTTOM)
+	return rhs;
+    if (rhs.kind == HIR_VALUE_BOTTOM)
+	return lhs;
+    result.constant = 0;
+    if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
+	|| rhs.kind == HIR_VALUE_FACT_UNKNOWN)
+	result.kind = HIR_VALUE_FACT_UNKNOWN;
+    else if (lhs.kind == HIR_VALUE_FACT_CONSTANT
+	     && rhs.kind == HIR_VALUE_FACT_CONSTANT
+	     && lhs.constant == rhs.constant)
+	return lhs;
+    else
+	result.kind = HIR_VALUE_FACT_INT;
+    return result;
+}
+
+static int
+safe_add(Num lhs, Num rhs, Num *result)
+{
+    if ((rhs > 0 && lhs > NUM_MAX - rhs)
+	|| (rhs < 0 && lhs < NUM_MIN - rhs))
+	return 0;
+    *result = lhs + rhs;
+    return 1;
+}
+
+static int
+safe_subtract(Num lhs, Num rhs, Num *result)
+{
+    if ((rhs > 0 && lhs < NUM_MIN + rhs)
+	|| (rhs < 0 && lhs > NUM_MAX + rhs))
+	return 0;
+    *result = lhs - rhs;
+    return 1;
+}
+
+static int
+safe_multiply(Num lhs, Num rhs, Num *result)
+{
+    if (lhs == 0 || rhs == 0) {
+	*result = 0;
+	return 1;
+    }
+    if ((lhs > 0 && rhs > 0 && lhs > NUM_MAX / rhs)
+	|| (lhs > 0 && rhs < 0 && rhs < NUM_MIN / lhs)
+	|| (lhs < 0 && rhs > 0 && lhs < NUM_MIN / rhs)
+	|| (lhs < 0 && rhs < 0 && lhs < NUM_MAX / rhs))
+	return 0;
+    *result = lhs * rhs;
+    return 1;
+}
+
+static HIRValueFact
+constant_fact(Num value)
+{
+    HIRValueFact fact;
+
+    fact.kind = HIR_VALUE_FACT_CONSTANT;
+    fact.constant = value;
+    return fact;
+}
+
+static HIRValueFact
+integer_fact(void)
+{
+    HIRValueFact fact;
+
+    fact.kind = HIR_VALUE_FACT_INT;
+    fact.constant = 0;
+    return fact;
+}
+
+static HIRValueFact
+unknown_fact(void)
+{
+    HIRValueFact fact;
+
+    fact.kind = HIR_VALUE_FACT_UNKNOWN;
+    fact.constant = 0;
+    return fact;
+}
+
+static HIRValueFact
+analyze_unary(HIROp op, HIRValueFact operand)
+{
+    if (operand.kind == HIR_VALUE_BOTTOM
+	|| operand.kind == HIR_VALUE_FACT_UNKNOWN)
+	return operand;
+    if (operand.kind != HIR_VALUE_FACT_CONSTANT)
+	return integer_fact();
+    switch (op) {
+    case HIR_OP_NEGATE:
+	if (operand.constant == NUM_MIN)
+	    return integer_fact();
+	return constant_fact(-operand.constant);
+    case HIR_OP_NOT:
+	return constant_fact(!operand.constant);
+    case HIR_OP_COMPLEMENT:
+	return constant_fact(~operand.constant);
+    default:
+	return unknown_fact();
+    }
+}
+
+static HIRValueFact
+analyze_binary(HIROp op, HIRValueFact lhs, HIRValueFact rhs)
+{
+    Num result;
+
+    if (lhs.kind == HIR_VALUE_BOTTOM || rhs.kind == HIR_VALUE_BOTTOM) {
+	HIRValueFact bottom = {HIR_VALUE_BOTTOM, 0};
+	return bottom;
+    }
+    if (lhs.kind == HIR_VALUE_FACT_UNKNOWN
+	|| rhs.kind == HIR_VALUE_FACT_UNKNOWN)
+	return unknown_fact();
+    if (lhs.kind != HIR_VALUE_FACT_CONSTANT
+	|| rhs.kind != HIR_VALUE_FACT_CONSTANT)
+	return integer_fact();
+    switch (op) {
+    case HIR_OP_ADD:
+	return safe_add(lhs.constant, rhs.constant, &result)
+	    ? constant_fact(result) : integer_fact();
+    case HIR_OP_SUB:
+	return safe_subtract(lhs.constant, rhs.constant, &result)
+	    ? constant_fact(result) : integer_fact();
+    case HIR_OP_MUL:
+	return safe_multiply(lhs.constant, rhs.constant, &result)
+	    ? constant_fact(result) : integer_fact();
+    case HIR_OP_EQ:
+	return constant_fact(lhs.constant == rhs.constant);
+    case HIR_OP_NE:
+	return constant_fact(lhs.constant != rhs.constant);
+    case HIR_OP_LT:
+	return constant_fact(lhs.constant < rhs.constant);
+    case HIR_OP_LE:
+	return constant_fact(lhs.constant <= rhs.constant);
+    case HIR_OP_GT:
+	return constant_fact(lhs.constant > rhs.constant);
+    case HIR_OP_GE:
+	return constant_fact(lhs.constant >= rhs.constant);
+    default:
+	return integer_fact();
+    }
+}
+
+static int
+update_value_fact(HIRValueFact *facts, int value, HIRValueFact candidate)
+{
+    HIRValueFact joined = join_value_fact(facts[value], candidate);
+
+    if (joined.kind == facts[value].kind
+	&& (joined.kind != HIR_VALUE_FACT_CONSTANT
+	    || joined.constant == facts[value].constant))
+	return 0;
+    facts[value] = joined;
+    return 1;
+}
+
+HIRValueAnalysis *
+hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRValueAnalysis *analysis;
+    HIRSSABlock *block;
+    HIRBasicBlock *cfg_block;
+    unsigned char *reachable;
+    unsigned char *feasible_edges;
+    int max_block_id = 0;
+    int changed = 1;
+
+    if (!ctx || !ssa || !ssa->cfg || ssa->form != HIR_FORM_SSA)
+	return 0;
+    for (cfg_block = ssa->cfg->blocks; cfg_block; cfg_block = cfg_block->next)
+	if (cfg_block->id > max_block_id)
+	    max_block_id = cfg_block->id;
+    analysis = hir_alloc(ctx, sizeof(HIRValueAnalysis));
+    analysis->num_facts = ctx->next_temp;
+    analysis->facts = hir_calloc(ctx, analysis->num_facts,
+				 sizeof(HIRValueFact));
+    reachable = hir_calloc(ctx, max_block_id + 1, sizeof(unsigned char));
+    feasible_edges = hir_calloc(ctx,
+		(size_t) (max_block_id + 1) * (max_block_id + 1),
+		sizeof(unsigned char));
+    if (ssa->cfg->entry)
+	reachable[ssa->cfg->entry->id] = 1;
+
+    while (changed) {
+	changed = 0;
+	for (block = ssa->blocks; block; block = block->next) {
+	    HIRSSAInstr *instr;
+	    HIRBasicBlock *basic;
+
+	    if (!reachable[block->id])
+		continue;
+	    for (instr = block->first; instr; instr = instr->next) {
+		HIRValueFact fact = {HIR_VALUE_BOTTOM, 0};
+
+		switch (instr->kind) {
+		case HIR_TAC_CONST:
+		    fact = instr->literal.type == TYPE_INT
+			? constant_fact(instr->literal.v.num) : unknown_fact();
+		    break;
+		case HIR_TAC_LOAD_LOCAL:
+		    fact = integer_fact();
+		    break;
+		case HIR_TAC_UNARY:
+		    fact = analyze_unary(instr->op,
+			analysis->facts[instr->src1]);
+		    break;
+		case HIR_TAC_BINARY:
+		    fact = analyze_binary(instr->op,
+			analysis->facts[instr->src1],
+			analysis->facts[instr->src2]);
+		    break;
+		case HIR_TAC_PHI:
+		    {
+			HIRPhiArg *arg;
+
+			for (arg = instr->phi_args; arg; arg = arg->next)
+			    if (feasible_edges[arg->block_id
+				    * (max_block_id + 1) + block->id])
+				fact = join_value_fact(fact,
+					analysis->facts[arg->value]);
+		    }
+		    break;
+		case HIR_TAC_UNSUPPORTED:
+		    fact = unknown_fact();
+		    break;
+		default:
+		    break;
+		}
+		if (ssa_defines_value(instr))
+		    changed |= update_value_fact(analysis->facts,
+					 instr->value, fact);
+		if (instr == block->last)
+		    break;
+	    }
+
+	    basic = cfg_block_for_id(ssa->cfg, block->id);
+	    if (basic) {
+		int first = 0;
+		int last = basic->num_successors;
+
+		if (block->last && block->last->kind == HIR_TAC_BRANCH_FALSE) {
+		    HIRValueFact condition =
+			analysis->facts[block->last->src1];
+
+		    if (condition.kind == HIR_VALUE_BOTTOM)
+			last = 0;
+		    else if (condition.kind == HIR_VALUE_FACT_CONSTANT) {
+			first = condition.constant ? 1 : 0;
+			last = first + 1;
+		    }
+		}
+		while (first < last) {
+		    int successor = basic->successors[first++]->id;
+		    int edge = block->id * (max_block_id + 1) + successor;
+
+		    if (!feasible_edges[edge]) {
+			feasible_edges[edge] = 1;
+			changed = 1;
+		    }
+		    if (!reachable[successor]) {
+			reachable[successor] = 1;
+			changed = 1;
+		    }
+		}
+	    }
+	}
+    }
+    return analysis;
+}
+
+HIRValueKind
+hir_value_kind(HIRValueAnalysis *analysis, int value)
+{
+    HIRValueFactKind kind;
+
+    if (!analysis || value <= 0 || value >= analysis->num_facts)
+	return HIR_VALUE_UNKNOWN;
+    kind = analysis->facts[value].kind;
+    if (kind == HIR_VALUE_FACT_CONSTANT)
+	return HIR_VALUE_INT_CONSTANT;
+    if (kind == HIR_VALUE_FACT_INT)
+	return HIR_VALUE_INT;
+    return HIR_VALUE_UNKNOWN;
+}
+
+Num
+hir_value_constant(HIRValueAnalysis *analysis, int value)
+{
+    if (!analysis || value <= 0 || value >= analysis->num_facts
+	|| analysis->facts[value].kind != HIR_VALUE_FACT_CONSTANT)
+	return 0;
+    return analysis->facts[value].constant;
+}
+
 static HIRSSABlock *
 ssa_block_for_id(HIRSSAProgram *ssa, int block_id)
 {
@@ -3315,6 +3635,42 @@ int
 hir_ssa_cfg_critical_edge_count(HIRSSAProgram *ssa)
 {
     return ssa ? hir_cfg_critical_edge_count(ssa->cfg) : 0;
+}
+
+HIRValueKind
+hir_ssa_return_value_kind(HIRSSAProgram *ssa, HIRValueAnalysis *analysis)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa ? ssa->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_RETURN)
+		return hir_value_kind(analysis, instr->src1);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return HIR_VALUE_UNKNOWN;
+}
+
+Num
+hir_ssa_return_constant(HIRSSAProgram *ssa, HIRValueAnalysis *analysis)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa ? ssa->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_RETURN)
+		return hir_value_constant(analysis, instr->src1);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
 }
 #endif
 
