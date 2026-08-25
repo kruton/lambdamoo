@@ -1336,7 +1336,7 @@ test_builtin_call_tac_ssa(void)
     memset(&call_expr, 0, sizeof(call_expr));
     call_expr.kind = EXPR_CALL;
     call_expr.lineno = 10;
-    call_expr.e.call.func = 1;
+    call_expr.e.call.func = 99;
     call_expr.e.call.args = &arg;
 
     ret = return_stmt(&call_expr);
@@ -1358,6 +1358,110 @@ test_builtin_call_tac_ssa(void)
     check_int("builtin call verify errors", hir_context_error_count(ctx), 0);
 
     check_int("builtin call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_pure_builtin_inlining_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    HIRValueAnalysis *analysis;
+    Arg_List a1, a2;
+    Expr e1, e2, call_abs, call_min;
+    Stmt ret;
+
+    e1 = int_expr(-42, 10);
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &e1;
+    a1.next = 0;
+
+    memset(&call_abs, 0, sizeof(call_abs));
+    call_abs.kind = EXPR_CALL;
+    call_abs.lineno = 10;
+    call_abs.e.call.func = 3; /* abs */
+    call_abs.e.call.args = &a1;
+
+    ret = return_stmt(&call_abs);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    e1.bytecode_pc = 1;
+    a1.bytecode_pc = 2;
+    call_abs.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("abs inline tac not null", tac != 0, 1);
+    check_int("abs inline unary count",
+	      hir_tac_count_unary_op(tac, HIR_OP_ABS), 1);
+    check_int("abs inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    check_int("abs inline verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("abs inline return kind",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("abs inline return constant",
+	      hir_ssa_return_constant(ssa, analysis), 42);
+
+    check_int("abs inline destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+
+    /* Test min(10, 20) inlining */
+    e1 = int_expr(10, 10);
+    e2 = int_expr(20, 10);
+    memset(&a2, 0, sizeof(a2));
+    a2.kind = ARG_NORMAL;
+    a2.expr = &e2;
+    a2.next = 0;
+
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &e1;
+    a1.next = &a2;
+
+    memset(&call_min, 0, sizeof(call_min));
+    call_min.kind = EXPR_CALL;
+    call_min.lineno = 10;
+    call_min.e.call.func = 4; /* min */
+    call_min.e.call.args = &a1;
+
+    ret = return_stmt(&call_min);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    e1.bytecode_pc = 1;
+    e2.bytecode_pc = 2;
+    a1.bytecode_pc = 3;
+    a2.bytecode_pc = 4;
+    call_min.bytecode_pc = 5;
+    ret.bytecode_pc = 6;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("min inline tac not null", tac != 0, 1);
+    check_int("min inline binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_MIN), 1);
+    check_int("min inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    check_int("min inline verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("min inline return kind",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("min inline return constant",
+	      hir_ssa_return_constant(ssa, analysis), 10);
+
+    check_int("min inline destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -1630,6 +1734,7 @@ main(void)
     test_scatter_destructuring_tac_ssa();
     test_list_construction_and_splicing_tac_ssa();
     test_builtin_call_tac_ssa();
+    test_pure_builtin_inlining_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

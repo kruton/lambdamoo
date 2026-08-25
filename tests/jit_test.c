@@ -95,6 +95,42 @@ binary_program(Num lhs, Num rhs, HIROp op)
     return program;
 }
 
+static JITProgram *
+unary_program(Num operand, HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *c = instruction(HIR_TAC_CONST);
+    JITInstruction *unary = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    c->value = 1;
+    c->literal = operand;
+
+    unary->value = 2;
+    unary->src1 = 1;
+    unary->op = op;
+
+    ret->src1 = 2;
+
+    c->next = unary;
+    unary->next = ret;
+
+    block->first = c;
+    block->last = ret;
+    return program;
+}
+
 static int
 arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
 {
@@ -1026,6 +1062,54 @@ main(void)
 	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
 	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
 	jit_program_free(call_prog);
+    }
+
+    /* Pure inlined built-ins execution tests */
+    {
+	JITProgram *abs_p = unary_program(-42, HIR_OP_ABS);
+	ticks = 10;
+	check(jit_program_execute(abs_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "abs execution failed");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "abs returned wrong value");
+	jit_program_free(abs_p);
+
+	JITProgram *min_p = binary_program(10, 20, HIR_OP_MIN);
+	ticks = 10;
+	check(jit_program_execute(min_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "min execution failed");
+	check(result.type == TYPE_INT && result.v.num == 10,
+	      "min returned wrong value");
+	jit_program_free(min_p);
+
+	JITProgram *max_p = binary_program(10, 20, HIR_OP_MAX);
+	ticks = 10;
+	check(jit_program_execute(max_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "max execution failed");
+	check(result.type == TYPE_INT && result.v.num == 20,
+	      "max returned wrong value");
+	jit_program_free(max_p);
+
+	JITProgram *toint_p = unary_program(123, HIR_OP_TOINT);
+	ticks = 10;
+	check(jit_program_execute(toint_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "toint execution failed");
+	check(result.type == TYPE_INT && result.v.num == 123,
+	      "toint returned wrong value");
+	jit_program_free(toint_p);
+
+	JITProgram *typeof_p = unary_program(123, HIR_OP_TYPEOF);
+	ticks = 10;
+	check(jit_program_execute(typeof_p, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "typeof execution failed");
+	check(result.type == TYPE_INT && result.v.num == TYPE_INT,
+	      "typeof returned wrong value");
+	jit_program_free(typeof_p);
     }
 
     jit_program_free(program);

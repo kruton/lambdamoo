@@ -1,3 +1,4 @@
+#include "functions.h"
 #include "storage.h"
 #include "utils.h"
 
@@ -45,4 +46,18 @@ void
 complex_free_var(Var value)
 {
     (void) value;
+}
+
+const char *
+name_func_by_num(unsigned id)
+{
+    switch (id) {
+    case 1: return "toint";
+    case 2: return "typeof";
+    case 3: return "abs";
+    case 4: return "min";
+    case 5: return "max";
+    case 6: return "length";
+    default: return "unknown_func";
+    }
 }
