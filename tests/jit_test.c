@@ -291,6 +291,68 @@ index_program(Num index_val)
 }
 
 static JITProgram *
+scatter_destructure_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *c1 = instruction(HIR_TAC_CONST);
+    JITInstruction *idx1 = instruction(HIR_TAC_BINARY);
+    JITInstruction *c2 = instruction(HIR_TAC_CONST);
+    JITInstruction *idx2 = instruction(HIR_TAC_BINARY);
+    JITInstruction *add = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->may_error = 1;
+    program->num_values = 7;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load->value = 1;
+    load->local_id = 0;
+
+    c1->value = 2;
+    c1->literal = 1;
+
+    idx1->value = 3;
+    idx1->src1 = 1;
+    idx1->src2 = 2;
+    idx1->op = HIR_OP_INDEX;
+
+    c2->value = 4;
+    c2->literal = 2;
+
+    idx2->value = 5;
+    idx2->src1 = 1;
+    idx2->src2 = 4;
+    idx2->op = HIR_OP_INDEX;
+
+    add->value = 6;
+    add->src1 = 3;
+    add->src2 = 5;
+    add->op = HIR_OP_ADD;
+
+    ret->src1 = 6;
+
+    load->next = c1;
+    c1->next = idx1;
+    idx1->next = c2;
+    c2->next = idx2;
+    idx2->next = add;
+    add->next = ret;
+
+    block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 deep_guard_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -622,6 +684,7 @@ main(void)
     JITProgram *bit_and = binary_program(0x55, 0x0f, HIR_OP_BITAND);
     JITProgram *bit_xor = binary_program(0x55, 0x0f, HIR_OP_BITXOR);
     JITProgram *bit_or = binary_program(0x55, 0x0f, HIR_OP_BITOR);
+    JITProgram *scatter = scatter_destructure_program();
     Var env[1];
     Var deep_env[2];
     Var deopt_stack[1];
@@ -889,8 +952,23 @@ main(void)
     check_differential(list_index1, env, 10, 0,
 		       "list non-int element fallback differed from reference");
 
+    /* Scatter destructuring execution test */
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 10;
+    list_elems[2].type = TYPE_INT;
+    list_elems[2].v.num = 32;
+    ticks = 10;
+    check(jit_program_execute(scatter, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "scatter destructure execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "scatter destructure returned the wrong value");
+    check_differential(scatter, env, 10, 0,
+		       "scatter destructure differed from reference execution");
+
     jit_program_free(program);
     jit_program_free(guard);
+    jit_program_free(scatter);
     jit_program_free(local_arith);
     jit_program_free(two_locals);
     jit_program_free(list_index1);

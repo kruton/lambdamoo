@@ -452,16 +452,15 @@ test_unsupported_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr list;
+    Expr prop, obj, name;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    memset(&list, 0, sizeof(list));
-    list.kind = EXPR_LIST;
-    list.lineno = 30;
-    list.e.list = 0;
-    ret = return_stmt(&list);
+    obj = id_expr(0, 30);
+    name = id_expr(1, 30);
+    prop = binary_expr(EXPR_PROP, &obj, &name);
+    ret = return_stmt(&prop);
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1185,6 +1184,137 @@ test_list_index_in_arithmetic_tac_ssa(void)
 }
 
 static void
+test_scatter_destructuring_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRValueAnalysis *analysis;
+    HIRTacProgram *tac;
+    Scatter sc1, sc2;
+    Expr scatter_lhs, args_rhs, asgn_expr, ret_add, ret_x, ret_y;
+    Stmt asgn_stmt_node, ret_stmt_node;
+
+    memset(&sc1, 0, sizeof(sc1));
+    sc1.kind = SCAT_REQUIRED;
+    sc1.id = 1;
+    sc1.next = &sc2;
+
+    memset(&sc2, 0, sizeof(sc2));
+    sc2.kind = SCAT_REQUIRED;
+    sc2.id = 2;
+    sc2.next = 0;
+
+    memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+    scatter_lhs.kind = EXPR_SCATTER;
+    scatter_lhs.lineno = 10;
+    scatter_lhs.e.scatter = &sc1;
+
+    args_rhs = id_expr(0, 10);
+    asgn_expr = binary_expr(EXPR_ASGN, &scatter_lhs, &args_rhs);
+    asgn_stmt_node = expr_stmt(&asgn_expr);
+
+    ret_x = id_expr(1, 11);
+    ret_y = id_expr(2, 11);
+    ret_add = binary_expr(EXPR_PLUS, &ret_x, &ret_y);
+    ret_stmt_node = return_stmt(&ret_add);
+    asgn_stmt_node.next = &ret_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 3;
+    args_rhs.bytecode_pc = 1;
+    asgn_expr.bytecode_pc = 2;
+    asgn_stmt_node.bytecode_pc = 3;
+    ret_x.bytecode_pc = 4;
+    ret_y.bytecode_pc = 5;
+    ret_add.bytecode_pc = 6;
+    ret_stmt_node.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &asgn_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("scatter tac not null", tac != 0, 1);
+    check_int("scatter tac store count",
+	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
+    check_int("scatter tac binary index count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 2);
+    check_int("scatter tac binary add count",
+	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
+    check_int("scatter verify errors", hir_context_error_count(ctx), 0);
+
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    check_int("scatter return fact",
+	      hir_ssa_return_value_kind(ssa, analysis),
+	      HIR_VALUE_INT);
+
+    check_int("scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_list_construction_and_splicing_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List a1, a2, a3;
+    Expr e1, e2, e3, list_expr;
+    Stmt ret;
+
+    e1 = int_expr(1, 10);
+    e2 = id_expr(0, 10);
+    e3 = int_expr(2, 10);
+
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &e1;
+    a1.next = &a2;
+
+    memset(&a2, 0, sizeof(a2));
+    a2.kind = ARG_SPLICE;
+    a2.expr = &e2;
+    a2.next = &a3;
+
+    memset(&a3, 0, sizeof(a3));
+    a3.kind = ARG_NORMAL;
+    a3.expr = &e3;
+    a3.next = 0;
+
+    memset(&list_expr, 0, sizeof(list_expr));
+    list_expr.kind = EXPR_LIST;
+    list_expr.lineno = 10;
+    list_expr.e.list = &a1;
+
+    ret = return_stmt(&list_expr);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    e1.bytecode_pc = 1;
+    e2.bytecode_pc = 2;
+    e3.bytecode_pc = 3;
+    list_expr.bytecode_pc = 4;
+    ret.bytecode_pc = 5;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("list splice tac not null", tac != 0, 1);
+    check_int("list splice singleton count",
+	      hir_tac_count_unary_op(tac, HIR_OP_MAKE_SINGLETON_LIST), 1);
+    check_int("list splice append count",
+	      hir_tac_count_binary_op(tac, HIR_OP_LIST_APPEND), 1);
+    check_int("list splice add tail count",
+	      hir_tac_count_binary_op(tac, HIR_OP_LIST_ADD_TAIL), 1);
+    check_int("list splice verify errors", hir_context_error_count(ctx), 0);
+
+    check_int("list splice destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1450,6 +1580,8 @@ main(void)
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
     test_list_index_in_arithmetic_tac_ssa();
+    test_scatter_destructuring_tac_ssa();
+    test_list_construction_and_splicing_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
