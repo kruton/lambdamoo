@@ -5176,17 +5176,36 @@ append_jump(HIRContext *ctx, HIRTacProgram *program, int label,
 }
 
 static void
-append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
-		    unsigned source_lineno, unsigned bytecode_pc)
+append_branch_false_internal(HIRContext *ctx, HIRTacProgram *program, int src,
+			     int label, unsigned source_lineno,
+			     unsigned bytecode_pc, int tick)
 {
     HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE, source_lineno);
 
-    append_tick(ctx, program, source_lineno, bytecode_pc);
+    if (tick)
+	append_tick(ctx, program, source_lineno, bytecode_pc);
     instr->bytecode_pc = bytecode_pc;
     snapshot_lower_stack(ctx, instr);
     instr->src1 = src;
     instr->label = label;
     append_tac(program, instr);
+}
+
+static void
+append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
+		    unsigned source_lineno, unsigned bytecode_pc)
+{
+    append_branch_false_internal(ctx, program, src, label, source_lineno,
+				 bytecode_pc, 1);
+}
+
+static void
+append_unticked_branch_false(HIRContext *ctx, HIRTacProgram *program, int src,
+			     int label, unsigned source_lineno,
+			     unsigned bytecode_pc)
+{
+    append_branch_false_internal(ctx, program, src, label, source_lineno,
+				 bytecode_pc, 0);
 }
 
 static void
@@ -5624,16 +5643,19 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     HIRTacInstr *const_tac;
     HIRTacInstr *add_tac;
 
-    /* Initialize loop variable to from_temp before loop */
     append_internal_store(ctx, program, stmt->u.for_range.local_id, from_temp,
 			  stmt->source_lineno);
 
     /* top_label: start of each iteration */
     append_label(ctx, program, top_label, stmt->source_lineno);
 
+    /* OP_FOR_RANGE charges one tick at the start of each iteration. */
+    append_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+
     /* Check if current loop variable <= to_temp (handles from > to on entry) */
     curr_local = append_internal_load(ctx, program, stmt->u.for_range.local_id,
 				     stmt->source_lineno);
+    ctx->lower_stack[base_depth] = curr_local;
     cond_temp = new_temp(ctx);
     instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
     instr->dst = cond_temp;
@@ -5641,9 +5663,13 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     instr->src2 = to_temp;
     instr->op = HIR_OP_LE;
     instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
     append_tac(program, instr);
-    append_branch_false(ctx, program, cond_temp, done_label, stmt->source_lineno,
-			stmt->bytecode_pc);
+    append_unticked_branch_false(ctx, program, cond_temp, done_label,
+				 stmt->source_lineno, stmt->bytecode_pc);
+
+    append_internal_store(ctx, program, stmt->u.for_range.local_id, curr_local,
+			  stmt->source_lineno);
 
     /* Lower loop body */
     lower_stmt_list(ctx, program, stmt->u.for_range.body);
@@ -5658,11 +5684,12 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     instr->src2 = to_temp;
     instr->op = HIR_OP_LT;
     instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
     append_tac(program, instr);
 
     /* If !(curr_local < to_temp), i.e. curr_local >= to_temp, exit loop */
-    append_branch_false(ctx, program, is_last, done_label, stmt->source_lineno,
-			stmt->bytecode_pc);
+    append_unticked_branch_false(ctx, program, is_last, done_label,
+				 stmt->source_lineno, stmt->bytecode_pc);
 
     /* Increment loop variable */
     one_temp = new_temp(ctx);
@@ -5671,6 +5698,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     const_tac->literal.type = TYPE_INT;
     const_tac->literal.v.num = 1;
     const_tac->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, const_tac);
     append_tac(program, const_tac);
 
     next_local = new_temp(ctx);
@@ -5680,6 +5708,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     add_tac->src2 = one_temp;
     add_tac->op = HIR_OP_ADD;
     add_tac->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, add_tac);
     append_tac(program, add_tac);
 
     append_internal_store(ctx, program, stmt->u.for_range.local_id, next_local,
