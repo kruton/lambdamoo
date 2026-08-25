@@ -135,6 +135,7 @@ extern int hir_verify_ssa(HIRContext *, HIRSSAProgram *);
 extern HIRValueAnalysis *hir_analyze_ssa_values(HIRContext *, HIRSSAProgram *);
 extern HIRValueKind hir_value_kind(HIRValueAnalysis *, int);
 extern Num hir_value_constant(HIRValueAnalysis *, int);
+extern int hir_optimize_ssa_constants(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)

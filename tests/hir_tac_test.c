@@ -211,6 +211,11 @@ test_arithmetic_and_local_tac(void)
 	      HIR_VALUE_INT_CONSTANT);
     check_int("arith return constant",
 	      (int) hir_ssa_return_constant(ssa, analysis), 9);
+    check_int("arith constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 2);
+    check_int("arith optimized binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
+    check_int("arith optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -343,6 +348,11 @@ test_constant_analysis_overflow(void)
 
     check_int("overflow return fact",
 	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
+    check_int("overflow optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
+    check_int("overflow binary retained",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 1);
+    check_int("overflow optimized verify", hir_verify_ssa(ctx, ssa), 1);
     check_int("overflow verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 }
@@ -680,6 +690,10 @@ test_while_loop_phi_ssa(void)
     analysis = hir_analyze_ssa_values(ctx, ssa);
     check_int("loop return fact",
 	      hir_ssa_return_value_kind(ssa, analysis), HIR_VALUE_INT);
+    check_int("loop constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
+    check_int("loop optimized blocks", hir_ssa_block_count(ssa), 4);
+    check_int("loop optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }
@@ -766,6 +780,15 @@ test_if_else_phi_ssa(void)
 	      HIR_VALUE_INT_CONSTANT);
     check_int("ifelse sparse return constant",
 	      (int) hir_ssa_return_constant(ssa, analysis), 3);
+    check_int("ifelse constant optimization changed",
+	      hir_optimize_ssa_constants(ctx, ssa), 3);
+    check_int("ifelse optimized blocks", hir_ssa_block_count(ssa), 3);
+    check_int("ifelse optimized edges", hir_ssa_cfg_edge_count(ssa), 2);
+    check_int("ifelse optimized binary count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
+    check_int("ifelse optimized phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("ifelse optimized verify", hir_verify_ssa(ctx, ssa), 1);
 
     hir_context_free(ctx);
 }

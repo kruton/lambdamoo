@@ -406,14 +406,16 @@ Completed in the first native-code milestone:
 * short-circuit `&&` and `||` lowering without eager right-operand evaluation;
 * definition-dominates-use SSA verification with focused negative tests; and
 * differential native/reference recipe tests for branching, phi copies,
-  guards, and resource-limit aborts.
+  guards, and resource-limit aborts;
+* sparse integer type and constant propagation; and
+* safe constant folding, constant-branch simplification, and unreachable-block
+  pruning.
 
 The next reviewable compiler milestones are:
 
-1. Add a sparse integer type/constant lattice and constant-folding tests.
-2. Model arithmetic error and overflow behavior explicitly before expanding
+1. Model arithmetic error and overflow behavior explicitly before expanding
    the integer tier to division, modulo, exponentiation, or shifts.
-3. Add bytecode resume-anchor mapping for AST-derived HIR operations.
-4. Add deoptimization maps before allowing guard failure after the first
+2. Add bytecode resume-anchor mapping for AST-derived HIR operations.
+3. Add deoptimization maps before allowing guard failure after the first
    tick or any operation that mutates interpreter-visible state.
-5. Add native source-line tracking for tick and seconds abort tracebacks.
+4. Add native source-line tracking for tick and seconds abort tracebacks.

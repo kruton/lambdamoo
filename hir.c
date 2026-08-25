@@ -2294,6 +2294,241 @@ hir_value_constant(HIRValueAnalysis *analysis, int value)
     return analysis->facts[value].constant;
 }
 
+static int
+cfg_has_edge_id(HIRBasicBlock *from, int target_id)
+{
+    int i;
+
+    for (i = 0; from && i < from->num_successors; i++)
+	if (from->successors[i]->id == target_id)
+	    return 1;
+    return 0;
+}
+
+static void
+mark_reachable_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
+{
+    int changed = 1;
+
+    if (cfg->entry)
+	reachable[cfg->entry->id] = 1;
+    while (changed) {
+	HIRBasicBlock *block;
+
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    int i;
+
+	    if (!reachable[block->id])
+		continue;
+	    for (i = 0; i < block->num_successors; i++) {
+		int successor = block->successors[i]->id;
+
+		if (!reachable[successor]) {
+		    reachable[successor] = 1;
+		    changed = 1;
+		}
+	    }
+	}
+    }
+}
+
+static void
+prune_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
+{
+    HIRBasicBlock *block = cfg->blocks;
+    HIRBasicBlock *previous = 0;
+
+    cfg->num_blocks = 0;
+    cfg->num_edges = 0;
+    cfg->last_block = 0;
+    while (block) {
+	HIRBasicBlock *next = block->next;
+
+	if (reachable[block->id]) {
+	    int source;
+	    int target = 0;
+
+	    for (source = 0; source < block->num_successors; source++)
+		if (reachable[block->successors[source]->id])
+		    block->successors[target++] = block->successors[source];
+	    block->num_successors = target;
+	    block->predecessor_count = 0;
+	    if (previous)
+		previous->next = block;
+	    else
+		cfg->blocks = block;
+	    previous = block;
+	    cfg->last_block = block;
+	    cfg->num_blocks++;
+	}
+	block = next;
+    }
+    if (previous)
+	previous->next = 0;
+    else
+	cfg->blocks = 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    block->successors[i]->predecessor_count++;
+	    cfg->num_edges++;
+	}
+    }
+}
+
+static void
+prune_ssa_blocks(HIRSSAProgram *ssa, unsigned char *reachable)
+{
+    HIRSSABlock *block = ssa->blocks;
+    HIRSSABlock *previous = 0;
+
+    ssa->num_blocks = 0;
+    ssa->num_instructions = 0;
+    ssa->num_values = 0;
+    ssa->last_block = 0;
+    while (block) {
+	HIRSSABlock *next = block->next;
+
+	if (reachable[block->id]) {
+	    HIRSSAInstr *instr;
+
+	    if (previous)
+		previous->next = block;
+	    else
+		ssa->blocks = block;
+	    previous = block;
+	    ssa->last_block = block;
+	    ssa->num_blocks++;
+	    for (instr = block->first; instr; instr = instr->next) {
+		ssa->num_instructions++;
+		if (ssa_defines_value(instr))
+		    ssa->num_values++;
+		if (instr == block->last)
+		    break;
+	    }
+	}
+	block = next;
+    }
+    if (previous)
+	previous->next = 0;
+    else
+	ssa->blocks = 0;
+}
+
+static void
+prune_phi_arguments(HIRSSAProgram *ssa, unsigned char *reachable)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_PHI) {
+		HIRPhiArg *arg = instr->phi_args;
+		HIRPhiArg *previous = 0;
+
+		while (arg) {
+		    HIRPhiArg *next = arg->next;
+		    HIRBasicBlock *pred = cfg_block_for_id(ssa->cfg,
+						       arg->block_id);
+
+		    if (reachable[arg->block_id]
+			&& cfg_has_edge_id(pred, block->id)) {
+			if (previous)
+			    previous->next = arg;
+			else
+			    instr->phi_args = arg;
+			previous = arg;
+		    }
+		    arg = next;
+		}
+		if (previous)
+		    previous->next = 0;
+		else
+		    instr->phi_args = 0;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+}
+
+int
+hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRValueAnalysis *analysis;
+    HIRSSABlock *block;
+    HIRBasicBlock *cfg_block;
+    unsigned char *reachable;
+    int max_block_id = 0;
+    int changes = 0;
+
+    if (!ctx || !ssa || !ssa->cfg || ssa->form != HIR_FORM_SSA)
+	return 0;
+    analysis = hir_analyze_ssa_values(ctx, ssa);
+    if (!analysis)
+	return 0;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if ((instr->kind == HIR_TAC_UNARY
+		 || instr->kind == HIR_TAC_BINARY
+		 || instr->kind == HIR_TAC_PHI)
+		&& hir_value_kind(analysis, instr->value)
+		== HIR_VALUE_INT_CONSTANT) {
+		instr->kind = HIR_TAC_CONST;
+		instr->literal.type = TYPE_INT;
+		instr->literal.v.num = hir_value_constant(analysis,
+							  instr->value);
+		instr->src1 = instr->src2 = 0;
+		instr->phi_args = 0;
+		changes++;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+	if (block->last && block->last->kind == HIR_TAC_BRANCH_FALSE
+	    && hir_value_kind(analysis, block->last->src1)
+	    == HIR_VALUE_INT_CONSTANT) {
+	    HIRBasicBlock *basic = cfg_block_for_id(ssa->cfg, block->id);
+	    int successor_index = hir_value_constant(analysis,
+						block->last->src1) ? 1 : 0;
+
+	    if (basic && basic->num_successors == 2) {
+		HIRBasicBlock *successor = basic->successors[successor_index];
+
+		basic->successors[0] = successor;
+		basic->num_successors = 1;
+		block->last->kind = HIR_TAC_JUMP;
+		block->last->src1 = 0;
+		if (basic->last) {
+		    basic->last->kind = HIR_TAC_JUMP;
+		    basic->last->label = successor->first
+			&& successor->first->kind == HIR_TAC_LABEL
+			? successor->first->label : 0;
+		}
+		changes++;
+	    }
+	}
+    }
+
+    for (cfg_block = ssa->cfg->blocks; cfg_block; cfg_block = cfg_block->next)
+	if (cfg_block->id > max_block_id)
+	    max_block_id = cfg_block->id;
+    reachable = hir_calloc(ctx, max_block_id + 1, sizeof(unsigned char));
+    mark_reachable_cfg_blocks(ssa->cfg, reachable);
+    prune_cfg_blocks(ssa->cfg, reachable);
+    prune_ssa_blocks(ssa, reachable);
+    prune_phi_arguments(ssa, reachable);
+    return changes;
+}
+
 static HIRSSABlock *
 ssa_block_for_id(HIRSSAProgram *ssa, int block_id)
 {

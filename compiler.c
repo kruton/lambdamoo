@@ -56,6 +56,10 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     hir_valid = hir_verify_dominator_tree(hir_ctx, cfg, dom_tree) && hir_valid;
     ssa_program = hir_build_ssa(hir_ctx, cfg);
     hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
+    if (hir_valid) {
+	(void) hir_optimize_ssa_constants(hir_ctx, ssa_program);
+	hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
+    }
     if (hir_valid)
 	hir_valid = hir_destroy_ssa(hir_ctx, ssa_program)
 	    && hir_verify_out_of_ssa(hir_ctx, ssa_program);
