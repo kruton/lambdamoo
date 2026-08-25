@@ -428,11 +428,13 @@ Completed in the first native-code milestone:
 * checked native list and argument-list indexing with bounds checking and
   element-type guards; and
 * list destructuring (scatter assignment) and list construction/splicing lowered
-  to TAC/SSA with bytecode anchors and native destructuring execution.
+  to TAC/SSA with bytecode anchors and native destructuring execution; and
+* deopt-before-call boundaries for built-in functions (`toint()`, `typeof()`, etc.)
+  with seamless runtime state handoff at `OP_BI_FUNC_CALL`.
 
 The next reviewable compiler milestones are:
 
-1. Add deopt-before-call boundaries for built-ins such as `toint()`, before
-   considering selected continuation-free built-ins for direct lowering.
-2. Direct lowering for pure continuation-free built-ins (`toint()`, `typeof()`,
-   `length()`, `abs()`, `min()`, `max()`).
+1. Direct lowering for pure continuation-free built-ins (`toint()`, `typeof()`,
+   `length()`, `abs()`, `min()`, `max()`) to eliminate deopt boundaries for
+   pure operations.
+2. Direct native lowering for property reads/writes (`EXPR_PROP`).
