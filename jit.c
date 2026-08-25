@@ -315,15 +315,26 @@ build_mir(JITProgram *program, MIRBuild *build)
 		case HIR_TAC_LOAD_LOCAL:
 		    {
 			MIR_label_t deopt = MIR_new_label(build->context);
+			MIR_label_t is_list = MIR_new_label(build->context);
 			MIR_label_t loaded = MIR_new_label(build->context);
+			char name[32];
+			sprintf(name, "var_type%d", copy_serial++);
+			MIR_reg_t var_type = new_reg(build, name);
 
-			append(build, MIR_new_insn(build->context, MIR_BNE,
-				MIR_new_label_op(build->context, deopt),
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, var_type),
 				MIR_new_mem_op(build->context, MIR_T_I32,
 					instr->local_id * sizeof(Var)
-					+ offsetof(Var, type), env, 0, 1),
+					+ offsetof(Var, type), env, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, is_list),
+				MIR_new_reg_op(build->context, var_type),
+				MIR_new_int_op(build->context, TYPE_LIST)));
+			append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, var_type),
 				MIR_new_int_op(build->context, TYPE_INT)));
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
 						  MIR_new_mem_op(build->context,
@@ -331,6 +342,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 								 ? MIR_T_I64 : MIR_T_I32,
 								 instr->local_id * sizeof(Var)
 								 + offsetof(Var, v.num),
+								 env, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+					      MIR_new_label_op(build->context, loaded)));
+			append(build, is_list);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+						  MIR_new_reg_op(build->context,
+								 values[instr->value]),
+						  MIR_new_mem_op(build->context,
+								 MIR_T_P,
+								 instr->local_id * sizeof(Var)
+								 + offsetof(Var, v.list),
 								 env, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 					      MIR_new_label_op(build->context, loaded)));
@@ -367,6 +389,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    {
 			MIR_label_t arithmetic_error = 0;
 			MIR_label_t invalid_argument = 0;
+			MIR_label_t range_error = 0;
 
 			if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD
 			    || instr->op == HIR_OP_EXP)
@@ -378,7 +401,72 @@ build_mir(JITProgram *program, MIRBuild *build)
 			    invalid_argument = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_INVARG,
 				instr->bytecode_pc, instr->source_lineno);
-		    if (instr->op == HIR_OP_EXP) {
+			if (instr->op == HIR_OP_INDEX)
+			    range_error = new_status_exit(build, &status_exits,
+				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
+				instr->bytecode_pc, instr->source_lineno);
+		    if (instr->op == HIR_OP_INDEX) {
+			MIR_label_t deopt = MIR_new_label(build->context);
+			MIR_label_t loaded = MIR_new_label(build->context);
+			MIR_reg_t list_ptr = values[instr->src1];
+			MIR_reg_t index = values[instr->src2];
+			char name[32];
+			sprintf(name, "list_len%d", copy_serial);
+			MIR_reg_t list_len = new_reg(build, name);
+			sprintf(name, "elem_offset%d", copy_serial);
+			MIR_reg_t elem_offset = new_reg(build, name);
+			sprintf(name, "elem_addr%d", copy_serial);
+			MIR_reg_t elem_addr = new_reg(build, name);
+			sprintf(name, "elem_type%d", copy_serial);
+			MIR_reg_t elem_type = new_reg(build, name);
+			copy_serial++;
+
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+				MIR_new_label_op(build->context, range_error),
+				MIR_new_reg_op(build->context, index),
+				MIR_new_int_op(build->context, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, list_ptr),
+				MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, list_len),
+				MIR_new_mem_op(build->context,
+					sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+					offsetof(Var, v.num), list_ptr, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BGT,
+				MIR_new_label_op(build->context, range_error),
+				MIR_new_reg_op(build->context, index),
+				MIR_new_reg_op(build->context, list_len)));
+			append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context, elem_offset),
+				MIR_new_reg_op(build->context, index),
+				MIR_new_int_op(build->context, sizeof(Var))));
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, elem_addr),
+				MIR_new_reg_op(build->context, list_ptr),
+				MIR_new_reg_op(build->context, elem_offset)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, elem_type),
+				MIR_new_mem_op(build->context, MIR_T_I32,
+					offsetof(Var, type), elem_addr, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, elem_type),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_mem_op(build->context,
+					sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+					offsetof(Var, v.num), elem_addr, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, loaded)));
+			append(build, deopt);
+			append_deopt_exit(build, program, instr->deopt_map, values,
+					  deopt_map_out, deopt_values, status,
+					  common_return);
+			append(build, loaded);
+		    } else if (instr->op == HIR_OP_EXP) {
 			MIR_label_t nonnegative = MIR_new_label(build->context);
 			MIR_label_t negative_one = MIR_new_label(build->context);
 			MIR_label_t loop = MIR_new_label(build->context);

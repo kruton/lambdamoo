@@ -243,7 +243,50 @@ two_local_program(HIROp op)
     block->last = ret;
     program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
 	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
-	|| op == HIR_OP_LSHR;
+	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX;
+    return program;
+}
+
+static JITProgram *
+index_program(Num index_val)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *index = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->may_error = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load->value = 1;
+    load->local_id = 0;
+    constant->value = 2;
+    constant->literal = index_val;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 11;
+    index->source_lineno = 7;
+    index->bytecode_pc = 11;
+    index->value = 3;
+    index->src1 = 1;
+    index->src2 = 2;
+    index->op = HIR_OP_INDEX;
+    ret->src1 = 3;
+    load->next = constant;
+    constant->next = tick;
+    tick->next = index;
+    index->next = ret;
+    block->first = load;
+    block->last = ret;
     return program;
 }
 
@@ -406,17 +449,38 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		values[instr->value] = instr->literal;
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
-		if (env[instr->local_id].type != TYPE_INT) {
+		if (env[instr->local_id].type == TYPE_INT)
+		    values[instr->value] = env[instr->local_id].v.num;
+		else if (env[instr->local_id].type == TYPE_LIST)
+		    values[instr->value] = (Num) env[instr->local_id].v.list;
+		else {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_FALLBACK;
 		}
-		values[instr->value] = env[instr->local_id].v.num;
 		break;
 	    case HIR_TAC_BINARY:
 		{
 		    IntegerArithmeticOperation operation;
 
-		    if (arithmetic_operation(instr->op, &operation)) {
+		    if (instr->op == HIR_OP_INDEX) {
+			Var *list_ptr = (Var *) values[instr->src1];
+			Num index = values[instr->src2];
+
+			if (!list_ptr) {
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_FALLBACK;
+			}
+			if (index < 1 || index > list_ptr[0].v.num) {
+			    *error = E_RANGE;
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_ERROR;
+			}
+			if (list_ptr[index].type != TYPE_INT) {
+			    myfree(values, M_PROGRAM);
+			    return JIT_RUN_FALLBACK;
+			}
+			values[instr->value] = list_ptr[index].v.num;
+		    } else if (arithmetic_operation(instr->op, &operation)) {
 			IntegerArithmeticResult arithmetic = integer_arithmetic(
 			    operation, values[instr->src1], values[instr->src2]);
 
@@ -545,6 +609,10 @@ main(void)
     JITProgram *power_error = binary_program(0, -1, HIR_OP_EXP);
     JITProgram *local_arith = local_arithmetic_program(5, HIR_OP_ADD);
     JITProgram *two_locals = two_local_program(HIR_OP_MUL);
+    JITProgram *list_index1 = index_program(1);
+    JITProgram *list_index2 = index_program(2);
+    JITProgram *list_index_low = index_program(0);
+    JITProgram *list_index_high = index_program(3);
     JITProgram *shift_left = binary_program(NUM_MIN, 1, HIR_OP_SHL);
     JITProgram *shift_right = binary_program(NUM_MIN, 63, HIR_OP_SHR);
     JITProgram *logical_shift = binary_program(NUM_MIN, 63, HIR_OP_LSHR);
@@ -557,6 +625,7 @@ main(void)
     Var env[1];
     Var deep_env[2];
     Var deopt_stack[1];
+    Var list_elems[3];
     Var result;
     int ticks = 10;
     int timed_out = 0;
@@ -766,10 +835,68 @@ main(void)
     check_differential(deep_guard, deep_env, 10, 0,
 		       "deep guard success differed from reference execution");
 
+    /* List indexing tests */
+    list_elems[0].type = TYPE_INT;
+    list_elems[0].v.num = 2;
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 42;
+    list_elems[2].type = TYPE_INT;
+    list_elems[2].v.num = 99;
+    env[0].type = TYPE_LIST;
+    env[0].v.list = list_elems;
+
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "list index 1 execution failed");
+    check(result.type == TYPE_INT && result.v.num == 42,
+	  "list index 1 returned the wrong value");
+    check_differential(list_index1, env, 10, 0,
+		       "list index 1 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index2, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_RETURNED, "list index 2 execution failed");
+    check(result.type == TYPE_INT && result.v.num == 99,
+	  "list index 2 returned the wrong value");
+    check_differential(list_index2, env, 10, 0,
+		       "list index 2 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index_low, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_ERROR, "list index 0 did not error");
+    check(error == E_RANGE, "list index 0 gave wrong error code");
+    check_differential(list_index_low, env, 10, 0,
+		       "list index 0 differed from reference execution");
+
+    ticks = 10;
+    check(jit_program_execute(list_index_high, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0)
+	  == JIT_RUN_ERROR, "list index 3 did not error");
+    check(error == E_RANGE, "list index 3 gave wrong error code");
+    check_differential(list_index_high, env, 10, 0,
+		       "list index 3 differed from reference execution");
+
+    /* Non-integer element in list falls back to interpreter */
+    list_elems[1].type = TYPE_STR;
+    list_elems[1].v.str = "hello";
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "list non-int element did not fallback");
+    check_differential(list_index1, env, 10, 0,
+		       "list non-int element fallback differed from reference");
+
     jit_program_free(program);
     jit_program_free(guard);
     jit_program_free(local_arith);
     jit_program_free(two_locals);
+    jit_program_free(list_index1);
+    jit_program_free(list_index2);
+    jit_program_free(list_index_low);
+    jit_program_free(list_index_high);
     jit_program_free(deep_guard);
     jit_program_free(branch);
     jit_program_free(divide);
