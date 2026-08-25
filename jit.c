@@ -79,6 +79,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_label_t fallback, tick_abort, seconds_abort;
     JITBlock *block;
     int max_block_id = 0;
+    int copy_serial = 0;
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
@@ -226,7 +227,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 			temps = mymalloc(sizeof(MIR_reg_t) * count, M_PROGRAM);
 			for (copy = instr->copies; copy; copy = copy->next) {
 			    char name[32];
-			    sprintf(name, "copy%d", n);
+			    sprintf(name, "copy%d", copy_serial++);
 			    temps[n] = new_reg(build, name);
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 							  MIR_new_reg_op(build->context,
