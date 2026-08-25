@@ -435,10 +435,12 @@ Completed in the first native-code milestone:
   `max()`, `toint()`, `typeof()`, `length()`) eliminating deopt boundaries for
   pure operations; and
 * direct native lowering for property reads (`obj.prop`) and property assignments
-  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration.
+  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration;
+* range-based `for` loop lowering (`for i in [start..end]`) with exact opcode
+  tick accounting and interpreter stack reconstruction; and
+* integer list iteration lowering (`for x in (list)`) with guarded list access,
+  bytecode anchors, and interpreter fallback for non-integer elements.
 
 The next reviewable compiler milestones are:
 
-1. Range-based `for` loop lowering (`for i in [start..end]`).
-2. List iteration `for` loop lowering (`for x in (list)`).
-3. Conditional expressions (`EXPR_COND` `c ? t | f`).
+1. Conditional expressions (`EXPR_COND` `c ? t | f`).

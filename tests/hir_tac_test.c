@@ -680,6 +680,21 @@ range_stmt(int id, Expr *from, Expr *to, Stmt *body, unsigned lineno)
     return stmt;
 }
 
+static Stmt
+list_stmt(int id, Expr *iterable, Stmt *body, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_LIST;
+    stmt.lineno = lineno;
+    stmt.s.list.id = id;
+    stmt.s.list.expr = iterable;
+    stmt.s.list.body = body;
+
+    return stmt;
+}
+
 static void
 test_loop_dominator_tree(void)
 {
@@ -1579,10 +1594,55 @@ test_for_range_loop_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 2);
     check_int("for range jump count",
 	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+    check_int("for range tick count",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 4);
     check_int("for range ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
 
     check_int("for range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_for_list_loop_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr iterable = id_expr(3, 11);
+    Expr sum_lhs = id_expr(1, 12);
+    Expr sum_rhs = id_expr(1, 12);
+    Expr item = id_expr(2, 12);
+    Expr add = binary_expr(EXPR_PLUS, &sum_rhs, &item);
+    Expr assign = binary_expr(EXPR_ASGN, &sum_lhs, &add);
+    Stmt body = expr_stmt(&assign);
+    Stmt loop = list_stmt(2, &iterable, &body, 11);
+    Expr result = id_expr(1, 13);
+    Stmt ret = return_stmt(&result);
+
+    loop.next = &ret;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &loop, &ctx, &cfg, &dom, &ssa);
+
+    check_int("for list tac not null", tac != 0, 1);
+    check_int("for list verify errors", hir_context_error_count(ctx), 0);
+    check_int("for list length count",
+	      hir_tac_count_unary_op(tac, HIR_OP_LENGTH), 1);
+    check_int("for list index count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 1);
+    check_int("for list branch false count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("for list tick count",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
+    check_int("for list ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+
+    check_int("for list destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -1858,6 +1918,7 @@ main(void)
     test_pure_builtin_inlining_tac_ssa();
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
+    test_for_list_loop_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
