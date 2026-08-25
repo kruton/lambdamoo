@@ -211,6 +211,8 @@ test_arithmetic_and_local_tac(void)
     check_int("arith line 11 count", hir_tac_count_lineno(tac, 11), 5);
     check_int("arith add anchor count",
 	      hir_tac_count_bytecode_pc(tac, 5), 2);
+    check_int("arith add stack depth",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 5), 2);
     check_int("arith return anchor count",
 	      hir_tac_count_bytecode_pc(tac, 10), 1);
     check_int("arith cfg blocks", hir_cfg_block_count(cfg), 1);
@@ -225,6 +227,8 @@ test_arithmetic_and_local_tac(void)
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 2);
     check_int("arith SSA add anchor count",
 	      hir_ssa_count_bytecode_pc(ssa, 5), 2);
+    check_int("arith SSA add stack depth",
+	      hir_ssa_stack_depth_at_bytecode_pc(ssa, 5), 2);
     check_int("arith verify errors", hir_context_error_count(ctx), 0);
     analysis = hir_analyze_ssa_values(ctx, ssa);
     check_int("arith return fact",
