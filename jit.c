@@ -441,7 +441,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    break;
 		case HIR_TAC_BINARY:
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL
-			|| instr->op == HIR_OP_LIST_APPEND) {
+			|| instr->op == HIR_OP_LIST_APPEND
+			|| instr->op == HIR_OP_GET_PROP) {
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
 					  status, common_return);
@@ -809,6 +810,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_CALL:
+		case HIR_TAC_PUT_PROP:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);
@@ -878,8 +880,12 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
+		if (program->deopt_maps[i].local_types)
+		    myfree(program->deopt_maps[i].local_types, M_PROGRAM);
 		if (program->deopt_maps[i].stack_values)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
+		if (program->deopt_maps[i].stack_types)
+		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
 	    }
 	    myfree(program->deopt_maps, M_PROGRAM);
 	}
@@ -897,6 +903,9 @@ jit_program_free(JITProgram *program)
 		myfree(copy, M_PROGRAM);
 		copy = next_copy;
 	    }
+	    if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_STR
+		&& instr->literal)
+		free_str((const char *) (intptr_t) instr->literal);
 	    myfree(instr, M_PROGRAM);
 	    instr = next_instr;
 	}
@@ -1059,13 +1068,29 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	map = &program->deopt_maps[deopt_map];
 	for (i = 0; i < map->num_locals; i++)
 	    if (map->local_values[i] > 0) {
+		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
 		free_var(env[i]);
-		env[i].type = TYPE_INT;
-		env[i].v.num = program->deopt_values[map->local_values[i]];
+		env[i].type = type;
+		if (type == TYPE_STR)
+		    env[i].v.str = str_ref((const char *) (intptr_t) program->deopt_values[map->local_values[i]]);
+		else if (type == TYPE_OBJ)
+		    env[i].v.obj = program->deopt_values[map->local_values[i]];
+		else if (type == TYPE_ERR)
+		    env[i].v.err = program->deopt_values[map->local_values[i]];
+		else
+		    env[i].v.num = program->deopt_values[map->local_values[i]];
 	    }
 	for (i = 0; deopt_stack && i < (int) map->stack_depth; i++) {
-	    deopt_stack[i].type = TYPE_INT;
-	    deopt_stack[i].v.num = program->deopt_values[map->stack_values[i]];
+	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
+	    deopt_stack[i].type = type;
+	    if (type == TYPE_STR)
+		deopt_stack[i].v.str = str_ref((const char *) (intptr_t) program->deopt_values[map->stack_values[i]]);
+	    else if (type == TYPE_OBJ)
+		deopt_stack[i].v.obj = program->deopt_values[map->stack_values[i]];
+	    else if (type == TYPE_ERR)
+		deopt_stack[i].v.err = program->deopt_values[map->stack_values[i]];
+	    else
+		deopt_stack[i].v.num = program->deopt_values[map->stack_values[i]];
 	}
 	if (deopt) {
 	    deopt->bytecode_pc = map->bytecode_pc;

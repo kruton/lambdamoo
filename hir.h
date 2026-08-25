@@ -43,6 +43,7 @@ typedef enum {
     HIR_EXPR_LIST,
     HIR_EXPR_CATCH,
     HIR_EXPR_SCATTER,
+    HIR_EXPR_PROP_STORE,
     HIR_EXPR_UNSUPPORTED
 } HIRExprKind;
 
@@ -97,7 +98,8 @@ typedef enum {
     HIR_OP_MAX,
     HIR_OP_TOINT,
     HIR_OP_TYPEOF,
-    HIR_OP_LENGTH
+    HIR_OP_LENGTH,
+    HIR_OP_GET_PROP
 } HIROp;
 
 typedef enum {
@@ -113,6 +115,7 @@ typedef enum {
     HIR_TAC_RETURN,
     HIR_TAC_RETURN0,
     HIR_TAC_CALL,
+    HIR_TAC_PUT_PROP,
     HIR_TAC_UNSUPPORTED,
     HIR_TAC_PHI,
     HIR_TAC_PARALLEL_COPY
