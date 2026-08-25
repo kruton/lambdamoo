@@ -364,6 +364,13 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_UNARY:
+		    if (instr->op == HIR_OP_MAKE_SINGLETON_LIST
+			|| instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (instr->op == HIR_OP_NEGATE)
 			append(build, MIR_new_insn(build->context, MIR_NEG,
 						      MIR_new_reg_op(build->context,
@@ -386,6 +393,13 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_int_op(build->context, -1)));
 		    break;
 		case HIR_TAC_BINARY:
+		    if (instr->op == HIR_OP_LIST_ADD_TAIL
+			|| instr->op == HIR_OP_LIST_APPEND) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    {
 			MIR_label_t arithmetic_error = 0;
 			MIR_label_t invalid_argument = 0;
@@ -708,6 +722,11 @@ build_mir(JITProgram *program, MIRBuild *build)
 								 offsetof(Var, type), result, 0, 1),
 						  MIR_new_int_op(build->context, TYPE_INT)));
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
+		    break;
+		case HIR_TAC_CALL:
+		    append_deopt_exit(build, program, instr->deopt_map, values,
+				      deopt_map_out, deopt_values, status,
+				      common_return);
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:

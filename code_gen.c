@@ -921,6 +921,7 @@ generate_expr(Expr * expr, State * state)
 	break;
     case EXPR_CALL:
 	generate_arg_list(expr->e.call.args, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_byte(OP_BI_FUNC_CALL, state);
 	emit_byte(expr->e.call.func, state);
 	if (state->cur_stack == 0)

@@ -201,6 +201,8 @@ struct HIRTacInstr {
     int local_id;
     HIROp op;
     Var literal;
+    unsigned func;
+    ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
     HIRTacInstr *next;
@@ -279,6 +281,8 @@ struct HIRSSAInstr {
     int local_id;
     HIROp op;
     Var literal;
+    unsigned func;
+    ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
     int num_local_values;
@@ -512,6 +516,10 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_BINARY:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_CALL:
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_LABEL:
@@ -1230,6 +1238,7 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_LOAD_LOCAL
 	    || instr->kind == HIR_TAC_UNARY
 	    || instr->kind == HIR_TAC_BINARY
+	    || instr->kind == HIR_TAC_CALL
 	    || instr->kind == HIR_TAC_UNSUPPORTED
 	    || instr->kind == HIR_TAC_PHI);
 }
@@ -1274,6 +1283,8 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->local_id = tac->local_id;
     instr->op = tac->op;
     instr->literal = tac->literal;
+    instr->func = tac->func;
+    instr->resume_key = tac->resume_key;
     instr->num_stack_values = tac->num_stack_values;
     instr->stack_values = tac->stack_values;
     instr->num_local_values = 0;
@@ -1907,6 +1918,7 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 	    switch (instr->kind) {
 	    case HIR_TAC_STORE_LOCAL:
 	    case HIR_TAC_UNARY:
+	    case HIR_TAC_CALL:
 	    case HIR_TAC_BRANCH_FALSE:
 	    case HIR_TAC_RETURN:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
@@ -1997,6 +2009,11 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_BINARY:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_CALL:
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -2303,6 +2320,7 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 					analysis->facts[arg->value]);
 		    }
 		    break;
+		case HIR_TAC_CALL:
 		case HIR_TAC_UNSUPPORTED:
 		    fact = unknown_fact();
 		    break;
@@ -2979,6 +2997,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
+	    case HIR_TAC_CALL:
 		mark_out_ssa_def(instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3022,6 +3041,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_UNARY:
+	    case HIR_TAC_CALL:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_BINARY:
@@ -3086,6 +3106,10 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_SHR:
     case HIR_OP_LSHR:
     case HIR_OP_INDEX:
+    case HIR_OP_MAKE_SINGLETON_LIST:
+    case HIR_OP_CHECK_LIST_FOR_SPLICE:
+    case HIR_OP_LIST_ADD_TAIL:
+    case HIR_OP_LIST_APPEND:
     case HIR_OP_EQ:
     case HIR_OP_NE:
     case HIR_OP_LT:
@@ -3113,6 +3137,7 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_CALL:
 	    case HIR_TAC_LABEL:
 	    case HIR_TAC_JUMP:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3246,6 +3271,13 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
 						    EOP_WHILE_ID))
+		    return 0;
+		break;
+	    case HIR_TAC_CALL:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_BI_FUNC_CALL)
 		    return 0;
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
@@ -3483,6 +3515,10 @@ hir_dump_tac(HIRTacProgram *program)
 	    break;
 	case HIR_TAC_RETURN0:
 	    break;
+	case HIR_TAC_CALL:
+	    fprintf(stderr, " t%d = call func(%u) t%d", instr->dst,
+		    instr->func, instr->src1);
+	    break;
 	case HIR_TAC_UNSUPPORTED:
 	    fprintf(stderr, " t%d", instr->dst);
 	    break;
@@ -3645,6 +3681,10 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_RETURN0:
 		break;
+	    case HIR_TAC_CALL:
+		fprintf(file, " t%d = call func(%u) t%d", instr->value,
+			instr->func, instr->src1);
+		break;
 	    case HIR_TAC_UNSUPPORTED:
 		if (instr->value > 0)
 		    fprintf(file, " t%d", instr->value);
@@ -3713,6 +3753,8 @@ tac_kind_name(HIRTacKind kind)
 	return "return";
     case HIR_TAC_RETURN0:
 	return "return0";
+    case HIR_TAC_CALL:
+	return "call";
     case HIR_TAC_UNSUPPORTED:
 	    return "unsupported";
     case HIR_TAC_PHI:
@@ -4644,12 +4686,12 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_CALL:
 	expr = new_expr(ctx, HIR_EXPR_CALL);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.call.resume_key.site = ast->e.call.resume_site;
 	expr->u.call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.call.func = ast->e.call.func;
 	expr->u.call.args = lift_arg_list(ctx, ast->e.call.args);
-	record_unsupported(ctx, "Call expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_VERB:
 	expr = new_expr(ctx, HIR_EXPR_VERB_CALL);
@@ -5258,6 +5300,30 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		list_temp = next_list_temp;
 	    }
 	    return list_temp;
+	}
+    case HIR_EXPR_CALL:
+	{
+	    HIRExpr list_expr;
+	    int args_temp;
+	    HIRTacInstr *call_tac;
+
+	    memset(&list_expr, 0, sizeof(list_expr));
+	    list_expr.kind = HIR_EXPR_LIST;
+	    list_expr.source_lineno = expr->source_lineno;
+	    list_expr.bytecode_pc = expr->bytecode_pc;
+	    list_expr.u.list.items = expr->u.call.args;
+	    args_temp = lower_expr(ctx, program, &list_expr);
+
+	    call_tac = new_tac(ctx, HIR_TAC_CALL, expr->source_lineno);
+	    call_tac->dst = new_temp(ctx);
+	    call_tac->src1 = args_temp;
+	    call_tac->func = expr->u.call.func;
+	    call_tac->resume_key = expr->u.call.resume_key;
+	    call_tac->bytecode_pc = expr->bytecode_pc;
+	    snapshot_lower_stack(ctx, call_tac);
+	    append_tac(program, call_tac);
+	    ctx->lower_stack[ctx->lower_stack_depth - 1] = call_tac->dst;
+	    return call_tac->dst;
 	}
     case HIR_EXPR_COND:
 	return append_unsupported_tac(ctx, program,
