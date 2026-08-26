@@ -65,6 +65,8 @@ The current branch has already established the first compiler backbone:
 * native entry and return through the existing activation unwinder;
 * JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
 * read-only MIR output through `disassemble(..., "mir")`;
+* hexadecimal machine-code output through `disassemble(..., "machine")`;
+* runtime deoptimization profiling with reason and call-site aggregation;
 * disposable JIT state that is rebuilt from source after database reload.
 
 ## 4. Phase 1: AST to HIR
@@ -514,7 +516,14 @@ Completed in the first native-code milestone:
   `jit_rt_str_ref`, `jit_rt_list_concat`, `jit_rt_list_append`, `jit_rt_list_in`,
   `jit_rt_get_prop`), with MIR call integration lowering string concatenation,
   string comparisons, list equality, string indexing, list membership, and
-  truth-value branching natively.
+  truth-value branching natively; and
+* direct native lowering for `ticks_left()`, `seconds_left()`, and `time()`,
+  including exact built-in anchors and tick accounting; and
+* entry-state modeling for uninitialized `TYPE_NONE` locals, with compiler-only
+  locals kept out of the runtime environment and semantic reads deoptimized
+  before the VM must raise `E_VARNF`; and
+* runtime deoptimization census support in `tests/deopt-census.sh`, with entry
+  guard failures reported separately from unsupported operations.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
 these, all 6,319 (100.00%) are JIT-eligible and compiled; zero verbs report
@@ -540,6 +549,25 @@ census confirms zero remaining blockers:
 Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
 
+Compile eligibility is no longer the useful coverage bottleneck. The current
+runtime sample enters 320 JIT-compiled activations but completes only 7 (2.19%)
+in native code; 312 (97.50%) deoptimize. The emergency workload suspends before
+finishing the requested object range, so these figures are a repeatable sample,
+not a database-wide execution census. Its current reason distribution is:
+
+* 138 `arithmetic_type` deopts (44.23%), including 104 calls to
+  `#59:verbname_match` at its first `args[1]` indexed access;
+* 98 entry or local `type_guard_failure` deopts (31.41%), down from 227 after
+  separating compiler-only locals from VM locals and modeling `TYPE_NONE`;
+* 45 `unsupported_operation` deopts (14.42%);
+* 22 `property_read` deopts (7.05%);
+* 6 `builtin_call` deopts (1.92%); and
+* 3 `verb_call` deopts (0.96%).
+
+The line-1 string expression in `#59:verbname_match` is correctly omitted from
+HIR. Its old line 1/PC 0 report was an entry guard failure, not execution of the
+side-effect-free expression. It now reaches line 2/PC 7 before deoptimizing.
+
 Reproduce the census from the repository root with a JIT-enabled build using:
 
 ```sh
@@ -552,23 +580,45 @@ verb names and removes its temporary output database on exit. The server may
 require permission to create its listening socket even though the census uses
 emergency mode and makes no network connections.
 
-The next reviewable compiler milestones, in dependency order, are:
+Reproduce the runtime deoptimization sample with:
 
-1. Make code-unit identity explicit in native entry and deoptimization maps,
+```sh
+./tests/deopt-census.sh Opal.db ./moo 0 25
+```
+
+The final two arguments select the inclusive object-number range. The script
+prints the profile written through `server_log()` and warns when a called verb
+suspends the emergency task before the range is complete.
+
+The next reviewable compiler milestones, in priority order, are:
+
+1. Reduce the dominant `arithmetic_type` runtime category. Start with indexed
+   values whose element type is currently guessed as integer: propagate known
+   argument/list element types where possible and otherwise use a precise
+   element guard or tagged result instead of deoptimizing every string result.
+   Use `#59:verbname_match` as the first differential regression case.
+2. Split and reduce the remaining 98 type-guard failures. Report the guarded
+   local slot plus expected and actual type, then distinguish true argument
+   specialization failures from inert entry-state values. Do not weaken guards
+   for values that can be semantically read before assignment.
+3. Classify the 45 unsupported-operation sites by operation and call-site
+   frequency. Lower the highest-frequency continuation-free operation first,
+   retaining exact bytecode anchors and deopt state for everything else.
+4. Define declarative built-in effect metadata (pure, may raise, may allocate,
+   may call, may suspend, ownership behavior) and make JIT eligibility consume
+   it. Only then expand fast paths for high-frequency, continuation-free
+   built-ins; all other built-ins remain deopt-before-call boundaries.
+5. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-2. Define declarative built-in effect metadata (pure, may raise, may allocate,
-   may call, may suspend, ownership behavior) and make JIT eligibility consume
-   it. Only then expand fast paths for high-frequency, continuation-free
-   built-ins; all other built-ins remain deopt-before-call boundaries.
-3. Add profile-guided, semantics-preserving optimization only after the wider
+6. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-4. Finish with database-scale validation and performance work: multi-verb and
+7. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
