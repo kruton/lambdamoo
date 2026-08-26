@@ -455,13 +455,14 @@ Completed in the first native-code milestone:
 * native representation for double-precision, unboxed floating-point
   (`TYPE_FLOAT`) values, including local loads, arithmetic, numeric error exits,
   comparisons, branches, returns, and deoptimization; other configured float
-  representations currently make affected verbs ineligible.
+  representations currently make affected verbs ineligible; and
+* ownership-aware string values (`TYPE_STR`) and non-integer list elements
+  (`TYPE_OBJ`, `TYPE_FLOAT`, `TYPE_STR`, `TYPE_LIST`) so indexing, iteration,
+  locals, returns, and deoptimization preserve reference counts.
 
 The next reviewable compiler milestones are:
 
-1. Add ownership-aware string values and non-integer list elements so indexing,
-   iteration, locals, returns, and deoptimization preserve reference counts.
-2. Model exception and `finally` stack markers before lowering catch expressions,
+1. Model exception and `finally` stack markers before lowering catch expressions,
    `try` statements, or other operations that unwind through native frames.
-3. Add fork and suspension boundaries only after native frames can materialize
+2. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.
