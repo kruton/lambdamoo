@@ -1048,6 +1048,7 @@ generate_expr(Expr * expr, State * state)
 	{
 	    int handler_label, end_label;
 
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    generate_codes(expr->e.catch.codes, state);
 	    emit_extended_byte(EOP_PUSH_LABEL, state);
 	    handler_label = add_label(state);
@@ -1227,6 +1228,7 @@ generate_stmt(Stmt * stmt, State * state)
 		int end_label, arm_count = 0;
 		Except_Arm *ex;
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		for (ex = stmt->s.catch.excepts; ex; ex = ex->next) {
 		    generate_codes(ex->codes, state);
 		    emit_extended_byte(EOP_PUSH_LABEL, state);
@@ -1263,6 +1265,7 @@ generate_stmt(Stmt * stmt, State * state)
 	    {
 		int handler_label;
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_extended_byte(EOP_TRY_FINALLY, state);
 		handler_label = add_label(state);
 		push_stack_slot(RSS_FINALLY, handler_label, state);

@@ -149,6 +149,8 @@ struct HIRExceptArm {
     int local_id;
     HIRArg *codes;
     HIRStmt *body;
+    int label;
+    unsigned source_lineno;
     HIRExceptArm *next;
 };
 
@@ -5263,10 +5265,10 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_CATCH:
 	expr = new_expr(ctx, HIR_EXPR_CATCH);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.catch_expr.body = lift_expr(ctx, ast->e.catch.try);
 	expr->u.catch_expr.codes = lift_arg_list(ctx, ast->e.catch.codes);
 	expr->u.catch_expr.handler = lift_expr(ctx, ast->e.catch.except);
-	record_unsupported(ctx, "Catch expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_SCATTER:
 	return unsupported_expr(ctx, ast);
@@ -5313,6 +5315,8 @@ lift_except_arms(HIRContext *ctx, Except_Arm *excepts)
 	arm->local_id = excepts->id;
 	arm->codes = lift_arg_list(ctx, excepts->codes);
 	arm->body = lift_stmt_list(ctx, excepts->stmt);
+	arm->source_lineno = excepts->stmt ? excepts->stmt->lineno : 0;
+	arm->label = -1;
 	arm->next = 0;
 
 	if (last)
@@ -5401,16 +5405,16 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_TRY_EXCEPT:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_EXCEPT);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.try_except.body = lift_stmt_list(ctx, ast->s.catch.body);
 	stmt->u.try_except.excepts = lift_except_arms(ctx, ast->s.catch.excepts);
-	record_unsupported(ctx, "Try-except statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_TRY_FINALLY:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_FINALLY);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.try_finally.body = lift_stmt_list(ctx, ast->s.finally.body);
 	stmt->u.try_finally.handler = lift_stmt_list(ctx, ast->s.finally.handler);
-	record_unsupported(ctx, "Try-finally statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_BREAK:
 	stmt = new_stmt(ctx, HIR_STMT_BREAK);
@@ -5689,6 +5693,94 @@ lower_cond_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     append_internal_store(ctx, program, result_local, alt_val,
 			  expr->source_lineno);
     append_label(ctx, program, done_label, expr->source_lineno);
+    result_temp = append_internal_load(ctx, program, result_local,
+				       expr->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    push_lower_stack(ctx, result_temp);
+    return result_temp;
+}
+
+static int
+lower_codes(HIRContext *ctx, HIRTacProgram *program, HIRArg *codes,
+	    unsigned source_lineno, unsigned bytecode_pc)
+{
+    if (codes) {
+	HIRExpr list_expr;
+	memset(&list_expr, 0, sizeof(list_expr));
+	list_expr.kind = HIR_EXPR_LIST;
+	list_expr.source_lineno = source_lineno;
+	list_expr.bytecode_pc = bytecode_pc;
+	list_expr.u.list.items = codes;
+	return lower_expr(ctx, program, &list_expr);
+    } else {
+	int zero_val = new_temp(ctx);
+	HIRTacInstr *zero_codes = new_tac(ctx, HIR_TAC_CONST, source_lineno);
+	zero_codes->dst = zero_val;
+	zero_codes->literal.type = TYPE_INT;
+	zero_codes->literal.v.num = 0;
+	zero_codes->bytecode_pc = bytecode_pc;
+	snapshot_lower_stack(ctx, zero_codes);
+	append_tac(program, zero_codes);
+	push_lower_stack(ctx, zero_val);
+	return zero_val;
+    }
+}
+
+static int
+lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int handler_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int result_local = ctx->next_local++;
+    int handler_pc_val = new_temp(ctx);
+    int catch_marker_val = new_temp(ctx);
+    HIRTacInstr *handler_pc_tac;
+    HIRTacInstr *catch_marker_tac;
+    int codes_val;
+    int try_val;
+    int handler_val;
+    int result_temp;
+
+    codes_val = lower_codes(ctx, program, expr->u.catch_expr.codes,
+			    expr->source_lineno, expr->bytecode_pc);
+    (void) codes_val;
+
+    handler_pc_tac = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
+    handler_pc_tac->dst = handler_pc_val;
+    handler_pc_tac->literal.type = TYPE_INT;
+    handler_pc_tac->literal.v.num = handler_label;
+    handler_pc_tac->bytecode_pc = expr->bytecode_pc;
+    snapshot_lower_stack(ctx, handler_pc_tac);
+    append_tac(program, handler_pc_tac);
+    push_lower_stack(ctx, handler_pc_val);
+
+    catch_marker_tac = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
+    catch_marker_tac->dst = catch_marker_val;
+    catch_marker_tac->literal.type = TYPE_CATCH;
+    catch_marker_tac->literal.v.num = 1;
+    catch_marker_tac->bytecode_pc = expr->bytecode_pc;
+    snapshot_lower_stack(ctx, catch_marker_tac);
+    append_tac(program, catch_marker_tac);
+    push_lower_stack(ctx, catch_marker_val);
+
+    try_val = lower_expr(ctx, program, expr->u.catch_expr.body);
+    append_internal_store(ctx, program, result_local, try_val,
+			  expr->source_lineno);
+
+    ctx->lower_stack_depth = base_depth;
+    append_jump(ctx, program, done_label, expr->source_lineno);
+
+    append_label(ctx, program, handler_label, expr->source_lineno);
+    if (expr->u.catch_expr.handler)
+	handler_val = lower_expr(ctx, program, expr->u.catch_expr.handler);
+    else
+	handler_val = try_val;
+
+    append_internal_store(ctx, program, result_local, handler_val,
+			  expr->source_lineno);
+    append_label(ctx, program, done_label, expr->source_lineno);
+
     result_temp = append_internal_load(ctx, program, result_local,
 				       expr->source_lineno);
     ctx->lower_stack_depth = base_depth;
@@ -6074,6 +6166,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	}
     case HIR_EXPR_COND:
 	return lower_cond_expr(ctx, program, expr);
+    case HIR_EXPR_CATCH:
+	return lower_catch_expr(ctx, program, expr);
     default:
 	return append_unsupported_tac(ctx, program,
 				      "Unsupported HIR expression in TAC lowering",
@@ -6388,6 +6482,92 @@ lower_continue(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 static void
+lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int handler_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int finally_val = new_temp(ctx);
+    HIRTacInstr *finally_marker;
+
+    finally_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
+    finally_marker->dst = finally_val;
+    finally_marker->literal.type = TYPE_FINALLY;
+    finally_marker->literal.v.num = handler_label;
+    finally_marker->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, finally_marker);
+    append_tac(program, finally_marker);
+    push_lower_stack(ctx, finally_val);
+
+    lower_stmt_list(ctx, program, stmt->u.try_finally.body);
+
+    ctx->lower_stack_depth = base_depth;
+    append_jump(ctx, program, done_label, stmt->source_lineno);
+
+    append_label(ctx, program, handler_label, stmt->source_lineno);
+    lower_stmt_list(ctx, program, stmt->u.try_finally.handler);
+
+    append_label(ctx, program, done_label, stmt->source_lineno);
+}
+
+static void
+lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    int base_depth = ctx->lower_stack_depth;
+    HIRExceptArm *ex;
+    int arm_count = 0;
+    int done_label = new_label(ctx);
+    int catch_marker_val;
+    HIRTacInstr *catch_marker;
+
+    for (ex = stmt->u.try_except.excepts; ex; ex = ex->next)
+	arm_count++;
+
+    for (ex = stmt->u.try_except.excepts; ex; ex = ex->next) {
+	int codes_val = lower_codes(ctx, program, ex->codes,
+				    ex->source_lineno, stmt->bytecode_pc);
+	int handler_label = new_label(ctx);
+	int handler_pc_val = new_temp(ctx);
+	HIRTacInstr *handler_pc;
+
+	(void) codes_val;
+	ex->label = handler_label;
+	handler_pc = new_tac(ctx, HIR_TAC_CONST, ex->source_lineno);
+	handler_pc->dst = handler_pc_val;
+	handler_pc->literal.type = TYPE_INT;
+	handler_pc->literal.v.num = handler_label;
+	handler_pc->bytecode_pc = stmt->bytecode_pc;
+	snapshot_lower_stack(ctx, handler_pc);
+	append_tac(program, handler_pc);
+	push_lower_stack(ctx, handler_pc_val);
+    }
+
+    catch_marker_val = new_temp(ctx);
+    catch_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
+    catch_marker->dst = catch_marker_val;
+    catch_marker->literal.type = TYPE_CATCH;
+    catch_marker->literal.v.num = arm_count;
+    catch_marker->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, catch_marker);
+    append_tac(program, catch_marker);
+    push_lower_stack(ctx, catch_marker_val);
+
+    lower_stmt_list(ctx, program, stmt->u.try_except.body);
+
+    ctx->lower_stack_depth = base_depth;
+    append_jump(ctx, program, done_label, stmt->source_lineno);
+
+    for (ex = stmt->u.try_except.excepts; ex; ex = ex->next) {
+	append_label(ctx, program, ex->label, ex->source_lineno);
+	lower_stmt_list(ctx, program, ex->body);
+	if (ex->next)
+	    append_jump(ctx, program, done_label, ex->source_lineno);
+    }
+
+    append_label(ctx, program, done_label, stmt->source_lineno);
+}
+
+static void
 lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     HIRTacInstr *instr;
@@ -6425,6 +6605,12 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	break;
     case HIR_STMT_FOR_LIST:
 	lower_for_list(ctx, program, stmt);
+	break;
+    case HIR_STMT_TRY_FINALLY:
+	lower_try_finally(ctx, program, stmt);
+	break;
+    case HIR_STMT_TRY_EXCEPT:
+	lower_try_except(ctx, program, stmt);
 	break;
     case HIR_STMT_BREAK:
 	lower_break(ctx, program, stmt);
