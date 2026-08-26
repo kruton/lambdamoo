@@ -1111,6 +1111,127 @@ string_not_program(const char *s)
     return_instr->literal_type = TYPE_INT;
     return program;
 }
+static JITProgram *
+catch_stack_marker_deopt_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *const_codes = instruction(HIR_TAC_CONST);
+    JITInstruction *const_pc = instruction(HIR_TAC_CONST);
+    JITInstruction *const_catch = instruction(HIR_TAC_CONST);
+    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 5;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_INT;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_CATCH;
+    program->value_types[4] = TYPE_INT;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 25;
+    map->error_pc = 25;
+    map->stack_depth = 3;
+    map->ticks_charged = 1;
+    map->num_locals = 0;
+    map->stack_values = allocate(sizeof(int) * 3);
+    map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_types[0] = TYPE_INT;
+    map->stack_types[1] = TYPE_INT;
+    map->stack_types[2] = TYPE_CATCH;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    const_codes->value = 1;
+    const_codes->literal = 0;
+    const_codes->literal_type = TYPE_INT;
+    const_codes->next = const_pc;
+
+    const_pc->value = 2;
+    const_pc->literal = 77;
+    const_pc->literal_type = TYPE_INT;
+    const_pc->next = const_catch;
+
+    const_catch->value = 3;
+    const_catch->literal = 1;
+    const_catch->literal_type = TYPE_CATCH;
+    const_catch->next = deopt_op;
+
+    deopt_op->value = 4;
+    deopt_op->src1 = 1;
+    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
+    deopt_op->deopt_map = 1;
+    deopt_op->bytecode_pc = 25;
+
+    block->first = const_codes;
+    block->last = deopt_op;
+    return program;
+}
+
+static JITProgram *
+finally_stack_marker_deopt_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *const_finally = instruction(HIR_TAC_CONST);
+    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 3;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_FINALLY;
+    program->value_types[2] = TYPE_INT;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 40;
+    map->error_pc = 40;
+    map->stack_depth = 1;
+    map->ticks_charged = 1;
+    map->num_locals = 0;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_FINALLY;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    const_finally->value = 1;
+    const_finally->literal = 88;
+    const_finally->literal_type = TYPE_FINALLY;
+    const_finally->next = deopt_op;
+
+    deopt_op->value = 2;
+    deopt_op->src1 = 1;
+    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
+    deopt_op->deopt_map = 1;
+    deopt_op->bytecode_pc = 40;
+
+    block->first = const_finally;
+    block->last = deopt_op;
+    return program;
+}
 
 static JITProgram *
 list_index_typed_program(var_type elem_type)
@@ -2263,6 +2384,41 @@ main(void)
 	      == JIT_RUN_FALLBACK, "list index elem type mismatch did not fallback");
 	jit_program_free(idx_str);
 	myfree(elements, M_LIST);
+    }
+
+    /* Exception and finally stack marker deoptimization tests */
+    {
+	JITProgram *catch_deopt = catch_stack_marker_deopt_program();
+	JITDeoptState deopt_state;
+	Var deopt_stack[10];
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	check(jit_program_execute(catch_deopt, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_FALLBACK, "catch marker deopt failed");
+	check(deopt_state.stack_depth == 3, "catch marker deopt depth wrong");
+	check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 0,
+	      "catch marker codes wrong");
+	check(deopt_stack[1].type == TYPE_INT && deopt_stack[1].v.num == 77,
+	      "catch marker handler pc wrong");
+	check(deopt_stack[2].type == TYPE_CATCH && deopt_stack[2].v.num == 1,
+	      "catch marker type/arm wrong");
+	free_var(deopt_stack[0]);
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	jit_program_free(catch_deopt);
+
+	JITProgram *fin_deopt = finally_stack_marker_deopt_program();
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	check(jit_program_execute(fin_deopt, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_FALLBACK, "finally marker deopt failed");
+	check(deopt_state.stack_depth == 1, "finally marker deopt depth wrong");
+	check(deopt_stack[0].type == TYPE_FINALLY && deopt_stack[0].v.num == 88,
+	      "finally marker type/handler wrong");
+	free_var(deopt_stack[0]);
+	jit_program_free(fin_deopt);
     }
 
     jit_program_free(program);

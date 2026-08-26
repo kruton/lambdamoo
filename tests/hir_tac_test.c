@@ -452,20 +452,15 @@ test_unsupported_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr catch_expr, try_expr, handler_expr;
+    Expr unsupp_expr;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    try_expr = id_expr(0, 30);
-    handler_expr = id_expr(1, 30);
-    memset(&catch_expr, 0, sizeof(catch_expr));
-    catch_expr.kind = EXPR_CATCH;
-    catch_expr.lineno = 30;
-    catch_expr.e.catch.try = &try_expr;
-    catch_expr.e.catch.codes = 0;
-    catch_expr.e.catch.except = &handler_expr;
-    ret = return_stmt(&catch_expr);
+    memset(&unsupp_expr, 0, sizeof(unsupp_expr));
+    unsupp_expr.kind = EXPR_LENGTH;
+    unsupp_expr.lineno = 30;
+    ret = return_stmt(&unsupp_expr);
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -2404,6 +2399,119 @@ test_repeated_local_assignment_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_catch_expr_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr catch_expr, try_expr, handler_expr;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    try_expr = id_expr(0, 30);
+    handler_expr = int_expr(42, 30);
+    memset(&catch_expr, 0, sizeof(catch_expr));
+    catch_expr.kind = EXPR_CATCH;
+    catch_expr.lineno = 30;
+    catch_expr.e.catch.try = &try_expr;
+    catch_expr.e.catch.codes = 0;
+    catch_expr.e.catch.except = &handler_expr;
+    ret = return_stmt(&catch_expr);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("catch expr tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("catch expr cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("catch expr ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("catch expr verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_try_except_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr val_expr, handler_val;
+    Stmt body_stmt, handler_stmt, try_stmt;
+    Except_Arm except_arm;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    val_expr = int_expr(10, 40);
+    body_stmt = return_stmt(&val_expr);
+    handler_val = int_expr(20, 42);
+    handler_stmt = return_stmt(&handler_val);
+
+    memset(&except_arm, 0, sizeof(except_arm));
+    except_arm.id = -1;
+    except_arm.codes = 0;
+    except_arm.stmt = &handler_stmt;
+
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_EXCEPT;
+    try_stmt.lineno = 40;
+    try_stmt.s.catch.body = &body_stmt;
+    try_stmt.s.catch.excepts = &except_arm;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("try except tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try except verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_try_finally_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr body_val, handler_val;
+    Stmt body_stmt, handler_stmt, try_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    body_val = int_expr(100, 50);
+    body_stmt = expr_stmt(&body_val);
+    handler_val = int_expr(200, 52);
+    handler_stmt = return_stmt(&handler_val);
+
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_FINALLY;
+    try_stmt.lineno = 50;
+    try_stmt.s.finally.body = &body_stmt;
+    try_stmt.s.finally.handler = &handler_stmt;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("try finally tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("try finally cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try finally ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try finally verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2437,6 +2545,9 @@ main(void)
     test_object_scalars_tac_ssa();
     test_float_scalars_tac_ssa();
     test_string_scalars_tac_ssa();
+    test_catch_expr_tac_ssa();
+    test_try_except_tac_ssa();
+    test_try_finally_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
