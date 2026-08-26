@@ -561,13 +561,13 @@ finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
 * 20 `arithmetic_type` deopts (9.39%);
-* 58 entry or local `type_guard_failure` deopts (27.23%), down from 227 after
+* 38 entry or local `type_guard_failure` deopts (17.84%), down from 227 after
   separating compiler-only locals from VM locals and preserving `TYPE_NONE`
   for user-local entry values before consumer-driven inference;
-* 76 `unsupported_operation` deopts (35.68%);
-* 42 `property_read` deopts (19.72%);
+* 84 `unsupported_operation` deopts (39.44%);
+* 51 `property_read` deopts (23.94%);
 * 6 `range_operation` deopts (2.82%);
-* 7 `builtin_call` deopts (3.29%); and
+* 10 `builtin_call` deopts (4.69%); and
 * 4 `verb_call` deopts (1.88%).
 
 The line-1 string expression in `#59:verbname_match` is correctly omitted from
@@ -593,6 +593,12 @@ at a caught `t[indx]` operation: the sampled value fails its dynamic list/index
 guard, so preserving the surrounding catch semantics still requires interpreter
 fallback.
 
+The former `#57:misc_option` line 1/PC 0 failure was an invalid specialization
+of built-in local `args` as an integer, not execution of its line-1 string
+comment. A list-splice check now propagates `TYPE_LIST` to its operand, so the
+sampled calls pass their entry guard and reach the real `$misc_options` property
+read on line 2/PC 7.
+
 Reproduce the census from the repository root with a JIT-enabled build using:
 
 ```sh
@@ -617,10 +623,10 @@ suspends the emergency task before the range is complete.
 
 The next reviewable compiler milestones, in priority order, are:
 
-1. Classify the 76 unsupported-operation sites by operation and call-site
+1. Classify the 84 unsupported-operation sites by operation and call-site
    frequency. Lower the highest-frequency continuation-free operation first,
    retaining exact bytecode anchors and deopt state for everything else.
-2. Split and reduce the remaining 58 type-guard failures. Report the guarded
+2. Split and reduce the remaining 38 type-guard failures. Report the guarded
    local slot plus expected and actual type, then distinguish true argument
    specialization failures from inert entry-state values. Do not weaken guards
    for values that can be semantically read before assignment.
