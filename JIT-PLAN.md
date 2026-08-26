@@ -439,23 +439,24 @@ Completed in the first native-code milestone:
 * range-based `for` loop lowering (`for i in [start..end]`) with exact opcode
   tick accounting and interpreter stack reconstruction; and
 * integer list iteration lowering (`for x in (list)`) with guarded list access,
-  bytecode anchors, and interpreter fallback for non-integer elements.
+  bytecode anchors, and interpreter fallback for non-integer elements; and
+* conditional expressions (`EXPR_COND` `c ? t | f`) with bytecode anchors,
+  nested evaluation, and clean SSA phi join.
 
 The next reviewable compiler milestones are:
 
-1. Conditional expressions (`EXPR_COND` `c ? t | f`).
-2. `break` and `continue`, including labeled exits from nested `while`, range,
+1. `break` and `continue`, including labeled exits from nested `while`, range,
    and list loops without losing bytecode resume anchors.
-3. Range expressions (`base[from..to]`) for list/string slicing and range
+2. Range expressions (`base[from..to]`) for list/string slicing and range
    assignment, initially through an exact deopt/runtime boundary and then with
    native lowering when ownership is modeled.
-4. Deopt-before-call boundaries for verb calls, preserving argument stacks,
+3. Deopt-before-call boundaries for verb calls, preserving argument stacks,
    permissions, traceback state, and activation-push semantics.
-5. Extend guarded SSA values beyond integers to object and floating-point
+4. Extend guarded SSA values beyond integers to object and floating-point
    scalars, including object ranges and exact arithmetic/error behavior.
-6. Add ownership-aware string values and non-integer list elements so indexing,
+5. Add ownership-aware string values and non-integer list elements so indexing,
    iteration, locals, returns, and deoptimization preserve reference counts.
-7. Model exception and `finally` stack markers before lowering catch expressions,
+6. Model exception and `finally` stack markers before lowering catch expressions,
    `try` statements, or other operations that unwind through native frames.
-8. Add fork and suspension boundaries only after native frames can materialize
+7. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.
