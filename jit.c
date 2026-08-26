@@ -4,8 +4,13 @@
 #include "options.h"
 
 #include "my-stdio.h"
+#include "my-string.h"
 
+#include "db.h"
+#include "exceptions.h"
 #include "jit_internal.h"
+#include "list.h"
+#include "server.h"
 #include "storage.h"
 #include "utils.h"
 
@@ -15,6 +20,238 @@
 #include <limits.h>
 #include <stddef.h>
 #include <string.h>
+
+#ifdef IGNORE_PROP_PROTECTED
+#define bi_prop_protected(prop, progr) (0)
+#else
+#define bi_prop_protected(prop, progr) ((!is_wizard(progr)) && server_flag_option_cached(prop))
+#endif
+
+static inline double
+raw_to_double(int64_t raw)
+{
+    double d;
+    memcpy(&d, &raw, sizeof(d));
+    return d;
+}
+
+static inline int64_t
+double_to_raw(double d)
+{
+    int64_t raw;
+    memcpy(&raw, &d, sizeof(raw));
+    return raw;
+}
+
+/* JIT Runtime Helpers for Complex Values and Properties */
+
+int
+jit_rt_is_true(int64_t raw_val, int val_type)
+{
+    Var v;
+
+    v.type = (var_type) val_type;
+    if (val_type == TYPE_FLOAT)
+	v.v.fnum = box_fl((FlNum) raw_to_double(raw_val));
+    else if (val_type == TYPE_STR)
+	v.v.str = (const char *) (intptr_t) raw_val;
+    else if (val_type == TYPE_LIST)
+	v.v.list = (Var *) (intptr_t) raw_val;
+    else
+	v.v.num = (Num) raw_val;
+    return is_true(v);
+}
+
+int
+jit_rt_equality(int64_t raw1, int type1, int64_t raw2, int type2, int case_matters)
+{
+    Var v1, v2;
+
+    v1.type = (var_type) type1;
+    if (type1 == TYPE_FLOAT)
+	v1.v.fnum = box_fl((FlNum) raw_to_double(raw1));
+    else if (type1 == TYPE_STR)
+	v1.v.str = (const char *) (intptr_t) raw1;
+    else if (type1 == TYPE_LIST)
+	v1.v.list = (Var *) (intptr_t) raw1;
+    else
+	v1.v.num = (Num) raw1;
+
+    v2.type = (var_type) type2;
+    if (type2 == TYPE_FLOAT)
+	v2.v.fnum = box_fl((FlNum) raw_to_double(raw2));
+    else if (type2 == TYPE_STR)
+	v2.v.str = (const char *) (intptr_t) raw2;
+    else if (type2 == TYPE_LIST)
+	v2.v.list = (Var *) (intptr_t) raw2;
+    else
+	v2.v.num = (Num) raw2;
+
+    return equality(v1, v2, case_matters);
+}
+
+int
+jit_rt_str_cmp(const char *s1, const char *s2, int case_matters)
+{
+    if (!s1)
+	s1 = "";
+    if (!s2)
+	s2 = "";
+    if (case_matters)
+	return strcmp(s1, s2);
+    else
+	return mystrcasecmp(s1, s2);
+}
+
+const char *
+jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
+{
+    int l1, l2, total;
+    char *res;
+
+    if (!s1)
+	s1 = "";
+    if (!s2)
+	s2 = "";
+    l1 = memo_strlen(s1);
+    l2 = memo_strlen(s2);
+    total = l1 + l2;
+
+    if (server_int_option_cached(SVO_MAX_STRING_CONCAT) < total) {
+	*err_out = E_QUOTA;
+	return 0;
+    }
+    res = mymalloc(total + 1, M_STRING);
+    memcpy(res, s1, l1);
+    memcpy(res + l1, s2, l2);
+    res[total] = '\0';
+    *err_out = E_NONE;
+    return res;
+}
+
+const char *
+jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
+{
+    int len;
+    char *res;
+
+    if (!str) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    len = memo_strlen(str);
+    if (idx < 1 || idx > len) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    res = mymalloc(2, M_STRING);
+    res[0] = str[idx - 1];
+    res[1] = '\0';
+    *err_out = E_NONE;
+    return res;
+}
+
+Var *
+jit_rt_list_concat(Var *l1, Var *l2, int32_t *err_out)
+{
+    Var v1, v2, res;
+
+    v1.type = TYPE_LIST;
+    v1.v.list = l1;
+    v2.type = TYPE_LIST;
+    v2.v.list = l2;
+
+    res = listconcat(v1, v2);
+    if (res.type == TYPE_ERR) {
+	*err_out = res.v.err;
+	return 0;
+    }
+    *err_out = E_NONE;
+    return res.v.list;
+}
+
+Var *
+jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
+{
+    Var l, elem, res;
+
+    l.type = TYPE_LIST;
+    l.v.list = list;
+
+    elem.type = (var_type) elem_type;
+    if (elem_type == TYPE_FLOAT)
+	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
+    else if (elem_type == TYPE_STR)
+	elem.v.str = (const char *) (intptr_t) elem_raw;
+    else if (elem_type == TYPE_LIST)
+	elem.v.list = (Var *) (intptr_t) elem_raw;
+    else
+	elem.v.num = (Num) elem_raw;
+
+    res = listappend(l, elem);
+    return res.v.list;
+}
+
+int64_t
+jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
+{
+    Var elem, l;
+
+    l.type = TYPE_LIST;
+    l.v.list = list;
+
+    elem.type = (var_type) elem_type;
+    if (elem_type == TYPE_FLOAT)
+	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
+    else if (elem_type == TYPE_STR)
+	elem.v.str = (const char *) (intptr_t) elem_raw;
+    else if (elem_type == TYPE_LIST)
+	elem.v.list = (Var *) (intptr_t) elem_raw;
+    else
+	elem.v.num = (Num) elem_raw;
+
+    return ismember(elem, l, 0);
+}
+
+int
+jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
+		int64_t *out_raw, int32_t *out_type, int32_t *err_out)
+{
+    Objid oid = (Objid) oid_num;
+    Objid progr = (Objid) progr_num;
+    Var prop, val;
+    db_prop_handle h;
+
+    if (!valid(oid)) {
+	*err_out = E_INVIND;
+	return 0;
+    }
+    h = db_find_property(oid, pname, &prop);
+    if (!h.ptr) {
+	*err_out = E_PROPNF;
+	return 0;
+    }
+    if (h.built_in ? bi_prop_protected(h.built_in, progr)
+		   : !db_property_allows(h, progr, PF_READ)) {
+	*err_out = E_PERM;
+	return 0;
+    }
+    val = h.built_in ? prop : var_ref(prop);
+    *out_type = val.type;
+    if (val.type == TYPE_FLOAT) {
+	double d = (double) fl_unbox(val.v.fnum);
+	*out_raw = double_to_raw(d);
+    }
+    else if (val.type == TYPE_STR)
+	*out_raw = (intptr_t) val.v.str;
+    else if (val.type == TYPE_LIST)
+	*out_raw = (intptr_t) val.v.list;
+    else
+	*out_raw = (int64_t) val.v.num;
+
+    *err_out = E_NONE;
+    return 1;
+}
 
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *);

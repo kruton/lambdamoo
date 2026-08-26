@@ -135,7 +135,7 @@ HIR_TAC_TEST_OBJS = tests/hir_tac_test.o tests/hir_test_hir.o \
 	tests/hir_test_stubs.o arena.o integer_arithmetic.o
 
 JIT_TEST_OBJS = tests/jit_test.o tests/jit_test_jit.o \
-	tests/hir_test_stubs.o integer_arithmetic.o mir-vendor.o mir-gen-vendor.o
+	tests/hir_test_stubs.o integer_arithmetic.o utf.o mir-vendor.o mir-gen-vendor.o
 
 all: moo
 

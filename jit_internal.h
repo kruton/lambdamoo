@@ -76,4 +76,14 @@ struct JITProgram {
     var_type *value_types;
 };
 
+extern int jit_rt_is_true(int64_t, int);
+extern int jit_rt_equality(int64_t, int, int64_t, int, int);
+extern int jit_rt_str_cmp(const char *, const char *, int);
+extern const char *jit_rt_str_concat(const char *, const char *, int32_t *);
+extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
+extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
+extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern int64_t jit_rt_list_in(int64_t, int, Var *);
+extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
+
 #endif /* !JIT_Internal_H */

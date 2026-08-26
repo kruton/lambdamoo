@@ -3210,5 +3210,106 @@ main(void)
     jit_program_free(bit_and);
     jit_program_free(bit_xor);
     jit_program_free(bit_or);
+
+    /* JIT complex value and property runtime helper unit tests */
+    {
+	/* 1. is_true helper tests */
+	check(jit_rt_is_true(1, TYPE_INT) == 1, "jit_rt_is_true int 1");
+	check(jit_rt_is_true(0, TYPE_INT) == 0, "jit_rt_is_true int 0");
+	double d_pos = 1.5;
+	double d_zero = 0.0;
+	int64_t raw_fpos = 0, raw_fzero = 0;
+	memcpy(&raw_fpos, &d_pos, sizeof(d_pos));
+	memcpy(&raw_fzero, &d_zero, sizeof(d_zero));
+	check(jit_rt_is_true(raw_fpos, TYPE_FLOAT) == 1, "jit_rt_is_true float 1.5");
+	check(jit_rt_is_true(raw_fzero, TYPE_FLOAT) == 0, "jit_rt_is_true float 0.0");
+	check(jit_rt_is_true((intptr_t)"hello", TYPE_STR) == 1, "jit_rt_is_true str non-empty");
+	check(jit_rt_is_true((intptr_t)"", TYPE_STR) == 0, "jit_rt_is_true str empty");
+	Var l_empty = new_list(0);
+	Var l_elem = new_list(1);
+	l_elem.v.list[1].type = TYPE_INT;
+	l_elem.v.list[1].v.num = 1;
+	check(jit_rt_is_true((intptr_t)l_empty.v.list, TYPE_LIST) == 0, "jit_rt_is_true list empty");
+	check(jit_rt_is_true((intptr_t)l_elem.v.list, TYPE_LIST) == 1, "jit_rt_is_true list non-empty");
+	free_var(l_empty);
+	free_var(l_elem);
+
+	/* 2. equality helper tests */
+	check(jit_rt_equality((intptr_t)"Foo", TYPE_STR, (intptr_t)"foo", TYPE_STR, 0) == 1,
+	      "jit_rt_equality str case-insensitive");
+	check(jit_rt_equality((intptr_t)"Foo", TYPE_STR, (intptr_t)"foo", TYPE_STR, 1) == 0,
+	      "jit_rt_equality str case-sensitive");
+	check(jit_rt_equality((intptr_t)"bar", TYPE_STR, (intptr_t)"bar", TYPE_STR, 1) == 1,
+	      "jit_rt_equality str equal");
+	check(jit_rt_equality(10, TYPE_INT, 10, TYPE_INT, 0) == 1, "jit_rt_equality int equal");
+	check(jit_rt_equality(10, TYPE_INT, 20, TYPE_INT, 0) == 0, "jit_rt_equality int unequal");
+
+	/* 3. string comparison tests */
+	check(jit_rt_str_cmp("abc", "abc", 1) == 0, "jit_rt_str_cmp equal");
+	check(jit_rt_str_cmp("abc", "ABC", 0) == 0, "jit_rt_str_cmp case-insensitive equal");
+	check(jit_rt_str_cmp("abc", "def", 1) < 0, "jit_rt_str_cmp lt");
+	check(jit_rt_str_cmp("xyz", "abc", 1) > 0, "jit_rt_str_cmp gt");
+
+	/* 4. string concat and index tests */
+	int32_t rt_err = E_NONE;
+	const char *concat_res = jit_rt_str_concat("Hello, ", "World!", &rt_err);
+	check(rt_err == E_NONE && concat_res && strcmp(concat_res, "Hello, World!") == 0,
+	      "jit_rt_str_concat success");
+	if (concat_res)
+	    free_str(concat_res);
+
+	const char *char_res = jit_rt_str_ref("LambdaMOO", 7, &rt_err);
+	check(rt_err == E_NONE && char_res && strcmp(char_res, "M") == 0,
+	      "jit_rt_str_ref index 7");
+	if (char_res)
+	    free_str(char_res);
+
+	char_res = jit_rt_str_ref("LambdaMOO", 0, &rt_err);
+	check(rt_err == E_RANGE && char_res == 0, "jit_rt_str_ref index 0 range error");
+
+	char_res = jit_rt_str_ref("LambdaMOO", 100, &rt_err);
+	check(rt_err == E_RANGE && char_res == 0, "jit_rt_str_ref index 100 range error");
+
+	/* 5. list concat and append tests */
+	Var l1 = new_list(1);
+	l1.v.list[1].type = TYPE_INT;
+	l1.v.list[1].v.num = 111;
+	Var l2 = new_list(1);
+	l2.v.list[1].type = TYPE_INT;
+	l2.v.list[1].v.num = 222;
+
+	Var *lconcat = jit_rt_list_concat(l1.v.list, l2.v.list, &rt_err);
+	check(rt_err == E_NONE && lconcat && lconcat[0].v.num == 2, "jit_rt_list_concat len");
+	check(lconcat[1].v.num == 111 && lconcat[2].v.num == 222, "jit_rt_list_concat elements");
+	Var lconcat_var;
+	lconcat_var.type = TYPE_LIST;
+	lconcat_var.v.list = lconcat;
+	free_var(lconcat_var);
+
+	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT);
+	check(lapp && lapp[0].v.num == 2 && lapp[2].v.num == 333, "jit_rt_list_append int");
+	Var lapp_var;
+	lapp_var.type = TYPE_LIST;
+	lapp_var.v.list = lapp;
+	free_var(lapp_var);
+
+	/* 6. list_in test */
+	check(jit_rt_list_in(111, TYPE_INT, l1.v.list) == 1, "jit_rt_list_in found");
+	check(jit_rt_list_in(999, TYPE_INT, l1.v.list) == 0, "jit_rt_list_in not found");
+
+	free_var(l1);
+	free_var(l2);
+
+	/* 7. get_prop test */
+	int64_t prop_raw = 0;
+	int32_t prop_type = 0;
+	int ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
+	check(ok == 1 && rt_err == E_NONE && prop_type == TYPE_INT && prop_raw == 123,
+	      "jit_rt_get_prop valid property read");
+
+	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
+	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
+    }
+
     return failures != 0;
 }
