@@ -2030,6 +2030,62 @@ test_verb_call_tac_ssa(void)
 }
 
 static void
+test_object_and_float_scalars_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr from_expr, to_expr, float_lit, o_lhs, o_rhs, one, add, assign;
+    Stmt for_stmt, ret_stmt, body_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    /* Object range loop: for o in [#0..#5] ... endfor */
+    memset(&from_expr, 0, sizeof(from_expr));
+    from_expr.kind = EXPR_VAR;
+    from_expr.lineno = 10;
+    from_expr.e.var.type = TYPE_OBJ;
+    from_expr.e.var.v.obj = 0;
+
+    memset(&to_expr, 0, sizeof(to_expr));
+    to_expr.kind = EXPR_VAR;
+    to_expr.lineno = 10;
+    to_expr.e.var.type = TYPE_OBJ;
+    to_expr.e.var.v.obj = 5;
+
+    o_lhs = id_expr(1, 11);
+    o_rhs = id_expr(1, 11);
+    one = int_expr(1, 11);
+    add = binary_expr(EXPR_PLUS, &o_rhs, &one);
+    assign = binary_expr(EXPR_ASGN, &o_lhs, &add);
+    body_stmt = expr_stmt(&assign);
+
+    for_stmt = range_stmt(1, &from_expr, &to_expr, &body_stmt, 10);
+
+    memset(&float_lit, 0, sizeof(float_lit));
+    float_lit.kind = EXPR_VAR;
+    float_lit.lineno = 12;
+    float_lit.e.var.type = TYPE_FLOAT;
+    float_lit.e.var.v.fnum = box_fl(3.14);
+
+    ret_stmt = return_stmt(&float_lit);
+    ret_stmt.lineno = 12;
+
+    for_stmt.next = &ret_stmt;
+
+    tac = lower_stmt(&names, &for_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("obj range tac not null", tac != 0, 1);
+    check_int("obj range verify errors", hir_context_error_count(ctx), 0);
+    check_int("obj range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -2307,6 +2363,7 @@ main(void)
     test_labeled_break_nested_loops_tac_ssa();
     test_range_expr_and_assignment_tac_ssa();
     test_verb_call_tac_ssa();
+    test_object_and_float_scalars_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

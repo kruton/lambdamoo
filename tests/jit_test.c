@@ -711,6 +711,101 @@ call_verb_program(void)
     return program;
 }
 
+static JITProgram *
+object_return_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_local->value = 1;
+    load_local->local_id = 0;
+    load_local->literal_type = TYPE_OBJ;
+    load_local->next = return_instr;
+    return_instr->src1 = 1;
+    return_instr->literal_type = TYPE_OBJ;
+    block->first = load_local;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+float_return_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_local->value = 1;
+    load_local->local_id = 0;
+    load_local->literal_type = TYPE_FLOAT;
+    load_local->next = return_instr;
+    return_instr->src1 = 1;
+    return_instr->literal_type = TYPE_FLOAT;
+    block->first = load_local;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+object_compare_program(HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_obj1 = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_obj2 = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *cmp = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_obj1->value = 1;
+    load_obj1->local_id = 0;
+    load_obj1->literal_type = TYPE_OBJ;
+    load_obj1->next = load_obj2;
+    load_obj2->value = 2;
+    load_obj2->local_id = 1;
+    load_obj2->literal_type = TYPE_OBJ;
+    load_obj2->next = cmp;
+    cmp->value = 3;
+    cmp->src1 = 1;
+    cmp->src2 = 2;
+    cmp->op = op;
+    cmp->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_INT;
+    block->first = load_obj1;
+    block->last = return_instr;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -756,8 +851,14 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		}
 		if (instr->literal_type == TYPE_INT)
 		    values[instr->value] = env[instr->local_id].v.num;
+		else if (instr->literal_type == TYPE_OBJ)
+		    values[instr->value] = env[instr->local_id].v.obj;
+		else if (instr->literal_type == TYPE_FLOAT)
+		    memcpy(&values[instr->value], &env[instr->local_id].v.fnum, sizeof(Num));
 		else if (instr->literal_type == TYPE_LIST)
 		    values[instr->value] = (Num) env[instr->local_id].v.list;
+		else if (instr->literal_type == TYPE_STR)
+		    values[instr->value] = (Num) (intptr_t) env[instr->local_id].v.str;
 		else {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_FALLBACK;
@@ -804,6 +905,24 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		    else if (instr->op == HIR_OP_BITAND)
 			values[instr->value] = values[instr->src1]
 			    & values[instr->src2];
+		    else if (instr->op == HIR_OP_EQ)
+			values[instr->value] = values[instr->src1]
+			    == values[instr->src2];
+		    else if (instr->op == HIR_OP_NE)
+			values[instr->value] = values[instr->src1]
+			    != values[instr->src2];
+		    else if (instr->op == HIR_OP_LT)
+			values[instr->value] = values[instr->src1]
+			    < values[instr->src2];
+		    else if (instr->op == HIR_OP_LE)
+			values[instr->value] = values[instr->src1]
+			    <= values[instr->src2];
+		    else if (instr->op == HIR_OP_GT)
+			values[instr->value] = values[instr->src1]
+			    > values[instr->src2];
+		    else if (instr->op == HIR_OP_GE)
+			values[instr->value] = values[instr->src1]
+			    >= values[instr->src2];
 		    else {
 			myfree(values, M_PROGRAM);
 			return JIT_RUN_FALLBACK;
@@ -836,8 +955,13 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			values[instr->src1] ? 1 : 0]);
 		break;
 	    case HIR_TAC_RETURN:
-		result->type = TYPE_INT;
-		result->v.num = values[instr->src1];
+		result->type = instr->literal_type;
+		if (instr->literal_type == TYPE_OBJ)
+		    result->v.obj = values[instr->src1];
+		else if (instr->literal_type == TYPE_FLOAT)
+		    memcpy(&result->v.fnum, &values[instr->src1], sizeof(Num));
+		else
+		    result->v.num = values[instr->src1];
 		myfree(values, M_PROGRAM);
 		return JIT_RUN_RETURNED;
 	    default:
@@ -876,7 +1000,11 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 	      || native_error == reference_error)
 	  && (native_status != JIT_RUN_RETURNED
 	      || (native_result.type == reference_result.type
-		  && native_result.v.num == reference_result.v.num)), message);
+		  && (native_result.type == TYPE_FLOAT
+		      ? fl_unbox(native_result.v.fnum) == fl_unbox(reference_result.v.fnum)
+		      : (native_result.type == TYPE_OBJ
+			 ? native_result.v.obj == reference_result.v.obj
+			 : native_result.v.num == reference_result.v.num)))), message);
 }
 
 static void
@@ -1335,6 +1463,67 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == TYPE_INT,
 	      "typeof returned wrong value");
 	jit_program_free(typeof_p);
+    }
+
+    /* Scalar object and float tests */
+    {
+	JITProgram *obj_p = object_return_program();
+	Var obj_env[1];
+	obj_env[0].type = TYPE_OBJ;
+	obj_env[0].v.obj = 1234;
+	ticks = 10;
+	check(jit_program_execute(obj_p, obj_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "object return execution failed");
+	check(result.type == TYPE_OBJ && result.v.obj == 1234,
+	      "object return returned wrong value");
+	check_differential(obj_p, obj_env, 10, 0, "object return differential");
+
+	/* Mismatched type guard fallback for object */
+	obj_env[0].type = TYPE_INT;
+	obj_env[0].v.num = 1234;
+	ticks = 10;
+	check(jit_program_execute(obj_p, obj_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "object guard mismatch failed to fallback");
+	jit_program_free(obj_p);
+
+	JITProgram *fl_p = float_return_program();
+	Var fl_env[1];
+	fl_env[0].type = TYPE_FLOAT;
+	fl_env[0].v.fnum = box_fl(2.718);
+	ticks = 10;
+	check(jit_program_execute(fl_p, fl_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "float return execution failed");
+	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 2.718,
+	      "float return returned wrong value");
+	check_differential(fl_p, fl_env, 10, 0, "float return differential");
+	jit_program_free(fl_p);
+
+	JITProgram *cmp_eq = object_compare_program(HIR_OP_EQ);
+	Var cmp_env[2];
+	cmp_env[0].type = TYPE_OBJ;
+	cmp_env[0].v.obj = 42;
+	cmp_env[1].type = TYPE_OBJ;
+	cmp_env[1].v.obj = 42;
+	ticks = 10;
+	check(jit_program_execute(cmp_eq, cmp_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "object compare eq execution failed");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "object compare eq returned wrong value");
+	check_differential(cmp_eq, cmp_env, 10, 0, "object compare eq differential");
+
+	cmp_env[1].v.obj = 99;
+	ticks = 10;
+	check(jit_program_execute(cmp_eq, cmp_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "object compare ne execution failed");
+	check(result.type == TYPE_INT && result.v.num == 0,
+	      "object compare ne returned wrong value");
+	check_differential(cmp_eq, cmp_env, 10, 0, "object compare ne differential");
+	jit_program_free(cmp_eq);
     }
 
     jit_program_free(program);
