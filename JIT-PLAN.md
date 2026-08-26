@@ -446,17 +446,34 @@ Completed in the first native-code milestone:
   and list loops without losing bytecode resume anchors; and
 * range expressions (`base[from..to]`) for list and string slicing, plus range
   assignments (`base[from..to] = rhs`), lowered through exact deoptimization and
-  interpreter stack reconstruction boundaries.
+  interpreter stack reconstruction boundaries; and
+* deopt-before-call boundaries for verb calls (`obj:verb(args...)`), preserving
+  argument stacks, permissions, traceback state, and activation-push semantics; and
+* guarded SSA values for object (`TYPE_OBJ`) scalars, including object range
+  loops, literal representations, comparisons, and exact deoptimization/return
+  semantics; and
+* native representation for double-precision, unboxed floating-point
+  (`TYPE_FLOAT`) values, including local loads, arithmetic, numeric error exits,
+  comparisons, branches, returns, and deoptimization; other configured float
+  representations currently make affected verbs ineligible; and
+* ownership-aware string values (`TYPE_STR`) and non-integer list elements
+  (`TYPE_OBJ`, `TYPE_FLOAT`, `TYPE_STR`, `TYPE_LIST`) so indexing, iteration,
+  locals, returns, and deoptimization preserve reference counts; and
+* exception and `finally` stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) modeled
+  before lowering catch expressions, `try-except`, and `try-finally` statements,
+  with relocated handler PCs and pre-entry deoptimization boundaries preserving
+  exact interpreter stack-unwind and `finally` semantics; and
+* fork and suspension deoptimization boundaries (`HIR_TAC_DEOPT`) modeling time
+  expressions, argument stacks, and exact bytecode resume anchors, ensuring
+  native execution materializes every continuation field required by serialized
+  activations; and
+* length expression (`$`, `EXPR_LENGTH`) lowering in indexed (`expr[$]`) and range
+  (`expr[from..$]`) contexts, maintaining context-sensitive base value tracking
+  and native length extraction.
 
 The next reviewable compiler milestones are:
 
-1. Deopt-before-call boundaries for verb calls, preserving argument stacks,
-   permissions, traceback state, and activation-push semantics.
-2. Extend guarded SSA values beyond integers to object and floating-point
-   scalars, including object ranges and exact arithmetic/error behavior.
-3. Add ownership-aware string values and non-integer list elements so indexing,
-   iteration, locals, returns, and deoptimization preserve reference counts.
-4. Model exception and `finally` stack markers before lowering catch expressions,
-   `try` statements, or other operations that unwind through native frames.
-5. Add fork and suspension boundaries only after native frames can materialize
-   every continuation field required by serialized activations.
+1. Lower optional, default, and rest scatter destructuring assignments (`{a, ?b = default, @rest} = expr`) with exact deoptimization boundaries.
+2. Integrate WAIF type (`TYPE_WAIF`) references and properties safely across HIR lowering and native frames.
+3. Expand native fast-path lowering and inlining for pure, continuation-free built-in functions.
+4. End-to-end multi-verb benchmark and differential validation across complex MOO database suites.

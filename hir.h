@@ -42,6 +42,7 @@ typedef enum {
     HIR_EXPR_RANGE,
     HIR_EXPR_LIST,
     HIR_EXPR_CATCH,
+    HIR_EXPR_LENGTH,
     HIR_EXPR_SCATTER,
     HIR_EXPR_PROP_STORE,
     HIR_EXPR_RANGE_STORE,
@@ -106,6 +107,7 @@ typedef enum {
 
 typedef enum {
     HIR_TAC_TICK,
+    HIR_TAC_DEOPT,
     HIR_TAC_CONST,
     HIR_TAC_LOAD_LOCAL,
     HIR_TAC_STORE_LOCAL,
@@ -117,6 +119,7 @@ typedef enum {
     HIR_TAC_RETURN,
     HIR_TAC_RETURN0,
     HIR_TAC_CALL,
+    HIR_TAC_CALL_VERB,
     HIR_TAC_PUT_PROP,
     HIR_TAC_RANGE_REF,
     HIR_TAC_RANGE_SET,

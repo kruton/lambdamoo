@@ -944,6 +944,7 @@ generate_expr(Expr * expr, State * state)
 	{
 	    unsigned saved = saved_stack_top(state);
 
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    if (saved != UINT_MAX) {
 		emit_extended_byte(EOP_LENGTH, state);
 		add_stack_ref(saved, state);
@@ -970,6 +971,7 @@ generate_expr(Expr * expr, State * state)
 	generate_expr(expr->e.verb.obj, state);
 	generate_expr(expr->e.verb.verb, state);
 	generate_arg_list(expr->e.verb.args, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_call_verb_op(OP_CALL_VERB, state);
 	if (state->cur_stack < 3)
 	    panic("Bad verb-call stack depth in GENERATE_EXPR()");
@@ -1083,6 +1085,7 @@ generate_expr(Expr * expr, State * state)
 	{
 	    int handler_label, end_label;
 
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    generate_codes(expr->e.catch.codes, state);
 	    emit_extended_byte(EOP_PUSH_LABEL, state);
 	    handler_label = add_label(state);
@@ -1095,6 +1098,7 @@ generate_expr(Expr * expr, State * state)
 	    emit_extended_byte(EOP_END_CATCH, state);
 	    end_label = add_label(state);
 	    pop_stack(3, state);	/* codes, label, catch */
+	    record_code_anchor(state, &expr->e.catch.handler_pc);
 	    define_label(handler_label, state);
 	    /* After this label, we still have a value on the stack, but now,
 	     * instead of it being the value of the main expression, we have
@@ -1226,6 +1230,7 @@ generate_stmt(Stmt * stmt, State * state)
 		unsigned code_unit, fork_index;
 
 		generate_expr(stmt->s.fork.time, state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		if (stmt->s.fork.id >= 0)
 		    emit_byte(OP_FORK_WITH_ID, state);
 		else
@@ -1262,6 +1267,7 @@ generate_stmt(Stmt * stmt, State * state)
 		int end_label, arm_count = 0;
 		Except_Arm *ex;
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		for (ex = stmt->s.catch.excepts; ex; ex = ex->next) {
 		    generate_codes(ex->codes, state);
 		    emit_extended_byte(EOP_PUSH_LABEL, state);
@@ -1279,6 +1285,7 @@ generate_stmt(Stmt * stmt, State * state)
 		end_label = add_label(state);
 		pop_stack(2 * arm_count + 1, state);	/* 2(codes,pc) + catch */
 		for (ex = stmt->s.catch.excepts; ex; ex = ex->next) {
+		    record_code_anchor(state, &ex->handler_pc);
 		    define_label(ex->label, state);
 		    push_stack(1, state);	/* exception tuple */
 		    if (ex->id >= 0)
@@ -1298,6 +1305,7 @@ generate_stmt(Stmt * stmt, State * state)
 	    {
 		int handler_label;
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_extended_byte(EOP_TRY_FINALLY, state);
 		handler_label = add_label(state);
 		push_stack_slot(RSS_FINALLY, handler_label, state);
@@ -1306,6 +1314,7 @@ generate_stmt(Stmt * stmt, State * state)
 		DECR_TRY_DEPTH(state);
 		emit_extended_byte(EOP_END_FINALLY, state);
 		pop_stack(1, state);	/* FINALLY marker */
+		record_code_anchor(state, &stmt->s.finally.handler_pc);
 		define_label(handler_label, state);
 		push_stack_slot(RSS_PENDING_REASON, 0, state);
 		push_stack_slot(RSS_PENDING_VALUE, state->num_loops

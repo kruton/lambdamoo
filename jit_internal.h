@@ -69,7 +69,10 @@ struct JITProgram {
     JITBlock *last_block;
     void *mir_context;
     void *native_function;
+    void *machine_code;
+    size_t machine_code_len;
     Num *deopt_values;
+    var_type *value_types;
 };
 
 #endif /* !JIT_Internal_H */

@@ -452,20 +452,15 @@ test_unsupported_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr verb_call, obj, name;
+    Expr unsupp_expr;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    obj = id_expr(0, 30);
-    name = id_expr(1, 30);
-    memset(&verb_call, 0, sizeof(verb_call));
-    verb_call.kind = EXPR_VERB;
-    verb_call.lineno = 30;
-    verb_call.e.verb.obj = &obj;
-    verb_call.e.verb.verb = &name;
-    verb_call.e.verb.args = 0;
-    ret = return_stmt(&verb_call);
+    memset(&unsupp_expr, 0, sizeof(unsupp_expr));
+    unsupp_expr.kind = EXPR_LENGTH;
+    unsupp_expr.lineno = 30;
+    ret = return_stmt(&unsupp_expr);
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1990,6 +1985,173 @@ test_range_expr_and_assignment_tac_ssa(void)
 }
 
 static void
+test_verb_call_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr verb_call, obj, name, arg_val;
+    Arg_List arg;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    obj = id_expr(0, 30);
+    name = id_expr(1, 30);
+    arg_val = int_expr(42, 30);
+    memset(&arg, 0, sizeof(arg));
+    arg.kind = ARG_NORMAL;
+    arg.expr = &arg_val;
+    arg.next = 0;
+
+    memset(&verb_call, 0, sizeof(verb_call));
+    verb_call.kind = EXPR_VERB;
+    verb_call.lineno = 30;
+    verb_call.e.verb.obj = &obj;
+    verb_call.e.verb.verb = &name;
+    verb_call.e.verb.args = &arg;
+    ret = return_stmt(&verb_call);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("verb call tac not null", tac != 0, 1);
+    check_int("verb call count", hir_tac_count_kind(tac, HIR_TAC_CALL_VERB), 1);
+    check_int("verb call verify errors", hir_context_error_count(ctx), 0);
+    check_int("verb call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_object_scalars_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr from_expr, to_expr, o_lhs, o_rhs, one, add, assign, ret_expr;
+    Stmt for_stmt, ret_stmt, body_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    /* Object range loop: for o in [#0..#5] ... endfor */
+    memset(&from_expr, 0, sizeof(from_expr));
+    from_expr.kind = EXPR_VAR;
+    from_expr.lineno = 10;
+    from_expr.e.var.type = TYPE_OBJ;
+    from_expr.e.var.v.obj = 0;
+
+    memset(&to_expr, 0, sizeof(to_expr));
+    to_expr.kind = EXPR_VAR;
+    to_expr.lineno = 10;
+    to_expr.e.var.type = TYPE_OBJ;
+    to_expr.e.var.v.obj = 5;
+
+    o_lhs = id_expr(1, 11);
+    o_rhs = id_expr(1, 11);
+    one = int_expr(1, 11);
+    add = binary_expr(EXPR_PLUS, &o_rhs, &one);
+    assign = binary_expr(EXPR_ASGN, &o_lhs, &add);
+    body_stmt = expr_stmt(&assign);
+
+    for_stmt = range_stmt(1, &from_expr, &to_expr, &body_stmt, 10);
+
+    ret_expr = id_expr(1, 12);
+    ret_stmt = return_stmt(&ret_expr);
+    ret_stmt.lineno = 12;
+
+    for_stmt.next = &ret_stmt;
+
+    tac = lower_stmt(&names, &for_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("obj range tac not null", tac != 0, 1);
+    check_int("obj range verify errors", hir_context_error_count(ctx), 0);
+    check_int("obj range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_float_scalars_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr f1, f2, add;
+    Stmt ret_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    memset(&f1, 0, sizeof(f1));
+    f1.kind = EXPR_VAR;
+    f1.lineno = 10;
+    f1.e.var.type = TYPE_FLOAT;
+    f1.e.var.v.fnum = box_fl(3.14);
+
+    memset(&f2, 0, sizeof(f2));
+    f2.kind = EXPR_VAR;
+    f2.lineno = 10;
+    f2.e.var.type = TYPE_FLOAT;
+    f2.e.var.v.fnum = box_fl(2.71);
+
+    add = binary_expr(EXPR_PLUS, &f1, &f2);
+    ret_stmt = return_stmt(&add);
+    ret_stmt.lineno = 10;
+
+    tac = lower_stmt(&names, &ret_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("float scalar tac not null", tac != 0, 1);
+    check_int("float scalar verify errors", hir_context_error_count(ctx), 0);
+    check_int("float scalar destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_string_scalars_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr s1;
+    Stmt ret_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    memset(&s1, 0, sizeof(s1));
+    s1.kind = EXPR_VAR;
+    s1.lineno = 10;
+    s1.e.var.type = TYPE_STR;
+    s1.e.var.v.str = str_dup("hello string");
+
+    ret_stmt = return_stmt(&s1);
+    ret_stmt.lineno = 10;
+
+    tac = lower_stmt(&names, &ret_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("string scalar tac not null", tac != 0, 1);
+    check_int("string scalar verify errors", hir_context_error_count(ctx), 0);
+    check_int("string scalar const count",
+	      hir_tac_count_kind(tac, HIR_TAC_CONST), 1);
+    check_int("string scalar return count",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("string scalar destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+    free_str(s1.e.var.v.str);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -2237,6 +2399,230 @@ test_repeated_local_assignment_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_catch_expr_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr catch_expr, try_expr, handler_expr;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    try_expr = id_expr(0, 30);
+    handler_expr = int_expr(42, 30);
+    memset(&catch_expr, 0, sizeof(catch_expr));
+    catch_expr.kind = EXPR_CATCH;
+    catch_expr.lineno = 30;
+    catch_expr.e.catch.try = &try_expr;
+    catch_expr.e.catch.codes = 0;
+    catch_expr.e.catch.except = &handler_expr;
+    ret = return_stmt(&catch_expr);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("catch expr tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("catch expr deopt boundary",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("catch expr cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("catch expr ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("catch expr verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_try_except_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr val_expr, handler_val;
+    Stmt body_stmt, handler_stmt, try_stmt;
+    Except_Arm except_arm;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    val_expr = int_expr(10, 40);
+    body_stmt = return_stmt(&val_expr);
+    handler_val = int_expr(20, 42);
+    handler_stmt = return_stmt(&handler_val);
+
+    memset(&except_arm, 0, sizeof(except_arm));
+    except_arm.id = -1;
+    except_arm.codes = 0;
+    except_arm.stmt = &handler_stmt;
+
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_EXCEPT;
+    try_stmt.lineno = 40;
+    try_stmt.s.catch.body = &body_stmt;
+    try_stmt.s.catch.excepts = &except_arm;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("try except tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
+    check_int("try except deopt boundary",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try except verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_try_finally_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr body_val, handler_val;
+    Stmt body_stmt, handler_stmt, try_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    body_val = int_expr(100, 50);
+    body_stmt = expr_stmt(&body_val);
+    handler_val = int_expr(200, 52);
+    handler_stmt = return_stmt(&handler_val);
+
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_FINALLY;
+    try_stmt.lineno = 50;
+    try_stmt.s.finally.body = &body_stmt;
+    try_stmt.s.finally.handler = &handler_stmt;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("try finally tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("try finally deopt boundary",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("try finally cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try finally ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try finally verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_fork_stmt_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr time_expr, body_val;
+    Stmt body_stmt, fork_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    time_expr = int_expr(5, 60);
+    body_val = int_expr(1, 61);
+    body_stmt = expr_stmt(&body_val);
+
+    memset(&fork_stmt, 0, sizeof(fork_stmt));
+    fork_stmt.kind = STMT_FORK;
+    fork_stmt.lineno = 60;
+    fork_stmt.s.fork.time = &time_expr;
+    fork_stmt.s.fork.id = 0;
+    fork_stmt.s.fork.body = &body_stmt;
+    fork_stmt.s.fork.code_unit = 1;
+
+    tac = lower_stmt(&names, &fork_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("fork stmt deopt boundary",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("fork stmt verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_fork_body_does_not_reject_enclosing_hir(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr time_expr, unsupported_body_expr;
+    Stmt body_stmt, fork_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    time_expr = int_expr(5, 65);
+    memset(&unsupported_body_expr, 0, sizeof(unsupported_body_expr));
+    unsupported_body_expr.kind = EXPR_LENGTH;
+    unsupported_body_expr.lineno = 66;
+    body_stmt = expr_stmt(&unsupported_body_expr);
+
+    memset(&fork_stmt, 0, sizeof(fork_stmt));
+    fork_stmt.kind = STMT_FORK;
+    fork_stmt.lineno = 65;
+    fork_stmt.s.fork.time = &time_expr;
+    fork_stmt.s.fork.id = 0;
+    fork_stmt.s.fork.body = &body_stmt;
+    fork_stmt.s.fork.code_unit = 1;
+
+    tac = lower_stmt(&names, &fork_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("fork body does not add unsupported tac",
+	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 0);
+    check_int("fork body does not add hir errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_length_expr_in_index_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr local_base, len_expr, idx_expr;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    local_base = id_expr(0, 70);
+    memset(&len_expr, 0, sizeof(len_expr));
+    len_expr.kind = EXPR_LENGTH;
+    len_expr.lineno = 70;
+    idx_expr = binary_expr(EXPR_INDEX, &local_base, &len_expr);
+    ret = return_stmt(&idx_expr);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("length in index tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("length in index tac unaries",
+	      hir_tac_count_kind(tac, HIR_TAC_UNARY), 1);
+    check_int("length in index verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2266,6 +2652,16 @@ main(void)
     test_break_and_continue_tac_ssa();
     test_labeled_break_nested_loops_tac_ssa();
     test_range_expr_and_assignment_tac_ssa();
+    test_verb_call_tac_ssa();
+    test_object_scalars_tac_ssa();
+    test_float_scalars_tac_ssa();
+    test_string_scalars_tac_ssa();
+    test_catch_expr_tac_ssa();
+    test_try_except_tac_ssa();
+    test_try_finally_tac_ssa();
+    test_fork_stmt_tac_ssa();
+    test_fork_body_does_not_reject_enclosing_hir();
+    test_length_expr_in_index_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

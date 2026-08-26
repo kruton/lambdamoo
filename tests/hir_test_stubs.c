@@ -1,20 +1,45 @@
 #include "functions.h"
+#include "ref_count.h"
 #include "storage.h"
 #include "utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+static inline int
+refcount_overhead(Memory_Type type)
+{
+    switch (type) {
+    case M_FLOAT:
+	return sizeof(FlNum) > sizeof(int) ? sizeof(FlNum) : sizeof(int);
+    case M_STRING:
+#ifdef MEMO_STRLEN
+	return sizeof(int) + sizeof(int);
+#else
+	return sizeof(int);
+#endif
+    case M_LIST:
+	return sizeof(Var *) > sizeof(int) ? sizeof(Var *) : sizeof(int);
+    default:
+	return 0;
+    }
+}
 
 void *
 mymalloc(unsigned size, Memory_Type type)
 {
-    void *ptr;
+    char *ptr;
+    int offs = refcount_overhead(type);
 
-    (void) type;
-    ptr = malloc(size);
+    ptr = malloc(size + offs);
     if (!ptr) {
 	fprintf(stderr, "mymalloc failed\n");
 	abort();
+    }
+    if (offs) {
+	ptr += offs;
+	((int *) ptr)[-1] = 1;
     }
 
     return ptr;
@@ -23,35 +48,58 @@ mymalloc(unsigned size, Memory_Type type)
 void *
 myrealloc(void *where, unsigned size, Memory_Type type)
 {
-    void *ptr;
+    int offs = refcount_overhead(type);
+    char *ptr;
 
-    (void) type;
-    ptr = realloc(where, size);
+    if (!where)
+	return mymalloc(size, type);
+    ptr = realloc((char *) where - offs, size + offs);
     if (!ptr) {
 	fprintf(stderr, "myrealloc failed\n");
 	abort();
     }
 
-    return ptr;
+    return ptr + offs;
 }
 
 void
 myfree(const void *where, Memory_Type type)
 {
-    (void) type;
-    free((void *) where);
+    int offs = refcount_overhead(type);
+
+    if (where)
+	free((char *) where - offs);
 }
 
 void
 complex_free_var(Var value)
 {
-    (void) value;
+    if (value.type == TYPE_STR)
+	free_str(value.v.str);
+    else if (value.type == TYPE_LIST) {
+	if (delref(value.v.list) == 0)
+	    myfree(value.v.list, M_LIST);
+    }
 }
 
 Var
 complex_var_ref(Var value)
 {
+    if (value.type == TYPE_STR)
+	addref(value.v.str);
+    else if (value.type == TYPE_LIST)
+	addref(value.v.list);
     return value;
+}
+
+int
+var_refcount(Var v)
+{
+    if (v.type == TYPE_STR)
+	return refcount(v.v.str);
+    if (v.type == TYPE_LIST)
+	return refcount(v.v.list);
+    return 1;
 }
 
 const char *
@@ -71,5 +119,18 @@ name_func_by_num(unsigned id)
 const char *
 str_ref(const char *s)
 {
+    addref(s);
     return s;
+}
+
+char *
+str_dup(const char *s)
+{
+    char *r;
+
+    if (!s)
+	s = "";
+    r = (char *) mymalloc(strlen(s) + 1, M_STRING);
+    strcpy(r, s);
+    return r;
 }
