@@ -500,6 +500,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_UNARY:
+		    if (program->value_types
+			&& (program->value_types[instr->src1] == TYPE_STR
+			    || program->value_types[instr->src1] == TYPE_LIST)
+			&& instr->op == HIR_OP_NOT) {
+			append_deopt_exit(build, program, instr->deopt_map, values,
+				deopt_map_out, deopt_values, status, common_return);
+			break;
+		    }
 		    if (instr->op == HIR_OP_MAKE_SINGLETON_LIST
 			|| instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
 			append_deopt_exit(build, program, instr->deopt_map,
@@ -638,6 +646,16 @@ build_mir(JITProgram *program, MIRBuild *build)
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
 					  status, common_return);
+			break;
+		    }
+		    if (program->value_types
+			&& (program->value_types[instr->src1] == TYPE_STR
+			    || program->value_types[instr->src1] == TYPE_LIST)
+			&& (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)) {
+			append_deopt_exit(build, program, instr->deopt_map, values,
+				deopt_map_out, deopt_values, status, common_return);
 			break;
 		    }
 		    if (program->value_types
@@ -1065,6 +1083,11 @@ build_mir(JITProgram *program, MIRBuild *build)
 		case HIR_TAC_BRANCH_FALSE:
 		    if (block->num_successors == 2) {
 			if (program->value_types
+			    && (program->value_types[instr->src1] == TYPE_STR
+				|| program->value_types[instr->src1] == TYPE_LIST)) {
+			    append_deopt_exit(build, program, instr->deopt_map, values,
+				deopt_map_out, deopt_values, status, common_return);
+			} else if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_FLOAT) {
 			    char name[32];
 			    sprintf(name, "zero_bf%d", copy_serial++);
@@ -1088,9 +1111,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1])));
 			}
-			append(build, MIR_new_insn(build->context, MIR_JMP,
-						      MIR_new_label_op(build->context,
-							 labels[block->successors[1]])));
+			if (!program->value_types
+			    || (program->value_types[instr->src1] != TYPE_STR
+				&& program->value_types[instr->src1] != TYPE_LIST))
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context,
+					 labels[block->successors[1]])));
 		    }
 		    break;
 		case HIR_TAC_RETURN:

@@ -1025,6 +1025,94 @@ string_const_program(const char *s)
 }
 
 static JITProgram *
+string_compare_program(const char *lhs, const char *rhs, HIROp op)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *compare = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    char *left_string = str_dup(lhs);
+    char *right_string = str_dup(rhs);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    left->value = 1;
+    left->literal = (uintptr_t) left_string;
+    left->literal_type = TYPE_STR;
+    left->next = right;
+    right->value = 2;
+    right->literal = (uintptr_t) right_string;
+    right->literal_type = TYPE_STR;
+    right->next = compare;
+    compare->value = 3;
+    compare->src1 = 1;
+    compare->src2 = 2;
+    compare->op = op;
+    compare->deopt_map = 0;
+    compare->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_INT;
+    block->first = left;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+string_branch_program(void)
+{
+    JITProgram *program = branch_program();
+    JITInstruction *load = program->blocks->first;
+
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = TYPE_INT;
+    load->literal_type = TYPE_STR;
+    return program;
+}
+
+static JITProgram *
+string_not_program(const char *s)
+{
+    JITProgram *program = string_const_program(s);
+    JITInstruction *constant = program->blocks->first;
+    JITInstruction *return_instr = constant->next;
+    JITInstruction *not_instr = instruction(HIR_TAC_UNARY);
+
+    program->num_values = 3;
+    myfree(program->value_types, M_PROGRAM);
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    constant->next = not_instr;
+    not_instr->value = 2;
+    not_instr->src1 = 1;
+    not_instr->op = HIR_OP_NOT;
+    not_instr->deopt_map = 0;
+    not_instr->next = return_instr;
+    return_instr->src1 = 2;
+    return_instr->literal_type = TYPE_INT;
+    return program;
+}
+
+static JITProgram *
 list_index_typed_program(var_type elem_type)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -2085,6 +2173,32 @@ main(void)
 	free_var(result);
 	check_differential(str_const, 0, 10, 0, "string const differential");
 	jit_program_free(str_const);
+
+	/* String truth and comparison semantics require content inspection. */
+	JITProgram *str_not = string_not_program("");
+	ticks = 10;
+	check(jit_program_execute(str_not, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "empty string not did not fallback");
+	jit_program_free(str_not);
+
+	JITProgram *str_eq = string_compare_program("same", "SAME", HIR_OP_EQ);
+	ticks = 10;
+	check(jit_program_execute(str_eq, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "string equality did not fallback");
+	jit_program_free(str_eq);
+
+	JITProgram *str_branch = string_branch_program();
+	Var branch_env[1];
+	branch_env[0].type = TYPE_STR;
+	branch_env[0].v.str = str_dup("");
+	ticks = 10;
+	check(jit_program_execute(str_branch, branch_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "empty string branch did not fallback");
+	free_var(branch_env[0]);
+	jit_program_free(str_branch);
     }
 
     /* Non-integer list indexing tests */
