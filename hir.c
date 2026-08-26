@@ -3757,7 +3757,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].source_lineno = 1;
-    program->deopt_maps[0].reason = JIT_DEOPT_UNSUPPORTED_OP;
+    program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
     program->deopt_maps[0].stack_depth = 0;
     program->deopt_maps[0].ticks_charged = 0;
     program->deopt_maps[0].num_locals = program->num_vars;

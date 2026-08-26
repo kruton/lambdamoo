@@ -53,6 +53,7 @@ add_entry_deopt_map(JITProgram *program)
 {
     program->num_deopt_maps = 1;
     program->deopt_maps = allocate(sizeof(JITDeoptMap));
+    program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
 }
 
 static JITProgram *
@@ -2506,6 +2507,8 @@ main(void)
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
 	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
+    check(deopt.reason == JIT_DEOPT_TYPE_GUARD,
+	  "entry guard returned the wrong deopt reason");
     check_differential(guard, env, 10, 0,
 		       "guard fallback differed from reference execution");
     free_var(env[0]);
