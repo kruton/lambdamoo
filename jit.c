@@ -787,7 +787,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, var_type),
 				MIR_new_int_op(build->context, expected_type)));
-			if (program->value_types
+			if (expected_type == TYPE_NONE) {
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context,
+					       values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			} else if (program->value_types
 			    && program->value_types[instr->value] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			    sprintf(name, "fl_ptr%d", copy_serial++);

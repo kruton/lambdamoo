@@ -363,6 +363,8 @@ test_short_circuit_tac(void)
     check_int("and synthetic loads",
 	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
     check_int("and phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("and internal locals are not environment loads",
+	      hir_ssa_out_of_range_load_count(ssa, names.size), 0);
     check_int("and verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 
@@ -379,6 +381,8 @@ test_short_circuit_tac(void)
     check_int("or synthetic loads",
 	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
     check_int("or phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("or internal locals are not environment loads",
+	      hir_ssa_out_of_range_load_count(ssa, names.size), 0);
     check_int("or verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 }

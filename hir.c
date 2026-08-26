@@ -1500,15 +1500,19 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	/* Empty stack! Insert implicit load at entry block. */
 	int t_init = ctx->next_temp++;
 	HIRSSAInstr *load = hir_alloc(ctx, sizeof(HIRSSAInstr));
-	load->kind = HIR_TAC_LOAD_LOCAL;
+	int internal_local = ctx->var_names
+	    && v >= (int) ctx->var_names->size;
+	load->kind = internal_local ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
 	load->bytecode_pc = NO_BYTECODE_PC;
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
 	load->label = 0;
-	load->local_id = v;
+	load->local_id = internal_local ? -1 : v;
 	load->op = HIR_OP_ADD;
+	load->literal.type = TYPE_INT;
+	load->literal.v.num = 0;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
 	load->num_local_values = 0;
@@ -4066,6 +4070,22 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
+    /* Unconstrained VM locals retain their uninitialized runtime type. */
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+
+	for (si = ssa_block->first; si; si = si->next) {
+	    if (si->kind == HIR_TAC_LOAD_LOCAL
+		&& si->bytecode_pc == NO_BYTECODE_PC
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value]) {
+		value_types[si->value] = TYPE_NONE;
+		value_types_known[si->value] = 1;
+	    }
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
@@ -4143,6 +4163,17 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    if (((ssa_instr->src1 > 0
+		  && ssa_instr->src1 < program->num_values
+		  && value_types[ssa_instr->src1] == TYPE_NONE)
+		 || (ssa_instr->src2 > 0
+		     && ssa_instr->src2 < program->num_values
+		     && value_types[ssa_instr->src2] == TYPE_NONE))
+		&& (ssa_instr->kind == HIR_TAC_UNARY
+		    || ssa_instr->kind == HIR_TAC_BINARY
+		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		    || ssa_instr->kind == HIR_TAC_RETURN))
+		instr->kind = HIR_TAC_DEOPT;
 	    if (uses_conflicted && (ssa_instr->kind == HIR_TAC_UNARY
 				    || ssa_instr->kind == HIR_TAC_BINARY
 				    || ssa_instr->kind == HIR_TAC_RETURN
@@ -5072,6 +5103,28 @@ hir_ssa_count_kind(HIRSSAProgram *ssa, HIRTacKind kind)
 	}
     }
 
+    return count;
+}
+
+int
+hir_ssa_out_of_range_load_count(HIRSSAProgram *ssa, int num_vars)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL
+		&& (instr->local_id < 0 || instr->local_id >= num_vars))
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
     return count;
 }
 
