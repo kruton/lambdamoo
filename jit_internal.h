@@ -14,6 +14,7 @@ typedef struct JITDeoptMap JITDeoptMap;
 struct JITDeoptMap {
     unsigned bytecode_pc;
     unsigned error_pc;
+    unsigned source_lineno;
     unsigned stack_depth;
     int ticks_charged;
     int num_locals;
@@ -21,6 +22,7 @@ struct JITDeoptMap {
     var_type *local_types;
     int *stack_values;
     var_type *stack_types;
+    JITDeoptReason reason;
 };
 
 struct JITCopy {

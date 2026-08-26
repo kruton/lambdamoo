@@ -43,6 +43,9 @@
 #include "exceptions.h"
 #include "execute.h"
 #include "functions.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "list.h"
 #include "log.h"
 #include "network.h"
@@ -491,6 +494,10 @@ main_loop(void)
 	{			/* Get rid of old un-logged-in or useless connections */
 	    int now = time(0);
 
+#ifdef ENABLE_JIT
+	    jit_profile_maybe_report(now);
+#endif
+
 	    for (h = all_shandles; h; h = nexth) {
 		Var v;
 
@@ -538,6 +545,9 @@ main_loop(void)
     }
 
     oklog("SHUTDOWN: %s\n", shutdown_message);
+#ifdef ENABLE_JIT
+    jit_profile_report();
+#endif
     send_shutdown_message(shutdown_message);
 }
 

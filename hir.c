@@ -3652,12 +3652,48 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     memset(map, 0, sizeof(JITDeoptMap));
     map->bytecode_pc = instr->bytecode_pc;
     map->error_pc = instr->bytecode_pc;
+    map->source_lineno = instr->source_lineno;
     map->stack_depth = instr->num_stack_values;
     map->ticks_charged = instr->kind == HIR_TAC_UNARY
 	|| instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_BRANCH_FALSE
 	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
+
+    switch (instr->kind) {
+    case HIR_TAC_CALL:
+	map->reason = JIT_DEOPT_BUILTIN_CALL;
+	break;
+    case HIR_TAC_CALL_VERB:
+	map->reason = JIT_DEOPT_VERB_CALL;
+	break;
+    case HIR_TAC_PUT_PROP:
+	map->reason = JIT_DEOPT_PROPERTY_WRITE;
+	break;
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+	map->reason = JIT_DEOPT_RANGE_OP;
+	break;
+    case HIR_TAC_BRANCH_FALSE:
+	map->reason = JIT_DEOPT_BRANCH_TYPE;
+	break;
+    case HIR_TAC_BINARY:
+	if (instr->op == HIR_OP_GET_PROP)
+	    map->reason = JIT_DEOPT_PROPERTY_READ;
+	else
+	    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+	break;
+    case HIR_TAC_UNARY:
+	map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+	break;
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_STORE_LOCAL:
+	map->reason = JIT_DEOPT_TYPE_GUARD;
+	break;
+    default:
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+	break;
+    }
     if (map->num_locals) {
 	map->local_values = mymalloc(sizeof(int) * map->num_locals, M_PROGRAM);
 	map->local_types = mymalloc(sizeof(var_type) * map->num_locals, M_PROGRAM);

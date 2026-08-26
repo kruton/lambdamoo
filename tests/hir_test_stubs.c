@@ -1,11 +1,13 @@
 #include "db.h"
 #include "functions.h"
 #include "list.h"
+#include "log.h"
 #include "ref_count.h"
 #include "server.h"
 #include "storage.h"
 #include "utils.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,4 +299,17 @@ db_property_allows(db_prop_handle h, Objid progr, db_prop_flag flag)
     (void) progr;
     (void) flag;
     return 1;
+}
+
+Num
+server_int_option(const char *name, Num defallt)
+{
+    (void) name;
+    return defallt;
+}
+
+void
+oklog(const char *fmt, ...)
+{
+    (void) fmt;
 }

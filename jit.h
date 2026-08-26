@@ -22,11 +22,28 @@ typedef enum {
     JIT_RUN_ABORT_SECONDS
 } JITRunResult;
 
+typedef enum {
+    JIT_DEOPT_NONE = 0,
+    JIT_DEOPT_BUILTIN_CALL,
+    JIT_DEOPT_VERB_CALL,
+    JIT_DEOPT_PROPERTY_READ,
+    JIT_DEOPT_PROPERTY_WRITE,
+    JIT_DEOPT_RANGE_OP,
+    JIT_DEOPT_TYPE_GUARD,
+    JIT_DEOPT_BRANCH_TYPE,
+    JIT_DEOPT_CONTROL_FLOW,
+    JIT_DEOPT_ARITHMETIC_TYPE,
+    JIT_DEOPT_UNSUPPORTED_OP,
+    JIT_DEOPT_NUM_REASONS
+} JITDeoptReason;
+
 typedef struct {
     unsigned bytecode_pc;
     unsigned error_pc;
+    unsigned source_lineno;
     unsigned stack_depth;
     int ticks_charged;
+    JITDeoptReason reason;
 } JITDeoptState;
 
 typedef struct {
@@ -34,6 +51,14 @@ typedef struct {
     unsigned error_pc;
     unsigned source_lineno;
 } JITSourceLocation;
+
+extern const char *jit_deopt_reason_name(JITDeoptReason);
+extern void jit_profile_record_entry(void);
+extern void jit_profile_record_completed(void);
+extern void jit_profile_record_deopt(Objid, const char *, const JITDeoptState *);
+extern void jit_profile_maybe_report(int);
+extern void jit_profile_report(void);
+extern void jit_profile_reset(void);
 
 extern JITProgram *jit_program_unsupported(const char *);
 extern JITProgram *jit_program_unsupported_with_diagnostic(const char *, const char *);

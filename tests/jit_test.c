@@ -3425,5 +3425,57 @@ main(void)
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
     }
 
+    /* Deoptimization profiling tests */
+    {
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
+	      "deopt reason name none");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BUILTIN_CALL), "builtin_call") == 0,
+	      "deopt reason name builtin_call");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_VERB_CALL), "verb_call") == 0,
+	      "deopt reason name verb_call");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_PROPERTY_READ), "property_read") == 0,
+	      "deopt reason name property_read");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_PROPERTY_WRITE), "property_write") == 0,
+	      "deopt reason name property_write");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_RANGE_OP), "range_operation") == 0,
+	      "deopt reason name range_operation");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_TYPE_GUARD), "type_guard_failure") == 0,
+	      "deopt reason name type_guard_failure");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BRANCH_TYPE), "branch_type_mismatch") == 0,
+	      "deopt reason name branch_type_mismatch");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_CONTROL_FLOW), "control_flow") == 0,
+	      "deopt reason name control_flow");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_ARITHMETIC_TYPE), "arithmetic_type") == 0,
+	      "deopt reason name arithmetic_type");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_UNSUPPORTED_OP), "unsupported_operation") == 0,
+	      "deopt reason name unsupported_operation");
+
+	jit_profile_reset();
+	jit_profile_record_entry();
+	jit_profile_record_entry();
+	jit_profile_record_completed();
+
+	JITDeoptState deopt_sample;
+	memset(&deopt_sample, 0, sizeof(deopt_sample));
+	deopt_sample.bytecode_pc = 42;
+	deopt_sample.source_lineno = 10;
+	deopt_sample.reason = JIT_DEOPT_BUILTIN_CALL;
+	jit_profile_record_deopt(0, "do_command", &deopt_sample);
+
+	deopt_sample.bytecode_pc = 18;
+	deopt_sample.source_lineno = 5;
+	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
+	jit_profile_record_deopt(1, "eval", &deopt_sample);
+
+	/* Trigger report generation */
+	jit_profile_report();
+
+	/* Trigger periodic check */
+	jit_profile_maybe_report(100);
+	jit_profile_maybe_report(2000);
+
+	jit_profile_reset();
+    }
+
     return failures != 0;
 }

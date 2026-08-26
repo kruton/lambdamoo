@@ -914,12 +914,14 @@ do {								\
 	    JITDeoptState deopt;
 	    enum error jit_error = E_NONE;
 
+	    jit_profile_record_entry();
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
 					     RUN_ACTIV.base_rt_stack);
 	    if (jit_result == JIT_RUN_RETURNED) {
+		jit_profile_record_completed();
 		STORE_STATE_VARIABLES();
 		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
 		    if (result && outcome == OUTCOME_DONE)
@@ -947,6 +949,8 @@ do {								\
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK) {
+		jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
+					 &deopt);
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;
