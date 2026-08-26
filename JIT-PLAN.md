@@ -434,8 +434,8 @@ Completed in the first native-code milestone:
 * deopt-before-call boundaries for built-in functions with seamless runtime state
   handoff at `OP_BI_FUNC_CALL`; and
 * direct native inlining for pure continuation-free built-ins (`abs()`, `min()`,
-  `max()`, `toint()`, `typeof()`, `length()`) eliminating deopt boundaries for
-  pure operations; and
+  `max()`, `toint()`, `typeof()`, `length()`, and two-argument `index()` and
+  `rindex()`) eliminating deopt boundaries for pure operations; and
 * direct native lowering for property reads (`obj.prop`) and property assignments
   (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration;
 * range-based `for` loop lowering (`for i in [start..end]`) with exact opcode
@@ -550,27 +550,27 @@ Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
 
 Compile eligibility is no longer the useful coverage bottleneck. The current
-runtime sample enters 320 JIT-compiled activations but completes only 7 (2.19%)
-in native code; 311 (97.19%) deoptimize. The emergency workload suspends before
+runtime sample enters 320 JIT-compiled activations and completes 105 (32.81%)
+in native code; 213 (66.56%) deoptimize. The emergency workload suspends before
 finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
-* 28 `arithmetic_type` deopts (9.00%), down from 138 after propagating a known
+* 28 `arithmetic_type` deopts (13.15%), down from 138 after propagating a known
   string type backward through concatenation into indexed operands;
-* 59 entry or local `type_guard_failure` deopts (18.97%), down from 227 after
+* 59 entry or local `type_guard_failure` deopts (27.70%), down from 227 after
   separating compiler-only locals from VM locals and preserving `TYPE_NONE`
   for user-local entry values before consumer-driven inference;
-* 190 `unsupported_operation` deopts (61.09%), including 104 calls to
-  `#59:verbname_match` at singleton-list construction on line 3;
-* 23 `property_read` deopts (7.40%);
-* 7 `builtin_call` deopts (2.25%); and
-* 4 `verb_call` deopts (1.29%).
+* 86 `unsupported_operation` deopts (40.38%);
+* 23 `property_read` deopts (10.80%);
+* 6 `range_operation` deopts (2.82%);
+* 7 `builtin_call` deopts (3.29%); and
+* 4 `verb_call` deopts (1.88%).
 
 The line-1 string expression in `#59:verbname_match` is correctly omitted from
 HIR. Its old line 1/PC 0 report was an entry guard failure, not execution of the
-side-effect-free expression. Backward string inference now carries its indexed
-argument accesses through line 2; the verb reaches line 3/PC 15 before
-deoptimizing on unsupported singleton-list construction.
+side-effect-free expression. Backward string inference carries its indexed
+argument accesses through line 2, and native two-argument `index()`/`rindex()`
+lowering now allows the sampled calls to complete without deoptimization.
 
 `#811:controls` previously inferred its scatter targets `who` and `what` as
 objects and incorrectly applied those types to their uninitialized entry SSA
@@ -610,7 +610,7 @@ The next reviewable compiler milestones, in priority order, are:
    local slot plus expected and actual type, then distinguish true argument
    specialization failures from inert entry-state values. Do not weaken guards
    for values that can be semantically read before assignment.
-3. Classify the 190 unsupported-operation sites by operation and call-site
+3. Classify the 86 unsupported-operation sites by operation and call-site
    frequency. Lower the highest-frequency continuation-free operation first,
    retaining exact bytecode anchors and deopt state for everything else.
 4. Define declarative built-in effect metadata (pure, may raise, may allocate,
