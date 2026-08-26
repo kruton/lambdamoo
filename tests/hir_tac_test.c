@@ -711,6 +711,60 @@ cond_expr_ast(Expr *cond, Expr *consequent, Expr *alternate, unsigned lineno)
     return expr;
 }
 
+static Stmt
+break_stmt(int exit_id, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_BREAK;
+    stmt.lineno = lineno;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
+    stmt.s.exit = exit_id;
+
+    return stmt;
+}
+
+static Stmt
+continue_stmt(int exit_id, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_CONTINUE;
+    stmt.lineno = lineno;
+    stmt.bytecode_pc = NO_BYTECODE_PC;
+    stmt.s.exit = exit_id;
+
+    return stmt;
+}
+
+static Cond_Arm
+cond_arm_ast(Expr *cond, Stmt *body)
+{
+    Cond_Arm arm;
+
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = cond;
+    arm.stmt = body;
+
+    return arm;
+}
+
+static Stmt
+cond_stmt_ast(Cond_Arm *arms, Stmt *otherwise, unsigned lineno)
+{
+    Stmt stmt;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = STMT_COND;
+    stmt.lineno = lineno;
+    stmt.s.cond.arms = arms;
+    stmt.s.cond.otherwise = otherwise;
+
+    return stmt;
+}
+
 static void
 test_loop_dominator_tree(void)
 {
@@ -1714,6 +1768,136 @@ test_cond_expr_tac_ssa(void)
 }
 
 static void
+test_break_and_continue_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /*
+     * for i in [1..10]
+     *   if (i == 3)
+     *     continue;
+     *   endif
+     *   if (i > 8)
+     *     break;
+     *   endif
+     *   sum = sum + i;
+     * endfor
+     * return sum;
+     */
+    Expr from = int_expr(1, 10);
+    Expr to = int_expr(10, 10);
+    Expr i_ref1 = id_expr(2, 11);
+    Expr three = int_expr(3, 11);
+    Expr cond1 = binary_expr(EXPR_EQ, &i_ref1, &three);
+    Stmt cont = continue_stmt(-1, 12);
+    Cond_Arm arm1 = cond_arm_ast(&cond1, &cont);
+    Stmt if_cont = cond_stmt_ast(&arm1, 0, 11);
+
+    Expr i_ref2 = id_expr(2, 14);
+    Expr eight = int_expr(8, 14);
+    Expr cond2 = binary_expr(EXPR_GT, &i_ref2, &eight);
+    Stmt brk = break_stmt(-1, 15);
+    Cond_Arm arm2 = cond_arm_ast(&cond2, &brk);
+    Stmt if_brk = cond_stmt_ast(&arm2, 0, 14);
+
+    Expr sum_lhs = id_expr(1, 17);
+    Expr sum_rhs = id_expr(1, 17);
+    Expr i_ref3 = id_expr(2, 17);
+    Expr add = binary_expr(EXPR_PLUS, &sum_rhs, &i_ref3);
+    Expr assign = binary_expr(EXPR_ASGN, &sum_lhs, &add);
+    Stmt body_assign = expr_stmt(&assign);
+
+    if_cont.next = &if_brk;
+    if_brk.next = &body_assign;
+
+    Stmt loop = range_stmt(2, &from, &to, &if_cont, 10);
+    Expr sum_ret = id_expr(1, 19);
+    Stmt ret = return_stmt(&sum_ret);
+
+    loop.next = &ret;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &loop, &ctx, &cfg, &dom, &ssa);
+
+    check_int("break/cont tac not null", tac != 0, 1);
+    check_int("break/cont verify errors", hir_context_error_count(ctx), 0);
+    check_int("break/cont ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+
+    check_int("break/cont destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_labeled_break_nested_loops_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /*
+     * for i in [1..10]
+     *   for j in [1..10]
+     *     if (j == 5)
+     *       break i;
+     *     endif
+     *     sum = sum + j;
+     *   endfor
+     * endfor
+     * return sum;
+     */
+    Expr from1 = int_expr(1, 10);
+    Expr to1 = int_expr(10, 10);
+    Expr from2 = int_expr(1, 11);
+    Expr to2 = int_expr(10, 11);
+
+    Expr j_ref1 = id_expr(3, 12);
+    Expr five = int_expr(5, 12);
+    Expr cond = binary_expr(EXPR_EQ, &j_ref1, &five);
+    Stmt brk_outer = break_stmt(2, 13); /* break i */
+    Cond_Arm arm = cond_arm_ast(&cond, &brk_outer);
+    Stmt if_brk = cond_stmt_ast(&arm, 0, 12);
+
+    Expr sum_lhs = id_expr(1, 14);
+    Expr sum_rhs = id_expr(1, 14);
+    Expr j_ref2 = id_expr(3, 14);
+    Expr add = binary_expr(EXPR_PLUS, &sum_rhs, &j_ref2);
+    Expr assign = binary_expr(EXPR_ASGN, &sum_lhs, &add);
+    Stmt body_assign = expr_stmt(&assign);
+
+    if_brk.next = &body_assign;
+
+    Stmt inner_loop = range_stmt(3, &from2, &to2, &if_brk, 11);
+    Stmt outer_loop = range_stmt(2, &from1, &to1, &inner_loop, 10);
+
+    Expr sum_ret = id_expr(1, 16);
+    Stmt ret = return_stmt(&sum_ret);
+
+    outer_loop.next = &ret;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &outer_loop, &ctx, &cfg, &dom, &ssa);
+
+    check_int("labeled break tac not null", tac != 0, 1);
+    check_int("labeled break verify errors", hir_context_error_count(ctx), 0);
+    check_int("labeled break ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+
+    check_int("labeled break destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1987,6 +2171,8 @@ main(void)
     test_for_range_loop_tac_ssa();
     test_for_list_loop_tac_ssa();
     test_cond_expr_tac_ssa();
+    test_break_and_continue_tac_ssa();
+    test_labeled_break_nested_loops_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
