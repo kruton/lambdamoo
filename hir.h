@@ -216,6 +216,7 @@ extern int hir_ssa_cfg_edge_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
 						 unsigned, HIROp);
+extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
 extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
 					       HIRValueAnalysis *);
 extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);

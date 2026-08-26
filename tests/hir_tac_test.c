@@ -2938,6 +2938,30 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
 }
 
 static void
+test_string_add_operand_inference(void)
+{
+    var_type inferred = TYPE_NONE;
+
+    check_int("string add infers unknown right operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 1, TYPE_STR,
+						&inferred), 1);
+    check_int("string add inferred type", inferred, TYPE_STR);
+
+    inferred = TYPE_NONE;
+    check_int("integer add does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 1, TYPE_INT,
+						&inferred), 0);
+    check_int("integer add leaves inferred type alone", inferred, TYPE_NONE);
+
+    check_int("non-add does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_SUB, 1, TYPE_STR,
+						&inferred), 0);
+    check_int("unknown peer does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 0, TYPE_STR,
+						&inferred), 0);
+}
+
+static void
 test_length_expr_in_stores_and_negatives(void)
 {
     Names names;
@@ -3056,6 +3080,7 @@ int
 main(void)
 {
     test_string_builtin_length_anchor();
+    test_string_add_operand_inference();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();

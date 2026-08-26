@@ -22,6 +22,17 @@
 #include <stddef.h>
 #include <string.h>
 
+static int
+infer_string_add_operand(HIROp op, int other_known, var_type other_type,
+			 var_type *inferred_type)
+{
+    if (op != HIR_OP_ADD || !other_known || other_type != TYPE_STR)
+	return 0;
+
+    *inferred_type = TYPE_STR;
+    return 1;
+}
+
 #ifdef HIR_TESTING
 static int
 is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
@@ -3888,6 +3899,24 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			&& si->src2 < program->num_values
 			&& value_types_known[si->src2];
 
+		    if (!src2_known
+			&& infer_string_add_operand(si->op, src1_known,
+					    src1_known
+					    ? value_types[si->src1] : TYPE_NONE,
+					    &value_types[si->src2])) {
+			    value_types_known[si->src2] = 1;
+			    src2_known = 1;
+			    types_changed = 1;
+		    } else if (!src1_known
+			       && infer_string_add_operand(si->op, src2_known,
+						   src2_known
+						   ? value_types[si->src2] : TYPE_NONE,
+						   &value_types[si->src1])) {
+			    value_types_known[si->src1] = 1;
+			    src1_known = 1;
+			    types_changed = 1;
+		    }
+
 		    if (src1_known || src2_known) {
 			var_type t1 = src1_known ? value_types[si->src1] : TYPE_INT;
 			var_type t2 = src2_known ? value_types[si->src2] : TYPE_INT;
@@ -7403,6 +7432,13 @@ hir_test_string_builtin_length_anchor(Bytecodes *bc, unsigned pc,
 				      unsigned func, HIROp op)
 {
     return is_string_builtin_length_anchor(bc, pc, func, op);
+}
+
+int
+hir_test_infer_string_add_operand(HIROp op, int other_known,
+				  var_type other_type, var_type *inferred_type)
+{
+    return infer_string_add_operand(op, other_known, other_type, inferred_type);
 }
 
 static HIRTacProgram *
