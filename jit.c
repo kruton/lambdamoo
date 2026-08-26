@@ -1018,6 +1018,8 @@ jit_program_compile(JITProgram *program)
 	program->reason = "code-generation-failed";
 	return 0;
     }
+    program->machine_code = build.function->u.func->machine_code;
+    program->machine_code_len = build.function->u.func->machine_code_len;
     program->mir_context = build.context;
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values,
 				     M_PROGRAM);
@@ -1132,5 +1134,33 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     }
     fclose(file);
     MIR_finish(build.context);
+    return 1;
+}
+
+int
+jit_program_dump_machine(JITProgram *program,
+			 void (*add_line)(const char *, void *), void *data)
+{
+    const unsigned char *code;
+    size_t offset;
+
+    if (!jit_program_compile(program) || !program->machine_code
+	|| !program->machine_code_len)
+	return 0;
+    code = program->machine_code;
+    for (offset = 0; offset < program->machine_code_len; offset += 16) {
+	char line[80];
+	size_t count = program->machine_code_len - offset;
+	size_t i;
+	int used;
+
+	if (count > 16)
+	    count = 16;
+	used = snprintf(line, sizeof(line), "%04lx:", (unsigned long) offset);
+	for (i = 0; i < count; i++)
+	    used += snprintf(line + used, sizeof(line) - used, " %02x",
+			     code[offset + i]);
+	add_line(line, data);
+    }
     return 1;
 }

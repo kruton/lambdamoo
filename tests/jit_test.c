@@ -12,6 +12,20 @@ static int failures;
 
 static void check(int, const char *);
 
+struct machine_dump {
+    int lines;
+    int valid_first_line;
+};
+
+static void
+check_machine_line(const char *line, void *data)
+{
+    struct machine_dump *dump = data;
+
+    if (dump->lines++ == 0)
+	dump->valid_first_line = !strncmp(line, "0000: ", 6);
+}
+
 static void *
 allocate(size_t size)
 {
@@ -1033,6 +1047,7 @@ main(void)
     int timed_out = 0;
     enum error error = E_NONE;
     int lines = 0;
+    struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
 
@@ -1043,6 +1058,13 @@ main(void)
 	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
+    check(jit_program_dump_machine(program, check_machine_line, &machine_dump),
+	  "machine-code dump failed");
+    check(machine_dump.lines > 0, "machine-code dump was empty");
+    check(machine_dump.valid_first_line,
+	  "machine-code dump did not contain hex bytes");
+    check(jit_program_state(program) == JIT_STATE_COMPILED,
+	  "machine-code dump did not compile lazily");
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
 			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
