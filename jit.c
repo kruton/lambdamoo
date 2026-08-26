@@ -279,6 +279,24 @@ jit_rt_rindex(const char *source, const char *what)
     return (int64_t) strrindex(source, what, 0);
 }
 
+int64_t
+jit_rt_valid(int64_t oid)
+{
+    return (int64_t) valid((Objid) oid);
+}
+
+int64_t
+jit_rt_parent(int64_t oid, int32_t *err_out)
+{
+    Objid obj = (Objid) oid;
+    if (!valid(obj)) {
+	*err_out = E_INVARG;
+	return 0;
+    }
+    *err_out = E_NONE;
+    return (int64_t) db_object_parent(obj);
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *);
 
@@ -312,6 +330,10 @@ typedef struct {
     MIR_item_t import_index;
     MIR_item_t proto_rindex;
     MIR_item_t import_rindex;
+    MIR_item_t proto_valid;
+    MIR_item_t import_valid;
+    MIR_item_t proto_parent;
+    MIR_item_t import_parent;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -620,6 +642,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_time", (void *) jit_rt_time);
     MIR_load_external(build->context, "jit_rt_index", (void *) jit_rt_index);
     MIR_load_external(build->context, "jit_rt_rindex", (void *) jit_rt_rindex);
+    MIR_load_external(build->context, "jit_rt_valid", (void *) jit_rt_valid);
+    MIR_load_external(build->context, "jit_rt_parent", (void *) jit_rt_parent);
 
     build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
 					 MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -673,6 +697,14 @@ build_mir(JITProgram *program, MIRBuild *build)
     build->proto_rindex = MIR_new_proto(build->context, "proto_rindex", 1, &res_i64, 2,
 					MIR_T_P, "source", MIR_T_P, "what");
     build->import_rindex = MIR_new_import(build->context, "jit_rt_rindex");
+
+    build->proto_valid = MIR_new_proto(build->context, "proto_valid", 1, &res_i64, 1,
+				       MIR_T_I64, "oid");
+    build->import_valid = MIR_new_import(build->context, "jit_rt_valid");
+
+    build->proto_parent = MIR_new_proto(build->context, "proto_parent", 1, &res_i64, 2,
+					MIR_T_I64, "oid", MIR_T_P, "err");
+    build->import_parent = MIR_new_import(build->context, "jit_rt_parent");
 
     build->function = MIR_new_func(build->context, "jit_verb", 1,
 				   &result_type, 8,
@@ -912,6 +944,48 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_ref_op(build->context, build->import_time),
 				MIR_new_reg_op(build->context,
 					       values[instr->value])));
+		    } else if (instr->op == HIR_OP_VALID) {
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_OBJ) {
+			    append(build, MIR_new_call_insn(build->context, 4,
+				MIR_new_ref_op(build->context, build->proto_valid),
+				MIR_new_ref_op(build->context, build->import_valid),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1])));
+			    break;
+			}
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    } else if (instr->op == HIR_OP_PARENT) {
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_OBJ) {
+			    char name[32];
+			    sprintf(name, "parent_err%d", copy_serial++);
+			    MIR_reg_t err_reg = new_reg(build, name);
+			    MIR_label_t invalid_arg = new_status_exit(build, &status_exits,
+				&last_status_exit, JIT_RUN_ERROR, E_INVARG, instr->bytecode_pc,
+				instr->source_lineno);
+			    append(build, MIR_new_call_insn(build->context, 5,
+				MIR_new_ref_op(build->context, build->proto_parent),
+				MIR_new_ref_op(build->context, build->import_parent),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_reg_op(build->context, error_out)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, invalid_arg),
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_int_op(build->context, E_NONE)));
+			    break;
+			}
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
 		    } else if (instr->op == HIR_OP_TOINT) {
 			int val_fl = program->value_types
 			    && program->value_types[instr->value] == TYPE_FLOAT;

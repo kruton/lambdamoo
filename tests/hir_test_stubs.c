@@ -343,6 +343,12 @@ valid(Objid oid)
     return oid >= 0;
 }
 
+Objid
+db_object_parent(Objid oid)
+{
+    return oid > 0 ? 0 : -1;
+}
+
 int
 is_wizard(Objid oid)
 {

@@ -3767,6 +3767,24 @@ main(void)
 
 	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
+
+	/* 8. valid/parent tests */
+	check(jit_rt_valid(0) == 1, "jit_rt_valid object #0");
+	check(jit_rt_valid(-1) == 0, "jit_rt_valid object #-1");
+
+	int64_t parent_res = jit_rt_parent(1, &rt_err);
+	check(parent_res == 0 && rt_err == E_NONE, "jit_rt_parent object #1");
+	parent_res = jit_rt_parent(-1, &rt_err);
+	check(rt_err == E_INVARG, "jit_rt_parent invalid object");
+
+	/* 9. index/rindex tests */
+	check(jit_rt_index("hello world", "world") == 7, "jit_rt_index found");
+	check(jit_rt_index("hello world", "xyz") == 0, "jit_rt_index not found");
+	check(jit_rt_rindex("foo bar foo", "foo") == 9, "jit_rt_rindex found");
+
+	/* 10. seconds_left / time tests */
+	check(jit_rt_seconds_left() == 5, "jit_rt_seconds_left stub");
+	check(jit_rt_time() > 0, "jit_rt_time positive");
     }
 
     /* Deoptimization profiling tests */

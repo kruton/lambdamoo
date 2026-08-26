@@ -3375,6 +3375,8 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_TIME:
     case HIR_OP_INDEX_BF:
     case HIR_OP_RINDEX_BF:
+    case HIR_OP_VALID:
+    case HIR_OP_PARENT:
 	return 1;
     default:
 	return 0;
@@ -3949,8 +3951,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    } else if (si->op == HIR_OP_NOT || si->op == HIR_OP_TYPEOF
 			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH
 			       || si->op == HIR_OP_ABS || si->op == HIR_OP_TICKS_LEFT
-			       || si->op == HIR_OP_SECONDS_LEFT || si->op == HIR_OP_TIME) {
+			       || si->op == HIR_OP_SECONDS_LEFT || si->op == HIR_OP_TIME
+			       || si->op == HIR_OP_VALID) {
 			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    } else if (si->op == HIR_OP_PARENT) {
+			value_types[si->value] = TYPE_OBJ;
 			value_types_known[si->value] = 1;
 		    }
 		} else if (si->kind == HIR_TAC_BINARY) {
@@ -4178,6 +4184,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_STR;
 		    value_types_known[si->src2] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_UNARY
+		&& (si->op == HIR_OP_VALID || si->op == HIR_OP_PARENT)) {
+		if (si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_OBJ;
+		    value_types_known[si->src1] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -5041,6 +5055,10 @@ op_name(HIROp op)
 	return "INDEX";
     case HIR_OP_RINDEX_BF:
 	return "RINDEX";
+    case HIR_OP_VALID:
+	return "VALID";
+    case HIR_OP_PARENT:
+	return "PARENT";
     }
 
     return "?";
@@ -7176,7 +7194,9 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 			      || !strcmp(func_name, "toint")
 			      || !strcmp(func_name, "tonum")
 			      || !strcmp(func_name, "typeof")
-			      || !strcmp(func_name, "length"))
+			      || !strcmp(func_name, "length")
+			      || !strcmp(func_name, "valid")
+			      || !strcmp(func_name, "parent"))
 		&& args && !args->next && args->kind == ARG_NORMAL) {
 		int arg_temp = lower_expr(ctx, program, args->expr);
 		int dst_temp = new_temp(ctx);
@@ -7189,6 +7209,10 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		    tac->op = HIR_OP_TYPEOF;
 		else if (!strcmp(func_name, "length"))
 		    tac->op = HIR_OP_LENGTH;
+		else if (!strcmp(func_name, "valid"))
+		    tac->op = HIR_OP_VALID;
+		else if (!strcmp(func_name, "parent"))
+		    tac->op = HIR_OP_PARENT;
 		else
 		    tac->op = HIR_OP_TOINT;
 		tac->func = expr->u.call.func;
