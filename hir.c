@@ -6338,8 +6338,11 @@ lower_index_lvalue_base(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     if (expr->kind != HIR_EXPR_INDEX)
 	return lower_expr(ctx, program, expr);
 
+    int prev_base = ctx->current_length_base;
     base = lower_index_lvalue_base(ctx, program, expr->u.pair.lhs);
+    ctx->current_length_base = base;
     index = lower_expr(ctx, program, expr->u.pair.rhs);
+    ctx->current_length_base = prev_base;
     append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
     instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
     instr->bytecode_pc = expr->bytecode_pc;
@@ -6480,10 +6483,16 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     case HIR_EXPR_INDEX_STORE:
 	{
 	    int saved_depth = ctx->lower_stack_depth;
+	    int prev_base = ctx->current_length_base;
 	    int base_temp = lower_index_lvalue_base(ctx, program,
 					     expr->u.index_store.base);
-	    int index_temp = lower_expr(ctx, program, expr->u.index_store.index);
-	    int rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
+	    int index_temp;
+	    int rhs_temp;
+
+	    ctx->current_length_base = base_temp;
+	    index_temp = lower_expr(ctx, program, expr->u.index_store.index);
+	    ctx->current_length_base = prev_base;
+	    rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
 
 	    (void) base_temp;
 	    (void) index_temp;
@@ -6522,11 +6531,18 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	}
     case HIR_EXPR_RANGE_STORE:
 	{
+	    int prev_base = ctx->current_length_base;
 	    int base_temp = lower_expr(ctx, program, expr->u.range_store.base);
-	    int from_temp = lower_expr(ctx, program, expr->u.range_store.from);
-	    int to_temp = lower_expr(ctx, program, expr->u.range_store.to);
-	    int rhs_temp = lower_expr(ctx, program, expr->u.range_store.rhs);
+	    int from_temp;
+	    int to_temp;
+	    int rhs_temp;
 	    int dst_temp = new_temp(ctx);
+
+	    ctx->current_length_base = base_temp;
+	    from_temp = lower_expr(ctx, program, expr->u.range_store.from);
+	    to_temp = lower_expr(ctx, program, expr->u.range_store.to);
+	    ctx->current_length_base = prev_base;
+	    rhs_temp = lower_expr(ctx, program, expr->u.range_store.rhs);
 	    (void) to_temp;
 	    (void) rhs_temp;
 

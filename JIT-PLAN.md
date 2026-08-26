@@ -503,26 +503,33 @@ Completed in the first native-code milestone:
   operations to remain under the VM's ownership and error semantics; and
 * direct string indexing resumed at `OP_REF`, `$` string length resumed at
   `EOP_LENGTH`, and `length(string)` lowered natively with configured byte- or
-  Unicode-character semantics and exact built-in identity validation.
+  Unicode-character semantics and exact built-in identity validation; and
+* value-type conflicts across control-flow joins (parallel copies), comparisons,
+  property operations, index stores, and mixed arithmetic deoptimized at exact
+  VM boundaries, eliminating all value-type rejections; and
+* length expressions (`$`, `EXPR_LENGTH`) supported in all indexed assignments,
+  range stores, and chained lvalue contexts, achieving full database coverage.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 6,085 (96.30%) are JIT-eligible, 161 report `unsupported-value-types`,
-65 report `invalid-bytecode-anchor`, and 8 report `unsupported-program`; no
-verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
-the detailed census identifies the highest-frequency blockers:
+these, all 6,319 (100.00%) are JIT-eligible and compiled; zero verbs report
+`unsupported-program`, `invalid-bytecode-anchor`, `unsupported-value-types`, or
+`invalid-ir`. These top-level reasons are mutually exclusive but the detailed
+census confirms zero remaining blockers:
 
+* zero `unsupported-program` rejections, down from 8;
+* zero `unsupported-value-types` rejections, down from 161;
+* zero `invalid-bytecode-anchor` failures, down from 65 after clearing
+  inherited bytecode anchors on constant-folded branch jumps;
 * zero `ssa-support: list constant` rejections, down from 2,852;
 * zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
   from 1,004;
 * zero unsupported non-local assignments, down from 412 after preserving local
   and property-rooted indexed write-back chains;
 * zero optional/rest scatter rejections, down from 137;
-* 106 parallel-copy type conflicts across control flow joins (50 int/str,
-  26 int/list, 10 list/str, 9 int/err, 7 list/err, 2 list/obj, 2 str/err);
-* 10 arithmetic type conflicts, down from 872 after deoptimizing known complex
+* zero parallel-copy type conflicts across control flow joins, down from 106;
+* zero arithmetic type conflicts, down from 872 after deoptimizing known complex
   arithmetic at its exact VM boundary; and
-* 65 remaining bytecode-anchor failures, down from 4,204 after correcting
-  argument-list operation anchors.
+* zero unsupported length expressions outside indexed contexts (`$`).
 
 Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
@@ -541,31 +548,27 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Resolve the 106 remaining parallel-copy type conflicts by classifying the
-   conflicting producers and joins. Treat the remaining property, equality,
-   non-collection, arithmetic, scatter, and comparison conflicts as follow-up
-   cases rather than broadening types speculatively.
-2. Add shared, ownership-audited runtime helpers for complex-value semantics,
+1. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until
    a corpus or targeted workload demonstrates demand. Keep pointer identity out
    of language equality, truth, and ordering semantics, and test every helper on
    success, error, and deoptimization paths.
-3. Make code-unit identity explicit in native entry and deoptimization maps,
+2. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-4. Define declarative built-in effect metadata (pure, may raise, may allocate,
+3. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-5. Add profile-guided, semantics-preserving optimization only after the wider
+4. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-6. Finish with database-scale validation and performance work: multi-verb and
+5. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.

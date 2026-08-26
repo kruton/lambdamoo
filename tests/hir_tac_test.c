@@ -2934,6 +2934,74 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
 }
 
 static void
+test_length_expr_in_stores_and_negatives(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr local_base, len_expr, one_expr, val_expr, idx_expr, range_expr;
+    Expr assign_idx, assign_range, assign_chained, unindexed_len, bad_assign;
+    Stmt stmt_idx, stmt_range, stmt_chained, bad_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    local_base = id_expr(0, 71);
+    memset(&len_expr, 0, sizeof(len_expr));
+    len_expr.kind = EXPR_LENGTH;
+    len_expr.lineno = 71;
+    one_expr = int_expr(1, 71);
+    val_expr = int_expr(42, 71);
+
+    /* 1. local[$] = 42 */
+    idx_expr = binary_expr(EXPR_INDEX, &local_base, &len_expr);
+    assign_idx = binary_expr(EXPR_ASGN, &idx_expr, &val_expr);
+    stmt_idx = expr_stmt(&assign_idx);
+    tac = lower_stmt(&names, &stmt_idx, &ctx, &cfg, &dom, &ssa);
+    check_int("length in index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in index store deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    hir_context_free(ctx);
+
+    /* 2. local[1..$] = 42 */
+    range_expr = range_expr_ast(&local_base, &one_expr, &len_expr, 71);
+    assign_range = binary_expr(EXPR_ASGN, &range_expr, &val_expr);
+    stmt_range = expr_stmt(&assign_range);
+    tac = lower_stmt(&names, &stmt_range, &ctx, &cfg, &dom, &ssa);
+    check_int("length in range store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in range store range_set count",
+	      hir_tac_count_kind(tac, HIR_TAC_RANGE_SET), 1);
+    hir_context_free(ctx);
+
+    /* 3. local[1][$] = 42 (chained index store) */
+    Expr outer_base = binary_expr(EXPR_INDEX, &local_base, &one_expr);
+    Expr chained_idx = binary_expr(EXPR_INDEX, &outer_base, &len_expr);
+    assign_chained = binary_expr(EXPR_ASGN, &chained_idx, &val_expr);
+    stmt_chained = expr_stmt(&assign_chained);
+    tac = lower_stmt(&names, &stmt_chained, &ctx, &cfg, &dom, &ssa);
+    check_int("length in chained index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in chained index store deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    hir_context_free(ctx);
+
+    /* 4. Negative test: unindexed $ (e.g. x = $) */
+    Expr target_var = id_expr(1, 72);
+    unindexed_len.kind = EXPR_LENGTH;
+    unindexed_len.lineno = 72;
+    unindexed_len.bytecode_pc = NO_BYTECODE_PC;
+    bad_assign = binary_expr(EXPR_ASGN, &target_var, &unindexed_len);
+    bad_stmt = expr_stmt(&bad_assign);
+    tac = lower_stmt(&names, &bad_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("unindexed length reports error", hir_context_error_count(ctx) > 0, 1);
+    check_int("unindexed length unsupported tac count",
+	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_constant_folded_branch_clears_bytecode_pc(void)
 {
     Names names;
@@ -3025,6 +3093,7 @@ main(void)
     test_fork_stmt_tac_ssa();
     test_fork_body_does_not_reject_enclosing_hir();
     test_length_expr_in_index_tac_ssa();
+    test_length_expr_in_stores_and_negatives();
     test_constant_folded_branch_clears_bytecode_pc();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
