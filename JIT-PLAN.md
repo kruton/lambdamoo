@@ -429,7 +429,9 @@ Completed in the first native-code milestone:
 * guarded integer locals whose values enter through the runtime environment; and
 * checked native list and argument-list indexing with bounds checking and
   either element-type guards or a runtime type tag for values whose type cannot
-  be inferred statically; and
+  be inferred statically, including tagged list bases and indexes; and
+* native equality, inequality, and list-membership operations over dynamically
+  tagged operands with exact type-guard fallback; and
 * list destructuring (scatter assignment) and list construction/splicing lowered
   to TAC/SSA with bytecode anchors and native destructuring execution, including
   trailing optional items with lazily evaluated defaults; rest scatter and
@@ -558,12 +560,12 @@ in native code; 213 (66.56%) deoptimize. The emergency workload suspends before
 finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
-* 28 `arithmetic_type` deopts (13.15%);
+* 20 `arithmetic_type` deopts (9.39%);
 * 58 entry or local `type_guard_failure` deopts (27.23%), down from 227 after
   separating compiler-only locals from VM locals and preserving `TYPE_NONE`
   for user-local entry values before consumer-driven inference;
 * 76 `unsupported_operation` deopts (35.68%);
-* 34 `property_read` deopts (15.96%);
+* 42 `property_read` deopts (19.72%);
 * 6 `range_operation` deopts (2.82%);
 * 7 `builtin_call` deopts (3.29%); and
 * 4 `verb_call` deopts (1.88%).
@@ -585,6 +587,11 @@ their runtime tag through SSA copies and deoptimization maps. Consequently, the
 hot `#52:has_callable_verb` case now passes its scatter anchor and exits at its
 later unsupported operation on line 6/PC 30 with `verbname` reconstructed as a
 string. Multiple trailing optionals with explicit defaults are also lowered.
+Tagged membership moves the sampled `#66:get` calls past line 6/PC 26 to their
+later property-read boundary on line 8/PC 37. The eight `#55:assoc` exits remain
+at a caught `t[indx]` operation: the sampled value fails its dynamic list/index
+guard, so preserving the surrounding catch semantics still requires interpreter
+fallback.
 
 Reproduce the census from the repository root with a JIT-enabled build using:
 
@@ -610,17 +617,16 @@ suspends the emergency task before the range is complete.
 
 The next reviewable compiler milestones, in priority order, are:
 
-1. Finish reducing the remaining `arithmetic_type` runtime category. Backward
-   string inference through concatenation has removed the indexed-access
-   failures in `#59:verbname_match`; next classify the remaining 28 sites and
-   lower the most frequent type-safe case.
+1. Classify the 76 unsupported-operation sites by operation and call-site
+   frequency. Lower the highest-frequency continuation-free operation first,
+   retaining exact bytecode anchors and deopt state for everything else.
 2. Split and reduce the remaining 58 type-guard failures. Report the guarded
    local slot plus expected and actual type, then distinguish true argument
    specialization failures from inert entry-state values. Do not weaken guards
    for values that can be semantically read before assignment.
-3. Classify the 76 unsupported-operation sites by operation and call-site
-   frequency. Lower the highest-frequency continuation-free operation first,
-   retaining exact bytecode anchors and deopt state for everything else.
+3. Classify the remaining 20 `arithmetic_type` exits. Do not inline the caught
+   `#55:assoc` index failure until native catch-region control flow can preserve
+   its `E_RANGE`/`E_TYPE` handler semantics.
 4. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
