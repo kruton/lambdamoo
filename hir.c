@@ -6564,9 +6564,6 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int limit;
     int condition;
 
-    /* Multiple optionals can run an earlier default before a later element
-       guard fails.  Keep those in the interpreter until scatter elements have
-       tagged SSA values, so deoptimization cannot repeat default side effects. */
     for (item = expr->u.scatter.items; item; item = item->next) {
 	if (item->kind == SCAT_REST) {
 	    append_scatter_deopt(ctx, program, expr->source_lineno,
@@ -6588,7 +6585,7 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	else if (item->kind == SCAT_OPTIONAL) {
 	    seen_optional = 1;
 	    optional++;
-	    if (optional > 1 || !item->expr) {
+	    if (!item->expr) {
 		append_scatter_deopt(ctx, program, expr->source_lineno,
 				     expr->bytecode_pc);
 		ctx->lower_stack_depth = saved_depth;

@@ -1591,8 +1591,9 @@ test_optional_scatter_default_lowering(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Scatter required1, required2, optional;
+    Scatter required1, required2, optional1, optional2;
     Expr default_value = int_expr(0, 10);
+    Expr second_default = int_expr(1, 10);
     Expr scatter_lhs;
     Expr rhs = id_expr(0, 10);
     Expr assign;
@@ -1605,11 +1606,16 @@ test_optional_scatter_default_lowering(void)
     memset(&required2, 0, sizeof(required2));
     required2.kind = SCAT_REQUIRED;
     required2.id = 2;
-    required2.next = &optional;
-    memset(&optional, 0, sizeof(optional));
-    optional.kind = SCAT_OPTIONAL;
-    optional.id = 3;
-    optional.expr = &default_value;
+    required2.next = &optional1;
+    memset(&optional1, 0, sizeof(optional1));
+    optional1.kind = SCAT_OPTIONAL;
+    optional1.id = 3;
+    optional1.expr = &default_value;
+    optional1.next = &optional2;
+    memset(&optional2, 0, sizeof(optional2));
+    optional2.kind = SCAT_OPTIONAL;
+    optional2.id = 4;
+    optional2.expr = &second_default;
 
     memset(&scatter_lhs, 0, sizeof(scatter_lhs));
     scatter_lhs.kind = EXPR_SCATTER;
@@ -1619,19 +1625,22 @@ test_optional_scatter_default_lowering(void)
     ret = return_stmt(&assign);
 
     memset(&names, 0, sizeof(names));
-    names.size = 4;
+    names.size = 5;
     rhs.bytecode_pc = 1;
     assign.bytecode_pc = 2;
     default_value.bytecode_pc = 3;
+    second_default.bytecode_pc = 5;
     ret.bytecode_pc = 4;
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
     check_int("optional scatter accepted", hir_context_error_count(ctx), 0);
     check_int("optional scatter indexes all targets",
-	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 3);
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 4);
     check_int("optional scatter lowers default",
 	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 1);
+    check_int("optional scatter lowers second default",
+	      hir_tac_count_bytecode_pc(tac, second_default.bytecode_pc), 1);
     check_int("optional scatter charges one opcode tick",
 	      hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
     check_int("optional scatter has invalid-shape deopt",
