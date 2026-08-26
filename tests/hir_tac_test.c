@@ -2518,6 +2518,41 @@ test_try_finally_tac_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_fork_stmt_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr time_expr, body_val;
+    Stmt body_stmt, fork_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    time_expr = int_expr(5, 60);
+    body_val = int_expr(1, 61);
+    body_stmt = expr_stmt(&body_val);
+
+    memset(&fork_stmt, 0, sizeof(fork_stmt));
+    fork_stmt.kind = STMT_FORK;
+    fork_stmt.lineno = 60;
+    fork_stmt.s.fork.time = &time_expr;
+    fork_stmt.s.fork.id = 0;
+    fork_stmt.s.fork.body = &body_stmt;
+    fork_stmt.s.fork.code_unit = 1;
+
+    tac = lower_stmt(&names, &fork_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("fork stmt deopt boundary",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("fork stmt verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2554,6 +2589,7 @@ main(void)
     test_catch_expr_tac_ssa();
     test_try_except_tac_ssa();
     test_try_finally_tac_ssa();
+    test_fork_stmt_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

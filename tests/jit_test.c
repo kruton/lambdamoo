@@ -1208,6 +1208,53 @@ exception_boundary_deopt_program(void)
 }
 
 static JITProgram *
+fork_boundary_deopt_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *const_time = instruction(HIR_TAC_CONST);
+    JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 2);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_INT;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 33;
+    map->error_pc = 33;
+    map->stack_depth = 1;
+    map->ticks_charged = 0;
+    map->num_locals = 0;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_INT;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    const_time->value = 1;
+    const_time->literal = 5;
+    const_time->literal_type = TYPE_INT;
+    const_time->next = deopt;
+
+    deopt->deopt_map = 1;
+    deopt->bytecode_pc = 33;
+
+    block->first = const_time;
+    block->last = deopt;
+    return program;
+}
+
+static JITProgram *
 finally_stack_marker_deopt_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -2462,6 +2509,22 @@ main(void)
 	      "finally marker type/handler wrong");
 	free_var(deopt_stack[0]);
 	jit_program_free(fin_deopt);
+
+	/* Fork boundary deoptimization tests */
+	JITProgram *fork_deopt = fork_boundary_deopt_program();
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	check(jit_program_execute(fork_deopt, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_FALLBACK, "fork boundary deopt failed");
+	check(deopt_state.bytecode_pc == 33,
+	      "fork boundary resumed at wrong pc");
+	check(deopt_state.stack_depth == 1,
+	      "fork boundary stack depth wrong");
+	check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 5,
+	      "fork boundary time value on stack wrong");
+	free_var(deopt_stack[0]);
+	jit_program_free(fork_deopt);
     }
 
     jit_program_free(program);
