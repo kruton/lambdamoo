@@ -923,6 +923,10 @@ emergency_mode(void)
     in_emergency_mode = 0;
     oklog("EMERGENCY_MODE: Leaving mode; %s continue...\n",
 	  start_ok ? "will" : "won't");
+#ifdef ENABLE_JIT
+    if (!start_ok)
+	jit_profile_report();
+#endif
     return start_ok;
  abort:
     printf("Bye.  (%s)\n\n", "NOT saving database");

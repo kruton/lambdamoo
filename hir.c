@@ -3749,8 +3749,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->num_vars = ctx->var_names ? ctx->var_names->size : 0;
     program->num_deopt_maps = 1;
     program->deopt_maps = mymalloc(sizeof(JITDeoptMap), M_PROGRAM);
+    memset(&program->deopt_maps[0], 0, sizeof(JITDeoptMap));
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].error_pc = 0;
+    program->deopt_maps[0].source_lineno = 1;
+    program->deopt_maps[0].reason = JIT_DEOPT_UNSUPPORTED_OP;
     program->deopt_maps[0].stack_depth = 0;
     program->deopt_maps[0].ticks_charged = 0;
     program->deopt_maps[0].num_locals = program->num_vars;
