@@ -248,7 +248,7 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
     for (i = 0; i < map->num_locals; i++) {
 	int val = map->local_values[i];
 	if (val > 0) {
-	    if (map->local_types && map->local_types[i] == TYPE_FLOAT) {
+	    if (program->value_types && program->value_types[val] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
 		    MIR_new_mem_op(build->context, MIR_T_D,
 				   val * sizeof(Num),
@@ -267,7 +267,7 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int sval = map->stack_values[i];
 	if (sval > 0) {
-	    if (map->stack_types && map->stack_types[i] == TYPE_FLOAT) {
+	    if (program->value_types && program->value_types[sval] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
 		    MIR_new_mem_op(build->context, MIR_T_D,
 				   sval * sizeof(Num),
@@ -411,7 +411,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 			deopt_map_out, deopt_values, status, common_return);
 		    break;
 		case HIR_TAC_CONST:
-		    if (instr->literal_type == TYPE_FLOAT) {
+		    if (program->value_types
+			&& program->value_types[instr->value] == TYPE_FLOAT) {
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_mem_op(build->context,
 								 sizeof(Num) == 8
@@ -452,7 +453,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, var_type),
 				MIR_new_int_op(build->context, expected_type)));
-			if (expected_type == TYPE_FLOAT) {
+			if (program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			    sprintf(name, "fl_ptr%d", copy_serial++);
 			    MIR_reg_t fl_ptr = new_reg(build, name);
@@ -504,6 +506,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_UNARY:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (program->value_types
 			&& (program->value_types[instr->src1] == TYPE_STR
 			    || program->value_types[instr->src1] == TYPE_LIST)
@@ -520,6 +528,16 @@ build_mir(JITProgram *program, MIRBuild *build)
 			break;
 		    }
 		    if (instr->op == HIR_OP_TOINT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl || src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
@@ -532,8 +550,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_int_op(build->context,
 								 instr->literal)));
 		    } else if (instr->op == HIR_OP_ABS) {
-			if (program->value_types
-			    && program->value_types[instr->src1] == TYPE_FLOAT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl != src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (src_fl) {
 			    MIR_label_t is_pos = MIR_new_label(build->context);
 			    MIR_label_t done = MIR_new_label(build->context);
 			    char name[32];
@@ -657,8 +684,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  deopt_map_out, deopt_values, status, common_return);
 			append(build, loaded);
 		    } else if (instr->op == HIR_OP_NEGATE) {
-			if (program->value_types
-			    && program->value_types[instr->src1] == TYPE_FLOAT)
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl != src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (src_fl)
 			    append(build, MIR_new_insn(build->context, MIR_DNEG,
 							  MIR_new_reg_op(build->context,
 									 values[instr->value]),
@@ -671,6 +707,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1])));
 		    } else if (instr->op == HIR_OP_NOT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			if (val_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_FLOAT) {
 			    char name[32];
@@ -695,15 +739,32 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1]),
 							  MIR_new_int_op(build->context, 0)));
-		    } else
+		    } else {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl || src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			append(build, MIR_new_insn(build->context, MIR_XOR,
 						      MIR_new_reg_op(build->context,
 								     values[instr->value]),
 						      MIR_new_reg_op(build->context,
 								     values[instr->src1]),
 						      MIR_new_int_op(build->context, -1)));
+		    }
 		    break;
 		case HIR_TAC_BINARY:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL
 			|| instr->op == HIR_OP_LIST_APPEND
 			|| instr->op == HIR_OP_GET_PROP
@@ -724,7 +785,50 @@ build_mir(JITProgram *program, MIRBuild *build)
 			break;
 		    }
 		    if (program->value_types
-			&& program->value_types[instr->src1] == TYPE_FLOAT) {
+			&& (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+			    || instr->op == HIR_OP_MUL || instr->op == HIR_OP_DIV
+			    || instr->op == HIR_OP_MOD || instr->op == HIR_OP_EXP
+			    || instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)
+			&& (program->value_types[instr->value] == TYPE_FLOAT
+			    || program->value_types[instr->src1] == TYPE_FLOAT
+			    || program->value_types[instr->src2] == TYPE_FLOAT)) {
+			int is_float_arith = (instr->op == HIR_OP_ADD
+					      || instr->op == HIR_OP_SUB
+					      || instr->op == HIR_OP_MUL
+					      || instr->op == HIR_OP_DIV);
+			int is_float_cmp = (instr->op == HIR_OP_EQ
+					    || instr->op == HIR_OP_NE
+					    || instr->op == HIR_OP_LT
+					    || instr->op == HIR_OP_LE
+					    || instr->op == HIR_OP_GT
+					    || instr->op == HIR_OP_GE);
+			int valid_float_op = (is_float_arith
+					      && program->value_types[instr->value] == TYPE_FLOAT
+					      && program->value_types[instr->src1] == TYPE_FLOAT
+					      && program->value_types[instr->src2] == TYPE_FLOAT)
+			    || (is_float_cmp
+				&& program->value_types[instr->src1] == TYPE_FLOAT
+				&& program->value_types[instr->src2] == TYPE_FLOAT);
+
+			if (!valid_float_op) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (is_float_cmp) {
+			    append(build, MIR_new_insn(build->context,
+						      float_binary_code(instr->op),
+						      MIR_new_reg_op(build->context,
+								     values[instr->value]),
+						      MIR_new_reg_op(build->context,
+								     values[instr->src1]),
+						      MIR_new_reg_op(build->context,
+								     values[instr->src2])));
+			    break;
+			}
 			if (instr->op == HIR_OP_DIV) {
 			    char name[32];
 			    sprintf(name, "zero_div%d", copy_serial++);
@@ -752,14 +856,34 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_reg_op(build->context,
 								     values[instr->src2])));
 			} else {
-			    append(build, MIR_new_insn(build->context,
-						      float_binary_code(instr->op),
-						      MIR_new_reg_op(build->context,
-								     values[instr->value]),
-						      MIR_new_reg_op(build->context,
-								     values[instr->src1]),
-						      MIR_new_reg_op(build->context,
-								     values[instr->src2])));
+			    if (values[instr->value] == values[instr->src1]
+				&& values[instr->value] == values[instr->src2]) {
+				char name[32];
+				sprintf(name, "fl_tmp%d", copy_serial++);
+				MIR_reg_t tmp = MIR_new_func_reg(build->context,
+								   build->function->u.func,
+								   MIR_T_D, name);
+				append(build, MIR_new_insn(build->context,
+							  float_binary_code(instr->op),
+							  MIR_new_reg_op(build->context, tmp),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src1]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src2])));
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_reg_op(build->context,
+									 values[instr->value]),
+							  MIR_new_reg_op(build->context, tmp)));
+			    } else {
+				append(build, MIR_new_insn(build->context,
+							  float_binary_code(instr->op),
+							  MIR_new_reg_op(build->context,
+									 values[instr->value]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src1]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src2])));
+			    }
 			}
 			if (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
 			    || instr->op == HIR_OP_MUL || instr->op == HIR_OP_DIV)
@@ -1011,10 +1135,18 @@ build_mir(JITProgram *program, MIRBuild *build)
 						 values[instr->value]),
 				MIR_new_reg_op(build->context, base)));
 			append(build, skip_multiply);
+		    {
+			char bsq_name[32];
+			sprintf(bsq_name, "base_sq%d", copy_serial);
+			MIR_reg_t base_sq = new_reg(build, bsq_name);
 			append(build, MIR_new_insn(build->context, MIR_MUL,
-				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base_sq),
 				MIR_new_reg_op(build->context, base),
 				MIR_new_reg_op(build->context, base)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base_sq)));
+		    }
 			append(build, MIR_new_insn(build->context, MIR_URSH,
 				MIR_new_reg_op(build->context, power),
 				MIR_new_reg_op(build->context, power),
@@ -1075,7 +1207,24 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_int_op(build->context,
 						 sizeof(Num) * CHAR_BIT)));
 			}
-			append(build, MIR_new_insn(build->context,
+			if (values[instr->value] == values[instr->src1]
+			    && values[instr->value] == values[instr->src2]) {
+			    char name[32];
+			    sprintf(name, "bin_tmp%d", copy_serial++);
+			    MIR_reg_t tmp = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context,
+						      binary_code(instr->op),
+				MIR_new_reg_op(build->context, tmp),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context, tmp)));
+			} else {
+			    append(build, MIR_new_insn(build->context,
 						      binary_code(instr->op),
 				MIR_new_reg_op(build->context,
 						 values[instr->value]),
@@ -1083,6 +1232,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 						 values[instr->src1]),
 				MIR_new_reg_op(build->context,
 						 values[instr->src2])));
+			}
 		    }
 		    }
 		    break;
@@ -1120,19 +1270,55 @@ build_mir(JITProgram *program, MIRBuild *build)
 			}
 			n = 0;
 			for (copy = instr->copies; copy; copy = copy->next) {
-			    if (program->value_types
-				&& program->value_types[copy->dst] == TYPE_FLOAT) {
+			    int src_fl = program->value_types
+				&& program->value_types[copy->src] == TYPE_FLOAT;
+			    int dst_fl = program->value_types
+				&& program->value_types[copy->dst] == TYPE_FLOAT;
+
+			    if (src_fl && dst_fl) {
 				append(build, MIR_new_insn(build->context, MIR_DMOV,
 							  MIR_new_reg_op(build->context,
 									 values[copy->dst]),
 							  MIR_new_reg_op(build->context,
 									 temps[n])));
-			    } else {
+			    } else if (!src_fl && !dst_fl) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 							  MIR_new_reg_op(build->context,
 									 values[copy->dst]),
 							  MIR_new_reg_op(build->context,
 									 temps[n])));
+			    } else if (!src_fl && dst_fl) {
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+							  MIR_new_mem_op(build->context,
+									 sizeof(Num) == 8
+									 ? MIR_T_I64 : MIR_T_I32,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1),
+							  MIR_new_reg_op(build->context,
+									 temps[n])));
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_reg_op(build->context,
+									 values[copy->dst]),
+							  MIR_new_mem_op(build->context,
+									 MIR_T_D,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1)));
+			    } else {
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_mem_op(build->context,
+									 MIR_T_D,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1),
+							  MIR_new_reg_op(build->context,
+									 temps[n])));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+							  MIR_new_reg_op(build->context,
+									 values[copy->dst]),
+							  MIR_new_mem_op(build->context,
+									 sizeof(Num) == 8
+									 ? MIR_T_I64 : MIR_T_I32,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1)));
 			    }
 			    n++;
 			}
@@ -1146,6 +1332,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 							 labels[block->successors[0]])));
 		    break;
 		case HIR_TAC_BRANCH_FALSE:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (block->num_successors == 2) {
 			if (program->value_types
 			    && (program->value_types[instr->src1] == TYPE_STR
@@ -1185,7 +1377,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_RETURN:
-		    if (instr->literal_type == TYPE_FLOAT) {
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
+		    if (program->value_types
+			&& program->value_types[instr->src1] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			/* Box if needed */
 #else

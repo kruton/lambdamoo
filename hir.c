@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef HIR_TESTING
 static int
 is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
 				HIROp op)
@@ -32,6 +33,7 @@ is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
 	&& bc->vector[pc] == OP_BI_FUNC_CALL && bc->vector[pc + 1] == func
 	&& func_name && !strcmp(func_name, "length");
 }
+#endif
 
 typedef struct HIRExpr HIRExpr;
 typedef struct HIRStmt HIRStmt;
@@ -3677,31 +3679,6 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     return program->num_deopt_maps++;
 }
 
-static const char *
-var_type_name(var_type type)
-{
-    switch (type) {
-    case TYPE_INT:
-	return "int";
-    case TYPE_FLOAT:
-	return "float";
-    case TYPE_STR:
-	return "str";
-    case TYPE_LIST:
-	return "list";
-    case TYPE_OBJ:
-	return "obj";
-    case TYPE_ERR:
-	return "err";
-    case TYPE_WAIF:
-	return "waif";
-    case TYPE_NONE:
-	return "none";
-    default:
-	return "unknown";
-    }
-}
-
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -3710,12 +3687,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     HIRSSABlock *ssa_block;
     var_type *value_types;
     unsigned char *value_types_known;
-    char value_type_diagnostic_buf[128];
+    unsigned char *value_types_conflicted;
     const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
-
-    value_type_diagnostic_buf[0] = '\0';
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ctx, ssa)) {
 	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
@@ -3759,9 +3734,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			   M_PROGRAM);
     value_types_known = mymalloc(program->num_values > 0
 				 ? program->num_values : 1, M_PROGRAM);
+    value_types_conflicted = mymalloc(program->num_values > 0
+				      ? program->num_values : 1, M_PROGRAM);
     for (i = 0; i < program->num_values; i++)
 	value_types[i] = TYPE_INT;
     memset(value_types_known, 0, program->num_values > 0
+	   ? program->num_values : 1);
+    memset(value_types_conflicted, 0, program->num_values > 0
 	   ? program->num_values : 1);
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
@@ -3820,12 +3799,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			    types_changed = 1;
 			} else if (value_types[copy->dst]
 				   != value_types[copy->src]) {
-			    snprintf(value_type_diagnostic_buf,
-				     sizeof(value_type_diagnostic_buf),
-				     "value-types: parallel-copy type conflict (%s vs %s)",
-				     var_type_name(value_types[copy->dst]),
-				     var_type_name(value_types[copy->src]));
-			    value_type_diagnostic = value_type_diagnostic_buf;
+			    if (value_types[copy->dst] == TYPE_FLOAT
+				|| value_types[copy->src] == TYPE_FLOAT)
+				value_type_diagnostic = "value-types: parallel-copy float conflict";
+			    value_types_conflicted[copy->dst] = 1;
 			}
 		    }
 		if (si->kind == HIR_TAC_UNARY
@@ -3835,14 +3812,18 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && value_types_known[si->src1]) {
 		    var_type inferred = value_types[si->src1];
 
-		    if (inferred != TYPE_INT && inferred != TYPE_FLOAT)
-			value_type_diagnostic = "value-types: unary numeric operand conflict";
-		    else if (!value_types_known[si->value]) {
-			value_types[si->value] = inferred;
-			value_types_known[si->value] = 1;
-			types_changed = 1;
-		    } else if (value_types[si->value] != inferred)
-			value_type_diagnostic = "value-types: unary numeric result conflict";
+		    if (inferred == TYPE_INT || inferred == TYPE_FLOAT) {
+			if (!value_types_known[si->value]) {
+			    value_types[si->value] = inferred;
+			    value_types_known[si->value] = 1;
+			    types_changed = 1;
+			} else if (value_types[si->value] != inferred) {
+			    if (value_types[si->value] == TYPE_FLOAT
+				|| inferred == TYPE_FLOAT)
+				value_type_diagnostic = "value-types: unary float conflict";
+			    value_types_conflicted[si->value] = 1;
+			}
+		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
 		    && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
@@ -3873,18 +3854,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				 && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
 				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
 			    inferred = TYPE_FLOAT;
-			else if (t1 == TYPE_FLOAT || t2 == TYPE_FLOAT) {
-			    value_type_diagnostic = "value-types: arithmetic operand conflict";
+			else if (t1 == TYPE_INT && t2 == TYPE_INT)
+			    inferred = TYPE_INT;
+			else
 			    valid = 0;
-			} else if (t1 != TYPE_INT || t2 != TYPE_INT) {
-			    valid = 0;
-			}
 			if (valid && !value_types_known[si->value]) {
 			    value_types[si->value] = inferred;
 			    value_types_known[si->value] = 1;
 			    types_changed = 1;
-			} else if (valid && value_types[si->value] != inferred)
-			    value_type_diagnostic = "value-types: arithmetic result conflict";
+			} else if (valid && value_types[si->value] != inferred) {
+			    if (value_types[si->value] == TYPE_FLOAT
+				|| inferred == TYPE_FLOAT)
+				value_type_diagnostic = "value-types: arithmetic float conflict";
+			    value_types_conflicted[si->value] = 1;
+			}
 		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
@@ -3908,9 +3891,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->src1] = value_types[si->src2];
 			value_types_known[si->src1] = 1;
 			types_changed = 1;
-		    } else if (src1_known && src2_known
-			       && value_types[si->src1] != value_types[si->src2])
-			value_type_diagnostic = "value-types: equality operand conflict";
+		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
 		    && (si->op == HIR_OP_LT || si->op == HIR_OP_LE
@@ -3932,9 +3913,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->src1] = value_types[si->src2];
 			value_types_known[si->src1] = 1;
 			types_changed = 1;
-		    } else if (src1_known && src2_known
-			       && value_types[si->src1] != value_types[si->src2])
-			value_type_diagnostic = "value-types: comparison operand conflict";
+		    }
 		}
 		if (si == ssa_block->last)
 		    break;
@@ -3951,38 +3930,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		|| (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX))
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
-		if (value_types_known[operand]
-		    && value_types[operand] != TYPE_LIST) {
-		    if (value_types[operand] == TYPE_STR) {
-			int string_index_deopt = si->kind == HIR_TAC_BINARY
-			    && si->bytecode_pc != NO_BYTECODE_PC
-			    && bytecode_program->main_vector.vector[si->bytecode_pc]
-			       == OP_REF;
-			int string_length_deopt = si->kind == HIR_TAC_UNARY
-			    && si->bytecode_pc != NO_BYTECODE_PC
-			    && jit_extended_anchor_matches(&bytecode_program->main_vector,
-						   si->bytecode_pc, EOP_LENGTH);
-			int string_builtin_length = is_string_builtin_length_anchor(
-			    &bytecode_program->main_vector, si->bytecode_pc,
-			    si->func, si->op);
-
-			if (!string_index_deopt && !string_length_deopt
-			    && !string_builtin_length
-			    && si->kind == HIR_TAC_BINARY)
-			    value_type_diagnostic = "value-types: string index operand";
-			else if (!string_index_deopt && !string_length_deopt
-				 && !string_builtin_length
-				 && si->bytecode_pc != NO_BYTECODE_PC
-				 && bytecode_program->main_vector.vector[si->bytecode_pc]
-				    == OP_BI_FUNC_CALL)
-			    value_type_diagnostic = "value-types: string built-in length operand";
-			else if (!string_index_deopt && !string_length_deopt
-				 && !string_builtin_length)
-			    value_type_diagnostic = "value-types: string length operand";
-		    } else
-			value_type_diagnostic = "value-types: non-collection operand";
-		}
-		else {
+		if (!value_types_known[operand]) {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
 		}
@@ -3991,23 +3939,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		int object = si->src1;
 		int property = si->src2;
 
-		if (object > 0 && object < program->num_values) {
-		    if (value_types_known[object]
-			&& value_types[object] != TYPE_OBJ)
-			value_type_diagnostic = "value-types: property object conflict";
-		    else {
-			value_types[object] = TYPE_OBJ;
-			value_types_known[object] = 1;
-		    }
+		if (object > 0 && object < program->num_values
+		    && !value_types_known[object]) {
+		    value_types[object] = TYPE_OBJ;
+		    value_types_known[object] = 1;
 		}
-		if (property > 0 && property < program->num_values) {
-		    if (value_types_known[property]
-			&& value_types[property] != TYPE_STR)
-			value_type_diagnostic = "value-types: property name conflict";
-		    else {
-			value_types[property] = TYPE_STR;
-			value_types_known[property] = 1;
-		    }
+		if (property > 0 && property < program->num_values
+		    && !value_types_known[property]) {
+		    value_types[property] = TYPE_STR;
+		    value_types_known[property] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -4015,37 +3955,25 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		int base = si->stack_values[si->num_stack_values - 3];
 		int index = si->stack_values[si->num_stack_values - 2];
 
-		if (base > 0 && base < program->num_values) {
-		    if (value_types_known[base]
-			&& value_types[base] != TYPE_LIST)
-			value_type_diagnostic = "value-types: index-store base conflict";
-		    else {
-			value_types[base] = TYPE_LIST;
-			value_types_known[base] = 1;
-		    }
+		if (base > 0 && base < program->num_values
+		    && !value_types_known[base]) {
+		    value_types[base] = TYPE_LIST;
+		    value_types_known[base] = 1;
 		}
-		if (index > 0 && index < program->num_values) {
-		    if (value_types_known[index]
-			&& value_types[index] != TYPE_INT)
-			value_type_diagnostic = "value-types: index-store index conflict";
-		    else {
-			value_types[index] = TYPE_INT;
-			value_types_known[index] = 1;
-		    }
+		if (index > 0 && index < program->num_values
+		    && !value_types_known[index]) {
+		    value_types[index] = TYPE_INT;
+		    value_types_known[index] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_SCATTER
 		&& si->num_stack_values == 1) {
 		int rhs = si->stack_values[0];
 
-		if (rhs > 0 && rhs < program->num_values) {
-		    if (value_types_known[rhs]
-			&& value_types[rhs] != TYPE_LIST)
-			value_type_diagnostic = "value-types: scatter rhs conflict";
-		    else {
-			value_types[rhs] = TYPE_LIST;
-			value_types_known[rhs] = 1;
-		    }
+		if (rhs > 0 && rhs < program->num_values
+		    && !value_types_known[rhs]) {
+		    value_types[rhs] = TYPE_LIST;
+		    value_types_known[rhs] = 1;
 		}
 	    }
 	    if ((si->kind == HIR_TAC_RANGE_REF
@@ -4089,7 +4017,24 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+	for (si = ssa_block->first; si; si = si->next) {
+	    HIRParallelCopy *copy;
+	    for (copy = si->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values) {
+		    int src_fl = value_types[copy->src] == TYPE_FLOAT;
+		    int dst_fl = value_types[copy->dst] == TYPE_FLOAT;
+		    if (src_fl != dst_fl)
+			value_types_conflicted[copy->dst] = 1;
+		}
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
     if (value_type_diagnostic) {
+	myfree(value_types_conflicted, M_PROGRAM);
 	myfree(value_types_known, M_PROGRAM);
 	myfree(value_types, M_PROGRAM);
 	jit_program_free(program);
@@ -4099,6 +4044,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 #if FLOATING_TYPE != FT_DOUBLE || FLOATS_ARE_BOXED
     for (i = 1; i < program->num_values; i++)
 	if (value_types_known[i] && value_types[i] == TYPE_FLOAT) {
+	    myfree(value_types_conflicted, M_PROGRAM);
 	    myfree(value_types_known, M_PROGRAM);
 	    myfree(value_types, M_PROGRAM);
 	    jit_program_free(program);
@@ -4130,6 +4076,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	     ssa_instr = ssa_instr->next) {
 	    HIRParallelCopy *ssa_copy;
 	    JITInstruction *instr = mymalloc(sizeof(JITInstruction), M_PROGRAM);
+	    int uses_conflicted = (ssa_instr->src1 > 0
+				   && ssa_instr->src1 < program->num_values
+				   && value_types_conflicted[ssa_instr->src1])
+		|| (ssa_instr->src2 > 0
+		    && ssa_instr->src2 < program->num_values
+		    && value_types_conflicted[ssa_instr->src2]);
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
@@ -4142,6 +4094,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    if (uses_conflicted && (ssa_instr->kind == HIR_TAC_UNARY
+				    || ssa_instr->kind == HIR_TAC_BINARY
+				    || ssa_instr->kind == HIR_TAC_RETURN
+				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
+		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
 		&& value_types_known[ssa_instr->src1]
 		&& value_types[ssa_instr->src1] == TYPE_STR
@@ -4155,6 +4112,25 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 						       ssa_instr->bytecode_pc,
 						       EOP_LENGTH))))
 		instr->kind = HIR_TAC_DEOPT;
+	    if (ssa_instr->kind == HIR_TAC_UNARY
+		&& (ssa_instr->op == HIR_OP_NOT || ssa_instr->op == HIR_OP_COMPLEMENT
+		    || ssa_instr->op == HIR_OP_NEGATE || ssa_instr->op == HIR_OP_ABS)) {
+		int src1_known = ssa_instr->src1 > 0
+		    && ssa_instr->src1 < program->num_values
+		    && value_types_known[ssa_instr->src1];
+		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
+
+		if (ssa_instr->op == HIR_OP_NOT) {
+		    if (src1_known && t1 != TYPE_INT && t1 != TYPE_OBJ && t1 != TYPE_ERR)
+			instr->kind = HIR_TAC_DEOPT;
+		} else if (ssa_instr->op == HIR_OP_COMPLEMENT) {
+		    if (src1_known && t1 != TYPE_INT)
+			instr->kind = HIR_TAC_DEOPT;
+		} else {
+		    if (src1_known && t1 != TYPE_INT && t1 != TYPE_FLOAT)
+			instr->kind = HIR_TAC_DEOPT;
+		}
+	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
 		    || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
@@ -4182,11 +4158,46 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
+	    if (ssa_instr->kind == HIR_TAC_BINARY
+		&& (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
+		    || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
+		    || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
+		    || ssa_instr->op == HIR_OP_BITOR || ssa_instr->op == HIR_OP_BITXOR
+		    || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_SHL
+		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR)) {
+		int src1_known = ssa_instr->src1 > 0
+		    && ssa_instr->src1 < program->num_values
+		    && value_types_known[ssa_instr->src1];
+		int src2_known = ssa_instr->src2 > 0
+		    && ssa_instr->src2 < program->num_values
+		    && value_types_known[ssa_instr->src2];
+		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
+		var_type t2 = src2_known ? value_types[ssa_instr->src2] : TYPE_INT;
+
+		if (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE) {
+		    if ((src1_known || src2_known)
+			&& !(t1 == TYPE_INT && t2 == TYPE_INT)
+			&& !(t1 == TYPE_OBJ && t2 == TYPE_OBJ)
+			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+			instr->kind = HIR_TAC_DEOPT;
+		} else if (ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
+			   || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE) {
+		    if ((src1_known || src2_known)
+			&& !(t1 == TYPE_INT && t2 == TYPE_INT)
+			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+			instr->kind = HIR_TAC_DEOPT;
+		} else {
+		    if ((src1_known || src2_known)
+			&& !(t1 == TYPE_INT && t2 == TYPE_INT))
+			instr->kind = HIR_TAC_DEOPT;
+		}
+	    }
 	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
 						  &bytecode_program->main_vector,
 						  value_types);
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
+		myfree(value_types_conflicted, M_PROGRAM);
 		myfree(value_types_known, M_PROGRAM);
 		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
@@ -4262,6 +4273,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	}
     }
 
+    myfree(value_types_conflicted, M_PROGRAM);
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     return program;
