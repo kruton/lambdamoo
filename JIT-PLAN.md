@@ -473,7 +473,8 @@ Completed in the first native-code milestone:
 * expanded differential validation harness comparing native and reference execution
   across values, errors, source locations, ticks, full deoptimization state (including
   bytecode PCs and runtime operand stacks), reference ownership, nested control flow,
-  forced fallbacks across all supported boundaries, and a continuous microbenchmark.
+  forced fallbacks across all supported boundaries, and repeated-execution smoke
+  coverage.
 
 The next reviewable compiler milestones, in dependency order, are:
 

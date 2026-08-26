@@ -2011,9 +2011,11 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
     enum error reference_error = E_NONE;
     JITSourceLocation native_loc, ref_loc;
     JITDeoptState native_deopt, ref_deopt;
-    Var native_deopt_stack[16], ref_deopt_stack[16];
+    Var *native_deopt_stack;
+    Var *ref_deopt_stack;
     Var *native_env_copy = 0;
     Var *ref_env_copy = 0;
+    unsigned stack_capacity = 1;
     int num_vars = program->num_vars;
     int i;
     JITRunResult native_status;
@@ -2023,15 +2025,18 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
     memset(&ref_loc, 0, sizeof(ref_loc));
     memset(&native_deopt, 0, sizeof(native_deopt));
     memset(&ref_deopt, 0, sizeof(ref_deopt));
-    memset(native_deopt_stack, 0, sizeof(native_deopt_stack));
-    memset(ref_deopt_stack, 0, sizeof(ref_deopt_stack));
+    for (i = 0; i < program->num_deopt_maps; i++)
+	if (program->deopt_maps[i].stack_depth > stack_capacity)
+	    stack_capacity = program->deopt_maps[i].stack_depth;
+    native_deopt_stack = allocate(sizeof(Var) * stack_capacity);
+    ref_deopt_stack = allocate(sizeof(Var) * stack_capacity);
 
     if (num_vars > 0 && env) {
 	native_env_copy = allocate(sizeof(Var) * num_vars);
 	ref_env_copy = allocate(sizeof(Var) * num_vars);
 	for (i = 0; i < num_vars; i++) {
-	    native_env_copy[i] = env[i];
-	    ref_env_copy[i] = env[i];
+	    native_env_copy[i] = var_ref(env[i]);
+	    ref_env_copy[i] = var_ref(env[i]);
 	}
     }
 
@@ -2049,9 +2054,11 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
     if (native_status == JIT_RUN_ERROR) {
 	check(native_error == reference_error, message);
 	check(native_loc.bytecode_pc == ref_loc.bytecode_pc, message);
+	check(native_loc.error_pc == ref_loc.error_pc, message);
 	check(native_loc.source_lineno == ref_loc.source_lineno, message);
     } else if (native_status == JIT_RUN_ABORT_TICKS || native_status == JIT_RUN_ABORT_SECONDS) {
 	check(native_loc.bytecode_pc == ref_loc.bytecode_pc, message);
+	check(native_loc.error_pc == ref_loc.error_pc, message);
 	check(native_loc.source_lineno == ref_loc.source_lineno, message);
     } else if (native_status == JIT_RUN_FALLBACK) {
 	check(native_deopt.bytecode_pc == ref_deopt.bytecode_pc, message);
@@ -2090,15 +2097,23 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 	    check(native_result.v.list == reference_result.v.list, message);
 	else
 	    check(native_result.v.num == reference_result.v.num, message);
-	free_var(native_result);
-	free_var(reference_result);
     }
 
-    for (i = 0; i < 16; i++) {
+    if (native_status == JIT_RUN_RETURNED)
+	free_var(native_result);
+    if (reference_status == JIT_RUN_RETURNED)
+	free_var(reference_result);
+    for (i = 0; i < (int) stack_capacity; i++) {
 	free_var(native_deopt_stack[i]);
 	free_var(ref_deopt_stack[i]);
     }
+    myfree(native_deopt_stack, M_PROGRAM);
+    myfree(ref_deopt_stack, M_PROGRAM);
     if (native_env_copy) {
+	for (i = 0; i < num_vars; i++) {
+	    free_var(native_env_copy[i]);
+	    free_var(ref_env_copy[i]);
+	}
 	myfree(native_env_copy, M_PROGRAM);
 	myfree(ref_env_copy, M_PROGRAM);
     }
@@ -2289,7 +2304,7 @@ main(void)
 		       "local arithmetic differed from reference execution");
 
     env[0].type = TYPE_STR;
-    env[0].v.str = "not an integer";
+    env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(local_arith, env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -2298,6 +2313,7 @@ main(void)
 	  "local arithmetic guard fallback had wrong state");
     check_differential(local_arith, env, 10, 0,
 		       "local arithmetic fallback differed from reference execution");
+    free_var(env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 6;
@@ -2313,7 +2329,7 @@ main(void)
 		       "two locals differed from reference execution");
 
     deep_env[0].type = TYPE_STR;
-    deep_env[0].v.str = "not an integer";
+    deep_env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -2322,11 +2338,12 @@ main(void)
 	  "two locals first guard fallback had wrong state");
     check_differential(two_locals, deep_env, 10, 0,
 		       "two locals first guard fallback differed from reference");
+    free_var(deep_env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 6;
     deep_env[1].type = TYPE_STR;
-    deep_env[1].v.str = "not an integer";
+    deep_env[1].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -2335,9 +2352,10 @@ main(void)
 	  "two locals second guard fallback had wrong state");
     check_differential(two_locals, deep_env, 10, 0,
 		       "two locals second guard fallback differed from reference");
+    free_var(deep_env[1]);
 
     env[0].type = TYPE_STR;
-    env[0].v.str = "not an integer";
+    env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -2345,13 +2363,14 @@ main(void)
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
 	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
-    check_differential(branch, env, 10, 0,
+    check_differential(guard, env, 10, 0,
 		       "guard fallback differed from reference execution");
+    free_var(env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 7;
     deep_env[1].type = TYPE_STR;
-    deep_env[1].v.str = "not an integer";
+    deep_env[1].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(deep_guard, deep_env, &result, &ticks,
 			      &timed_out, &error, 0, &deopt, deopt_stack)
@@ -2364,6 +2383,11 @@ main(void)
 	  "deep guard did not materialize an updated local");
     check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 42,
 	  "deep guard did not materialize the operand stack");
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 7;
+    check_differential(deep_guard, deep_env, 10, 0,
+		       "deep guard fallback differed from reference execution");
+    free_var(deep_env[1]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 7;
@@ -2444,6 +2468,9 @@ main(void)
 	  == JIT_RUN_FALLBACK, "list non-int element did not fallback");
     check_differential(list_index1, env, 10, 0,
 		       "list non-int element fallback differed from reference");
+    free_var(list_elems[1]);
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 42;
     free_var(env[0]);
 
     /* Scatter destructuring execution test */
@@ -2465,6 +2492,8 @@ main(void)
     check_differential(scatter, env, 10, 0,
 		       "scatter destructure differed from reference execution");
     free_var(env[0]);
+    env[0].type = TYPE_INT;
+    env[0].v.num = 0;
 
     /* Call boundary deopt test */
     {
@@ -2999,7 +3028,7 @@ main(void)
 	jit_program_free(range_set_p);
     }
 
-    /* Microbenchmark loop: 1,000 iterations of native JIT loop execution */
+    /* Repeated-execution smoke test: 1,000 native JIT loop executions */
     {
 	JITProgram *bench_p = nested_loop_branch_program();
 	int iter;
@@ -3010,13 +3039,13 @@ main(void)
 	    JITRunResult res = jit_program_execute(bench_p, 0, &result, &ticks,
 						   &timed_out, &error, 0, 0, 0);
 	    if (res != JIT_RUN_RETURNED || result.v.num != 5) {
-		check(0, "microbenchmark iteration failed");
+		check(0, "repeated execution iteration failed");
 		break;
 	    }
 	    free_var(result);
 	}
 	check(jit_program_state(bench_p) == JIT_STATE_COMPILED,
-	      "microbenchmark lost JIT compiled state");
+	      "repeated execution lost JIT compiled state");
 	jit_program_free(bench_p);
     }
 
