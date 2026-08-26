@@ -2,12 +2,13 @@
 
 #include "my-math.h"
 #include "my-stdio.h"
+#include "my-string.h"
 
 #include "integer_arithmetic.h"
 #include "storage.h"
+#include "utils.h"
 
 #include <limits.h>
-#include <string.h>
 
 static int failures;
 
@@ -951,6 +952,129 @@ float_unary_program(double val, HIROp op)
     return program;
 }
 
+static JITProgram *
+string_return_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 2);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_local->value = 1;
+    load_local->local_id = 0;
+    load_local->literal_type = TYPE_STR;
+    load_local->deopt_map = 0;
+    load_local->next = return_instr;
+
+    return_instr->src1 = 1;
+    return_instr->literal_type = TYPE_STR;
+
+    block->first = load_local;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+string_const_program(const char *s)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 2);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    constant->value = 1;
+    constant->literal_type = TYPE_STR;
+    {
+	char *dup_s = str_dup(s);
+	constant->literal = (uintptr_t) dup_s;
+    }
+    constant->next = return_instr;
+
+    return_instr->src1 = 1;
+    return_instr->literal_type = TYPE_STR;
+
+    block->first = constant;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+list_index_typed_program(var_type elem_type)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = elem_type;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->deopt_map = 0;
+    load_list->next = const_idx;
+
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->deopt_map = 0;
+    index_instr->next = return_instr;
+
+    return_instr->src1 = 3;
+    return_instr->literal_type = elem_type;
+
+    block->first = load_list;
+    block->last = return_instr;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -1006,7 +1130,7 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		    memcpy(&values[instr->value], &f, sizeof(Num));
 		}
 		else if (instr->literal_type == TYPE_LIST)
-		    values[instr->value] = (Num) env[instr->local_id].v.list;
+		    values[instr->value] = (Num) (intptr_t) env[instr->local_id].v.list;
 		else if (instr->literal_type == TYPE_STR)
 		    values[instr->value] = (Num) (intptr_t) env[instr->local_id].v.str;
 		else {
@@ -1091,8 +1215,10 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			break;
 		    }
 		    if (instr->op == HIR_OP_INDEX) {
-			Var *list_ptr = (Var *) values[instr->src1];
+			Var *list_ptr = (Var *) (intptr_t) values[instr->src1];
 			Num index = values[instr->src2];
+			var_type expected_type = program->value_types
+			    ? program->value_types[instr->value] : TYPE_INT;
 
 			if (!list_ptr) {
 			    myfree(values, M_PROGRAM);
@@ -1103,11 +1229,21 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			    myfree(values, M_PROGRAM);
 			    return JIT_RUN_ERROR;
 			}
-			if (list_ptr[index].type != TYPE_INT) {
+			if (list_ptr[index].type != expected_type) {
 			    myfree(values, M_PROGRAM);
 			    return JIT_RUN_FALLBACK;
 			}
-			values[instr->value] = list_ptr[index].v.num;
+			if (expected_type == TYPE_FLOAT) {
+			    FlNum f = fl_unbox(list_ptr[index].v.fnum);
+			    memcpy(&values[instr->value], &f, sizeof(Num));
+			} else if (expected_type == TYPE_OBJ)
+			    values[instr->value] = list_ptr[index].v.obj;
+			else if (expected_type == TYPE_STR)
+			    values[instr->value] = (Num) (intptr_t) list_ptr[index].v.str;
+			else if (expected_type == TYPE_LIST)
+			    values[instr->value] = (Num) (intptr_t) list_ptr[index].v.list;
+			else
+			    values[instr->value] = list_ptr[index].v.num;
 		    } else if (arithmetic_operation(instr->op, &operation)) {
 			IntegerArithmeticResult arithmetic = integer_arithmetic(
 			    operation, values[instr->src1], values[instr->src2]);
@@ -1185,8 +1321,13 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		    memcpy(&f, &values[instr->src1], sizeof(FlNum));
 		    result->v.fnum = box_fl(f);
 		}
+		else if (instr->literal_type == TYPE_STR)
+		    result->v.str = (const char *) (intptr_t) values[instr->src1];
+		else if (instr->literal_type == TYPE_LIST)
+		    result->v.list = (Var *) (intptr_t) values[instr->src1];
 		else
 		    result->v.num = values[instr->src1];
+		*result = var_ref(*result);
 		myfree(values, M_PROGRAM);
 		return JIT_RUN_RETURNED;
 	    default:
@@ -1227,9 +1368,17 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 	      || (native_result.type == reference_result.type
 		  && (native_result.type == TYPE_FLOAT
 		      ? fl_unbox(native_result.v.fnum) == fl_unbox(reference_result.v.fnum)
-		      : (native_result.type == TYPE_OBJ
-			 ? native_result.v.obj == reference_result.v.obj
-			 : native_result.v.num == reference_result.v.num)))), message);
+		      : (native_result.type == TYPE_STR
+			 ? !strcmp(native_result.v.str, reference_result.v.str)
+			 : (native_result.type == TYPE_OBJ
+			    ? native_result.v.obj == reference_result.v.obj
+			    : (native_result.type == TYPE_LIST
+			       ? native_result.v.list == reference_result.v.list
+			       : native_result.v.num == reference_result.v.num)))))), message);
+    if (native_status == JIT_RUN_RETURNED)
+	free_var(native_result);
+    if (reference_status == JIT_RUN_RETURNED)
+	free_var(reference_result);
 }
 
 static void
@@ -1285,8 +1434,8 @@ main(void)
     Var env[1];
     Var deep_env[3];
     Var deopt_stack[4];
-    Var call_args[1];
-    Var list_elems[3];
+    Var *call_args = mymalloc(sizeof(Var) * 1, M_LIST);
+    Var *list_elems = mymalloc(sizeof(Var) * 3, M_LIST);
     Var result;
     int ticks = 10;
     int timed_out = 0;
@@ -1565,19 +1714,25 @@ main(void)
 
     /* Non-integer element in list falls back to interpreter */
     list_elems[1].type = TYPE_STR;
-    list_elems[1].v.str = "hello";
+    list_elems[1].v.str = str_dup("hello");
     ticks = 10;
     check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
 	  == JIT_RUN_FALLBACK, "list non-int element did not fallback");
     check_differential(list_index1, env, 10, 0,
 		       "list non-int element fallback differed from reference");
+    free_var(env[0]);
 
     /* Scatter destructuring execution test */
-    list_elems[1].type = TYPE_INT;
-    list_elems[1].v.num = 10;
-    list_elems[2].type = TYPE_INT;
-    list_elems[2].v.num = 32;
+    Var *scatter_elems = mymalloc(sizeof(Var) * 3, M_LIST);
+    scatter_elems[0].type = TYPE_INT;
+    scatter_elems[0].v.num = 2;
+    scatter_elems[1].type = TYPE_INT;
+    scatter_elems[1].v.num = 10;
+    scatter_elems[2].type = TYPE_INT;
+    scatter_elems[2].v.num = 32;
+    env[0].type = TYPE_LIST;
+    env[0].v.list = scatter_elems;
     ticks = 10;
     check(jit_program_execute(scatter, env, &result, &ticks, &timed_out,
 			      &error, 0, 0, 0)
@@ -1586,6 +1741,7 @@ main(void)
 	  "scatter destructure returned the wrong value");
     check_differential(scatter, env, 10, 0,
 		       "scatter destructure differed from reference execution");
+    free_var(env[0]);
 
     /* Call boundary deopt test */
     {
@@ -1626,7 +1782,7 @@ main(void)
 	deep_env[0].type = TYPE_OBJ;
 	deep_env[0].v.obj = 0;
 	deep_env[1].type = TYPE_STR;
-	deep_env[1].v.str = "test";
+	deep_env[1].v.str = str_dup("test");
 	call_args[0].type = TYPE_INT;
 	call_args[0].v.num = 0;
 	deep_env[2].type = TYPE_LIST;
@@ -1647,6 +1803,10 @@ main(void)
 	check(deopt_stack[2].type == TYPE_LIST
 	      && deopt_stack[2].v.list[0].v.num == 0,
 	      "call_verb wrong argument stack value");
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	free_var(deep_env[1]);
+	free_var(deep_env[2]);
 	jit_program_free(call_prog);
     }
 
@@ -1887,6 +2047,108 @@ main(void)
 	      "float typeof returned wrong value");
 	check_differential(fl_typeof, 0, 10, 0, "float typeof differential");
 	jit_program_free(fl_typeof);
+    }
+
+    /* Scalar string tests */
+    {
+	JITProgram *str_p = string_return_program();
+	Var str_env[1];
+	str_env[0].type = TYPE_STR;
+	str_env[0].v.str = str_dup("hello world");
+	ticks = 10;
+	check(jit_program_execute(str_p, str_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string return execution failed");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "hello world"),
+	      "string return returned wrong value");
+	check(var_refcount(result) >= 2, "string return refcount not incremented");
+	free_var(result);
+	free_var(str_env[0]);
+
+	/* Mismatched type guard fallback for string */
+	str_env[0].type = TYPE_INT;
+	str_env[0].v.num = 1234;
+	ticks = 10;
+	check(jit_program_execute(str_p, str_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "string guard mismatch failed to fallback");
+	jit_program_free(str_p);
+
+	/* String constant program */
+	JITProgram *str_const = string_const_program("constant string");
+	ticks = 10;
+	check(jit_program_execute(str_const, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string const execution failed");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "constant string"),
+	      "string const returned wrong value");
+	free_var(result);
+	check_differential(str_const, 0, 10, 0, "string const differential");
+	jit_program_free(str_const);
+    }
+
+    /* Non-integer list indexing tests */
+    {
+	Var list_env[1];
+	Var *elements = mymalloc(sizeof(Var) * 2, M_LIST);
+
+	/* 1. Object element */
+	JITProgram *idx_obj = list_index_typed_program(TYPE_OBJ);
+	elements[0].type = TYPE_INT;
+	elements[0].v.num = 1;
+	elements[1].type = TYPE_OBJ;
+	elements[1].v.obj = 4321;
+	list_env[0].type = TYPE_LIST;
+	list_env[0].v.list = elements;
+	ticks = 10;
+	check(jit_program_execute(idx_obj, list_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "list index obj execution failed");
+	check(result.type == TYPE_OBJ && result.v.obj == 4321,
+	      "list index obj returned wrong value");
+	free_var(result);
+	check_differential(idx_obj, list_env, 10, 0, "list index obj differential");
+	jit_program_free(idx_obj);
+
+	/* 2. Float element */
+	JITProgram *idx_fl = list_index_typed_program(TYPE_FLOAT);
+	elements[1].type = TYPE_FLOAT;
+	elements[1].v.fnum = box_fl(2.71828);
+	ticks = 10;
+	check(jit_program_execute(idx_fl, list_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "list index float execution failed");
+	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 2.71828,
+	      "list index float returned wrong value");
+	free_var(result);
+	check_differential(idx_fl, list_env, 10, 0, "list index float differential");
+	jit_program_free(idx_fl);
+
+	/* 3. String element */
+	JITProgram *idx_str = list_index_typed_program(TYPE_STR);
+	elements[1].type = TYPE_STR;
+	elements[1].v.str = str_dup("list string element");
+	ticks = 10;
+	check(jit_program_execute(idx_str, list_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "list index str execution failed");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "list string element"),
+	      "list index str returned wrong value");
+	check(var_refcount(result) >= 2, "list index str refcount not incremented");
+	free_var(result);
+	check_differential(idx_str, list_env, 10, 0, "list index str differential");
+
+	free_var(elements[1]);
+
+	/* 4. Element type mismatch on index (expected string, found int) -> fallback */
+	elements[1].type = TYPE_INT;
+	elements[1].v.num = 999;
+	ticks = 10;
+	check(jit_program_execute(idx_str, list_env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK, "list index elem type mismatch did not fallback");
+	jit_program_free(idx_str);
+	myfree(elements, M_LIST);
     }
 
     jit_program_free(program);
