@@ -477,14 +477,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_reg_op(build->context,
 								     values[instr->value]),
 						      MIR_new_mem_op(build->context,
-								     expected_type == TYPE_LIST
+								     (expected_type == TYPE_LIST
+								      || expected_type == TYPE_STR)
 								     ? MIR_T_P
 								     : (sizeof(Num) == 8
 								     ? MIR_T_I64 : MIR_T_I32),
 								     instr->local_id * sizeof(Var)
 								     + (expected_type == TYPE_LIST
 									? offsetof(Var, v.list)
-									: offsetof(Var, v.num)),
+									: (expected_type == TYPE_STR
+									   ? offsetof(Var, v.str)
+									   : offsetof(Var, v.num))),
 								     env, 0, 1)));
 			}
 			append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -784,15 +787,50 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_reg_op(build->context, elem_type),
 				MIR_new_mem_op(build->context, MIR_T_I32,
 					offsetof(Var, type), elem_addr, 0, 1)));
+			var_type expected_elem_type = program->value_types
+			    ? program->value_types[instr->value] : TYPE_INT;
+
 			append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, elem_type),
-				MIR_new_int_op(build->context, TYPE_INT)));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_int_op(build->context, expected_elem_type)));
+			if (expected_elem_type == TYPE_FLOAT) {
+#if FLOATS_ARE_BOXED
+			    sprintf(name, "elem_fl_ptr%d", copy_serial++);
+			    MIR_reg_t elem_fl_ptr = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+						      MIR_new_reg_op(build->context, elem_fl_ptr),
+						      MIR_new_mem_op(build->context, MIR_T_P,
+							      offsetof(Var, v.fnum),
+							      elem_addr, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_DMOV,
+						      MIR_new_reg_op(build->context,
+								     values[instr->value]),
+						      MIR_new_mem_op(build->context, MIR_T_D,
+								     0, elem_fl_ptr, 0, 1)));
+#else
+			    append(build, MIR_new_insn(build->context, MIR_DMOV,
+						      MIR_new_reg_op(build->context,
+								     values[instr->value]),
+						      MIR_new_mem_op(build->context, MIR_T_D,
+							      offsetof(Var, v.fnum),
+							      elem_addr, 0, 1)));
+#endif
+			} else {
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_mem_op(build->context,
-					sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-					offsetof(Var, v.num), elem_addr, 0, 1)));
+					(expected_elem_type == TYPE_LIST
+					 || expected_elem_type == TYPE_STR)
+					? MIR_T_P
+					: (sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32),
+					(expected_elem_type == TYPE_LIST
+					 ? offsetof(Var, v.list)
+					 : (expected_elem_type == TYPE_STR
+					    ? offsetof(Var, v.str)
+					    : offsetof(Var, v.num))),
+					elem_addr, 0, 1)));
+			}
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 				MIR_new_label_op(build->context, loaded)));
 			append(build, deopt);
@@ -1071,9 +1109,16 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    } else {
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						      MIR_new_mem_op(build->context,
-								     sizeof(Num) == 8
-								     ? MIR_T_I64 : MIR_T_I32,
-								     offsetof(Var, v.num),
+								     (instr->literal_type == TYPE_LIST
+								      || instr->literal_type == TYPE_STR)
+								     ? MIR_T_P
+								     : (sizeof(Num) == 8
+									? MIR_T_I64 : MIR_T_I32),
+								     (instr->literal_type == TYPE_LIST
+								      ? offsetof(Var, v.list)
+								      : (instr->literal_type == TYPE_STR
+									 ? offsetof(Var, v.str)
+									 : offsetof(Var, v.num))),
 								     result, 0, 1),
 						      MIR_new_reg_op(build->context,
 								     values[instr->src1])));
@@ -1410,6 +1455,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->stack_depth = map->stack_depth;
 	    deopt->ticks_charged = map->ticks_charged;
 	}
+    }
+    if (native_result == JIT_RUN_RETURNED) {
+	if (result)
+	    *result = var_ref(*result);
     }
     return native_result;
 }

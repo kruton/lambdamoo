@@ -3668,8 +3668,32 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
-		    && (si->op == HIR_OP_EQ || si->op == HIR_OP_NE
-			|| si->op == HIR_OP_LT || si->op == HIR_OP_LE
+		    && (si->op == HIR_OP_EQ || si->op == HIR_OP_NE)) {
+		    int src1_known = si->src1 > 0 && si->src1 < program->num_values
+			&& value_types_known[si->src1];
+		    int src2_known = si->src2 > 0 && si->src2 < program->num_values
+			&& value_types_known[si->src2];
+
+		    if (src1_known && (value_types[si->src1] == TYPE_OBJ
+				       || value_types[si->src1] == TYPE_FLOAT
+				       || value_types[si->src1] == TYPE_STR)
+			&& !src2_known) {
+			value_types[si->src2] = value_types[si->src1];
+			value_types_known[si->src2] = 1;
+			types_changed = 1;
+		    } else if (src2_known && (value_types[si->src2] == TYPE_OBJ
+					      || value_types[si->src2] == TYPE_FLOAT
+					      || value_types[si->src2] == TYPE_STR)
+			       && !src1_known) {
+			value_types[si->src1] = value_types[si->src2];
+			value_types_known[si->src1] = 1;
+			types_changed = 1;
+		    } else if (src1_known && src2_known
+			       && value_types[si->src1] != value_types[si->src2])
+			invalid_value_types = 1;
+		}
+		if (si->kind == HIR_TAC_BINARY
+		    && (si->op == HIR_OP_LT || si->op == HIR_OP_LE
 			|| si->op == HIR_OP_GT || si->op == HIR_OP_GE)) {
 		    int src1_known = si->src1 > 0 && si->src1 < program->num_values
 			&& value_types_known[si->src1];
