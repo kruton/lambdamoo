@@ -483,11 +483,13 @@ Completed in the first native-code milestone:
   adding synthetic tick charges to structural SSA blocks; and
 * ownership-correct empty and persistent list constants, with JIT-program
   references retained across repeated native execution and released at program
-  teardown.
+  teardown; and
+* argument-list operation anchors taken from individual argument bytecode PCs,
+  reducing bytecode-anchor rejections without weakening anchor validation.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 553 (8.75%) are JIT-eligible, 4,204 report `invalid-bytecode-anchor`,
-1,541 report `unsupported-program`, and 21 report `unsupported-value-types`; no
+these, 4,001 (63.32%) are JIT-eligible, 1,541 report `unsupported-program`, 730
+report `unsupported-value-types`, and 47 report `invalid-bytecode-anchor`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
@@ -495,8 +497,8 @@ the detailed census identifies the highest-frequency blockers:
 * 1,004 `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections;
 * 412 unsupported non-local assignments;
 * 125 optional/rest scatter rejections; and
-* 4,204 bytecode-anchor failures, including 2,230 singleton-list and 1,139
-  splice-check anchor mismatches reported by the normalized census.
+* 47 remaining bytecode-anchor failures, down from 4,204 after correcting
+  argument-list operation anchors.
 
 Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
@@ -527,6 +529,9 @@ The next reviewable compiler milestones, in dependency order, are:
    (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.
+4. Classify the 730 `unsupported-value-types` results by diagnostic and value
+   producer, then improve inference or add guarded representations for the
+   largest safe category before broadening complex-value operations.
 5. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer

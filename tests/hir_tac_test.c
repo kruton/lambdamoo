@@ -1413,8 +1413,11 @@ test_list_construction_and_splicing_tac_ssa(void)
     e1.bytecode_pc = 1;
     e2.bytecode_pc = 2;
     e3.bytecode_pc = 3;
-    list_expr.bytecode_pc = 4;
-    ret.bytecode_pc = 5;
+    a1.bytecode_pc = 4;
+    a2.bytecode_pc = 5;
+    a3.bytecode_pc = 6;
+    list_expr.bytecode_pc = 7;
+    ret.bytecode_pc = 8;
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1425,9 +1428,58 @@ test_list_construction_and_splicing_tac_ssa(void)
 	      hir_tac_count_binary_op(tac, HIR_OP_LIST_APPEND), 1);
     check_int("list splice add tail count",
 	      hir_tac_count_binary_op(tac, HIR_OP_LIST_ADD_TAIL), 1);
+    check_int("list splice first item pc",
+	      hir_tac_count_bytecode_pc(tac, 4), 1);
+    check_int("list splice second item pc",
+	      hir_tac_count_bytecode_pc(tac, 5), 1);
+    check_int("list splice third item pc",
+	      hir_tac_count_bytecode_pc(tac, 6), 1);
     check_int("list splice verify errors", hir_context_error_count(ctx), 0);
 
     check_int("list splice destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_initial_list_splice_anchor(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List arg;
+    Expr value, list_expr;
+    Stmt ret;
+
+    value = id_expr(0, 10);
+    memset(&arg, 0, sizeof(arg));
+    arg.kind = ARG_SPLICE;
+    arg.expr = &value;
+    arg.bytecode_pc = 2;
+
+    memset(&list_expr, 0, sizeof(list_expr));
+    list_expr.kind = EXPR_LIST;
+    list_expr.lineno = 10;
+    list_expr.e.list = &arg;
+    list_expr.bytecode_pc = 3;
+    ret = return_stmt(&list_expr);
+    ret.bytecode_pc = 4;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    value.bytecode_pc = 1;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("initial splice check count",
+	      hir_tac_count_unary_op(tac, HIR_OP_CHECK_LIST_FOR_SPLICE), 1);
+    check_int("initial splice check pc",
+	      hir_tac_count_bytecode_pc(tac, 2), 1);
+    check_int("initial splice verify errors", hir_context_error_count(ctx), 0);
+
+    check_int("initial splice destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -2692,6 +2744,7 @@ main(void)
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_list_construction_and_splicing_tac_ssa();
+    test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
     test_property_read_and_write_tac_ssa();
