@@ -448,15 +448,16 @@ Completed in the first native-code milestone:
   assignments (`base[from..to] = rhs`), lowered through exact deoptimization and
   interpreter stack reconstruction boundaries; and
 * deopt-before-call boundaries for verb calls (`obj:verb(args...)`), preserving
-  argument stacks, permissions, traceback state, and activation-push semantics.
+  argument stacks, permissions, traceback state, and activation-push semantics; and
+* guarded SSA values for object (`TYPE_OBJ`) and floating-point (`TYPE_FLOAT`)
+  scalars, including object range loops, literal representations, comparisons,
+  and exact deoptimization/return semantics.
 
 The next reviewable compiler milestones are:
 
-1. Extend guarded SSA values beyond integers to object and floating-point
-   scalars, including object ranges and exact arithmetic/error behavior.
-2. Add ownership-aware string values and non-integer list elements so indexing,
+1. Add ownership-aware string values and non-integer list elements so indexing,
    iteration, locals, returns, and deoptimization preserve reference counts.
-3. Model exception and `finally` stack markers before lowering catch expressions,
+2. Model exception and `finally` stack markers before lowering catch expressions,
    `try` statements, or other operations that unwind through native frames.
-4. Add fork and suspension boundaries only after native frames can materialize
+3. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.
