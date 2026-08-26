@@ -517,19 +517,15 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Add membership (`HIR_OP_IN`), currently the first unsupported operation for
-   1,004 verbs, using interpreter-equivalent equality, error, tick, and ownership
-   semantics for strings and lists. Use a runtime helper and deoptimize types
-   whose membership semantics are not yet modeled safely.
-2. Classify and lower the 412 unsupported non-local assignments by left-hand
+1. Classify and lower the 412 unsupported non-local assignments by left-hand
    side shape. Implement the most frequent missing assignment form first and
    retain interpreter evaluation order, mutation ownership, errors, and bytecode
    anchors; keep uncommon or unsafe forms as explicit deoptimization boundaries.
-3. Lower optional, default, and rest scatter assignments
+2. Lower optional, default, and rest scatter assignments
    (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.
-4. Classify the 730 `unsupported-value-types` results by diagnostic and value
+3. Classify the 963 `unsupported-value-types` results by diagnostic and value
    producer, then improve inference or add guarded representations for the
    largest safe category before broadening complex-value operations.
 5. Add shared, ownership-audited runtime helpers for complex-value semantics,

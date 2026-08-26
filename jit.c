@@ -646,7 +646,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 		case HIR_TAC_BINARY:
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL
 			|| instr->op == HIR_OP_LIST_APPEND
-			|| instr->op == HIR_OP_GET_PROP) {
+			|| instr->op == HIR_OP_GET_PROP
+			|| instr->op == HIR_OP_IN) {
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
 					  status, common_return);

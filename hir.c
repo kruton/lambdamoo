@@ -3282,6 +3282,7 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_LE:
     case HIR_OP_GT:
     case HIR_OP_GE:
+    case HIR_OP_IN:
 	return 1;
     default:
 	return 0;
@@ -3438,6 +3439,7 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST;
 	case HIR_OP_GT: return op == OP_GT;
 	case HIR_OP_GE: return op == OP_GE;
+	case HIR_OP_IN: return op == OP_IN;
 	case HIR_OP_BITOR:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITOR);
 	case HIR_OP_BITXOR:
@@ -4012,7 +4014,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
 		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
-		    || ssa_instr->op == HIR_OP_INDEX))
+		    || ssa_instr->op == HIR_OP_INDEX || ssa_instr->op == HIR_OP_IN))
 		program->may_error = 1;
 	    instr->literal_type = ssa_instr->kind == HIR_TAC_CONST
 		? ssa_instr->literal.type

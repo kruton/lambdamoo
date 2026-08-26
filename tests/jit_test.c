@@ -293,7 +293,7 @@ two_local_program(HIROp op)
     block->last = ret;
     program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
 	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
-	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX;
+	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX || op == HIR_OP_IN;
     return program;
 }
 
@@ -567,6 +567,79 @@ list_constant_program(int size)
     ret->literal_type = TYPE_LIST;
     list_const->next = ret;
     block->first = list_const;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+in_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_lhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_rhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *in_tac = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->may_error = 1;
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[1] = TYPE_INT;
+    program->value_types[2] = TYPE_LIST;
+    program->value_types[3] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 12;
+    map->stack_depth = 2;
+    map->ticks_charged = 1;
+    map->num_locals = 2;
+    map->local_values = allocate(sizeof(int) * 2);
+    map->local_values[0] = 1;
+    map->local_values[1] = 2;
+    map->local_types = allocate(sizeof(var_type) * 2);
+    map->local_types[0] = TYPE_INT;
+    map->local_types[1] = TYPE_LIST;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_types = allocate(sizeof(var_type) * 2);
+    map->stack_types[0] = TYPE_INT;
+    map->stack_types[1] = TYPE_LIST;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_lhs->value = 1;
+    load_lhs->local_id = 0;
+    load_lhs->literal_type = TYPE_INT;
+    load_lhs->deopt_map = 0;
+    load_rhs->value = 2;
+    load_rhs->local_id = 1;
+    load_rhs->literal_type = TYPE_LIST;
+    load_rhs->deopt_map = 0;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 12;
+    in_tac->source_lineno = 7;
+    in_tac->bytecode_pc = 12;
+    in_tac->value = 3;
+    in_tac->src1 = 1;
+    in_tac->src2 = 2;
+    in_tac->op = HIR_OP_IN;
+    in_tac->deopt_map = 1;
+    ret->src1 = 3;
+
+    load_lhs->next = load_rhs;
+    load_rhs->next = tick;
+    tick->next = in_tac;
+    in_tac->next = ret;
+    block->first = load_lhs;
     block->last = ret;
     return program;
 }
@@ -3026,6 +3099,41 @@ main(void)
 	    }
 	    jit_program_free(list_const_p);
 	}
+    }
+
+    {
+	JITProgram *in_p = in_program();
+	Var env[2];
+	Var stack[4];
+	JITDeoptState deopt_state;
+
+	env[0].type = TYPE_INT;
+	env[0].v.num = 42;
+	env[1] = new_list(2);
+	env[1].v.list[1].type = TYPE_INT;
+	env[1].v.list[1].v.num = 10;
+	env[1].v.list[2].type = TYPE_INT;
+	env[1].v.list[2].v.num = 42;
+
+	check(jit_program_compile(in_p) == 1, "in JIT compile failed");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	memset(&deopt_state, 0, sizeof(deopt_state));
+	JITRunResult res = jit_program_execute(in_p, env, &result,
+					       &ticks, &timed_out, &error,
+					       0, &deopt_state, stack);
+	check(res == JIT_RUN_FALLBACK, "in deopt fallback result");
+	check(deopt_state.bytecode_pc == 12, "in deopt bytecode_pc");
+	check(deopt_state.stack_depth == 2, "in deopt stack depth");
+	check(stack[0].type == TYPE_INT && stack[0].v.num == 42,
+	      "in deopt stack[0] lhs");
+	check(stack[1].type == TYPE_LIST && stack[1].v.list[0].v.num == 2,
+	      "in deopt stack[1] rhs");
+	free_var(stack[0]);
+	free_var(stack[1]);
+	free_var(env[1]);
+	jit_program_free(in_p);
     }
 
     jit_program_free(program);
