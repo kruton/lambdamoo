@@ -3688,7 +3688,8 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 
 static int
 jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
-		  Bytecodes *bytecodes, var_type *value_types)
+		  Bytecodes *bytecodes, var_type *value_types,
+		  unsigned char *value_is_tagged)
 {
     JITDeoptMap *map;
     int i;
@@ -3769,7 +3770,8 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	for (i = 0; i < map->num_locals; i++)
 	    map->local_types[i] = (instr->local_values[i] > 0
 				   && instr->local_values[i] < program->num_values)
-		? value_types[instr->local_values[i]] : TYPE_INT;
+		? (value_is_tagged[instr->local_values[i]]
+		   ? TYPE_ANY : value_types[instr->local_values[i]]) : TYPE_INT;
     }
     if (map->stack_depth) {
 	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
@@ -3779,7 +3781,8 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	for (i = 0; i < (int) map->stack_depth; i++)
 	    map->stack_types[i] = (instr->stack_values[i] > 0
 				   && instr->stack_values[i] < program->num_values)
-		? value_types[instr->stack_values[i]] : TYPE_INT;
+		? (value_is_tagged[instr->stack_values[i]]
+		   ? TYPE_ANY : value_types[instr->stack_values[i]]) : TYPE_INT;
     }
     return program->num_deopt_maps++;
 }
@@ -3793,6 +3796,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     var_type *value_types;
     unsigned char *value_types_known;
     unsigned char *value_types_conflicted;
+    unsigned char *value_is_tagged;
     const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
@@ -3844,11 +3848,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				 ? program->num_values : 1, M_PROGRAM);
     value_types_conflicted = mymalloc(program->num_values > 0
 				      ? program->num_values : 1, M_PROGRAM);
+    value_is_tagged = mymalloc(program->num_values > 0
+			      ? program->num_values : 1, M_PROGRAM);
     for (i = 0; i < program->num_values; i++)
 	value_types[i] = TYPE_INT;
     memset(value_types_known, 0, program->num_values > 0
 	   ? program->num_values : 1);
     memset(value_types_conflicted, 0, program->num_values > 0
+	   ? program->num_values : 1);
+    memset(value_is_tagged, 0, program->num_values > 0
 	   ? program->num_values : 1);
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
@@ -4182,6 +4190,42 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
+    /* Preserve the runtime tag for list elements whose type cannot be inferred.
+       Parallel-copy destinations need a tag as well, including joins with a
+       statically typed default value. */
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+
+	for (si = ssa_block->first; si; si = si->next) {
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
+    do {
+	types_changed = 0;
+	for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	    HIRSSAInstr *si;
+
+	    for (si = ssa_block->first; si; si = si->next) {
+		HIRParallelCopy *copy;
+
+		for (copy = si->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& value_is_tagged[copy->src]
+			&& !value_is_tagged[copy->dst]) {
+			value_is_tagged[copy->dst] = 1;
+			types_changed = 1;
+		    }
+		if (si == ssa_block->last)
+		    break;
+	    }
+	}
+    } while (types_changed);
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
@@ -4201,6 +4245,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     if (value_type_diagnostic) {
 	myfree(value_types_conflicted, M_PROGRAM);
 	myfree(value_types_known, M_PROGRAM);
+	myfree(value_is_tagged, M_PROGRAM);
 	myfree(value_types, M_PROGRAM);
 	jit_program_free(program);
 	return jit_program_unsupported_with_diagnostic("unsupported-value-types",
@@ -4211,6 +4256,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	if (value_types_known[i] && value_types[i] == TYPE_FLOAT) {
 	    myfree(value_types_conflicted, M_PROGRAM);
 	    myfree(value_types_known, M_PROGRAM);
+	    myfree(value_is_tagged, M_PROGRAM);
 	    myfree(value_types, M_PROGRAM);
 	    jit_program_free(program);
 	    return jit_program_unsupported_with_diagnostic("unsupported-float-representation",
@@ -4247,6 +4293,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
 		    && value_types_conflicted[ssa_instr->src2]);
+	    int uses_tagged = (ssa_instr->src1 > 0
+			       && ssa_instr->src1 < program->num_values
+			       && value_is_tagged[ssa_instr->src1])
+		|| (ssa_instr->src2 > 0
+		    && ssa_instr->src2 < program->num_values
+		    && value_is_tagged[ssa_instr->src2]);
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
@@ -4274,6 +4326,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				    || ssa_instr->kind == HIR_TAC_BINARY
 				    || ssa_instr->kind == HIR_TAC_RETURN
 				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
+		instr->kind = HIR_TAC_DEOPT;
+	    if (uses_tagged && (ssa_instr->kind == HIR_TAC_UNARY
+			       || ssa_instr->kind == HIR_TAC_BINARY
+			       || ssa_instr->kind == HIR_TAC_RETURN
+			       || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
 		&& value_types_known[ssa_instr->src1]
@@ -4369,12 +4426,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
-						  &bytecode_program->main_vector,
-						  value_types);
+					  &bytecode_program->main_vector,
+					  value_types, value_is_tagged);
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
 		myfree(value_types_conflicted, M_PROGRAM);
 		myfree(value_types_known, M_PROGRAM);
+		myfree(value_is_tagged, M_PROGRAM);
 		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
 		return jit_program_unsupported_with_diagnostic("invalid-deopt-map",
@@ -4452,6 +4510,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_conflicted, M_PROGRAM);
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
+    program->value_is_tagged = value_is_tagged;
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */

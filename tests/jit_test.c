@@ -1512,6 +1512,67 @@ list_index_typed_program(var_type elem_type)
 }
 
 static JITProgram *
+list_index_tagged_deopt_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *copy_instr = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *deopt_instr = instruction(HIR_TAC_DEOPT);
+    JITCopy *copy = allocate(sizeof(JITCopy));
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_is_tagged = allocate(5);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[4] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = 12;
+    map->source_lineno = 4;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 4;
+    map->stack_types[0] = TYPE_ANY;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = copy_instr;
+    copy->src = 3;
+    copy->dst = 4;
+    copy_instr->copies = copy;
+    copy_instr->next = deopt_instr;
+    deopt_instr->deopt_map = 1;
+    block->first = load_list;
+    block->last = deopt_instr;
+    return program;
+}
+
+static JITProgram *
 verb_call_boundary_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3165,6 +3226,29 @@ main(void)
 	      == JIT_RUN_FALLBACK, "list index elem type mismatch did not fallback");
 	jit_program_free(idx_str);
 	myfree(elements, M_LIST);
+    }
+
+    /* Dynamically tagged list elements survive SSA copies and deoptimization. */
+    {
+	JITProgram *tagged = list_index_tagged_deopt_program();
+	Var tagged_env[1];
+	Var tagged_stack[1];
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_STR;
+	tagged_env[0].v.list[1].v.str = str_dup("tagged element");
+	memset(tagged_stack, 0, sizeof(tagged_stack));
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt,
+				  tagged_stack) == JIT_RUN_FALLBACK,
+	      "tagged list index did not reach deopt boundary");
+	check(tagged_stack[0].type == TYPE_STR
+	      && !strcmp(tagged_stack[0].v.str, "tagged element"),
+	      "tagged list index reconstructed the wrong value");
+	free_var(tagged_stack[0]);
+	free_var(tagged_env[0]);
+	jit_program_free(tagged);
     }
 
     /* Exception and finally stack marker deoptimization tests */

@@ -76,6 +76,7 @@ struct JITProgram {
     size_t machine_code_len;
     Num *deopt_values;
     var_type *value_types;
+    unsigned char *value_is_tagged;
 };
 
 extern int jit_rt_is_true(int64_t, int);

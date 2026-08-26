@@ -1536,12 +1536,27 @@ build_mir(JITProgram *program, MIRBuild *build)
 					offsetof(Var, type), elem_addr, 0, 1)));
 			var_type expected_elem_type = program->value_types
 			    ? program->value_types[instr->value] : TYPE_INT;
+			int tagged_result = program->value_is_tagged
+			    && program->value_is_tagged[instr->value];
 
-			append(build, MIR_new_insn(build->context, MIR_BNE,
+			if (tagged_result)
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    (program->num_values + instr->value) * sizeof(Num),
+				    deopt_values, 0, 1),
+				MIR_new_reg_op(build->context, elem_type)));
+			else
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, elem_type),
 				MIR_new_int_op(build->context, expected_elem_type)));
-			if (expected_elem_type == TYPE_FLOAT) {
+			if (tagged_result) {
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), elem_addr, 0, 1)));
+			} else if (expected_elem_type == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			    sprintf(name, "elem_fl_ptr%d", copy_serial++);
 			    MIR_reg_t elem_fl_ptr = new_reg(build, name);
@@ -1782,9 +1797,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 			int count = 0;
 			int n = 0;
 			MIR_reg_t *temps;
+			MIR_reg_t *tag_temps;
 			for (copy = instr->copies; copy; copy = copy->next)
 			    count++;
 			temps = mymalloc(sizeof(MIR_reg_t) * count, M_PROGRAM);
+			tag_temps = mymalloc(sizeof(MIR_reg_t) * count, M_PROGRAM);
+			memset(tag_temps, 0, sizeof(MIR_reg_t) * count);
 			for (copy = instr->copies; copy; copy = copy->next) {
 			    char name[32];
 			    sprintf(name, "copy%d", copy_serial++);
@@ -1805,6 +1823,22 @@ build_mir(JITProgram *program, MIRBuild *build)
 									 temps[n]),
 							  MIR_new_reg_op(build->context,
 									 values[copy->src])));
+			    }
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[copy->dst]) {
+				sprintf(name, "copy_tag%d", copy_serial++);
+				tag_temps[n] = new_reg(build, name);
+				if (program->value_is_tagged[copy->src])
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_reg_op(build->context, tag_temps[n]),
+					MIR_new_mem_op(build->context, MIR_T_I32,
+					    (program->num_values + copy->src) * sizeof(Num),
+					    deopt_values, 0, 1)));
+				else
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_reg_op(build->context, tag_temps[n]),
+					MIR_new_int_op(build->context,
+					    program->value_types[copy->src])));
 			    }
 			    n++;
 			}
@@ -1860,8 +1894,15 @@ build_mir(JITProgram *program, MIRBuild *build)
 									 copy->dst * sizeof(Num),
 									 deopt_values, 0, 1)));
 			    }
+			    if (tag_temps[n])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_mem_op(build->context, MIR_T_I32,
+					(program->num_values + copy->dst) * sizeof(Num),
+					deopt_values, 0, 1),
+				    MIR_new_reg_op(build->context, tag_temps[n])));
 			    n++;
 			}
+			myfree(tag_temps, M_PROGRAM);
 			myfree(temps, M_PROGRAM);
 		    }
 		    break;
@@ -2079,6 +2120,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->deopt_values, M_PROGRAM);
     if (program->value_types)
 	myfree(program->value_types, M_PROGRAM);
+    if (program->value_is_tagged)
+	myfree(program->value_is_tagged, M_PROGRAM);
     block = program->blocks;
     while (block) {
 	JITBlock *next_block = block->next;
@@ -2125,9 +2168,11 @@ jit_program_bytes(JITProgram *program)
 	return 0;
     bytes = sizeof(JITProgram);
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
-    bytes += sizeof(Num) * program->num_values;
+    bytes += sizeof(Num) * program->num_values * 2;
     if (program->value_types)
 	bytes += sizeof(var_type) * program->num_values;
+    if (program->value_is_tagged)
+	bytes += sizeof(unsigned char) * program->num_values;
     for (i = 0; i < program->num_deopt_maps; i++)
 	bytes += sizeof(int) * (program->deopt_maps[i].num_locals
 			      + program->deopt_maps[i].stack_depth);
@@ -2242,9 +2287,9 @@ jit_program_compile(JITProgram *program)
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
     program->mir_context = build.context;
-    program->deopt_values = mymalloc(sizeof(Num) * program->num_values,
+    program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
-    memset(program->deopt_values, 0, sizeof(Num) * program->num_values);
+    memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
     program->state = JIT_STATE_COMPILED;
     return 1;
 }
@@ -2317,6 +2362,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	for (i = 0; i < map->num_locals; i++)
 	    if (map->local_values[i] > 0) {
 		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
+		if (type == TYPE_ANY)
+		    type = (var_type) program->deopt_values[program->num_values
+			+ map->local_values[i]];
 		Var value = materialize_deopt_value(type,
 			program->deopt_values[map->local_values[i]]);
 
@@ -2325,6 +2373,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    }
 	for (i = 0; deopt_stack && i < (int) map->stack_depth; i++) {
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
+	    if (type == TYPE_ANY)
+		type = (var_type) program->deopt_values[program->num_values
+		    + map->stack_values[i]];
 
 	    deopt_stack[i] = materialize_deopt_value(type,
 		program->deopt_values[map->stack_values[i]]);
