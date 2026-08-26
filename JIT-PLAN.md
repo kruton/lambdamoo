@@ -500,10 +500,13 @@ Completed in the first native-code milestone:
   construction, ownership, and errors to the existing VM implementation; and
 * arithmetic on known complex values resumed at its exact interpreter boundary,
   preserving native integer and float arithmetic while allowing string and list
-  operations to remain under the VM's ownership and error semantics.
+  operations to remain under the VM's ownership and error semantics; and
+* direct string indexing resumed at `OP_REF`, `$` string length resumed at
+  `EOP_LENGTH`, and `length(string)` lowered natively with configured byte- or
+  Unicode-character semantics and exact built-in identity validation.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 5,982 (94.67%) are JIT-eligible, 264 report `unsupported-value-types`,
+these, 6,085 (96.30%) are JIT-eligible, 161 report `unsupported-value-types`,
 65 report `invalid-bytecode-anchor`, and 8 report `unsupported-program`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
@@ -536,12 +539,10 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Resolve the remaining value-type conflicts in census order: 131 list
-   operand conflicts, then 91 parallel-copy conflicts. Distinguish string
-   indexing/length from list operations at deoptimization boundaries before
-   changing native ownership behavior. Treat the remaining property, equality,
-   arithmetic, scatter, and comparison conflicts as follow-up cases rather than
-   broadening types speculatively.
+1. Resolve the 106 remaining parallel-copy type conflicts by classifying the
+   conflicting producers and joins. Treat the remaining property, equality,
+   non-collection, arithmetic, scatter, and comparison conflicts as follow-up
+   cases rather than broadening types speculatively.
 2. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until

@@ -7,6 +7,7 @@
 #include "integer_arithmetic.h"
 #include "list.h"
 #include "storage.h"
+#include "utf.h"
 #include "utils.h"
 
 #include <limits.h>
@@ -1163,6 +1164,32 @@ string_not_program(const char *s)
     return_instr->literal_type = TYPE_INT;
     return program;
 }
+
+static JITProgram *
+string_length_program(const char *s)
+{
+    JITProgram *program = string_const_program(s);
+    JITInstruction *constant = program->blocks->first;
+    JITInstruction *return_instr = constant->next;
+    JITInstruction *length_instr = instruction(HIR_TAC_UNARY);
+
+    program->num_values = 3;
+    myfree(program->value_types, M_PROGRAM);
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    constant->next = length_instr;
+    length_instr->value = 2;
+    length_instr->src1 = 1;
+    length_instr->op = HIR_OP_LENGTH;
+    length_instr->deopt_map = 0;
+    length_instr->next = return_instr;
+    return_instr->src1 = 2;
+    return_instr->literal_type = TYPE_INT;
+    return program;
+}
+
 static JITProgram *
 catch_stack_marker_deopt_program(void)
 {
@@ -1759,7 +1786,12 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			goto do_fallback;
 		    }
 		}
-		if (program->value_types && program->value_types[instr->src1] == TYPE_FLOAT) {
+		if (instr->op == HIR_OP_LENGTH && program->value_types
+		    && program->value_types[instr->src1] == TYPE_STR)
+		    values[instr->value] = memo_strlen_utf((const char *)
+			(intptr_t) values[instr->src1]);
+		else if (program->value_types
+			 && program->value_types[instr->src1] == TYPE_FLOAT) {
 		    FlNum f;
 		    memcpy(&f, &values[instr->src1], sizeof(FlNum));
 		    if (instr->op == HIR_OP_NEGATE) {
@@ -2885,6 +2917,17 @@ main(void)
 	      == JIT_RUN_FALLBACK, "empty string branch did not fallback");
 	free_var(branch_env[0]);
 	jit_program_free(str_branch);
+
+	JITProgram *str_length = string_length_program("h\xc3\xa9llo");
+	ticks = 10;
+	check(jit_program_execute(str_length, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string length execution failed");
+	check(result.type == TYPE_INT
+	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
+	      "string length returned wrong configured character length");
+	check_differential(str_length, 0, 10, 0, "string length differential");
+	jit_program_free(str_length);
     }
 
     /* Non-integer list indexing tests */

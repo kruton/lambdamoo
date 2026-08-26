@@ -585,11 +585,71 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_label_op(build->context, deopt),
 						  MIR_new_reg_op(build->context, list_ptr),
 						  MIR_new_int_op(build->context, 0)));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_mem_op(build->context,
-								 sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-								 offsetof(Var, v.num), list_ptr, 0, 1)));
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_STR) {
+			    MIR_label_t scan = MIR_new_label(build->context);
+			    MIR_reg_t offset;
+			    MIR_reg_t byte;
+#if UNICODE_STRINGS
+			    MIR_label_t continuation = MIR_new_label(build->context);
+			    MIR_reg_t prefix;
+#endif
+			    char name[32];
+
+			    sprintf(name, "str_offset%d", copy_serial);
+			    offset = new_reg(build, name);
+			    sprintf(name, "str_byte%d", copy_serial);
+			    byte = new_reg(build, name);
+#if UNICODE_STRINGS
+			    sprintf(name, "str_prefix%d", copy_serial++);
+			    prefix = new_reg(build, name);
+#else
+			    copy_serial++;
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, scan);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_mem_op(build->context, MIR_T_U8, 0,
+					       list_ptr, offset, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, loaded),
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_int_op(build->context, 0)));
+#if UNICODE_STRINGS
+			    append(build, MIR_new_insn(build->context, MIR_AND,
+				MIR_new_reg_op(build->context, prefix),
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_int_op(build->context, 0xc0)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, continuation),
+				MIR_new_reg_op(build->context, prefix),
+				MIR_new_int_op(build->context, 0x80)));
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 1)));
+#if UNICODE_STRINGS
+			    append(build, continuation);
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_int_op(build->context, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, scan)));
+			} else
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), list_ptr, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 						  MIR_new_label_op(build->context, loaded)));
 			append(build, deopt);

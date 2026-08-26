@@ -3,6 +3,7 @@
 #include "hir.h"
 
 #include "integer_arithmetic.h"
+#include "opcode.h"
 #include "storage.h"
 
 #include <limits.h>
@@ -33,6 +34,34 @@ check_rejected(const char *name, int accepted, int before_errors,
 	fprintf(stderr, "%s: verifier did not record an error\n", name);
 	failures++;
     }
+}
+
+static void
+test_string_builtin_length_anchor(void)
+{
+    Byte vector[] = {OP_BI_FUNC_CALL, 6};
+    Bytecodes bytecodes;
+
+    memset(&bytecodes, 0, sizeof(bytecodes));
+    bytecodes.vector = vector;
+    bytecodes.size = sizeof(vector);
+    check_int("string length built-in anchor",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_LENGTH), 1);
+    vector[1] = 1;
+    check_int("other built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 1,
+						    HIR_OP_LENGTH), 0);
+    check_int("mismatched encoded built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_LENGTH), 0);
+    vector[1] = 6;
+    check_int("non-length operation rejected at length built-in",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_ABS), 0);
+    check_int("truncated built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 1, 6,
+						    HIR_OP_LENGTH), 0);
 }
 
 #ifdef HIR_DUMP_SSA
@@ -2907,6 +2936,7 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
 int
 main(void)
 {
+    test_string_builtin_length_anchor();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();

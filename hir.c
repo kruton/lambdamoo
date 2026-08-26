@@ -22,6 +22,17 @@
 #include <stddef.h>
 #include <string.h>
 
+static int
+is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
+				HIROp op)
+{
+    const char *func_name = name_func_by_num(func);
+
+    return op == HIR_OP_LENGTH && pc != NO_BYTECODE_PC && pc + 1 < bc->size
+	&& bc->vector[pc] == OP_BI_FUNC_CALL && bc->vector[pc + 1] == func
+	&& func_name && !strcmp(func_name, "length");
+}
+
 typedef struct HIRExpr HIRExpr;
 typedef struct HIRStmt HIRStmt;
 typedef struct HIRArg HIRArg;
@@ -3907,8 +3918,36 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
 		if (value_types_known[operand]
-		    && value_types[operand] != TYPE_LIST)
-		    value_type_diagnostic = "value-types: list operand conflict";
+		    && value_types[operand] != TYPE_LIST) {
+		    if (value_types[operand] == TYPE_STR) {
+			int string_index_deopt = si->kind == HIR_TAC_BINARY
+			    && si->bytecode_pc != NO_BYTECODE_PC
+			    && bytecode_program->main_vector.vector[si->bytecode_pc]
+			       == OP_REF;
+			int string_length_deopt = si->kind == HIR_TAC_UNARY
+			    && si->bytecode_pc != NO_BYTECODE_PC
+			    && jit_extended_anchor_matches(&bytecode_program->main_vector,
+						   si->bytecode_pc, EOP_LENGTH);
+			int string_builtin_length = is_string_builtin_length_anchor(
+			    &bytecode_program->main_vector, si->bytecode_pc,
+			    si->func, si->op);
+
+			if (!string_index_deopt && !string_length_deopt
+			    && !string_builtin_length
+			    && si->kind == HIR_TAC_BINARY)
+			    value_type_diagnostic = "value-types: string index operand";
+			else if (!string_index_deopt && !string_length_deopt
+				 && !string_builtin_length
+				 && si->bytecode_pc != NO_BYTECODE_PC
+				 && bytecode_program->main_vector.vector[si->bytecode_pc]
+				    == OP_BI_FUNC_CALL)
+			    value_type_diagnostic = "value-types: string built-in length operand";
+			else if (!string_index_deopt && !string_length_deopt
+				 && !string_builtin_length)
+			    value_type_diagnostic = "value-types: string length operand";
+		    } else
+			value_type_diagnostic = "value-types: non-collection operand";
+		}
 		else {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
@@ -4069,6 +4108,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
+		&& value_types_known[ssa_instr->src1]
+		&& value_types[ssa_instr->src1] == TYPE_STR
+		&& ((ssa_instr->kind == HIR_TAC_BINARY
+		     && ssa_instr->op == HIR_OP_INDEX
+		     && bytecode_program->main_vector.vector[ssa_instr->bytecode_pc]
+		        == OP_REF)
+		    || (ssa_instr->kind == HIR_TAC_UNARY
+			&& ssa_instr->op == HIR_OP_LENGTH
+			&& jit_extended_anchor_matches(&bytecode_program->main_vector,
+						       ssa_instr->bytecode_pc,
+						       EOP_LENGTH))))
+		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
 		    || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
@@ -7150,6 +7202,13 @@ lower_stmt_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 #ifdef HIR_TESTING
+int
+hir_test_string_builtin_length_anchor(Bytecodes *bc, unsigned pc,
+				      unsigned func, HIROp op)
+{
+    return is_string_builtin_length_anchor(bc, pc, func, op);
+}
+
 static HIRTacProgram *
 new_test_tac_program(HIRContext *ctx)
 {
