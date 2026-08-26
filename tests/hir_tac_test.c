@@ -3150,6 +3150,39 @@ test_uninitialized_entry_load_classification(void)
 }
 
 static void
+test_builtin_entry_types(void)
+{
+    int first_user = SLOT_FLOAT + 1;
+    var_type type = TYPE_ANY;
+
+    check_int("player entry load has object type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_PLAYER, first_user, &type), 1);
+    check_int("player entry load type", type, TYPE_OBJ);
+    check_int("args entry load has list type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_ARGS, first_user, &type), 1);
+    check_int("args entry load type", type, TYPE_LIST);
+    check_int("verb entry load has string type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_VERB, first_user, &type), 1);
+    check_int("verb entry load type", type, TYPE_STR);
+    check_int("NUM entry load has integer type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_NUM, first_user, &type), 1);
+    check_int("NUM entry load type", type, TYPE_INT);
+    check_int("user local has no built-in type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  first_user, first_user, &type), 0);
+    check_int("waif-capable this has no fixed type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_THIS, first_user, &type), 0);
+    check_int("anchored load has no entry type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, 0, SLOT_THIS,
+					  first_user, &type), 0);
+}
+
+static void
 test_length_expr_in_stores_and_negatives(void)
 {
     Names names;
@@ -3271,6 +3304,7 @@ main(void)
     test_string_add_operand_inference();
     test_list_operand_inference();
     test_uninitialized_entry_load_classification();
+    test_builtin_entry_types();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();

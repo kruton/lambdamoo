@@ -222,6 +222,8 @@ extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_is_uninitialized_entry_load(HIRTacKind, unsigned, int,
 						int);
+extern int hir_test_builtin_entry_type(HIRTacKind, unsigned, int, int,
+				       var_type *);
 extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
 					       HIRValueAnalysis *);
 extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);

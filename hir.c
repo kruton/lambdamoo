@@ -47,6 +47,44 @@ is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
 	&& local_id >= first_user_local;
 }
 
+static int
+builtin_entry_type(HIRTacKind kind, unsigned bytecode_pc, int local_id,
+		   int first_user_local, var_type *type)
+{
+    if (kind != HIR_TAC_LOAD_LOCAL || bytecode_pc != NO_BYTECODE_PC
+	|| local_id < 0 || local_id >= first_user_local)
+	return 0;
+
+    switch (local_id) {
+    case SLOT_NUM:
+    case SLOT_OBJ:
+    case SLOT_STR:
+    case SLOT_LIST:
+    case SLOT_ERR:
+    case SLOT_INT:
+    case SLOT_FLOAT:
+	*type = TYPE_INT;
+	return 1;
+    case SLOT_PLAYER:
+    case SLOT_DOBJ:
+    case SLOT_IOBJ:
+	*type = TYPE_OBJ;
+	return 1;
+    case SLOT_VERB:
+    case SLOT_ARGSTR:
+    case SLOT_DOBJSTR:
+    case SLOT_PREPSTR:
+    case SLOT_IOBJSTR:
+	*type = TYPE_STR;
+	return 1;
+    case SLOT_ARGS:
+	*type = TYPE_LIST;
+	return 1;
+    default:
+	return 0;
+    }
+}
+
 #ifdef HIR_TESTING
 static int
 is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
@@ -3445,6 +3483,23 @@ ssa_definition_for_value(HIRSSAProgram *ssa, int value)
 }
 
 static int
+ssa_first_list_element(HIRSSAProgram *ssa, int value)
+{
+    HIRSSAInstr *def;
+
+    while ((def = ssa_definition_for_value(ssa, value)) != 0) {
+	if (def->kind == HIR_TAC_UNARY
+	    && def->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return def->src1;
+	if (def->kind != HIR_TAC_BINARY
+	    || def->op != HIR_OP_LIST_ADD_TAIL)
+	    return 0;
+	value = def->src1;
+    }
+    return 0;
+}
+
+static int
 jit_extended_anchor_matches(Bytecodes *bc, unsigned pc, Extended_Opcode op)
 {
     return pc + 1 < bc->size && bc->vector[pc] == OP_EXTENDED
@@ -3869,8 +3924,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
 	    if (si->value > 0 && si->value < program->num_values) {
+		var_type entry_type;
+
 		if (si->kind == HIR_TAC_CONST) {
 		    value_types[si->value] = si->literal.type;
+		    value_types_known[si->value] = 1;
+		} else if (builtin_entry_type(si->kind, si->bytecode_pc,
+					   si->local_id,
+					   first_user_slot(bytecode_program->version),
+					   &entry_type)) {
+		    value_types[si->value] = entry_type;
 		    value_types_known[si->value] = 1;
 		} else if (is_uninitialized_entry_load(si->kind,
 						       si->bytecode_pc,
@@ -4182,15 +4245,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    }
 	    if (si->kind == HIR_TAC_CALL) {
 		const char *func_name = name_func_by_num(si->func);
-		HIRSSAInstr *args = ssa_definition_for_value(ssa, si->src1);
+		int first_arg = ssa_first_list_element(ssa, si->src1);
 
-		if (func_name && !strcmp(func_name, "valid")
-		    && args && args->kind == HIR_TAC_UNARY
-		    && args->op == HIR_OP_MAKE_SINGLETON_LIST
-		    && args->src1 > 0 && args->src1 < program->num_values
-		    && !value_types_known[args->src1]) {
-		    value_types[args->src1] = TYPE_OBJ;
-		    value_types_known[args->src1] = 1;
+		if (func_name
+		    && (!strcmp(func_name, "valid") || !strcmp(func_name, "notify"))
+		    && first_arg > 0 && first_arg < program->num_values
+		    && !value_types_known[first_arg]) {
+		    value_types[first_arg] = TYPE_OBJ;
+		    value_types_known[first_arg] = 1;
 		}
 	    }
 	    if (si == ssa_block->last)
@@ -7761,6 +7823,14 @@ hir_test_is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
 {
     return is_uninitialized_entry_load(kind, bytecode_pc, local_id,
 				       first_user_local);
+}
+
+int
+hir_test_builtin_entry_type(HIRTacKind kind, unsigned bytecode_pc,
+			    int local_id, int first_user_local, var_type *type)
+{
+    return builtin_entry_type(kind, bytecode_pc, local_id, first_user_local,
+			      type);
 }
 
 static HIRTacProgram *
