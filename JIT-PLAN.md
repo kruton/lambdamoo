@@ -443,20 +443,20 @@ Completed in the first native-code milestone:
 * conditional expressions (`EXPR_COND` `c ? t | f`) with bytecode anchors,
   nested evaluation, and clean SSA phi join; and
 * `break` and `continue`, including labeled exits from nested `while`, range,
-  and list loops without losing bytecode resume anchors.
+  and list loops without losing bytecode resume anchors; and
+* range expressions (`base[from..to]`) for list and string slicing, plus range
+  assignments (`base[from..to] = rhs`), lowered through exact deoptimization and
+  interpreter stack reconstruction boundaries.
 
 The next reviewable compiler milestones are:
 
-1. Range expressions (`base[from..to]`) for list/string slicing and range
-   assignment, initially through an exact deopt/runtime boundary and then with
-   native lowering when ownership is modeled.
-2. Deopt-before-call boundaries for verb calls, preserving argument stacks,
+1. Deopt-before-call boundaries for verb calls, preserving argument stacks,
    permissions, traceback state, and activation-push semantics.
-3. Extend guarded SSA values beyond integers to object and floating-point
+2. Extend guarded SSA values beyond integers to object and floating-point
    scalars, including object ranges and exact arithmetic/error behavior.
-4. Add ownership-aware string values and non-integer list elements so indexing,
+3. Add ownership-aware string values and non-integer list elements so indexing,
    iteration, locals, returns, and deoptimization preserve reference counts.
-5. Model exception and `finally` stack markers before lowering catch expressions,
+4. Model exception and `finally` stack markers before lowering catch expressions,
    `try` statements, or other operations that unwind through native frames.
-6. Add fork and suspension boundaries only after native frames can materialize
+5. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.
