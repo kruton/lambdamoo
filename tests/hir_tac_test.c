@@ -2554,6 +2554,44 @@ test_fork_stmt_tac_ssa(void)
 }
 
 static void
+test_fork_body_does_not_reject_enclosing_hir(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr time_expr, unsupported_body_expr;
+    Stmt body_stmt, fork_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    time_expr = int_expr(5, 65);
+    memset(&unsupported_body_expr, 0, sizeof(unsupported_body_expr));
+    unsupported_body_expr.kind = EXPR_LENGTH;
+    unsupported_body_expr.lineno = 66;
+    body_stmt = expr_stmt(&unsupported_body_expr);
+
+    memset(&fork_stmt, 0, sizeof(fork_stmt));
+    fork_stmt.kind = STMT_FORK;
+    fork_stmt.lineno = 65;
+    fork_stmt.s.fork.time = &time_expr;
+    fork_stmt.s.fork.id = 0;
+    fork_stmt.s.fork.body = &body_stmt;
+    fork_stmt.s.fork.code_unit = 1;
+
+    tac = lower_stmt(&names, &fork_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("fork body does not add unsupported tac",
+	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 0);
+    check_int("fork body does not add hir errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_length_expr_in_index_tac_ssa(void)
 {
     Names names;
@@ -2622,6 +2660,7 @@ main(void)
     test_try_except_tac_ssa();
     test_try_finally_tac_ssa();
     test_fork_stmt_tac_ssa();
+    test_fork_body_does_not_reject_enclosing_hir();
     test_length_expr_in_index_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();

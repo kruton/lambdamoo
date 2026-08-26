@@ -391,6 +391,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack_capacity = 0;
     ctx->lower_stack = 0;
     ctx->current_loop = 0;
+    ctx->current_length_base = 0;
 
     return ctx;
 }
@@ -3278,14 +3279,18 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_MAKE_SINGLETON_LIST;
 	if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
 	    return op == OP_CHECK_LIST_FOR_SPLICE;
-	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
-	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_LENGTH)
+	if (instr->op == HIR_OP_LENGTH)
 	    return (instr->bytecode_pc + 1 < bc->size
 		    && bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		    && bc->vector[instr->bytecode_pc + 1] == instr->func)
 		|| op == OP_FOR_LIST
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_LENGTH);
+	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
+	    || instr->op == HIR_OP_TYPEOF)
+	    return instr->bytecode_pc + 1 < bc->size
+		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					   EOP_COMPLEMENT);
     }
@@ -5409,19 +5414,12 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	stmt->u.for_range.body = lift_stmt_list(ctx, ast->s.range.body);
 	return stmt;
     case STMT_FORK:
-	{
-	    unsigned enclosing_code_unit = ctx->current_code_unit;
-
-	    stmt = new_stmt(ctx, HIR_STMT_FORK);
-	    stmt->source_lineno = ast->lineno;
-	    stmt->bytecode_pc = ast->bytecode_pc;
-	    stmt->u.fork.local_id = ast->s.fork.id;
-	    stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
-	    ctx->current_code_unit = ast->s.fork.code_unit;
-	    stmt->u.fork.body = lift_stmt_list(ctx, ast->s.fork.body);
-	    ctx->current_code_unit = enclosing_code_unit;
-	    return stmt;
-	}
+	stmt = new_stmt(ctx, HIR_STMT_FORK);
+	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
+	stmt->u.fork.local_id = ast->s.fork.id;
+	stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
+	return stmt;
     case STMT_TRY_EXCEPT:
 	stmt = new_stmt(ctx, HIR_STMT_TRY_EXCEPT);
 	stmt->source_lineno = ast->lineno;
