@@ -3,6 +3,7 @@
 #include "hir.h"
 
 #include "integer_arithmetic.h"
+#include "opcode.h"
 #include "storage.h"
 
 #include <limits.h>
@@ -33,6 +34,34 @@ check_rejected(const char *name, int accepted, int before_errors,
 	fprintf(stderr, "%s: verifier did not record an error\n", name);
 	failures++;
     }
+}
+
+static void
+test_string_builtin_length_anchor(void)
+{
+    Byte vector[] = {OP_BI_FUNC_CALL, 6};
+    Bytecodes bytecodes;
+
+    memset(&bytecodes, 0, sizeof(bytecodes));
+    bytecodes.vector = vector;
+    bytecodes.size = sizeof(vector);
+    check_int("string length built-in anchor",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_LENGTH), 1);
+    vector[1] = 1;
+    check_int("other built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 1,
+						    HIR_OP_LENGTH), 0);
+    check_int("mismatched encoded built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_LENGTH), 0);
+    vector[1] = 6;
+    check_int("non-length operation rejected at length built-in",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 0, 6,
+						    HIR_OP_ABS), 0);
+    check_int("truncated built-in rejected as string length",
+	      hir_test_string_builtin_length_anchor(&bytecodes, 1, 6,
+						    HIR_OP_LENGTH), 0);
 }
 
 #ifdef HIR_DUMP_SSA
@@ -286,8 +315,8 @@ test_control_flow_tac(void)
     check_int("control tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 2);
     check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 9);
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
-    check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
-    check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
+    check_int("control cfg blocks", hir_cfg_block_count(cfg), 4);
+    check_int("control cfg edges", hir_cfg_edge_count(cfg), 3);
     check_int("control dom reachable blocks",
 	      hir_dom_reachable_block_count(dom), 4);
     check_int("control dom entry idom", hir_dom_idom_block(dom, 1), 1);
@@ -295,8 +324,8 @@ test_control_flow_tac(void)
     check_int("control dom unreachable idom", hir_dom_idom_block(dom, 3), 0);
     check_int("control dom else-label idom", hir_dom_idom_block(dom, 4), 1);
     check_int("control dom done idom", hir_dom_idom_block(dom, 5), 4);
-    check_int("control ssa blocks", hir_ssa_block_count(ssa), 5);
-    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 11);
+    check_int("control ssa blocks", hir_ssa_block_count(ssa), 4);
+    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 10);
     check_int("control ssa values", hir_ssa_value_count(ssa), 4);
     check_int("control ssa branch count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
@@ -1253,6 +1282,134 @@ test_list_index_tac_ssa(void)
 }
 
 static void
+test_direct_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr list = id_expr(0, 10);
+    Expr index = int_expr(2, 10);
+    Expr lhs = binary_expr(EXPR_INDEX, &list, &index);
+    Expr value = int_expr(42, 10);
+    Expr assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    Stmt ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    list.bytecode_pc = 1;
+    index.bytecode_pc = 2;
+    value.bytecode_pc = 3;
+    assign.bytecode_pc = 4;
+    ret.bytecode_pc = 5;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("index assignment accepted", hir_context_error_count(ctx), 0);
+    check_int("index assignment deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 4), 3);
+    check_int("index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_nested_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr list = id_expr(0, 10);
+    Expr first_index = int_expr(1, 10);
+    Expr inner = binary_expr(EXPR_INDEX, &list, &first_index);
+    Expr second_index = int_expr(2, 10);
+    Expr lhs = binary_expr(EXPR_INDEX, &inner, &second_index);
+    Expr value = int_expr(42, 10);
+    Expr assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    Stmt ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    list.bytecode_pc = 1;
+    first_index.bytecode_pc = 2;
+    inner.bytecode_pc = 3;
+    second_index.bytecode_pc = 4;
+    value.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    ret.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("nested index assignment accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("nested index assignment preserved ref",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 1);
+    check_int("nested index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 6), 5);
+    check_int("nested index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("nested index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_property_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr object = id_expr(0, 10);
+    Expr property;
+    Expr property_ref;
+    Expr index = int_expr(2, 10);
+    Expr lhs;
+    Expr value = int_expr(42, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&property, 0, sizeof(property));
+    property.kind = EXPR_VAR;
+    property.lineno = 10;
+    property.e.var.type = TYPE_STR;
+    property.e.var.v.str = "items";
+    property_ref = binary_expr(EXPR_PROP, &object, &property);
+    lhs = binary_expr(EXPR_INDEX, &property_ref, &index);
+    assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    object.bytecode_pc = 1;
+    property.bytecode_pc = 2;
+    property_ref.bytecode_pc = 3;
+    index.bytecode_pc = 4;
+    value.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    ret.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("property index assignment accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("property index assignment preserved property",
+	      hir_tac_count_binary_op(tac, HIR_OP_GET_PROP), 1);
+    check_int("property index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 6), 5);
+    check_int("property index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("property index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_list_index_in_arithmetic_tac_ssa(void)
 {
     Names names;
@@ -1308,7 +1465,6 @@ test_scatter_destructuring_tac_ssa(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
-    HIRValueAnalysis *analysis;
     HIRTacProgram *tac;
     Scatter sc1, sc2;
     Expr scatter_lhs, args_rhs, asgn_expr, ret_add, ret_x, ret_y;
@@ -1352,20 +1508,73 @@ test_scatter_destructuring_tac_ssa(void)
     tac = lower_stmt(&names, &asgn_stmt_node, &ctx, &cfg, &dom, &ssa);
 
     check_int("scatter tac not null", tac != 0, 1);
-    check_int("scatter tac store count",
-	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
-    check_int("scatter tac binary index count",
-	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 2);
+    check_int("scatter tac deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("scatter tac deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
     check_int("scatter tac binary add count",
 	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("scatter verify errors", hir_context_error_count(ctx), 0);
 
-    analysis = hir_analyze_ssa_values(ctx, ssa);
-    check_int("scatter return fact",
-	      hir_ssa_return_value_kind(ssa, analysis),
-	      HIR_VALUE_INT);
-
     check_int("scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_optional_rest_scatter_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Scatter required, optional, rest;
+    Expr default_value = int_expr(10, 10);
+    Expr scatter_lhs;
+    Expr rhs = id_expr(0, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&required, 0, sizeof(required));
+    required.kind = SCAT_REQUIRED;
+    required.id = 1;
+    required.next = &optional;
+    memset(&optional, 0, sizeof(optional));
+    optional.kind = SCAT_OPTIONAL;
+    optional.id = 2;
+    optional.expr = &default_value;
+    optional.next = &rest;
+    memset(&rest, 0, sizeof(rest));
+    rest.kind = SCAT_REST;
+    rest.id = 3;
+
+    memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+    scatter_lhs.kind = EXPR_SCATTER;
+    scatter_lhs.lineno = 10;
+    scatter_lhs.e.scatter = &required;
+    assign = binary_expr(EXPR_ASGN, &scatter_lhs, &rhs);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 4;
+    rhs.bytecode_pc = 1;
+    assign.bytecode_pc = 2;
+    ret.bytecode_pc = 3;
+    default_value.bytecode_pc = 99;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("optional rest scatter accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("optional rest scatter deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("optional rest scatter deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("optional rest scatter default not lowered",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 0);
+    check_int("optional rest scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("optional rest scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -1413,8 +1622,11 @@ test_list_construction_and_splicing_tac_ssa(void)
     e1.bytecode_pc = 1;
     e2.bytecode_pc = 2;
     e3.bytecode_pc = 3;
-    list_expr.bytecode_pc = 4;
-    ret.bytecode_pc = 5;
+    a1.bytecode_pc = 4;
+    a2.bytecode_pc = 5;
+    a3.bytecode_pc = 6;
+    list_expr.bytecode_pc = 7;
+    ret.bytecode_pc = 8;
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1425,9 +1637,58 @@ test_list_construction_and_splicing_tac_ssa(void)
 	      hir_tac_count_binary_op(tac, HIR_OP_LIST_APPEND), 1);
     check_int("list splice add tail count",
 	      hir_tac_count_binary_op(tac, HIR_OP_LIST_ADD_TAIL), 1);
+    check_int("list splice first item pc",
+	      hir_tac_count_bytecode_pc(tac, 4), 1);
+    check_int("list splice second item pc",
+	      hir_tac_count_bytecode_pc(tac, 5), 1);
+    check_int("list splice third item pc",
+	      hir_tac_count_bytecode_pc(tac, 6), 1);
     check_int("list splice verify errors", hir_context_error_count(ctx), 0);
 
     check_int("list splice destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_initial_list_splice_anchor(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List arg;
+    Expr value, list_expr;
+    Stmt ret;
+
+    value = id_expr(0, 10);
+    memset(&arg, 0, sizeof(arg));
+    arg.kind = ARG_SPLICE;
+    arg.expr = &value;
+    arg.bytecode_pc = 2;
+
+    memset(&list_expr, 0, sizeof(list_expr));
+    list_expr.kind = EXPR_LIST;
+    list_expr.lineno = 10;
+    list_expr.e.list = &arg;
+    list_expr.bytecode_pc = 3;
+    ret = return_stmt(&list_expr);
+    ret.bytecode_pc = 4;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    value.bytecode_pc = 1;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("initial splice check count",
+	      hir_tac_count_unary_op(tac, HIR_OP_CHECK_LIST_FOR_SPLICE), 1);
+    check_int("initial splice check pc",
+	      hir_tac_count_bytecode_pc(tac, 2), 1);
+    check_int("initial splice verify errors", hir_context_error_count(ctx), 0);
+
+    check_int("initial splice destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -1472,6 +1733,10 @@ test_builtin_call_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
     check_int("builtin call singleton count",
 	      hir_tac_count_unary_op(tac, HIR_OP_MAKE_SINGLETON_LIST), 1);
+    check_int("builtin call singleton pc",
+	      hir_tac_count_bytecode_pc(tac, 2), 1);
+    check_int("builtin call call pc",
+	      hir_tac_count_bytecode_pc(tac, 3), 1);
     check_int("builtin call verify errors", hir_context_error_count(ctx), 0);
 
     check_int("builtin call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
@@ -2473,8 +2738,8 @@ test_try_except_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
     check_int("try except deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
-    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
-    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try except verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -2623,9 +2888,170 @@ test_length_expr_in_index_tac_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_unreachable_dead_code_and_folded_phi_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr cond, one, two, comment, dead_var;
+    Stmt then_stmt, else_stmt, if_stmt_node, dead_stmt, final_ret;
+    Cond_Arm arm;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    cond = int_expr(1, 80);
+    one = int_expr(1, 81);
+    two = int_expr(2, 82);
+    then_stmt = return_stmt(&one);
+    else_stmt = return_stmt(&two);
+    arm = cond_arm_ast(&cond, &then_stmt);
+    if_stmt_node = cond_stmt_ast(&arm, &else_stmt, 80);
+
+    comment = int_expr(999, 85);
+    dead_var = id_expr(0, 85);
+    dead_stmt = expr_stmt(&comment);
+    final_ret = return_stmt(&dead_var);
+    if_stmt_node.next = &dead_stmt;
+    dead_stmt.next = &final_ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+    check_int("dead code verify errors", hir_context_error_count(ctx), 0);
+    check_int("dead code ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("dead code adds no synthetic ticks",
+	      hir_ssa_count_kind(ssa, HIR_TAC_TICK),
+	      hir_tac_count_kind(tac, HIR_TAC_TICK));
+    (void) hir_optimize_ssa_constants(ctx, ssa);
+    check_int("dead code ssa valid after opt", hir_verify_ssa(ctx, ssa), 1);
+    check_int("dead code out-of-ssa destroy", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("dead code out-of-ssa verify", hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_length_expr_in_stores_and_negatives(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr local_base, len_expr, one_expr, val_expr, idx_expr, range_expr;
+    Expr assign_idx, assign_range, assign_chained, unindexed_len, bad_assign;
+    Stmt stmt_idx, stmt_range, stmt_chained, bad_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    local_base = id_expr(0, 71);
+    memset(&len_expr, 0, sizeof(len_expr));
+    len_expr.kind = EXPR_LENGTH;
+    len_expr.lineno = 71;
+    one_expr = int_expr(1, 71);
+    val_expr = int_expr(42, 71);
+
+    /* 1. local[$] = 42 */
+    idx_expr = binary_expr(EXPR_INDEX, &local_base, &len_expr);
+    assign_idx = binary_expr(EXPR_ASGN, &idx_expr, &val_expr);
+    stmt_idx = expr_stmt(&assign_idx);
+    tac = lower_stmt(&names, &stmt_idx, &ctx, &cfg, &dom, &ssa);
+    check_int("length in index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in index store deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    hir_context_free(ctx);
+
+    /* 2. local[1..$] = 42 */
+    range_expr = range_expr_ast(&local_base, &one_expr, &len_expr, 71);
+    assign_range = binary_expr(EXPR_ASGN, &range_expr, &val_expr);
+    stmt_range = expr_stmt(&assign_range);
+    tac = lower_stmt(&names, &stmt_range, &ctx, &cfg, &dom, &ssa);
+    check_int("length in range store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in range store range_set count",
+	      hir_tac_count_kind(tac, HIR_TAC_RANGE_SET), 1);
+    hir_context_free(ctx);
+
+    /* 3. local[1][$] = 42 (chained index store) */
+    Expr outer_base = binary_expr(EXPR_INDEX, &local_base, &one_expr);
+    Expr chained_idx = binary_expr(EXPR_INDEX, &outer_base, &len_expr);
+    assign_chained = binary_expr(EXPR_ASGN, &chained_idx, &val_expr);
+    stmt_chained = expr_stmt(&assign_chained);
+    tac = lower_stmt(&names, &stmt_chained, &ctx, &cfg, &dom, &ssa);
+    check_int("length in chained index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in chained index store deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    hir_context_free(ctx);
+
+    /* 4. Negative test: unindexed $ (e.g. x = $) */
+    Expr target_var = id_expr(1, 72);
+    unindexed_len.kind = EXPR_LENGTH;
+    unindexed_len.lineno = 72;
+    unindexed_len.bytecode_pc = NO_BYTECODE_PC;
+    bad_assign = binary_expr(EXPR_ASGN, &target_var, &unindexed_len);
+    bad_stmt = expr_stmt(&bad_assign);
+    tac = lower_stmt(&names, &bad_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("unindexed length reports error", hir_context_error_count(ctx) > 0, 1);
+    check_int("unindexed length unsupported tac count",
+	      hir_tac_count_kind(tac, HIR_TAC_UNSUPPORTED), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_constant_folded_branch_clears_bytecode_pc(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Expr cond, ret_val;
+    Stmt body_stmt, loop_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    /* Build while (1) return 42; endwhile */
+    cond = int_expr(1, 90);
+    ret_val = int_expr(42, 91);
+    body_stmt = return_stmt(&ret_val);
+    body_stmt.bytecode_pc = 2;
+
+    memset(&loop_stmt, 0, sizeof(loop_stmt));
+    loop_stmt.kind = STMT_WHILE;
+    loop_stmt.lineno = 90;
+    loop_stmt.bytecode_pc = 0;
+    loop_stmt.s.loop.id = -1;
+    loop_stmt.s.loop.condition = &cond;
+    loop_stmt.s.loop.body = &body_stmt;
+
+    (void) lower_stmt(&names, &loop_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("constant while loop ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("constant while loop has branch before opt",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("constant while loop has branch anchor before opt",
+	      hir_ssa_count_bytecode_pc(ssa, 0), 2);
+
+    (void) hir_optimize_ssa_constants(ctx, ssa);
+    check_int("constant while loop opt ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("constant while loop branch folded",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 0);
+    check_int("folded branch clears branch bytecode_pc anchor",
+	      hir_ssa_count_bytecode_pc(ssa, 0), 1);
+    check_int("folded branch destroys ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("folded branch verifies out of ssa", hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
+    test_string_builtin_length_anchor();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();
@@ -2640,9 +3066,14 @@ main(void)
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
+    test_direct_index_assignment_deopt();
+    test_nested_index_assignment_deopt();
+    test_property_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
+    test_optional_rest_scatter_deopt();
     test_list_construction_and_splicing_tac_ssa();
+    test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
     test_property_read_and_write_tac_ssa();
@@ -2662,11 +3093,14 @@ main(void)
     test_fork_stmt_tac_ssa();
     test_fork_body_does_not_reject_enclosing_hir();
     test_length_expr_in_index_tac_ssa();
+    test_length_expr_in_stores_and_negatives();
+    test_constant_folded_branch_clears_bytecode_pc();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
     test_critical_edge_ssa_destruction();
     test_repeated_local_assignment_ssa();
+    test_unreachable_dead_code_and_folded_phi_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
     test_negative_cfg_verifier_cases();

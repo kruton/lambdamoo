@@ -45,6 +45,7 @@ typedef enum {
     HIR_EXPR_LENGTH,
     HIR_EXPR_SCATTER,
     HIR_EXPR_PROP_STORE,
+    HIR_EXPR_INDEX_STORE,
     HIR_EXPR_RANGE_STORE,
     HIR_EXPR_UNSUPPORTED
 } HIRExprKind;
@@ -102,6 +103,7 @@ typedef enum {
     HIR_OP_TYPEOF,
     HIR_OP_LENGTH,
     HIR_OP_GET_PROP,
+    HIR_OP_SCATTER,
     HIR_OP_CHARGE_TICK
 } HIROp;
 
@@ -208,6 +210,8 @@ extern int hir_ssa_form(HIRSSAProgram *);
 extern int hir_ssa_cfg_block_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_edge_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
+extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
+						 unsigned, HIROp);
 extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
 					       HIRValueAnalysis *);
 extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);

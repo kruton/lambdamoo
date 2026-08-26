@@ -4,8 +4,13 @@
 #include "options.h"
 
 #include "my-stdio.h"
+#include "my-string.h"
 
+#include "db.h"
+#include "exceptions.h"
 #include "jit_internal.h"
+#include "list.h"
+#include "server.h"
 #include "storage.h"
 #include "utils.h"
 
@@ -16,6 +21,238 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef IGNORE_PROP_PROTECTED
+#define bi_prop_protected(prop, progr) (0)
+#else
+#define bi_prop_protected(prop, progr) ((!is_wizard(progr)) && server_flag_option_cached(prop))
+#endif
+
+static inline double
+raw_to_double(int64_t raw)
+{
+    double d;
+    memcpy(&d, &raw, sizeof(d));
+    return d;
+}
+
+static inline int64_t
+double_to_raw(double d)
+{
+    int64_t raw;
+    memcpy(&raw, &d, sizeof(raw));
+    return raw;
+}
+
+/* JIT Runtime Helpers for Complex Values and Properties */
+
+int
+jit_rt_is_true(int64_t raw_val, int val_type)
+{
+    Var v;
+
+    v.type = (var_type) val_type;
+    if (val_type == TYPE_FLOAT)
+	v.v.fnum = box_fl((FlNum) raw_to_double(raw_val));
+    else if (val_type == TYPE_STR)
+	v.v.str = (const char *) (intptr_t) raw_val;
+    else if (val_type == TYPE_LIST)
+	v.v.list = (Var *) (intptr_t) raw_val;
+    else
+	v.v.num = (Num) raw_val;
+    return is_true(v);
+}
+
+int
+jit_rt_equality(int64_t raw1, int type1, int64_t raw2, int type2, int case_matters)
+{
+    Var v1, v2;
+
+    v1.type = (var_type) type1;
+    if (type1 == TYPE_FLOAT)
+	v1.v.fnum = box_fl((FlNum) raw_to_double(raw1));
+    else if (type1 == TYPE_STR)
+	v1.v.str = (const char *) (intptr_t) raw1;
+    else if (type1 == TYPE_LIST)
+	v1.v.list = (Var *) (intptr_t) raw1;
+    else
+	v1.v.num = (Num) raw1;
+
+    v2.type = (var_type) type2;
+    if (type2 == TYPE_FLOAT)
+	v2.v.fnum = box_fl((FlNum) raw_to_double(raw2));
+    else if (type2 == TYPE_STR)
+	v2.v.str = (const char *) (intptr_t) raw2;
+    else if (type2 == TYPE_LIST)
+	v2.v.list = (Var *) (intptr_t) raw2;
+    else
+	v2.v.num = (Num) raw2;
+
+    return equality(v1, v2, case_matters);
+}
+
+int
+jit_rt_str_cmp(const char *s1, const char *s2, int case_matters)
+{
+    if (!s1)
+	s1 = "";
+    if (!s2)
+	s2 = "";
+    if (case_matters)
+	return strcmp(s1, s2);
+    else
+	return mystrcasecmp(s1, s2);
+}
+
+const char *
+jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
+{
+    int l1, l2, total;
+    char *res;
+
+    if (!s1)
+	s1 = "";
+    if (!s2)
+	s2 = "";
+    l1 = memo_strlen(s1);
+    l2 = memo_strlen(s2);
+    total = l1 + l2;
+
+    if (server_int_option_cached(SVO_MAX_STRING_CONCAT) < total) {
+	*err_out = E_QUOTA;
+	return 0;
+    }
+    res = mymalloc(total + 1, M_STRING);
+    memcpy(res, s1, l1);
+    memcpy(res + l1, s2, l2);
+    res[total] = '\0';
+    *err_out = E_NONE;
+    return res;
+}
+
+const char *
+jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
+{
+    int len;
+    char *res;
+
+    if (!str) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    len = memo_strlen(str);
+    if (idx < 1 || idx > len) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    res = mymalloc(2, M_STRING);
+    res[0] = str[idx - 1];
+    res[1] = '\0';
+    *err_out = E_NONE;
+    return res;
+}
+
+Var *
+jit_rt_list_concat(Var *l1, Var *l2, int32_t *err_out)
+{
+    Var v1, v2, res;
+
+    v1.type = TYPE_LIST;
+    v1.v.list = l1;
+    v2.type = TYPE_LIST;
+    v2.v.list = l2;
+
+    res = listconcat(v1, v2);
+    if (res.type == TYPE_ERR) {
+	*err_out = res.v.err;
+	return 0;
+    }
+    *err_out = E_NONE;
+    return res.v.list;
+}
+
+Var *
+jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
+{
+    Var l, elem, res;
+
+    l.type = TYPE_LIST;
+    l.v.list = list;
+
+    elem.type = (var_type) elem_type;
+    if (elem_type == TYPE_FLOAT)
+	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
+    else if (elem_type == TYPE_STR)
+	elem.v.str = (const char *) (intptr_t) elem_raw;
+    else if (elem_type == TYPE_LIST)
+	elem.v.list = (Var *) (intptr_t) elem_raw;
+    else
+	elem.v.num = (Num) elem_raw;
+
+    res = listappend(l, elem);
+    return res.v.list;
+}
+
+int64_t
+jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
+{
+    Var elem, l;
+
+    l.type = TYPE_LIST;
+    l.v.list = list;
+
+    elem.type = (var_type) elem_type;
+    if (elem_type == TYPE_FLOAT)
+	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
+    else if (elem_type == TYPE_STR)
+	elem.v.str = (const char *) (intptr_t) elem_raw;
+    else if (elem_type == TYPE_LIST)
+	elem.v.list = (Var *) (intptr_t) elem_raw;
+    else
+	elem.v.num = (Num) elem_raw;
+
+    return ismember(elem, l, 0);
+}
+
+int
+jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
+		int64_t *out_raw, int32_t *out_type, int32_t *err_out)
+{
+    Objid oid = (Objid) oid_num;
+    Objid progr = (Objid) progr_num;
+    Var prop, val;
+    db_prop_handle h;
+
+    if (!valid(oid)) {
+	*err_out = E_INVIND;
+	return 0;
+    }
+    h = db_find_property(oid, pname, &prop);
+    if (!h.ptr) {
+	*err_out = E_PROPNF;
+	return 0;
+    }
+    if (h.built_in ? bi_prop_protected(h.built_in, progr)
+		   : !db_property_allows(h, progr, PF_READ)) {
+	*err_out = E_PERM;
+	return 0;
+    }
+    val = h.built_in ? prop : var_ref(prop);
+    *out_type = val.type;
+    if (val.type == TYPE_FLOAT) {
+	double d = (double) fl_unbox(val.v.fnum);
+	*out_raw = double_to_raw(d);
+    }
+    else if (val.type == TYPE_STR)
+	*out_raw = (intptr_t) val.v.str;
+    else if (val.type == TYPE_LIST)
+	*out_raw = (intptr_t) val.v.list;
+    else
+	*out_raw = (int64_t) val.v.num;
+
+    *err_out = E_NONE;
+    return 1;
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *);
 
@@ -23,6 +260,24 @@ typedef struct {
     MIR_context_t context;
     MIR_module_t module;
     MIR_item_t function;
+    MIR_item_t proto_is_true;
+    MIR_item_t import_is_true;
+    MIR_item_t proto_equality;
+    MIR_item_t import_equality;
+    MIR_item_t proto_str_cmp;
+    MIR_item_t import_str_cmp;
+    MIR_item_t proto_str_concat;
+    MIR_item_t import_str_concat;
+    MIR_item_t proto_str_ref;
+    MIR_item_t import_str_ref;
+    MIR_item_t proto_list_concat;
+    MIR_item_t import_list_concat;
+    MIR_item_t proto_list_append;
+    MIR_item_t import_list_append;
+    MIR_item_t proto_list_in;
+    MIR_item_t import_list_in;
+    MIR_item_t proto_get_prop;
+    MIR_item_t import_get_prop;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -248,7 +503,7 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
     for (i = 0; i < map->num_locals; i++) {
 	int val = map->local_values[i];
 	if (val > 0) {
-	    if (map->local_types && map->local_types[i] == TYPE_FLOAT) {
+	    if (program->value_types && program->value_types[val] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
 		    MIR_new_mem_op(build->context, MIR_T_D,
 				   val * sizeof(Num),
@@ -267,7 +522,7 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int sval = map->stack_values[i];
 	if (sval > 0) {
-	    if (map->stack_types && map->stack_types[i] == TYPE_FLOAT) {
+	    if (program->value_types && program->value_types[sval] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
 		    MIR_new_mem_op(build->context, MIR_T_D,
 				   sval * sizeof(Num),
@@ -314,6 +569,59 @@ build_mir(JITProgram *program, MIRBuild *build)
     if (!build->context)
 	return 0;
     build->module = MIR_new_module(build->context, "lambda_moo_jit");
+    MIR_type_t res_i64 = MIR_T_I64;
+    MIR_type_t res_p = MIR_T_P;
+    MIR_type_t res_i32 = MIR_T_I32;
+
+    MIR_load_external(build->context, "jit_rt_is_true", (void *) jit_rt_is_true);
+    MIR_load_external(build->context, "jit_rt_equality", (void *) jit_rt_equality);
+    MIR_load_external(build->context, "jit_rt_str_cmp", (void *) jit_rt_str_cmp);
+    MIR_load_external(build->context, "jit_rt_str_concat", (void *) jit_rt_str_concat);
+    MIR_load_external(build->context, "jit_rt_str_ref", (void *) jit_rt_str_ref);
+    MIR_load_external(build->context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
+    MIR_load_external(build->context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(build->context, "jit_rt_list_in", (void *) jit_rt_list_in);
+    MIR_load_external(build->context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
+
+    build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
+					 MIR_T_I64, "raw", MIR_T_I32, "type");
+    build->import_is_true = MIR_new_import(build->context, "jit_rt_is_true");
+
+    build->proto_equality = MIR_new_proto(build->context, "proto_equality", 1, &res_i32, 5,
+					  MIR_T_I64, "r1", MIR_T_I32, "t1",
+					  MIR_T_I64, "r2", MIR_T_I32, "t2",
+					  MIR_T_I32, "cm");
+    build->import_equality = MIR_new_import(build->context, "jit_rt_equality");
+
+    build->proto_str_cmp = MIR_new_proto(build->context, "proto_str_cmp", 1, &res_i32, 3,
+					 MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_I32, "cm");
+    build->import_str_cmp = MIR_new_import(build->context, "jit_rt_str_cmp");
+
+    build->proto_str_concat = MIR_new_proto(build->context, "proto_str_concat", 1, &res_p, 3,
+					    MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_P, "err");
+    build->import_str_concat = MIR_new_import(build->context, "jit_rt_str_concat");
+
+    build->proto_str_ref = MIR_new_proto(build->context, "proto_str_ref", 1, &res_p, 3,
+					 MIR_T_P, "s", MIR_T_I64, "idx", MIR_T_P, "err");
+    build->import_str_ref = MIR_new_import(build->context, "jit_rt_str_ref");
+
+    build->proto_list_concat = MIR_new_proto(build->context, "proto_list_concat", 1, &res_p, 3,
+					     MIR_T_P, "l1", MIR_T_P, "l2", MIR_T_P, "err");
+    build->import_list_concat = MIR_new_import(build->context, "jit_rt_list_concat");
+
+    build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 3,
+					     MIR_T_P, "l", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+    build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
+
+    build->proto_list_in = MIR_new_proto(build->context, "proto_list_in", 1, &res_i64, 3,
+					 MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type", MIR_T_P, "l");
+    build->import_list_in = MIR_new_import(build->context, "jit_rt_list_in");
+
+    build->proto_get_prop = MIR_new_proto(build->context, "proto_get_prop", 1, &res_i32, 6,
+					  MIR_T_I64, "oid", MIR_T_P, "pname", MIR_T_I64, "progr",
+					  MIR_T_P, "out_raw", MIR_T_P, "out_type", MIR_T_P, "err");
+    build->import_get_prop = MIR_new_import(build->context, "jit_rt_get_prop");
+
     build->function = MIR_new_func(build->context, "jit_verb", 1,
 				   &result_type, 8,
 				   MIR_T_P, "env", MIR_T_P, "result",
@@ -411,7 +719,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 			deopt_map_out, deopt_values, status, common_return);
 		    break;
 		case HIR_TAC_CONST:
-		    if (instr->literal_type == TYPE_FLOAT) {
+		    if (program->value_types
+			&& program->value_types[instr->value] == TYPE_FLOAT) {
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_mem_op(build->context,
 								 sizeof(Num) == 8
@@ -452,7 +761,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, var_type),
 				MIR_new_int_op(build->context, expected_type)));
-			if (expected_type == TYPE_FLOAT) {
+			if (program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			    sprintf(name, "fl_ptr%d", copy_serial++);
 			    MIR_reg_t fl_ptr = new_reg(build, name);
@@ -504,6 +814,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_UNARY:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (program->value_types
 			&& (program->value_types[instr->src1] == TYPE_STR
 			    || program->value_types[instr->src1] == TYPE_LIST)
@@ -520,6 +836,16 @@ build_mir(JITProgram *program, MIRBuild *build)
 			break;
 		    }
 		    if (instr->op == HIR_OP_TOINT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl || src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
@@ -532,8 +858,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_int_op(build->context,
 								 instr->literal)));
 		    } else if (instr->op == HIR_OP_ABS) {
-			if (program->value_types
-			    && program->value_types[instr->src1] == TYPE_FLOAT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl != src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (src_fl) {
 			    MIR_label_t is_pos = MIR_new_label(build->context);
 			    MIR_label_t done = MIR_new_label(build->context);
 			    char name[32];
@@ -585,11 +920,71 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_label_op(build->context, deopt),
 						  MIR_new_reg_op(build->context, list_ptr),
 						  MIR_new_int_op(build->context, 0)));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_mem_op(build->context,
-								 sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-								 offsetof(Var, v.num), list_ptr, 0, 1)));
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_STR) {
+			    MIR_label_t scan = MIR_new_label(build->context);
+			    MIR_reg_t offset;
+			    MIR_reg_t byte;
+#if UNICODE_STRINGS
+			    MIR_label_t continuation = MIR_new_label(build->context);
+			    MIR_reg_t prefix;
+#endif
+			    char name[32];
+
+			    sprintf(name, "str_offset%d", copy_serial);
+			    offset = new_reg(build, name);
+			    sprintf(name, "str_byte%d", copy_serial);
+			    byte = new_reg(build, name);
+#if UNICODE_STRINGS
+			    sprintf(name, "str_prefix%d", copy_serial++);
+			    prefix = new_reg(build, name);
+#else
+			    copy_serial++;
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, scan);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_mem_op(build->context, MIR_T_U8, 0,
+					       list_ptr, offset, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, loaded),
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_int_op(build->context, 0)));
+#if UNICODE_STRINGS
+			    append(build, MIR_new_insn(build->context, MIR_AND,
+				MIR_new_reg_op(build->context, prefix),
+				MIR_new_reg_op(build->context, byte),
+				MIR_new_int_op(build->context, 0xc0)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, continuation),
+				MIR_new_reg_op(build->context, prefix),
+				MIR_new_int_op(build->context, 0x80)));
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 1)));
+#if UNICODE_STRINGS
+			    append(build, continuation);
+#endif
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_reg_op(build->context, offset),
+				MIR_new_int_op(build->context, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, scan)));
+			} else
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), list_ptr, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 						  MIR_new_label_op(build->context, loaded)));
 			append(build, deopt);
@@ -597,8 +992,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  deopt_map_out, deopt_values, status, common_return);
 			append(build, loaded);
 		    } else if (instr->op == HIR_OP_NEGATE) {
-			if (program->value_types
-			    && program->value_types[instr->src1] == TYPE_FLOAT)
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl != src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (src_fl)
 			    append(build, MIR_new_insn(build->context, MIR_DNEG,
 							  MIR_new_reg_op(build->context,
 									 values[instr->value]),
@@ -611,6 +1015,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1])));
 		    } else if (instr->op == HIR_OP_NOT) {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			if (val_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_FLOAT) {
 			    char name[32];
@@ -635,15 +1047,32 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1]),
 							  MIR_new_int_op(build->context, 0)));
-		    } else
+		    } else {
+			int val_fl = program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT;
+			int src_fl = program->value_types
+			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			if (val_fl || src_fl) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
 			append(build, MIR_new_insn(build->context, MIR_XOR,
 						      MIR_new_reg_op(build->context,
 								     values[instr->value]),
 						      MIR_new_reg_op(build->context,
 								     values[instr->src1]),
 						      MIR_new_int_op(build->context, -1)));
+		    }
 		    break;
 		case HIR_TAC_BINARY:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL
 			|| instr->op == HIR_OP_LIST_APPEND
 			|| instr->op == HIR_OP_GET_PROP) {
@@ -652,18 +1081,171 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  status, common_return);
 			break;
 		    }
-		    if (program->value_types
-			&& (program->value_types[instr->src1] == TYPE_STR
-			    || program->value_types[instr->src1] == TYPE_LIST)
-			&& (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
-			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
-			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)) {
-			append_deopt_exit(build, program, instr->deopt_map, values,
-				deopt_map_out, deopt_values, status, common_return);
+		    if (instr->op == HIR_OP_IN) {
+			if (program->value_types
+			    && program->value_types[instr->src2] == TYPE_LIST) {
+			    var_type elem_type = program->value_types[instr->src1];
+			    char name[32];
+			    sprintf(name, "in_type%d", copy_serial++);
+			    MIR_reg_t in_type = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, in_type),
+				MIR_new_int_op(build->context, elem_type)));
+			    append(build, MIR_new_call_insn(build->context, 6,
+				MIR_new_ref_op(build->context, build->proto_list_in),
+				MIR_new_ref_op(build->context, build->import_list_in),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_reg_op(build->context, in_type),
+				MIR_new_reg_op(build->context, values[instr->src2])));
+			    break;
+			}
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
 			break;
 		    }
 		    if (program->value_types
-			&& program->value_types[instr->src1] == TYPE_FLOAT) {
+			&& program->value_types[instr->src1] == TYPE_STR
+			&& program->value_types[instr->src2] == TYPE_STR
+			&& (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)) {
+			char name[32];
+			sprintf(name, "str_cmp%d", copy_serial++);
+			MIR_reg_t cmp_res = new_reg(build, name);
+			sprintf(name, "case_reg%d", copy_serial++);
+			MIR_reg_t case_reg = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, case_reg),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_call_insn(build->context, 6,
+			    MIR_new_ref_op(build->context, build->proto_str_cmp),
+			    MIR_new_ref_op(build->context, build->import_str_cmp),
+			    MIR_new_reg_op(build->context, cmp_res),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, values[instr->src2]),
+			    MIR_new_reg_op(build->context, case_reg)));
+			MIR_insn_code_t code = (instr->op == HIR_OP_EQ) ? MIR_EQ
+					     : (instr->op == HIR_OP_NE) ? MIR_NE
+					     : (instr->op == HIR_OP_LT) ? MIR_LT
+					     : (instr->op == HIR_OP_LE) ? MIR_LE
+					     : (instr->op == HIR_OP_GT) ? MIR_GT
+					     : MIR_GE;
+			append(build, MIR_new_insn(build->context, code,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, cmp_res),
+			    MIR_new_int_op(build->context, 0)));
+			break;
+		    }
+		    if (program->value_types
+			&& program->value_types[instr->src1] == TYPE_LIST
+			&& program->value_types[instr->src2] == TYPE_LIST
+			&& (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE)) {
+			char name[32];
+			sprintf(name, "list_eq%d", copy_serial++);
+			MIR_reg_t eq_res = new_reg(build, name);
+			sprintf(name, "ltype_reg%d", copy_serial++);
+			MIR_reg_t ltype_reg = new_reg(build, name);
+			sprintf(name, "case_reg%d", copy_serial++);
+			MIR_reg_t case_reg = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, ltype_reg),
+			    MIR_new_int_op(build->context, TYPE_LIST)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, case_reg),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_call_insn(build->context, 8,
+			    MIR_new_ref_op(build->context, build->proto_equality),
+			    MIR_new_ref_op(build->context, build->import_equality),
+			    MIR_new_reg_op(build->context, eq_res),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, ltype_reg),
+			    MIR_new_reg_op(build->context, values[instr->src2]),
+			    MIR_new_reg_op(build->context, ltype_reg),
+			    MIR_new_reg_op(build->context, case_reg)));
+			if (instr->op == HIR_OP_EQ)
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, eq_res)));
+			else
+			    append(build, MIR_new_insn(build->context, MIR_EQ,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, eq_res),
+				MIR_new_int_op(build->context, 0)));
+			break;
+		    }
+		    if (program->value_types
+			&& program->value_types[instr->src1] == TYPE_STR
+			&& program->value_types[instr->src2] == TYPE_STR
+			&& instr->op == HIR_OP_ADD) {
+			char name[32];
+			sprintf(name, "str_err%d", copy_serial++);
+			MIR_reg_t err_reg = new_reg(build, name);
+			MIR_label_t quota_error = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ERROR, E_QUOTA, instr->bytecode_pc,
+			    instr->source_lineno);
+			append(build, MIR_new_call_insn(build->context, 6,
+			    MIR_new_ref_op(build->context, build->proto_str_concat),
+			    MIR_new_ref_op(build->context, build->import_str_concat),
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, values[instr->src2]),
+			    MIR_new_reg_op(build->context, error_out)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, err_reg),
+			    MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BNE,
+			    MIR_new_label_op(build->context, quota_error),
+			    MIR_new_reg_op(build->context, err_reg),
+			    MIR_new_int_op(build->context, E_NONE)));
+			break;
+		    }
+		    if (program->value_types
+			&& (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+			    || instr->op == HIR_OP_MUL || instr->op == HIR_OP_DIV
+			    || instr->op == HIR_OP_MOD || instr->op == HIR_OP_EXP
+			    || instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)
+			&& (program->value_types[instr->value] == TYPE_FLOAT
+			    || program->value_types[instr->src1] == TYPE_FLOAT
+			    || program->value_types[instr->src2] == TYPE_FLOAT)) {
+			int is_float_arith = (instr->op == HIR_OP_ADD
+					      || instr->op == HIR_OP_SUB
+					      || instr->op == HIR_OP_MUL
+					      || instr->op == HIR_OP_DIV);
+			int is_float_cmp = (instr->op == HIR_OP_EQ
+					    || instr->op == HIR_OP_NE
+					    || instr->op == HIR_OP_LT
+					    || instr->op == HIR_OP_LE
+					    || instr->op == HIR_OP_GT
+					    || instr->op == HIR_OP_GE);
+			int valid_float_op = (is_float_arith
+					      && program->value_types[instr->value] == TYPE_FLOAT
+					      && program->value_types[instr->src1] == TYPE_FLOAT
+					      && program->value_types[instr->src2] == TYPE_FLOAT)
+			    || (is_float_cmp
+				&& program->value_types[instr->src1] == TYPE_FLOAT
+				&& program->value_types[instr->src2] == TYPE_FLOAT);
+
+			if (!valid_float_op) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+					      values, deopt_map_out, deopt_values,
+					      status, common_return);
+			    break;
+			}
+			if (is_float_cmp) {
+			    append(build, MIR_new_insn(build->context,
+						      float_binary_code(instr->op),
+						      MIR_new_reg_op(build->context,
+								     values[instr->value]),
+						      MIR_new_reg_op(build->context,
+								     values[instr->src1]),
+						      MIR_new_reg_op(build->context,
+								     values[instr->src2])));
+			    break;
+			}
 			if (instr->op == HIR_OP_DIV) {
 			    char name[32];
 			    sprintf(name, "zero_div%d", copy_serial++);
@@ -691,14 +1273,34 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_reg_op(build->context,
 								     values[instr->src2])));
 			} else {
-			    append(build, MIR_new_insn(build->context,
-						      float_binary_code(instr->op),
-						      MIR_new_reg_op(build->context,
-								     values[instr->value]),
-						      MIR_new_reg_op(build->context,
-								     values[instr->src1]),
-						      MIR_new_reg_op(build->context,
-								     values[instr->src2])));
+			    if (values[instr->value] == values[instr->src1]
+				&& values[instr->value] == values[instr->src2]) {
+				char name[32];
+				sprintf(name, "fl_tmp%d", copy_serial++);
+				MIR_reg_t tmp = MIR_new_func_reg(build->context,
+								   build->function->u.func,
+								   MIR_T_D, name);
+				append(build, MIR_new_insn(build->context,
+							  float_binary_code(instr->op),
+							  MIR_new_reg_op(build->context, tmp),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src1]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src2])));
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_reg_op(build->context,
+									 values[instr->value]),
+							  MIR_new_reg_op(build->context, tmp)));
+			    } else {
+				append(build, MIR_new_insn(build->context,
+							  float_binary_code(instr->op),
+							  MIR_new_reg_op(build->context,
+									 values[instr->value]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src1]),
+							  MIR_new_reg_op(build->context,
+									 values[instr->src2])));
+			    }
 			}
 			if (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
 			    || instr->op == HIR_OP_MUL || instr->op == HIR_OP_DIV)
@@ -765,6 +1367,30 @@ build_mir(JITProgram *program, MIRBuild *build)
 				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
 				instr->bytecode_pc, instr->source_lineno);
 		    if (instr->op == HIR_OP_INDEX) {
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_STR) {
+			    char name[32];
+			    sprintf(name, "str_idx_err%d", copy_serial++);
+			    MIR_reg_t err_reg = new_reg(build, name);
+			    MIR_label_t range_err = new_status_exit(build, &status_exits,
+				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
+				instr->bytecode_pc, instr->source_lineno);
+			    append(build, MIR_new_call_insn(build->context, 6,
+				MIR_new_ref_op(build->context, build->proto_str_ref),
+				MIR_new_ref_op(build->context, build->import_str_ref),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_reg_op(build->context, values[instr->src2]),
+				MIR_new_reg_op(build->context, error_out)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, range_err),
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_int_op(build->context, E_NONE)));
+			    break;
+			}
 			MIR_label_t deopt = MIR_new_label(build->context);
 			MIR_label_t loaded = MIR_new_label(build->context);
 			MIR_reg_t list_ptr = values[instr->src1];
@@ -950,10 +1576,18 @@ build_mir(JITProgram *program, MIRBuild *build)
 						 values[instr->value]),
 				MIR_new_reg_op(build->context, base)));
 			append(build, skip_multiply);
+		    {
+			char bsq_name[32];
+			sprintf(bsq_name, "base_sq%d", copy_serial);
+			MIR_reg_t base_sq = new_reg(build, bsq_name);
 			append(build, MIR_new_insn(build->context, MIR_MUL,
-				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base_sq),
 				MIR_new_reg_op(build->context, base),
 				MIR_new_reg_op(build->context, base)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, base_sq)));
+		    }
 			append(build, MIR_new_insn(build->context, MIR_URSH,
 				MIR_new_reg_op(build->context, power),
 				MIR_new_reg_op(build->context, power),
@@ -1014,7 +1648,24 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_int_op(build->context,
 						 sizeof(Num) * CHAR_BIT)));
 			}
-			append(build, MIR_new_insn(build->context,
+			if (values[instr->value] == values[instr->src1]
+			    && values[instr->value] == values[instr->src2]) {
+			    char name[32];
+			    sprintf(name, "bin_tmp%d", copy_serial++);
+			    MIR_reg_t tmp = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context,
+						      binary_code(instr->op),
+				MIR_new_reg_op(build->context, tmp),
+				MIR_new_reg_op(build->context,
+						 values[instr->src1]),
+				MIR_new_reg_op(build->context,
+						 values[instr->src2])));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context,
+						 values[instr->value]),
+				MIR_new_reg_op(build->context, tmp)));
+			} else {
+			    append(build, MIR_new_insn(build->context,
 						      binary_code(instr->op),
 				MIR_new_reg_op(build->context,
 						 values[instr->value]),
@@ -1022,6 +1673,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 						 values[instr->src1]),
 				MIR_new_reg_op(build->context,
 						 values[instr->src2])));
+			}
 		    }
 		    }
 		    break;
@@ -1059,19 +1711,55 @@ build_mir(JITProgram *program, MIRBuild *build)
 			}
 			n = 0;
 			for (copy = instr->copies; copy; copy = copy->next) {
-			    if (program->value_types
-				&& program->value_types[copy->dst] == TYPE_FLOAT) {
+			    int src_fl = program->value_types
+				&& program->value_types[copy->src] == TYPE_FLOAT;
+			    int dst_fl = program->value_types
+				&& program->value_types[copy->dst] == TYPE_FLOAT;
+
+			    if (src_fl && dst_fl) {
 				append(build, MIR_new_insn(build->context, MIR_DMOV,
 							  MIR_new_reg_op(build->context,
 									 values[copy->dst]),
 							  MIR_new_reg_op(build->context,
 									 temps[n])));
-			    } else {
+			    } else if (!src_fl && !dst_fl) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 							  MIR_new_reg_op(build->context,
 									 values[copy->dst]),
 							  MIR_new_reg_op(build->context,
 									 temps[n])));
+			    } else if (!src_fl && dst_fl) {
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+							  MIR_new_mem_op(build->context,
+									 sizeof(Num) == 8
+									 ? MIR_T_I64 : MIR_T_I32,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1),
+							  MIR_new_reg_op(build->context,
+									 temps[n])));
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_reg_op(build->context,
+									 values[copy->dst]),
+							  MIR_new_mem_op(build->context,
+									 MIR_T_D,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1)));
+			    } else {
+				append(build, MIR_new_insn(build->context, MIR_DMOV,
+							  MIR_new_mem_op(build->context,
+									 MIR_T_D,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1),
+							  MIR_new_reg_op(build->context,
+									 temps[n])));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+							  MIR_new_reg_op(build->context,
+									 values[copy->dst]),
+							  MIR_new_mem_op(build->context,
+									 sizeof(Num) == 8
+									 ? MIR_T_I64 : MIR_T_I32,
+									 copy->dst * sizeof(Num),
+									 deopt_values, 0, 1)));
 			    }
 			    n++;
 			}
@@ -1085,12 +1773,34 @@ build_mir(JITProgram *program, MIRBuild *build)
 							 labels[block->successors[0]])));
 		    break;
 		case HIR_TAC_BRANCH_FALSE:
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
 		    if (block->num_successors == 2) {
 			if (program->value_types
 			    && (program->value_types[instr->src1] == TYPE_STR
 				|| program->value_types[instr->src1] == TYPE_LIST)) {
-			    append_deopt_exit(build, program, instr->deopt_map, values,
-				deopt_map_out, deopt_values, status, common_return);
+			    char name[32];
+			    sprintf(name, "truth%d", copy_serial++);
+			    MIR_reg_t truth = new_reg(build, name);
+			    sprintf(name, "type_reg%d", copy_serial++);
+			    MIR_reg_t type_reg = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, type_reg),
+				MIR_new_int_op(build->context, program->value_types[instr->src1])));
+			    append(build, MIR_new_call_insn(build->context, 5,
+				MIR_new_ref_op(build->context, build->proto_is_true),
+				MIR_new_ref_op(build->context, build->import_is_true),
+				MIR_new_reg_op(build->context, truth),
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_reg_op(build->context, type_reg)));
+			    append(build, MIR_new_insn(build->context, MIR_BF,
+				MIR_new_label_op(build->context,
+						 labels[block->successors[0]]),
+				MIR_new_reg_op(build->context, truth)));
 			} else if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_FLOAT) {
 			    char name[32];
@@ -1115,16 +1825,20 @@ build_mir(JITProgram *program, MIRBuild *build)
 							  MIR_new_reg_op(build->context,
 									 values[instr->src1])));
 			}
-			if (!program->value_types
-			    || (program->value_types[instr->src1] != TYPE_STR
-				&& program->value_types[instr->src1] != TYPE_LIST))
-			    append(build, MIR_new_insn(build->context, MIR_JMP,
-				MIR_new_label_op(build->context,
-					 labels[block->successors[1]])));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context,
+					     labels[block->successors[1]])));
 		    }
 		    break;
 		case HIR_TAC_RETURN:
-		    if (instr->literal_type == TYPE_FLOAT) {
+		    if (instr->kind == HIR_TAC_DEOPT) {
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
+		    if (program->value_types
+			&& program->value_types[instr->src1] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			/* Box if needed */
 #else
@@ -1218,14 +1932,21 @@ build_mir(JITProgram *program, MIRBuild *build)
 }
 
 JITProgram *
-jit_program_unsupported(const char *reason)
+jit_program_unsupported_with_diagnostic(const char *reason, const char *diagnostic)
 {
     JITProgram *program = mymalloc(sizeof(JITProgram), M_PROGRAM);
 
     memset(program, 0, sizeof(JITProgram));
     program->state = JIT_STATE_UNSUPPORTED;
-    program->reason = reason;
+    program->reason = str_dup(reason ? reason : "unsupported-program");
+    program->diagnostic = str_dup(diagnostic ? diagnostic : "none");
     return program;
+}
+
+JITProgram *
+jit_program_unsupported(const char *reason)
+{
+    return jit_program_unsupported_with_diagnostic(reason, 0);
 }
 
 void
@@ -1274,12 +1995,23 @@ jit_program_free(JITProgram *program)
 	    if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_STR
 		&& instr->literal)
 		free_str((const char *) (intptr_t) instr->literal);
+	    else if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_LIST
+		&& instr->literal) {
+		Var list_var;
+		list_var.type = TYPE_LIST;
+		list_var.v.list = (Var *) (intptr_t) instr->literal;
+		free_var(list_var);
+	    }
 	    myfree(instr, M_PROGRAM);
 	    instr = next_instr;
 	}
 	myfree(block, M_PROGRAM);
 	block = next_block;
     }
+    if (program->reason)
+	free_str(program->reason);
+    if (program->diagnostic)
+	free_str(program->diagnostic);
     myfree(program, M_PROGRAM);
 }
 
@@ -1341,6 +2073,12 @@ jit_program_reason(JITProgram *program)
     return program ? program->reason : "unsupported-program";
 }
 
+const char *
+jit_program_diagnostic(JITProgram *program)
+{
+    return (program && program->diagnostic) ? program->diagnostic : "none";
+}
+
 int
 jit_program_is_eligible(JITProgram *program)
 {
@@ -1377,18 +2115,29 @@ jit_program_compile(JITProgram *program)
 	return 1;
     if (!build_mir(program, &build)) {
 	program->state = JIT_STATE_FAILED;
-	program->reason = "code-generation-failed";
+	if (program->reason)
+	    free_str(program->reason);
+	program->reason = str_dup("code-generation-failed");
+	if (program->diagnostic)
+	    free_str(program->diagnostic);
+	program->diagnostic = str_dup("mir build module failed");
 	return 0;
     }
     MIR_load_module(build.context, build.module);
     MIR_gen_init(build.context);
     MIR_gen_set_optimize_level(build.context, 0);
+    MIR_link(build.context, MIR_set_gen_interface, 0);
     program->native_function = MIR_gen(build.context, build.function);
     if (!program->native_function) {
 	MIR_gen_finish(build.context);
 	MIR_finish(build.context);
 	program->state = JIT_STATE_FAILED;
-	program->reason = "code-generation-failed";
+	if (program->reason)
+	    free_str(program->reason);
+	program->reason = str_dup("code-generation-failed");
+	if (program->diagnostic)
+	    free_str(program->diagnostic);
+	program->diagnostic = str_dup("mir generator failed");
 	return 0;
     }
     program->machine_code = build.function->u.func->machine_code;

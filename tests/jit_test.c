@@ -5,7 +5,9 @@
 #include "my-string.h"
 
 #include "integer_arithmetic.h"
+#include "list.h"
 #include "storage.h"
+#include "utf.h"
 #include "utils.h"
 
 #include <limits.h>
@@ -54,9 +56,21 @@ add_entry_deopt_map(JITProgram *program)
 }
 
 static JITProgram *
-arithmetic_program(void)
+new_jit_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = str_dup("none");
+    program->diagnostic = str_dup("none");
+    program->eligible = 1;
+    return program;
+}
+
+static JITProgram *
+arithmetic_program(void)
+{
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *one = instruction(HIR_TAC_CONST);
     JITInstruction *two = instruction(HIR_TAC_CONST);
@@ -64,9 +78,6 @@ arithmetic_program(void)
     JITInstruction *add = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
@@ -114,15 +125,12 @@ binary_program(Num lhs, Num rhs, HIROp op)
 static JITProgram *
 unary_program(Num operand, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c = instruction(HIR_TAC_CONST);
     JITInstruction *unary = instruction(HIR_TAC_UNARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -186,14 +194,11 @@ arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
 static JITProgram *
 guard_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -212,7 +217,7 @@ guard_program(void)
 static JITProgram *
 local_arithmetic_program(Num constant_val, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *constant = instruction(HIR_TAC_CONST);
@@ -220,9 +225,6 @@ local_arithmetic_program(Num constant_val, HIROp op)
     JITInstruction *binary = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -257,7 +259,7 @@ local_arithmetic_program(Num constant_val, HIROp op)
 static JITProgram *
 two_local_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load0 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load1 = instruction(HIR_TAC_LOAD_LOCAL);
@@ -265,9 +267,6 @@ two_local_program(HIROp op)
     JITInstruction *binary = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -302,7 +301,7 @@ two_local_program(HIROp op)
 static JITProgram *
 index_program(Num index_val)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *constant = instruction(HIR_TAC_CONST);
@@ -310,9 +309,6 @@ index_program(Num index_val)
     JITInstruction *index = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->may_error = 1;
     program->num_values = 4;
     program->num_vars = 1;
@@ -346,7 +342,7 @@ index_program(Num index_val)
 static JITProgram *
 scatter_destructure_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
@@ -356,9 +352,6 @@ scatter_destructure_program(void)
     JITInstruction *add = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->may_error = 1;
     program->num_values = 7;
     program->num_vars = 1;
@@ -409,15 +402,12 @@ scatter_destructure_program(void)
 static JITProgram *
 call_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
     JITInstruction *call = instruction(HIR_TAC_CALL);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -456,16 +446,13 @@ call_boundary_program(void)
 static JITProgram *
 get_prop_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
     JITInstruction *c2 = instruction(HIR_TAC_CONST);
     JITInstruction *get = instruction(HIR_TAC_BINARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -511,7 +498,7 @@ get_prop_program(void)
 static JITProgram *
 deep_guard_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
@@ -519,9 +506,6 @@ deep_guard_program(void)
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -556,9 +540,114 @@ deep_guard_program(void)
 }
 
 static JITProgram *
+list_constant_program(int size)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *list_const = instruction(HIR_TAC_CONST);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    Var list = new_list(size);
+    int i;
+
+    for (i = 1; i <= size; i++) {
+	list.v.list[i].type = TYPE_INT;
+	list.v.list[i].v.num = i * 10;
+    }
+
+    program->num_values = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 2);
+    program->value_types[1] = TYPE_LIST;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    list_const->value = 1;
+    list_const->literal_type = TYPE_LIST;
+    list_const->literal = (uintptr_t) list.v.list;
+    ret->src1 = 1;
+    ret->literal_type = TYPE_LIST;
+    list_const->next = ret;
+    block->first = list_const;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+in_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_lhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_rhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *in_tac = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[1] = TYPE_INT;
+    program->value_types[2] = TYPE_LIST;
+    program->value_types[3] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 12;
+    map->stack_depth = 2;
+    map->ticks_charged = 1;
+    map->num_locals = 2;
+    map->local_values = allocate(sizeof(int) * 2);
+    map->local_values[0] = 1;
+    map->local_values[1] = 2;
+    map->local_types = allocate(sizeof(var_type) * 2);
+    map->local_types[0] = TYPE_INT;
+    map->local_types[1] = TYPE_LIST;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_types = allocate(sizeof(var_type) * 2);
+    map->stack_types[0] = TYPE_INT;
+    map->stack_types[1] = TYPE_LIST;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_lhs->value = 1;
+    load_lhs->local_id = 0;
+    load_lhs->literal_type = TYPE_INT;
+    load_lhs->deopt_map = 0;
+    load_rhs->value = 2;
+    load_rhs->local_id = 1;
+    load_rhs->literal_type = TYPE_LIST;
+    load_rhs->deopt_map = 0;
+    tick->source_lineno = 7;
+    tick->bytecode_pc = 12;
+    in_tac->source_lineno = 7;
+    in_tac->bytecode_pc = 12;
+    in_tac->value = 3;
+    in_tac->src1 = 1;
+    in_tac->src2 = 2;
+    in_tac->op = HIR_OP_IN;
+    in_tac->deopt_map = 1;
+    ret->src1 = 3;
+
+    load_lhs->next = load_rhs;
+    load_rhs->next = tick;
+    tick->next = in_tac;
+    in_tac->next = ret;
+    block->first = load_lhs;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 branch_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *entry = allocate(sizeof(JITBlock));
     JITBlock *truth = allocate(sizeof(JITBlock));
     JITBlock *falsehood = allocate(sizeof(JITBlock));
@@ -576,9 +665,6 @@ branch_program(void)
     JITCopy *copy1 = allocate(sizeof(JITCopy));
     JITCopy *copy2 = allocate(sizeof(JITCopy));
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 1;
     program->num_blocks = 4;
@@ -632,15 +718,12 @@ branch_program(void)
 static JITProgram *
 charge_tick_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
@@ -660,7 +743,7 @@ charge_tick_program(void)
 static JITProgram *
 call_verb_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_obj = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_verb = instruction(HIR_TAC_LOAD_LOCAL);
@@ -669,9 +752,6 @@ call_verb_program(void)
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 3;
     program->num_blocks = 1;
@@ -730,14 +810,11 @@ call_verb_program(void)
 static JITProgram *
 object_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -758,16 +835,13 @@ object_return_program(void)
 static JITProgram *
 object_compare_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_obj1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_obj2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *cmp = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -797,14 +871,11 @@ object_compare_program(HIROp op)
 static JITProgram *
 float_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -828,16 +899,13 @@ float_return_program(void)
 static JITProgram *
 float_binary_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_f1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_f2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *bin = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -872,16 +940,13 @@ float_binary_program(HIROp op)
 static JITProgram *
 float_compare_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_f1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_f2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *cmp = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -916,15 +981,12 @@ float_compare_program(HIROp op)
 static JITProgram *
 float_unary_program(double val, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *unary = instruction(HIR_TAC_UNARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -955,14 +1017,11 @@ float_unary_program(double val, HIROp op)
 static JITProgram *
 string_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -990,14 +1049,11 @@ string_return_program(void)
 static JITProgram *
 string_const_program(const char *s)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1027,7 +1083,7 @@ string_const_program(const char *s)
 static JITProgram *
 string_compare_program(const char *lhs, const char *rhs, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *left = instruction(HIR_TAC_CONST);
     JITInstruction *right = instruction(HIR_TAC_CONST);
@@ -1036,9 +1092,6 @@ string_compare_program(const char *lhs, const char *rhs, HIROp op)
     char *left_string = str_dup(lhs);
     char *right_string = str_dup(rhs);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_blocks = 1;
     program->value_types = allocate(sizeof(var_type) * 4);
@@ -1067,6 +1120,95 @@ string_compare_program(const char *lhs, const char *rhs, HIROp op)
     return_instr->src1 = 3;
     return_instr->literal_type = TYPE_INT;
     block->first = left;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+string_concat_program(const char *left_string, const char *right_string)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    char *ls = str_dup(left_string);
+    char *rs = str_dup(right_string);
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    left->value = 1;
+    left->literal = (uintptr_t) ls;
+    left->literal_type = TYPE_STR;
+    left->next = right;
+    right->value = 2;
+    right->literal = (uintptr_t) rs;
+    right->literal_type = TYPE_STR;
+    right->next = concat;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->deopt_map = 0;
+    concat->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_STR;
+    block->first = left;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+string_index_program(const char *s, int idx)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *str_const = instruction(HIR_TAC_CONST);
+    JITInstruction *idx_const = instruction(HIR_TAC_CONST);
+    JITInstruction *index_op = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    char *str = str_dup(s);
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    str_const->value = 1;
+    str_const->literal = (uintptr_t) str;
+    str_const->literal_type = TYPE_STR;
+    str_const->next = idx_const;
+    idx_const->value = 2;
+    idx_const->literal = idx;
+    idx_const->literal_type = TYPE_INT;
+    idx_const->next = index_op;
+    index_op->value = 3;
+    index_op->src1 = 1;
+    index_op->src2 = 2;
+    index_op->op = HIR_OP_INDEX;
+    index_op->deopt_map = 0;
+    index_op->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_STR;
+    block->first = str_const;
     block->last = return_instr;
     return program;
 }
@@ -1111,10 +1253,36 @@ string_not_program(const char *s)
     return_instr->literal_type = TYPE_INT;
     return program;
 }
+
+static JITProgram *
+string_length_program(const char *s)
+{
+    JITProgram *program = string_const_program(s);
+    JITInstruction *constant = program->blocks->first;
+    JITInstruction *return_instr = constant->next;
+    JITInstruction *length_instr = instruction(HIR_TAC_UNARY);
+
+    program->num_values = 3;
+    myfree(program->value_types, M_PROGRAM);
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    constant->next = length_instr;
+    length_instr->value = 2;
+    length_instr->src1 = 1;
+    length_instr->op = HIR_OP_LENGTH;
+    length_instr->deopt_map = 0;
+    length_instr->next = return_instr;
+    return_instr->src1 = 2;
+    return_instr->literal_type = TYPE_INT;
+    return program;
+}
+
 static JITProgram *
 catch_stack_marker_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_codes = instruction(HIR_TAC_CONST);
     JITInstruction *const_pc = instruction(HIR_TAC_CONST);
@@ -1122,9 +1290,6 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1184,14 +1349,11 @@ catch_stack_marker_deopt_program(void)
 static JITProgram *
 exception_boundary_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 1;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
@@ -1210,15 +1372,12 @@ exception_boundary_deopt_program(void)
 static JITProgram *
 fork_boundary_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_time = instruction(HIR_TAC_CONST);
     JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
@@ -1257,15 +1416,12 @@ fork_boundary_deopt_program(void)
 static JITProgram *
 finally_stack_marker_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_finally = instruction(HIR_TAC_CONST);
     JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1309,16 +1465,13 @@ finally_stack_marker_deopt_program(void)
 static JITProgram *
 list_index_typed_program(var_type elem_type)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *const_idx = instruction(HIR_TAC_CONST);
     JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -1357,6 +1510,241 @@ list_index_typed_program(var_type elem_type)
     return program;
 }
 
+static JITProgram *
+verb_call_boundary_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
+    JITDeoptMap *map;
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 55;
+    map->error_pc = 55;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    block->first = block->last = call_verb;
+    call_verb->deopt_map = 1;
+    call_verb->bytecode_pc = 55;
+    return program;
+}
+
+static JITProgram *
+prop_boundary_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *put_prop = instruction(HIR_TAC_PUT_PROP);
+    JITDeoptMap *map;
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 60;
+    map->error_pc = 60;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    block->first = block->last = put_prop;
+    put_prop->deopt_map = 1;
+    put_prop->bytecode_pc = 60;
+    return program;
+}
+
+static JITProgram *
+range_boundary_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *range_ref = instruction(HIR_TAC_RANGE_REF);
+    JITDeoptMap *map;
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 65;
+    map->error_pc = 65;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    block->first = block->last = range_ref;
+    range_ref->deopt_map = 1;
+    range_ref->bytecode_pc = 65;
+    return program;
+}
+
+static JITProgram *
+range_set_boundary_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *range_set = instruction(HIR_TAC_RANGE_SET);
+    JITDeoptMap *map;
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 70;
+    map->error_pc = 70;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    block->first = block->last = range_set;
+    range_set->deopt_map = 1;
+    range_set->bytecode_pc = 70;
+    return program;
+}
+
+static JITProgram *
+nested_loop_branch_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *b1 = allocate(sizeof(JITBlock));
+    JITBlock *b2 = allocate(sizeof(JITBlock));
+    JITBlock *b3 = allocate(sizeof(JITBlock));
+    JITBlock *b4 = allocate(sizeof(JITBlock));
+    JITBlock *b5 = allocate(sizeof(JITBlock));
+    JITBlock *b6 = allocate(sizeof(JITBlock));
+    JITBlock *b7 = allocate(sizeof(JITBlock));
+
+    program->num_values = 20;
+    program->num_vars = 0;
+    program->num_blocks = 7;
+    add_entry_deopt_map(program);
+
+    program->blocks = b1;
+    program->last_block = b7;
+
+    b1->id = 1; b1->next = b2;
+    b2->id = 2; b2->next = b3;
+    b3->id = 3; b3->next = b4;
+    b4->id = 4; b4->next = b5;
+    b5->id = 5; b5->next = b6;
+    b6->id = 6; b6->next = b7;
+    b7->id = 7; b7->next = 0;
+
+    /* B1 (Entry) */
+    JITInstruction *c_acc0 = instruction(HIR_TAC_CONST);
+    c_acc0->value = 1; c_acc0->literal = 0; c_acc0->literal_type = TYPE_INT;
+
+    JITInstruction *c_i1 = instruction(HIR_TAC_CONST);
+    c_i1->value = 2; c_i1->literal = 1; c_i1->literal_type = TYPE_INT;
+
+    JITInstruction *cp_entry = instruction(HIR_TAC_PARALLEL_COPY);
+    JITCopy *cp_e1 = allocate(sizeof(JITCopy));
+    JITCopy *cp_e2 = allocate(sizeof(JITCopy));
+    cp_e1->dst = 5; cp_e1->src = 1; cp_e1->next = cp_e2;
+    cp_e2->dst = 6; cp_e2->src = 2; cp_e2->next = 0;
+    cp_entry->copies = cp_e1;
+
+    JITInstruction *jmp_entry = instruction(HIR_TAC_JUMP);
+    c_acc0->next = c_i1; c_i1->next = cp_entry; cp_entry->next = jmp_entry;
+    b1->first = c_acc0; b1->last = jmp_entry;
+    b1->num_successors = 1;
+    b1->successors[0] = 2;
+
+    /* B2 (Header) */
+    JITInstruction *t_hdr = instruction(HIR_TAC_TICK);
+    JITInstruction *c_limit = instruction(HIR_TAC_CONST);
+    c_limit->value = 7; c_limit->literal = 10; c_limit->literal_type = TYPE_INT;
+
+    JITInstruction *cmp_le = instruction(HIR_TAC_BINARY);
+    cmp_le->value = 8; cmp_le->src1 = 6; cmp_le->src2 = 7; cmp_le->op = HIR_OP_LE;
+
+    JITInstruction *br_hdr = instruction(HIR_TAC_BRANCH_FALSE);
+    br_hdr->src1 = 8;
+
+    t_hdr->next = c_limit; c_limit->next = cmp_le; cmp_le->next = br_hdr;
+    b2->first = t_hdr; b2->last = br_hdr;
+    b2->num_successors = 2;
+    b2->successors[0] = 7;
+    b2->successors[1] = 3;
+
+    /* B3 (Body) */
+    JITInstruction *c_mask = instruction(HIR_TAC_CONST);
+    c_mask->value = 9; c_mask->literal = 1; c_mask->literal_type = TYPE_INT;
+
+    JITInstruction *and_instr = instruction(HIR_TAC_BINARY);
+    and_instr->value = 10; and_instr->src1 = 6; and_instr->src2 = 9; and_instr->op = HIR_OP_BITAND;
+
+    JITInstruction *br_body = instruction(HIR_TAC_BRANCH_FALSE);
+    br_body->src1 = 10;
+
+    c_mask->next = and_instr; and_instr->next = br_body;
+    b3->first = c_mask; b3->last = br_body;
+    b3->num_successors = 2;
+    b3->successors[0] = 4;
+    b3->successors[1] = 5;
+
+    /* B4 (Even) */
+    JITInstruction *add_even = instruction(HIR_TAC_BINARY);
+    add_even->value = 11; add_even->src1 = 5; add_even->src2 = 6; add_even->op = HIR_OP_ADD;
+
+    JITInstruction *cp_even = instruction(HIR_TAC_PARALLEL_COPY);
+    JITCopy *cp_ev = allocate(sizeof(JITCopy));
+    cp_ev->dst = 13; cp_ev->src = 11; cp_ev->next = 0;
+    cp_even->copies = cp_ev;
+
+    JITInstruction *jmp_even = instruction(HIR_TAC_JUMP);
+    add_even->next = cp_even; cp_even->next = jmp_even;
+    b4->first = add_even; b4->last = jmp_even;
+    b4->num_successors = 1;
+    b4->successors[0] = 6;
+
+    /* B5 (Odd) */
+    JITInstruction *sub_odd = instruction(HIR_TAC_BINARY);
+    sub_odd->value = 12; sub_odd->src1 = 5; sub_odd->src2 = 6; sub_odd->op = HIR_OP_SUB;
+
+    JITInstruction *cp_odd = instruction(HIR_TAC_PARALLEL_COPY);
+    JITCopy *cp_od = allocate(sizeof(JITCopy));
+    cp_od->dst = 13; cp_od->src = 12; cp_od->next = 0;
+    cp_odd->copies = cp_od;
+
+    JITInstruction *jmp_odd = instruction(HIR_TAC_JUMP);
+    sub_odd->next = cp_odd; cp_odd->next = jmp_odd;
+    b5->first = sub_odd; b5->last = jmp_odd;
+    b5->num_successors = 1;
+    b5->successors[0] = 6;
+
+    /* B6 (Latch) */
+    JITInstruction *c_inc = instruction(HIR_TAC_CONST);
+    c_inc->value = 14; c_inc->literal = 1; c_inc->literal_type = TYPE_INT;
+
+    JITInstruction *add_inc = instruction(HIR_TAC_BINARY);
+    add_inc->value = 15; add_inc->src1 = 6; add_inc->src2 = 14; add_inc->op = HIR_OP_ADD;
+
+    JITInstruction *cp_latch = instruction(HIR_TAC_PARALLEL_COPY);
+    JITCopy *cp_l1 = allocate(sizeof(JITCopy));
+    JITCopy *cp_l2 = allocate(sizeof(JITCopy));
+    cp_l1->dst = 5; cp_l1->src = 13; cp_l1->next = cp_l2;
+    cp_l2->dst = 6; cp_l2->src = 15; cp_l2->next = 0;
+    cp_latch->copies = cp_l1;
+
+    JITInstruction *jmp_latch = instruction(HIR_TAC_JUMP);
+    c_inc->next = add_inc; add_inc->next = cp_latch; cp_latch->next = jmp_latch;
+    b6->first = c_inc; b6->last = jmp_latch;
+    b6->num_successors = 1;
+    b6->successors[0] = 2;
+
+    /* B7 (Exit) */
+    JITInstruction *ret_exit = instruction(HIR_TAC_RETURN);
+    ret_exit->src1 = 5;
+    b7->first = b7->last = ret_exit;
+
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -1368,12 +1756,57 @@ find_block(JITProgram *program, int id)
     return 0;
 }
 
+static Var
+materialize_deopt_value(var_type type, Num raw)
+{
+    Var value;
+
+    value.type = type;
+    if (type == TYPE_STR)
+	value.v.str = (const char *) (intptr_t) raw;
+    else if (type == TYPE_LIST)
+	value.v.list = (Var *) (intptr_t) raw;
+    else if (type == TYPE_OBJ)
+	value.v.obj = raw;
+    else if (type == TYPE_ERR)
+	value.v.err = raw;
+    else if (type == TYPE_FLOAT) {
+	FlNum f;
+	memcpy(&f, &raw, sizeof(FlNum));
+	value.v.fnum = box_fl(f);
+	return value;
+    }
+    else
+	value.v.num = raw;
+    return var_ref(value);
+}
+
 static JITRunResult
 reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
-		  int *timed_out, enum error *error)
+		  int *timed_out, enum error *error,
+		  JITSourceLocation *source_location,
+		  JITDeoptState *deopt, Var *deopt_stack)
 {
     Num *values = allocate(sizeof(Num) * (program->num_values + 1));
     JITBlock *block = program->blocks;
+    JITSourceLocation ignored_loc;
+    int deopt_map_index = -1;
+
+    if (!source_location)
+	source_location = &ignored_loc;
+    source_location->bytecode_pc = 0;
+    source_location->error_pc = 0;
+    source_location->source_lineno = 0;
+
+    if (deopt) {
+	memset(deopt, 0, sizeof(*deopt));
+	if (program && program->num_deopt_maps > 0) {
+	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
+	    deopt->error_pc = program->deopt_maps[0].error_pc;
+	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
+	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+	}
+    }
 
     while (block) {
 	JITInstruction *instr;
@@ -1384,17 +1817,28 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 	    case HIR_TAC_TICK:
 		--*ticks;
 		if (instr->op != HIR_OP_CHARGE_TICK && *ticks <= 0) {
+		    source_location->bytecode_pc = instr->bytecode_pc;
+		    source_location->error_pc = instr->bytecode_pc;
+		    source_location->source_lineno = instr->source_lineno;
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_TICKS;
 		}
 		if (instr->op != HIR_OP_CHARGE_TICK && *timed_out) {
+		    source_location->bytecode_pc = instr->bytecode_pc;
+		    source_location->error_pc = instr->bytecode_pc;
+		    source_location->source_lineno = instr->source_lineno;
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_SECONDS;
 		}
 		break;
 	    case HIR_TAC_DEOPT:
-		myfree(values, M_PROGRAM);
-		return JIT_RUN_FALLBACK;
+	    case HIR_TAC_CALL:
+	    case HIR_TAC_CALL_VERB:
+	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
+		deopt_map_index = instr->deopt_map;
+		goto do_fallback;
 	    case HIR_TAC_CONST:
 		if (instr->literal_type == TYPE_FLOAT)
 		    memcpy(&values[instr->value], &instr->literal, sizeof(Num));
@@ -1403,8 +1847,8 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
 		if (env[instr->local_id].type != instr->literal_type) {
-		    myfree(values, M_PROGRAM);
-		    return JIT_RUN_FALLBACK;
+		    deopt_map_index = instr->deopt_map;
+		    goto do_fallback;
 		}
 		if (instr->literal_type == TYPE_INT)
 		    values[instr->value] = env[instr->local_id].v.num;
@@ -1419,12 +1863,24 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		else if (instr->literal_type == TYPE_STR)
 		    values[instr->value] = (Num) (intptr_t) env[instr->local_id].v.str;
 		else {
-		    myfree(values, M_PROGRAM);
-		    return JIT_RUN_FALLBACK;
+		    deopt_map_index = instr->deopt_map;
+		    goto do_fallback;
 		}
 		break;
 	    case HIR_TAC_UNARY:
-		if (program->value_types && program->value_types[instr->src1] == TYPE_FLOAT) {
+		if (program->value_types && (program->value_types[instr->src1] == TYPE_STR
+					     || program->value_types[instr->src1] == TYPE_LIST)) {
+		    if (instr->op == HIR_OP_NOT) {
+			deopt_map_index = instr->deopt_map;
+			goto do_fallback;
+		    }
+		}
+		if (instr->op == HIR_OP_LENGTH && program->value_types
+		    && program->value_types[instr->src1] == TYPE_STR)
+		    values[instr->value] = memo_strlen_utf((const char *)
+			(intptr_t) values[instr->src1]);
+		else if (program->value_types
+			 && program->value_types[instr->src1] == TYPE_FLOAT) {
 		    FlNum f;
 		    memcpy(&f, &values[instr->src1], sizeof(FlNum));
 		    if (instr->op == HIR_OP_NEGATE) {
@@ -1444,6 +1900,15 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		{
 		    IntegerArithmeticOperation operation;
 
+		    if (program->value_types
+			&& (program->value_types[instr->src1] == TYPE_STR
+			    || program->value_types[instr->src1] == TYPE_LIST)
+			&& (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+			    || instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+			    || instr->op == HIR_OP_GT || instr->op == HIR_OP_GE)) {
+			deopt_map_index = instr->deopt_map;
+			goto do_fallback;
+		    }
 		    if (program->value_types && program->value_types[instr->src1] == TYPE_FLOAT) {
 			FlNum a, b, res;
 			memcpy(&a, &values[instr->src1], sizeof(FlNum));
@@ -1452,6 +1917,9 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			    res = a + b;
 			    if (!IS_REAL(res)) {
 				*error = E_FLOAT;
+				source_location->bytecode_pc = instr->bytecode_pc;
+				source_location->error_pc = instr->bytecode_pc;
+				source_location->source_lineno = instr->source_lineno;
 				myfree(values, M_PROGRAM);
 				return JIT_RUN_ERROR;
 			    }
@@ -1460,6 +1928,9 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			    res = a - b;
 			    if (!IS_REAL(res)) {
 				*error = E_FLOAT;
+				source_location->bytecode_pc = instr->bytecode_pc;
+				source_location->error_pc = instr->bytecode_pc;
+				source_location->source_lineno = instr->source_lineno;
 				myfree(values, M_PROGRAM);
 				return JIT_RUN_ERROR;
 			    }
@@ -1468,6 +1939,9 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			    res = a * b;
 			    if (!IS_REAL(res)) {
 				*error = E_FLOAT;
+				source_location->bytecode_pc = instr->bytecode_pc;
+				source_location->error_pc = instr->bytecode_pc;
+				source_location->source_lineno = instr->source_lineno;
 				myfree(values, M_PROGRAM);
 				return JIT_RUN_ERROR;
 			    }
@@ -1475,12 +1949,18 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			} else if (instr->op == HIR_OP_DIV) {
 			    if (b == 0.0) {
 				*error = E_DIV;
+				source_location->bytecode_pc = instr->bytecode_pc;
+				source_location->error_pc = instr->bytecode_pc;
+				source_location->source_lineno = instr->source_lineno;
 				myfree(values, M_PROGRAM);
 				return JIT_RUN_ERROR;
 			    }
 			    res = a / b;
 			    if (!IS_REAL(res)) {
 				*error = E_FLOAT;
+				source_location->bytecode_pc = instr->bytecode_pc;
+				source_location->error_pc = instr->bytecode_pc;
+				source_location->source_lineno = instr->source_lineno;
 				myfree(values, M_PROGRAM);
 				return JIT_RUN_ERROR;
 			    }
@@ -1506,17 +1986,20 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			    ? program->value_types[instr->value] : TYPE_INT;
 
 			if (!list_ptr) {
-			    myfree(values, M_PROGRAM);
-			    return JIT_RUN_FALLBACK;
+			    deopt_map_index = instr->deopt_map;
+			    goto do_fallback;
 			}
 			if (index < 1 || index > list_ptr[0].v.num) {
 			    *error = E_RANGE;
+			    source_location->bytecode_pc = instr->bytecode_pc;
+			    source_location->error_pc = instr->bytecode_pc;
+			    source_location->source_lineno = instr->source_lineno;
 			    myfree(values, M_PROGRAM);
 			    return JIT_RUN_ERROR;
 			}
 			if (list_ptr[index].type != expected_type) {
-			    myfree(values, M_PROGRAM);
-			    return JIT_RUN_FALLBACK;
+			    deopt_map_index = instr->deopt_map;
+			    goto do_fallback;
 			}
 			if (expected_type == TYPE_FLOAT) {
 			    FlNum f = fl_unbox(list_ptr[index].v.fnum);
@@ -1535,6 +2018,9 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 
 			if (!arithmetic.succeeded) {
 			    *error = arithmetic.error;
+			    source_location->bytecode_pc = instr->bytecode_pc;
+			    source_location->error_pc = instr->bytecode_pc;
+			    source_location->source_lineno = instr->source_lineno;
 			    myfree(values, M_PROGRAM);
 			    return JIT_RUN_ERROR;
 			}
@@ -1567,12 +2053,12 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			values[instr->value] = values[instr->src1]
 			    >= values[instr->src2];
 		    else {
-			myfree(values, M_PROGRAM);
-			return JIT_RUN_FALLBACK;
+			deopt_map_index = instr->deopt_map;
+			goto do_fallback;
 		    }
 		}
 		break;
-	case HIR_TAC_PARALLEL_COPY:
+	    case HIR_TAC_PARALLEL_COPY:
 		{
 		    JITCopy *copy;
 		    Num *saved;
@@ -1594,6 +2080,11 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		next = find_block(program, block->successors[0]);
 		break;
 	    case HIR_TAC_BRANCH_FALSE:
+		if (program->value_types && (program->value_types[instr->src1] == TYPE_STR
+					     || program->value_types[instr->src1] == TYPE_LIST)) {
+		    deopt_map_index = instr->deopt_map;
+		    goto do_fallback;
+		}
 		next = find_block(program, block->successors[
 			values[instr->src1] ? 1 : 0]);
 		break;
@@ -1623,6 +2114,30 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 	}
 	block = next;
     }
+
+do_fallback:
+    if (deopt_map_index >= 0 && deopt_map_index < program->num_deopt_maps) {
+	JITDeoptMap *map = &program->deopt_maps[deopt_map_index];
+	int i;
+	for (i = 0; env && i < map->num_locals; i++) {
+	    if (map->local_values[i] > 0) {
+		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
+		Var val = materialize_deopt_value(type, values[map->local_values[i]]);
+		free_var(env[i]);
+		env[i] = val;
+	    }
+	}
+	for (i = 0; deopt_stack && i < (int) map->stack_depth; i++) {
+	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
+	    deopt_stack[i] = materialize_deopt_value(type, values[map->stack_values[i]]);
+	}
+	if (deopt) {
+	    deopt->bytecode_pc = map->bytecode_pc;
+	    deopt->error_pc = map->error_pc;
+	    deopt->stack_depth = map->stack_depth;
+	    deopt->ticks_charged = map->ticks_charged;
+	}
+    }
     myfree(values, M_PROGRAM);
     return JIT_RUN_FALLBACK;
 }
@@ -1637,33 +2152,114 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
     int reference_ticks = initial_ticks;
     enum error native_error = E_NONE;
     enum error reference_error = E_NONE;
+    JITSourceLocation native_loc, ref_loc;
+    JITDeoptState native_deopt, ref_deopt;
+    Var *native_deopt_stack;
+    Var *ref_deopt_stack;
+    Var *native_env_copy = 0;
+    Var *ref_env_copy = 0;
+    unsigned stack_capacity = 1;
+    int num_vars = program->num_vars;
+    int i;
     JITRunResult native_status;
     JITRunResult reference_status;
 
-    native_status = jit_program_execute(program, env, &native_result,
-					&native_ticks, &timed_out,
-					&native_error, 0, 0, 0);
-    reference_status = reference_execute(program, env, &reference_result,
-					 &reference_ticks, &timed_out,
-					 &reference_error);
-    check(native_status == reference_status && native_ticks == reference_ticks
-	  && (native_status != JIT_RUN_ERROR
-	      || native_error == reference_error)
-	  && (native_status != JIT_RUN_RETURNED
-	      || (native_result.type == reference_result.type
-		  && (native_result.type == TYPE_FLOAT
-		      ? fl_unbox(native_result.v.fnum) == fl_unbox(reference_result.v.fnum)
-		      : (native_result.type == TYPE_STR
-			 ? !strcmp(native_result.v.str, reference_result.v.str)
-			 : (native_result.type == TYPE_OBJ
-			    ? native_result.v.obj == reference_result.v.obj
-			    : (native_result.type == TYPE_LIST
-			       ? native_result.v.list == reference_result.v.list
-			       : native_result.v.num == reference_result.v.num)))))), message);
+    memset(&native_loc, 0, sizeof(native_loc));
+    memset(&ref_loc, 0, sizeof(ref_loc));
+    memset(&native_deopt, 0, sizeof(native_deopt));
+    memset(&ref_deopt, 0, sizeof(ref_deopt));
+    for (i = 0; i < program->num_deopt_maps; i++)
+	if (program->deopt_maps[i].stack_depth > stack_capacity)
+	    stack_capacity = program->deopt_maps[i].stack_depth;
+    native_deopt_stack = allocate(sizeof(Var) * stack_capacity);
+    ref_deopt_stack = allocate(sizeof(Var) * stack_capacity);
+
+    if (num_vars > 0 && env) {
+	native_env_copy = allocate(sizeof(Var) * num_vars);
+	ref_env_copy = allocate(sizeof(Var) * num_vars);
+	for (i = 0; i < num_vars; i++) {
+	    native_env_copy[i] = var_ref(env[i]);
+	    ref_env_copy[i] = var_ref(env[i]);
+	}
+    }
+
+    native_status = jit_program_execute(program, native_env_copy ? native_env_copy : env,
+					&native_result, &native_ticks, &timed_out,
+					&native_error, &native_loc, &native_deopt,
+					native_deopt_stack);
+    reference_status = reference_execute(program, ref_env_copy ? ref_env_copy : env,
+					 &reference_result, &reference_ticks, &timed_out,
+					 &reference_error, &ref_loc, &ref_deopt,
+					 ref_deopt_stack);
+
+    check(native_status == reference_status, message);
+    check(native_ticks == reference_ticks, message);
+    if (native_status == JIT_RUN_ERROR) {
+	check(native_error == reference_error, message);
+	check(native_loc.bytecode_pc == ref_loc.bytecode_pc, message);
+	check(native_loc.error_pc == ref_loc.error_pc, message);
+	check(native_loc.source_lineno == ref_loc.source_lineno, message);
+    } else if (native_status == JIT_RUN_ABORT_TICKS || native_status == JIT_RUN_ABORT_SECONDS) {
+	check(native_loc.bytecode_pc == ref_loc.bytecode_pc, message);
+	check(native_loc.error_pc == ref_loc.error_pc, message);
+	check(native_loc.source_lineno == ref_loc.source_lineno, message);
+    } else if (native_status == JIT_RUN_FALLBACK) {
+	check(native_deopt.bytecode_pc == ref_deopt.bytecode_pc, message);
+	check(native_deopt.error_pc == ref_deopt.error_pc, message);
+	check(native_deopt.stack_depth == ref_deopt.stack_depth, message);
+	check(native_deopt.ticks_charged == ref_deopt.ticks_charged, message);
+	for (i = 0; i < (int) native_deopt.stack_depth; i++) {
+	    check(native_deopt_stack[i].type == ref_deopt_stack[i].type, message);
+	    if (native_deopt_stack[i].type == TYPE_INT)
+		check(native_deopt_stack[i].v.num == ref_deopt_stack[i].v.num, message);
+	    else if (native_deopt_stack[i].type == TYPE_OBJ)
+		check(native_deopt_stack[i].v.obj == ref_deopt_stack[i].v.obj, message);
+	    else if (native_deopt_stack[i].type == TYPE_STR)
+		check(!strcmp(native_deopt_stack[i].v.str, ref_deopt_stack[i].v.str), message);
+	    else if (native_deopt_stack[i].type == TYPE_FLOAT)
+		check(fl_unbox(native_deopt_stack[i].v.fnum) == fl_unbox(ref_deopt_stack[i].v.fnum), message);
+	}
+	if (native_env_copy && ref_env_copy) {
+	    for (i = 0; i < num_vars; i++) {
+		check(native_env_copy[i].type == ref_env_copy[i].type, message);
+		if (native_env_copy[i].type == TYPE_INT)
+		    check(native_env_copy[i].v.num == ref_env_copy[i].v.num, message);
+		else if (native_env_copy[i].type == TYPE_OBJ)
+		    check(native_env_copy[i].v.obj == ref_env_copy[i].v.obj, message);
+	    }
+	}
+    } else if (native_status == JIT_RUN_RETURNED) {
+	check(native_result.type == reference_result.type, message);
+	if (native_result.type == TYPE_FLOAT)
+	    check(fl_unbox(native_result.v.fnum) == fl_unbox(reference_result.v.fnum), message);
+	else if (native_result.type == TYPE_STR)
+	    check(!strcmp(native_result.v.str, reference_result.v.str), message);
+	else if (native_result.type == TYPE_OBJ)
+	    check(native_result.v.obj == reference_result.v.obj, message);
+	else if (native_result.type == TYPE_LIST)
+	    check(native_result.v.list == reference_result.v.list, message);
+	else
+	    check(native_result.v.num == reference_result.v.num, message);
+    }
+
     if (native_status == JIT_RUN_RETURNED)
 	free_var(native_result);
     if (reference_status == JIT_RUN_RETURNED)
 	free_var(reference_result);
+    for (i = 0; i < (int) stack_capacity; i++) {
+	free_var(native_deopt_stack[i]);
+	free_var(ref_deopt_stack[i]);
+    }
+    myfree(native_deopt_stack, M_PROGRAM);
+    myfree(ref_deopt_stack, M_PROGRAM);
+    if (native_env_copy) {
+	for (i = 0; i < num_vars; i++) {
+	    free_var(native_env_copy[i]);
+	    free_var(ref_env_copy[i]);
+	}
+	myfree(native_env_copy, M_PROGRAM);
+	myfree(ref_env_copy, M_PROGRAM);
+    }
 }
 
 static void
@@ -1851,7 +2447,7 @@ main(void)
 		       "local arithmetic differed from reference execution");
 
     env[0].type = TYPE_STR;
-    env[0].v.str = "not an integer";
+    env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(local_arith, env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -1860,6 +2456,7 @@ main(void)
 	  "local arithmetic guard fallback had wrong state");
     check_differential(local_arith, env, 10, 0,
 		       "local arithmetic fallback differed from reference execution");
+    free_var(env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 6;
@@ -1875,7 +2472,7 @@ main(void)
 		       "two locals differed from reference execution");
 
     deep_env[0].type = TYPE_STR;
-    deep_env[0].v.str = "not an integer";
+    deep_env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -1884,11 +2481,12 @@ main(void)
 	  "two locals first guard fallback had wrong state");
     check_differential(two_locals, deep_env, 10, 0,
 		       "two locals first guard fallback differed from reference");
+    free_var(deep_env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 6;
     deep_env[1].type = TYPE_STR;
-    deep_env[1].v.str = "not an integer";
+    deep_env[1].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(two_locals, deep_env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -1897,9 +2495,10 @@ main(void)
 	  "two locals second guard fallback had wrong state");
     check_differential(two_locals, deep_env, 10, 0,
 		       "two locals second guard fallback differed from reference");
+    free_var(deep_env[1]);
 
     env[0].type = TYPE_STR;
-    env[0].v.str = "not an integer";
+    env[0].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(guard, env, &result, &ticks, &timed_out,
 			      &error, 0, &deopt, 0)
@@ -1907,13 +2506,14 @@ main(void)
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
 	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
-    check_differential(branch, env, 10, 0,
+    check_differential(guard, env, 10, 0,
 		       "guard fallback differed from reference execution");
+    free_var(env[0]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 7;
     deep_env[1].type = TYPE_STR;
-    deep_env[1].v.str = "not an integer";
+    deep_env[1].v.str = str_dup("not an integer");
     ticks = 10;
     check(jit_program_execute(deep_guard, deep_env, &result, &ticks,
 			      &timed_out, &error, 0, &deopt, deopt_stack)
@@ -1926,6 +2526,11 @@ main(void)
 	  "deep guard did not materialize an updated local");
     check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 42,
 	  "deep guard did not materialize the operand stack");
+    deep_env[0].type = TYPE_INT;
+    deep_env[0].v.num = 7;
+    check_differential(deep_guard, deep_env, 10, 0,
+		       "deep guard fallback differed from reference execution");
+    free_var(deep_env[1]);
 
     deep_env[0].type = TYPE_INT;
     deep_env[0].v.num = 7;
@@ -2006,6 +2611,9 @@ main(void)
 	  == JIT_RUN_FALLBACK, "list non-int element did not fallback");
     check_differential(list_index1, env, 10, 0,
 		       "list non-int element fallback differed from reference");
+    free_var(list_elems[1]);
+    list_elems[1].type = TYPE_INT;
+    list_elems[1].v.num = 42;
     free_var(env[0]);
 
     /* Scatter destructuring execution test */
@@ -2027,6 +2635,8 @@ main(void)
     check_differential(scatter, env, 10, 0,
 		       "scatter destructure differed from reference execution");
     free_var(env[0]);
+    env[0].type = TYPE_INT;
+    env[0].v.num = 0;
 
     /* Call boundary deopt test */
     {
@@ -2383,7 +2993,9 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(str_eq, 0, &result, &ticks, &timed_out,
 				  &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "string equality did not fallback");
+	      == JIT_RUN_RETURNED, "string equality execution returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "string equality case-insensitive match");
 	jit_program_free(str_eq);
 
 	JITProgram *str_branch = string_branch_program();
@@ -2393,9 +3005,51 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(str_branch, branch_env, &result, &ticks,
 				  &timed_out, &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "empty string branch did not fallback");
+	      == JIT_RUN_RETURNED, "empty string branch executed natively");
+	check(result.type == TYPE_INT && result.v.num == 20,
+	      "empty string branch selected false arm");
 	free_var(branch_env[0]);
 	jit_program_free(str_branch);
+
+	JITProgram *str_length = string_length_program("h\xc3\xa9llo");
+	ticks = 10;
+	check(jit_program_execute(str_length, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string length execution failed");
+	check(result.type == TYPE_INT
+	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
+	      "string length returned wrong configured character length");
+	check_differential(str_length, 0, 10, 0, "string length differential");
+	jit_program_free(str_length);
+
+	JITProgram *str_cat = string_concat_program("Hello, ", "world!");
+	ticks = 10;
+	check(jit_program_execute(str_cat, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string concat execution returned");
+	check(result.type == TYPE_STR && strcmp(result.v.str, "Hello, world!") == 0,
+	      "string concat returned expected string");
+	free_var(result);
+	jit_program_free(str_cat);
+
+	JITProgram *str_idx = string_index_program("LambdaMOO", 7);
+	ticks = 10;
+	check(jit_program_execute(str_idx, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string index execution returned");
+	check(result.type == TYPE_STR && strcmp(result.v.str, "M") == 0,
+	      "string index returned expected character");
+	free_var(result);
+	jit_program_free(str_idx);
+
+	JITProgram *str_lt = string_compare_program("abc", "def", HIR_OP_LT);
+	ticks = 10;
+	check(jit_program_execute(str_lt, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string less-than execution returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "string less-than match");
+	jit_program_free(str_lt);
     }
 
     /* Non-integer list indexing tests */
@@ -2527,6 +3181,121 @@ main(void)
 	jit_program_free(fork_deopt);
     }
 
+    /* Nested control flow (loop + conditional) differential test */
+    {
+	JITProgram *loop_p = nested_loop_branch_program();
+	ticks = 50;
+	check(jit_program_execute(loop_p, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "nested loop execution failed");
+	check(result.type == TYPE_INT && result.v.num == 5,
+	      "nested loop returned wrong value");
+	check(ticks == 39, "nested loop consumed wrong tick count");
+	free_var(result);
+	check_differential(loop_p, 0, 50, 0, "nested loop differential");
+	jit_program_free(loop_p);
+    }
+
+    /* Boundary deoptimization differential tests */
+    {
+	JITProgram *vcall_p = verb_call_boundary_program();
+	check_differential(vcall_p, 0, 10, 0, "verb call boundary differential");
+	jit_program_free(vcall_p);
+
+	JITProgram *prop_p = prop_boundary_program();
+	check_differential(prop_p, 0, 10, 0, "prop boundary differential");
+	jit_program_free(prop_p);
+
+	JITProgram *range_p = range_boundary_program();
+	check_differential(range_p, 0, 10, 0, "range ref boundary differential");
+	jit_program_free(range_p);
+
+	JITProgram *range_set_p = range_set_boundary_program();
+	check_differential(range_set_p, 0, 10, 0, "range set boundary differential");
+	jit_program_free(range_set_p);
+    }
+
+    /* Repeated-execution smoke test: 1,000 native JIT loop executions */
+    {
+	JITProgram *bench_p = nested_loop_branch_program();
+	int iter;
+	for (iter = 0; iter < 1000; iter++) {
+	    ticks = 50;
+	    timed_out = 0;
+	    error = E_NONE;
+	    JITRunResult res = jit_program_execute(bench_p, 0, &result, &ticks,
+						   &timed_out, &error, 0, 0, 0);
+	    if (res != JIT_RUN_RETURNED || result.v.num != 5) {
+		check(0, "repeated execution iteration failed");
+		break;
+	    }
+	    free_var(result);
+	}
+	check(jit_program_state(bench_p) == JIT_STATE_COMPILED,
+	      "repeated execution lost JIT compiled state");
+	jit_program_free(bench_p);
+    }
+
+    {
+	int size;
+
+	for (size = 0; size <= 2; size += 2) {
+	    JITProgram *list_const_p = list_constant_program(size);
+	    int iter;
+
+	    check(jit_program_compile(list_const_p) == 1,
+		  "list constant JIT compile failed");
+	    for (iter = 0; iter < 50; iter++) {
+		ticks = 50;
+		timed_out = 0;
+		error = E_NONE;
+		JITRunResult res = jit_program_execute(list_const_p, 0, &result,
+						       &ticks, &timed_out, &error,
+						       0, 0, 0);
+		check(res == JIT_RUN_RETURNED, "list constant return result");
+		check(result.type == TYPE_LIST, "list constant result type");
+		check(result.v.list[0].v.num == size, "list constant length");
+		if (size)
+		    check(result.v.list[1].v.num == 10
+			  && result.v.list[2].v.num == 20,
+			  "list constant elements");
+		free_var(result);
+	    }
+	    jit_program_free(list_const_p);
+	}
+    }
+
+    {
+	JITProgram *in_p = in_program();
+	Var env[2];
+	Var stack[4];
+	JITDeoptState deopt_state;
+
+	env[0].type = TYPE_INT;
+	env[0].v.num = 42;
+	env[1] = new_list(2);
+	env[1].v.list[1].type = TYPE_INT;
+	env[1].v.list[1].v.num = 10;
+	env[1].v.list[2].type = TYPE_INT;
+	env[1].v.list[2].v.num = 42;
+
+	check(jit_program_compile(in_p) == 1, "in JIT compile failed");
+	check(jit_program_may_error(in_p) == 0,
+	      "deoptimized in operation should not mark program may-error");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	memset(&deopt_state, 0, sizeof(deopt_state));
+	JITRunResult res = jit_program_execute(in_p, env, &result,
+					       &ticks, &timed_out, &error,
+					       0, &deopt_state, stack);
+	check(res == JIT_RUN_RETURNED, "in native execution result");
+	check(result.type == TYPE_INT && result.v.num == 2,
+	      "in native execution index value");
+	free_var(env[1]);
+	jit_program_free(in_p);
+    }
+
     jit_program_free(program);
     jit_program_free(guard);
     jit_program_free(scatter);
@@ -2555,5 +3324,106 @@ main(void)
     jit_program_free(bit_and);
     jit_program_free(bit_xor);
     jit_program_free(bit_or);
+
+    /* JIT complex value and property runtime helper unit tests */
+    {
+	/* 1. is_true helper tests */
+	check(jit_rt_is_true(1, TYPE_INT) == 1, "jit_rt_is_true int 1");
+	check(jit_rt_is_true(0, TYPE_INT) == 0, "jit_rt_is_true int 0");
+	double d_pos = 1.5;
+	double d_zero = 0.0;
+	int64_t raw_fpos = 0, raw_fzero = 0;
+	memcpy(&raw_fpos, &d_pos, sizeof(d_pos));
+	memcpy(&raw_fzero, &d_zero, sizeof(d_zero));
+	check(jit_rt_is_true(raw_fpos, TYPE_FLOAT) == 1, "jit_rt_is_true float 1.5");
+	check(jit_rt_is_true(raw_fzero, TYPE_FLOAT) == 0, "jit_rt_is_true float 0.0");
+	check(jit_rt_is_true((intptr_t)"hello", TYPE_STR) == 1, "jit_rt_is_true str non-empty");
+	check(jit_rt_is_true((intptr_t)"", TYPE_STR) == 0, "jit_rt_is_true str empty");
+	Var l_empty = new_list(0);
+	Var l_elem = new_list(1);
+	l_elem.v.list[1].type = TYPE_INT;
+	l_elem.v.list[1].v.num = 1;
+	check(jit_rt_is_true((intptr_t)l_empty.v.list, TYPE_LIST) == 0, "jit_rt_is_true list empty");
+	check(jit_rt_is_true((intptr_t)l_elem.v.list, TYPE_LIST) == 1, "jit_rt_is_true list non-empty");
+	free_var(l_empty);
+	free_var(l_elem);
+
+	/* 2. equality helper tests */
+	check(jit_rt_equality((intptr_t)"Foo", TYPE_STR, (intptr_t)"foo", TYPE_STR, 0) == 1,
+	      "jit_rt_equality str case-insensitive");
+	check(jit_rt_equality((intptr_t)"Foo", TYPE_STR, (intptr_t)"foo", TYPE_STR, 1) == 0,
+	      "jit_rt_equality str case-sensitive");
+	check(jit_rt_equality((intptr_t)"bar", TYPE_STR, (intptr_t)"bar", TYPE_STR, 1) == 1,
+	      "jit_rt_equality str equal");
+	check(jit_rt_equality(10, TYPE_INT, 10, TYPE_INT, 0) == 1, "jit_rt_equality int equal");
+	check(jit_rt_equality(10, TYPE_INT, 20, TYPE_INT, 0) == 0, "jit_rt_equality int unequal");
+
+	/* 3. string comparison tests */
+	check(jit_rt_str_cmp("abc", "abc", 1) == 0, "jit_rt_str_cmp equal");
+	check(jit_rt_str_cmp("abc", "ABC", 0) == 0, "jit_rt_str_cmp case-insensitive equal");
+	check(jit_rt_str_cmp("abc", "def", 1) < 0, "jit_rt_str_cmp lt");
+	check(jit_rt_str_cmp("xyz", "abc", 1) > 0, "jit_rt_str_cmp gt");
+
+	/* 4. string concat and index tests */
+	int32_t rt_err = E_NONE;
+	const char *concat_res = jit_rt_str_concat("Hello, ", "World!", &rt_err);
+	check(rt_err == E_NONE && concat_res && strcmp(concat_res, "Hello, World!") == 0,
+	      "jit_rt_str_concat success");
+	if (concat_res)
+	    free_str(concat_res);
+
+	const char *char_res = jit_rt_str_ref("LambdaMOO", 7, &rt_err);
+	check(rt_err == E_NONE && char_res && strcmp(char_res, "M") == 0,
+	      "jit_rt_str_ref index 7");
+	if (char_res)
+	    free_str(char_res);
+
+	char_res = jit_rt_str_ref("LambdaMOO", 0, &rt_err);
+	check(rt_err == E_RANGE && char_res == 0, "jit_rt_str_ref index 0 range error");
+
+	char_res = jit_rt_str_ref("LambdaMOO", 100, &rt_err);
+	check(rt_err == E_RANGE && char_res == 0, "jit_rt_str_ref index 100 range error");
+
+	/* 5. list concat and append tests */
+	Var l1 = new_list(1);
+	l1.v.list[1].type = TYPE_INT;
+	l1.v.list[1].v.num = 111;
+	Var l2 = new_list(1);
+	l2.v.list[1].type = TYPE_INT;
+	l2.v.list[1].v.num = 222;
+
+	Var *lconcat = jit_rt_list_concat(l1.v.list, l2.v.list, &rt_err);
+	check(rt_err == E_NONE && lconcat && lconcat[0].v.num == 2, "jit_rt_list_concat len");
+	check(lconcat[1].v.num == 111 && lconcat[2].v.num == 222, "jit_rt_list_concat elements");
+	Var lconcat_var;
+	lconcat_var.type = TYPE_LIST;
+	lconcat_var.v.list = lconcat;
+	free_var(lconcat_var);
+
+	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT);
+	check(lapp && lapp[0].v.num == 2 && lapp[2].v.num == 333, "jit_rt_list_append int");
+	Var lapp_var;
+	lapp_var.type = TYPE_LIST;
+	lapp_var.v.list = lapp;
+	free_var(lapp_var);
+
+	/* 6. list_in test */
+	check(jit_rt_list_in(111, TYPE_INT, l1.v.list) == 1, "jit_rt_list_in found");
+	check(jit_rt_list_in(999, TYPE_INT, l1.v.list) == 0, "jit_rt_list_in not found");
+
+	free_var(l1);
+	free_var(l2);
+
+	/* 7. get_prop test */
+	int64_t prop_raw = 0;
+	int32_t prop_type = 0;
+	int ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
+	check(ok == 1 && rt_err == E_NONE && prop_type == TYPE_INT && prop_raw == 123,
+	      "jit_rt_get_prop valid property read");
+
+	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
+	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
+    }
+
     return failures != 0;
 }

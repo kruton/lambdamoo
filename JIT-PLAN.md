@@ -469,11 +469,106 @@ Completed in the first native-code milestone:
   activations; and
 * length expression (`$`, `EXPR_LENGTH`) lowering in indexed (`expr[$]`) and range
   (`expr[from..$]`) contexts, maintaining context-sensitive base value tracking
-  and native length extraction.
+  and native length extraction; and
+* expanded differential validation harness comparing native and reference execution
+  across values, errors, source locations, ticks, full deoptimization state (including
+  bytecode PCs and runtime operand stacks), reference ownership, nested control flow,
+  forced fallbacks across all supported boundaries, and repeated-execution smoke
+  coverage; and
+* actionable JIT rejection diagnostics exposed through `verb_info(..., 1)`, plus
+  `tests/census.sh` for aggregating top-level reasons and detailed diagnostics
+  across testmoo.db without modifying the source database; and
+* SSA construction fixes for unreachable dead code, unreachable phi inputs, and
+  folded-phi ordering, eliminating the `invalid-ir` category from testmoo.db without
+  adding synthetic tick charges to structural SSA blocks; and
+* ownership-correct empty and persistent list constants, with JIT-program
+  references retained across repeated native execution and released at program
+  teardown; and
+* argument-list operation anchors taken from individual argument bytecode PCs,
+  reducing bytecode-anchor rejections without weakening anchor validation; and
+* membership (`HIR_OP_IN`) accepted at an exact deoptimization boundary, with
+  its operands, tick refund, and bytecode resume state restored for interpreter
+  evaluation; and
+* direct indexed local assignments accepted at `OP_PUT_TEMP` deoptimization
+  boundaries with their base, index, and right-hand-side stack values preserved;
+  and
+* nested local- and property-rooted indexed assignments, with `OP_PUSH_REF` and
+  `OP_PUSH_GET_PROP` anchors preserving every intermediate value required by
+  interpreter write-back; and
+* all scatter assignments resumed at an exact `EOP_SCATTER` interpreter
+  boundary, preserving the RHS list while leaving arity checks, defaults, rest
+  construction, ownership, and errors to the existing VM implementation; and
+* arithmetic on known complex values resumed at its exact interpreter boundary,
+  preserving native integer and float arithmetic while allowing string and list
+  operations to remain under the VM's ownership and error semantics; and
+* direct string indexing resumed at `OP_REF`, `$` string length resumed at
+  `EOP_LENGTH`, and `length(string)` lowered natively with configured byte- or
+  Unicode-character semantics and exact built-in identity validation; and
+* value-type conflicts across control-flow joins (parallel copies), comparisons,
+  property operations, index stores, and mixed arithmetic deoptimized at exact
+  VM boundaries, eliminating all value-type rejections; and
+* length expressions (`$`, `EXPR_LENGTH`) supported in all indexed assignments,
+  range stores, and chained lvalue contexts, achieving full database coverage.
 
-The next reviewable compiler milestones are:
+The testmoo.db baseline measured after this milestone contains 6,319 verbs. Of
+these, all 6,319 (100.00%) are JIT-eligible and compiled; zero verbs report
+`unsupported-program`, `invalid-bytecode-anchor`, `unsupported-value-types`, or
+`invalid-ir`. These top-level reasons are mutually exclusive but the detailed
+census confirms zero remaining blockers:
 
-1. Lower optional, default, and rest scatter destructuring assignments (`{a, ?b = default, @rest} = expr`) with exact deoptimization boundaries.
-2. Integrate WAIF type (`TYPE_WAIF`) references and properties safely across HIR lowering and native frames.
-3. Expand native fast-path lowering and inlining for pure, continuation-free built-in functions.
-4. End-to-end multi-verb benchmark and differential validation across complex MOO database suites.
+* zero `unsupported-program` rejections, down from 8;
+* zero `unsupported-value-types` rejections, down from 161;
+* zero `invalid-bytecode-anchor` failures, down from 65 after clearing
+  inherited bytecode anchors on constant-folded branch jumps;
+* zero `ssa-support: list constant` rejections, down from 2,852;
+* zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
+  from 1,004;
+* zero unsupported non-local assignments, down from 412 after preserving local
+  and property-rooted indexed write-back chains;
+* zero optional/rest scatter rejections, down from 137;
+* zero parallel-copy type conflicts across control flow joins, down from 106;
+* zero arithmetic type conflicts, down from 872 after deoptimizing known complex
+  arithmetic at its exact VM boundary; and
+* zero unsupported length expressions outside indexed contexts (`$`).
+
+Counts describe the first reported failure in each verb. Fixing one category may
+expose a later rejection, so the census must be rerun after every milestone.
+
+Reproduce the census from the repository root with a JIT-enabled build using:
+
+```sh
+./tests/census.sh testmoo.db ./moo
+```
+
+The optional arguments select another database and server binary. The script
+uses numeric verb descriptors to avoid ambiguity from aliases or overlapping
+verb names and removes its temporary output database on exit. The server may
+require permission to create its listening socket even though the census uses
+emergency mode and makes no network connections.
+
+The next reviewable compiler milestones, in dependency order, are:
+
+1. Add shared, ownership-audited runtime helpers for complex-value semantics,
+   then use them to broaden native string and nested-list operations and to
+   broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until
+   a corpus or targeted workload demonstrates demand. Keep pointer identity out
+   of language equality, truth, and ordering semantics, and test every helper on
+   success, error, and deoptimization paths.
+2. Make code-unit identity explicit in native entry and deoptimization maps,
+   then compile fork vectors independently. A fork statement should remain an
+   interpreter boundary, but its separately compiled body should be eligible
+   for native entry without confusing main-vector bytecode PCs, resume anchors,
+   or serialized activations.
+3. Define declarative built-in effect metadata (pure, may raise, may allocate,
+   may call, may suspend, ownership behavior) and make JIT eligibility consume
+   it. Only then expand fast paths for high-frequency, continuation-free
+   built-ins; all other built-ins remain deopt-before-call boundaries.
+4. Add profile-guided, semantics-preserving optimization only after the wider
+   differential suite is green: redundant guards and local traffic first,
+   followed by block-level tick batching where exact timeout and source-location
+   behavior can be proven. Measure each optimization against interpreter, JIT
+   O0, and optimized JIT runs.
+5. Finish with database-scale validation and performance work: multi-verb and
+   suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
+   comparison, compile-time and code-size accounting, and benchmarks that
+   identify the next coverage or optimization bottleneck.
