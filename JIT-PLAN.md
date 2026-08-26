@@ -614,6 +614,11 @@ validated via the verb activation's programmer object, `#811:controls` runs
 deoptimizations decreased from 144 to 72, property-read deopts dropped from 61
 to 0, and completed verb execution rose from 15.45% to 29.09%.
 
+Rest scatter destructuring (`@rest`, e.g. `{line, @xargs} = args`) is now
+lowered directly via `HIR_OP_SUBLIST_FROM` and `jit_rt_sublist_from()`. This
+eliminates scatter bailouts across variadic argument parsers, including
+`#6:notify` and `#53:verb_or_property` in `codepoint.db`.
+
 Reproduce the census from the repository root with a JIT-enabled build using:
 
 ```sh
