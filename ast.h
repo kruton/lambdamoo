@@ -83,6 +83,7 @@ struct Expr_Catch {
     Expr *try;
     Arg_List *codes;
     Expr *except;
+    unsigned handler_pc;
 };
 
 enum Expr_Kind {
@@ -136,6 +137,7 @@ struct Except_Arm {
     Stmt *stmt;
     /* This field is for convenience during code generation and decompiling */
     int label;
+    unsigned handler_pc;
 };
 
 struct Stmt_Cond {
@@ -176,6 +178,7 @@ struct Stmt_Catch {
 struct Stmt_Finally {
     Stmt *body;
     Stmt *handler;
+    unsigned handler_pc;
 };
 
 enum Stmt_Kind {

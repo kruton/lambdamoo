@@ -1061,6 +1061,7 @@ generate_expr(Expr * expr, State * state)
 	    emit_extended_byte(EOP_END_CATCH, state);
 	    end_label = add_label(state);
 	    pop_stack(3, state);	/* codes, label, catch */
+	    record_code_anchor(state, &expr->e.catch.handler_pc);
 	    define_label(handler_label, state);
 	    /* After this label, we still have a value on the stack, but now,
 	     * instead of it being the value of the main expression, we have
@@ -1246,6 +1247,7 @@ generate_stmt(Stmt * stmt, State * state)
 		end_label = add_label(state);
 		pop_stack(2 * arm_count + 1, state);	/* 2(codes,pc) + catch */
 		for (ex = stmt->s.catch.excepts; ex; ex = ex->next) {
+		    record_code_anchor(state, &ex->handler_pc);
 		    define_label(ex->label, state);
 		    push_stack(1, state);	/* exception tuple */
 		    if (ex->id >= 0)
@@ -1274,6 +1276,7 @@ generate_stmt(Stmt * stmt, State * state)
 		DECR_TRY_DEPTH(state);
 		emit_extended_byte(EOP_END_FINALLY, state);
 		pop_stack(1, state);	/* FINALLY marker */
+		record_code_anchor(state, &stmt->s.finally.handler_pc);
 		define_label(handler_label, state);
 		push_stack(2, state);	/* continuation value, reason */
 		generate_stmt(stmt->s.finally.handler, state);

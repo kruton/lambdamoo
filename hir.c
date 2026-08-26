@@ -131,6 +131,7 @@ struct HIRExpr {
 	    HIRExpr *body;
 	    HIRArg *codes;
 	    HIRExpr *handler;
+	    unsigned handler_pc;
 	} catch_expr;
 	struct {
 	    enum Expr_Kind expr_kind;
@@ -151,6 +152,7 @@ struct HIRExceptArm {
     HIRStmt *body;
     int label;
     unsigned source_lineno;
+    unsigned handler_pc;
     HIRExceptArm *next;
 };
 
@@ -194,6 +196,7 @@ struct HIRStmt {
 	struct {
 	    HIRStmt *body;
 	    HIRStmt *handler;
+	    unsigned handler_pc;
 	} try_finally;
 	int exit_id;
 	enum Stmt_Kind stmt_kind;
@@ -523,6 +526,7 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
     for (instr = program->first; instr; instr = instr->next) {
 	switch (instr->kind) {
 	case HIR_TAC_TICK:
+	case HIR_TAC_DEOPT:
 	    break;
 	case HIR_TAC_CONST:
 	case HIR_TAC_LOAD_LOCAL:
@@ -2030,6 +2034,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
+	    case HIR_TAC_DEOPT:
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
@@ -3056,6 +3061,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    instruction_count++;
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
+	    case HIR_TAC_DEOPT:
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
@@ -3215,6 +3221,7 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
+	    case HIR_TAC_DEOPT:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
@@ -3343,6 +3350,7 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
+	    case HIR_TAC_DEOPT:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3933,6 +3941,7 @@ hir_dump_tac(HIRTacProgram *program)
 
 	switch (instr->kind) {
 	case HIR_TAC_TICK:
+	case HIR_TAC_DEOPT:
 	    break;
 	case HIR_TAC_CONST:
 	    fprintf(stderr, " t%d = ", instr->dst);
@@ -4113,6 +4122,7 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
+	    case HIR_TAC_DEOPT:
 		break;
 	    case HIR_TAC_CONST:
 		fprintf(file, " t%d = ", instr->value);
@@ -4217,6 +4227,8 @@ tac_kind_name(HIRTacKind kind)
     switch (kind) {
     case HIR_TAC_TICK:
 	return "tick";
+    case HIR_TAC_DEOPT:
+	return "deopt";
     case HIR_TAC_CONST:
 	return "const";
     case HIR_TAC_LOAD_LOCAL:
@@ -5269,6 +5281,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	expr->u.catch_expr.body = lift_expr(ctx, ast->e.catch.try);
 	expr->u.catch_expr.codes = lift_arg_list(ctx, ast->e.catch.codes);
 	expr->u.catch_expr.handler = lift_expr(ctx, ast->e.catch.except);
+	expr->u.catch_expr.handler_pc = ast->e.catch.handler_pc;
 	return expr;
     case EXPR_SCATTER:
 	return unsupported_expr(ctx, ast);
@@ -5317,6 +5330,7 @@ lift_except_arms(HIRContext *ctx, Except_Arm *excepts)
 	arm->body = lift_stmt_list(ctx, excepts->stmt);
 	arm->source_lineno = excepts->stmt ? excepts->stmt->lineno : 0;
 	arm->label = -1;
+	arm->handler_pc = excepts->handler_pc;
 	arm->next = 0;
 
 	if (last)
@@ -5415,6 +5429,7 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.try_finally.body = lift_stmt_list(ctx, ast->s.finally.body);
 	stmt->u.try_finally.handler = lift_stmt_list(ctx, ast->s.finally.handler);
+	stmt->u.try_finally.handler_pc = ast->s.finally.handler_pc;
 	return stmt;
     case STMT_BREAK:
 	stmt = new_stmt(ctx, HIR_STMT_BREAK);
@@ -5726,6 +5741,17 @@ lower_codes(HIRContext *ctx, HIRTacProgram *program, HIRArg *codes,
     }
 }
 
+static void
+append_deopt_boundary(HIRContext *ctx, HIRTacProgram *program,
+		      unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *deopt = new_tac(ctx, HIR_TAC_DEOPT, source_lineno);
+
+    deopt->bytecode_pc = bytecode_pc;
+    snapshot_lower_stack(ctx, deopt);
+    append_tac(program, deopt);
+}
+
 static int
 lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
@@ -5742,6 +5768,9 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int handler_val;
     int result_temp;
 
+    append_deopt_boundary(ctx, program, expr->source_lineno,
+			  expr->bytecode_pc);
+
     codes_val = lower_codes(ctx, program, expr->u.catch_expr.codes,
 			    expr->source_lineno, expr->bytecode_pc);
     (void) codes_val;
@@ -5749,7 +5778,7 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     handler_pc_tac = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
     handler_pc_tac->dst = handler_pc_val;
     handler_pc_tac->literal.type = TYPE_INT;
-    handler_pc_tac->literal.v.num = handler_label;
+    handler_pc_tac->literal.v.num = expr->u.catch_expr.handler_pc;
     handler_pc_tac->bytecode_pc = expr->bytecode_pc;
     snapshot_lower_stack(ctx, handler_pc_tac);
     append_tac(program, handler_pc_tac);
@@ -6490,10 +6519,13 @@ lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int finally_val = new_temp(ctx);
     HIRTacInstr *finally_marker;
 
+    append_deopt_boundary(ctx, program, stmt->source_lineno,
+			  stmt->bytecode_pc);
+
     finally_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
     finally_marker->dst = finally_val;
     finally_marker->literal.type = TYPE_FINALLY;
-    finally_marker->literal.v.num = handler_label;
+    finally_marker->literal.v.num = stmt->u.try_finally.handler_pc;
     finally_marker->bytecode_pc = stmt->bytecode_pc;
     snapshot_lower_stack(ctx, finally_marker);
     append_tac(program, finally_marker);
@@ -6520,6 +6552,9 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int catch_marker_val;
     HIRTacInstr *catch_marker;
 
+    append_deopt_boundary(ctx, program, stmt->source_lineno,
+			  stmt->bytecode_pc);
+
     for (ex = stmt->u.try_except.excepts; ex; ex = ex->next)
 	arm_count++;
 
@@ -6535,7 +6570,7 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	handler_pc = new_tac(ctx, HIR_TAC_CONST, ex->source_lineno);
 	handler_pc->dst = handler_pc_val;
 	handler_pc->literal.type = TYPE_INT;
-	handler_pc->literal.v.num = handler_label;
+	handler_pc->literal.v.num = ex->handler_pc;
 	handler_pc->bytecode_pc = stmt->bytecode_pc;
 	snapshot_lower_stack(ctx, handler_pc);
 	append_tac(program, handler_pc);

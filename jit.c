@@ -406,6 +406,10 @@ build_mir(JITProgram *program, MIRBuild *build)
 						  MIR_new_reg_op(build->context,
 								 timeout_value)));
 		    break;
+		case HIR_TAC_DEOPT:
+		    append_deopt_exit(build, program, instr->deopt_map, values,
+			deopt_map_out, deopt_values, status, common_return);
+		    break;
 		case HIR_TAC_CONST:
 		    if (instr->literal_type == TYPE_FLOAT) {
 			append(build, MIR_new_insn(build->context, MIR_MOV,

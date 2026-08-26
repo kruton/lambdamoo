@@ -461,7 +461,8 @@ Completed in the first native-code milestone:
   locals, returns, and deoptimization preserve reference counts; and
 * exception and `finally` stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) modeled
   before lowering catch expressions, `try-except`, and `try-finally` statements,
-  preserving exact interpreter stack-unwind state on deoptimization.
+  with relocated handler PCs and pre-entry deoptimization boundaries preserving
+  exact interpreter stack-unwind and `finally` semantics.
 
 The next reviewable compiler milestone is:
 

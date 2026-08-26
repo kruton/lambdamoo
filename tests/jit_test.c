@@ -1182,6 +1182,32 @@ catch_stack_marker_deopt_program(void)
 }
 
 static JITProgram *
+exception_boundary_deopt_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 1;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 19;
+    map->error_pc = 19;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    block->first = block->last = deopt;
+    deopt->deopt_map = 1;
+    deopt->bytecode_pc = 19;
+    return program;
+}
+
+static JITProgram *
 finally_stack_marker_deopt_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
@@ -1319,6 +1345,9 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		    return JIT_RUN_ABORT_SECONDS;
 		}
 		break;
+	    case HIR_TAC_DEOPT:
+		myfree(values, M_PROGRAM);
+		return JIT_RUN_FALLBACK;
 	    case HIR_TAC_CONST:
 		if (instr->literal_type == TYPE_FLOAT)
 		    memcpy(&values[instr->value], &instr->literal, sizeof(Num));
@@ -2388,6 +2417,20 @@ main(void)
 
     /* Exception and finally stack marker deoptimization tests */
     {
+	JITProgram *boundary = exception_boundary_deopt_program();
+	JITDeoptState boundary_state;
+	ticks = 10;
+	check(jit_program_execute(boundary, 0, &result, &ticks, &timed_out,
+				  &error, 0, &boundary_state, 0)
+	      == JIT_RUN_FALLBACK, "exception boundary did not deopt");
+	check(boundary_state.bytecode_pc == 19,
+	      "exception boundary resumed at wrong pc");
+	check(boundary_state.stack_depth == 0,
+	      "exception boundary preserved setup stack");
+	check(boundary_state.ticks_charged == 0,
+	      "exception boundary charged a tick");
+	jit_program_free(boundary);
+
 	JITProgram *catch_deopt = catch_stack_marker_deopt_program();
 	JITDeoptState deopt_state;
 	Var deopt_stack[10];
