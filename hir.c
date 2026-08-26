@@ -2785,8 +2785,10 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 		basic->num_successors = 1;
 		block->last->kind = HIR_TAC_JUMP;
 		block->last->src1 = 0;
+		block->last->bytecode_pc = NO_BYTECODE_PC;
 		if (basic->last) {
 		    basic->last->kind = HIR_TAC_JUMP;
+		    basic->last->bytecode_pc = NO_BYTECODE_PC;
 		    basic->last->label = successor->first
 			&& successor->first->kind == HIR_TAC_LABEL
 			? successor->first->label : 0;

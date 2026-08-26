@@ -2933,6 +2933,53 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_constant_folded_branch_clears_bytecode_pc(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Expr cond, ret_val;
+    Stmt body_stmt, loop_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    /* Build while (1) return 42; endwhile */
+    cond = int_expr(1, 90);
+    ret_val = int_expr(42, 91);
+    body_stmt = return_stmt(&ret_val);
+    body_stmt.bytecode_pc = 2;
+
+    memset(&loop_stmt, 0, sizeof(loop_stmt));
+    loop_stmt.kind = STMT_WHILE;
+    loop_stmt.lineno = 90;
+    loop_stmt.bytecode_pc = 0;
+    loop_stmt.s.loop.id = -1;
+    loop_stmt.s.loop.condition = &cond;
+    loop_stmt.s.loop.body = &body_stmt;
+
+    (void) lower_stmt(&names, &loop_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("constant while loop ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("constant while loop has branch before opt",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("constant while loop has branch anchor before opt",
+	      hir_ssa_count_bytecode_pc(ssa, 0), 2);
+
+    (void) hir_optimize_ssa_constants(ctx, ssa);
+    check_int("constant while loop opt ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("constant while loop branch folded",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 0);
+    check_int("folded branch clears branch bytecode_pc anchor",
+	      hir_ssa_count_bytecode_pc(ssa, 0), 1);
+    check_int("folded branch destroys ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("folded branch verifies out of ssa", hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2978,6 +3025,7 @@ main(void)
     test_fork_stmt_tac_ssa();
     test_fork_body_does_not_reject_enclosing_hir();
     test_length_expr_in_index_tac_ssa();
+    test_constant_folded_branch_clears_bytecode_pc();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
