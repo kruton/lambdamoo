@@ -3320,6 +3320,7 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    && bc->vector[instr->bytecode_pc] != OP_AND
 		    && bc->vector[instr->bytecode_pc] != OP_OR
 		    && bc->vector[instr->bytecode_pc] != OP_IF
+		    && bc->vector[instr->bytecode_pc] != OP_IF_QUES
 		    && bc->vector[instr->bytecode_pc] != OP_EIF
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_RANGE
@@ -4837,6 +4838,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_COND:
 	expr = new_expr(ctx, HIR_EXPR_COND);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.cond.condition = lift_expr(ctx, ast->e.cond.condition);
 	expr->u.cond.consequent = lift_expr(ctx, ast->e.cond.consequent);
 	expr->u.cond.alternate = lift_expr(ctx, ast->e.cond.alternate);
@@ -5283,6 +5285,38 @@ lower_short_circuit(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 }
 
 static int
+lower_cond_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int cond = lower_expr(ctx, program, expr->u.cond.condition);
+    int result_local = ctx->next_local++;
+    int alt_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int cons_val;
+    int alt_val;
+    int result_temp;
+
+    append_branch_false(ctx, program, cond, alt_label,
+			expr->source_lineno, expr->bytecode_pc);
+    ctx->lower_stack_depth = base_depth;
+    cons_val = lower_expr(ctx, program, expr->u.cond.consequent);
+    append_internal_store(ctx, program, result_local, cons_val,
+			  expr->source_lineno);
+    append_jump(ctx, program, done_label, expr->source_lineno);
+    append_label(ctx, program, alt_label, expr->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    alt_val = lower_expr(ctx, program, expr->u.cond.alternate);
+    append_internal_store(ctx, program, result_local, alt_val,
+			  expr->source_lineno);
+    append_label(ctx, program, done_label, expr->source_lineno);
+    result_temp = append_internal_load(ctx, program, result_local,
+				       expr->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    push_lower_stack(ctx, result_temp);
+    return result_temp;
+}
+
+static int
 append_unsupported_tac(HIRContext *ctx, HIRTacProgram *program,
 		       const char *message, unsigned source_lineno)
 {
@@ -5587,9 +5621,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    return call_tac->dst;
 	}
     case HIR_EXPR_COND:
-	return append_unsupported_tac(ctx, program,
-				      "Conditional expression is not yet lowerable to TAC",
-				      expr->source_lineno);
+	return lower_cond_expr(ctx, program, expr);
     default:
 	return append_unsupported_tac(ctx, program,
 				      "Unsupported HIR expression in TAC lowering",

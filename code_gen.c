@@ -945,6 +945,7 @@ generate_expr(Expr * expr, State * state)
 	    int else_label, end_label;
 
 	    generate_expr(expr->e.cond.condition, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_IF_QUES, state);
 	    else_label = add_label(state);
 	    pop_stack(1, state);
