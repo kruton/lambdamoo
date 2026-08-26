@@ -606,6 +606,14 @@ comment. A list-splice check now propagates `TYPE_LIST` to its operand, so the
 sampled calls pass their entry guard and reach the real `$misc_options` property
 read on line 2/PC 7.
 
+Catch expressions, singleton list creation (`HIR_OP_MAKE_SINGLETON_LIST`), list
+appending (`HIR_OP_LIST_ADD_TAIL`), and property reads (`HIR_OP_GET_PROP`) with
+dynamically tagged object support are now lowered natively. With permissions
+validated via the verb activation's programmer object, `#811:controls` runs
+100% natively without deoptimization. Across objects #0..#25 in `Opal.db`, total
+deoptimizations decreased from 144 to 72, property-read deopts dropped from 61
+to 0, and completed verb execution rose from 15.45% to 29.09%.
+
 Reproduce the census from the repository root with a JIT-enabled build using:
 
 ```sh
