@@ -765,6 +765,22 @@ cond_stmt_ast(Cond_Arm *arms, Stmt *otherwise, unsigned lineno)
     return stmt;
 }
 
+static Expr
+range_expr_ast(Expr *base, Expr *from, Expr *to, unsigned lineno)
+{
+    Expr expr;
+
+    memset(&expr, 0, sizeof(expr));
+    expr.kind = EXPR_RANGE;
+    expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
+    expr.e.range.base = base;
+    expr.e.range.from = from;
+    expr.e.range.to = to;
+
+    return expr;
+}
+
 static void
 test_loop_dominator_tree(void)
 {
@@ -1902,6 +1918,77 @@ test_labeled_break_nested_loops_tac_ssa(void)
 }
 
 static void
+test_range_expr_and_assignment_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /*
+     * sub = list[2..4];
+     * list[2..4] = {10, 20};
+     * return sub;
+     */
+    Expr list_id = id_expr(1, 10);
+    Expr from1 = int_expr(2, 10);
+    Expr to1 = int_expr(4, 10);
+    Expr slice = range_expr_ast(&list_id, &from1, &to1, 10);
+    Expr sub_id = id_expr(2, 10);
+    Expr assign_sub = binary_expr(EXPR_ASGN, &sub_id, &slice);
+    Stmt stmt1 = expr_stmt(&assign_sub);
+
+    Expr list_id2 = id_expr(1, 11);
+    Expr from2 = int_expr(2, 11);
+    Expr to2 = int_expr(4, 11);
+    Expr lhs_range = range_expr_ast(&list_id2, &from2, &to2, 11);
+    Expr ten = int_expr(10, 11);
+    Expr twenty = int_expr(20, 11);
+    Arg_List a2;
+    Arg_List a1;
+    Expr rhs_list;
+
+    memset(&a2, 0, sizeof(a2));
+    a2.kind = ARG_NORMAL;
+    a2.expr = &twenty;
+    a2.next = 0;
+
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &ten;
+    a1.next = &a2;
+
+    memset(&rhs_list, 0, sizeof(rhs_list));
+    rhs_list.kind = EXPR_LIST;
+    rhs_list.lineno = 11;
+    rhs_list.bytecode_pc = NO_BYTECODE_PC;
+    rhs_list.e.list = &a1;
+
+    Expr assign_range = binary_expr(EXPR_ASGN, &lhs_range, &rhs_list);
+    Stmt stmt2 = expr_stmt(&assign_range);
+
+    Expr ret_expr = id_expr(2, 12);
+    Stmt ret = return_stmt(&ret_expr);
+
+    stmt1.next = &stmt2;
+    stmt2.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &stmt1, &ctx, &cfg, &dom, &ssa);
+
+    check_int("range tac not null", tac != 0, 1);
+    check_int("range ref count", hir_tac_count_kind(tac, HIR_TAC_RANGE_REF), 1);
+    check_int("range set count", hir_tac_count_kind(tac, HIR_TAC_RANGE_SET), 1);
+    check_int("range verify errors", hir_context_error_count(ctx), 0);
+    check_int("range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -2177,6 +2264,7 @@ main(void)
     test_cond_expr_tac_ssa();
     test_break_and_continue_tac_ssa();
     test_labeled_break_nested_loops_tac_ssa();
+    test_range_expr_and_assignment_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
