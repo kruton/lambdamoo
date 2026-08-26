@@ -2655,10 +2655,11 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
     dead_stmt.next = &final_ret;
 
     tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
-    (void) tac;
-
     check_int("dead code verify errors", hir_context_error_count(ctx), 0);
     check_int("dead code ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("dead code adds no synthetic ticks",
+	      hir_ssa_count_kind(ssa, HIR_TAC_TICK),
+	      hir_tac_count_kind(tac, HIR_TAC_TICK));
     (void) hir_optimize_ssa_constants(ctx, ssa);
     check_int("dead code ssa valid after opt", hir_verify_ssa(ctx, ssa), 1);
     check_int("dead code out-of-ssa destroy", hir_destroy_ssa(ctx, ssa), 1);

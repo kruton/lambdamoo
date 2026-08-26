@@ -4,7 +4,6 @@ set -euo pipefail
 
 DB_FILE="${1:-Opal.db}"
 MOO_BIN="${2:-./moo}"
-TMP_OUT="/tmp/census_tmp_$$.db"
 
 if [ ! -f "$DB_FILE" ]; then
     echo "Error: Database file '$DB_FILE' not found." >&2
@@ -16,12 +15,16 @@ if [ ! -x "$MOO_BIN" ]; then
     exit 1
 fi
 
+TMP_DIR=$(mktemp -d /tmp/opal-jit-census.XXXXXX)
+TMP_OUT="$TMP_DIR/output.db"
+
 cleanup() {
-    rm -f "$TMP_OUT" "$TMP_OUT.#1#"
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
 python3 - "$MOO_BIN" "$DB_FILE" "$TMP_OUT" << 'PYEOF'
+import re
 import subprocess
 import sys
 
@@ -86,7 +89,7 @@ for item in (diags)
 endfor
 return out;
 .
-abort
+quit
 """
 
 proc = subprocess.Popen(
@@ -99,6 +102,11 @@ proc = subprocess.Popen(
 
 stdout, stderr = proc.communicate(moo_code)
 
+if proc.returncode != 0:
+    print(f"Error: MOO server exited with status {proc.returncode}.", file=sys.stderr)
+    print(stderr, file=sys.stderr)
+    sys.exit(proc.returncode or 1)
+
 total = 0
 eligible = 0
 reasons = []
@@ -106,7 +114,6 @@ diags = []
 
 for line in stdout.splitlines():
     if line.startswith('=> {"TOTAL::'):
-        import re
         items = re.findall(r'"([^"]*)"', line)
         for item in items:
             parts = item.split('::')
@@ -125,10 +132,16 @@ for line in stdout.splitlines():
 if total == 0:
     print("Error: Failed to obtain census output from MOO server.", file=sys.stderr)
     print(stdout, file=sys.stderr)
+    print(stderr, file=sys.stderr)
     sys.exit(1)
 
 reasons.sort(key=lambda x: x[1], reverse=True)
 diags.sort(key=lambda x: x[1], reverse=True)
+normalized_diags = {}
+for diagnostic, count in diags:
+    normalized = re.sub(r"^anchor: pc [0-9]+ ", "anchor: pc * ", diagnostic)
+    normalized_diags[normalized] = normalized_diags.get(normalized, 0) + count
+normalized_diags = sorted(normalized_diags.items(), key=lambda x: x[1], reverse=True)
 
 print("=" * 76)
 print("OPAL.DB JIT CENSUS REPORT")
@@ -147,6 +160,12 @@ print("\n" + "-" * 76)
 print(f"{'DETAILED DIAGNOSTIC (TOP 40)':<52} {'COUNT':>8} {'PERCENT':>12}")
 print("-" * 76)
 for d, count in diags[:40]:
+    print(f"{d:<52} {count:>8} {count/total*100:>11.2f}%")
+
+print("\n" + "-" * 76)
+print(f"{'NORMALIZED DIAGNOSTIC (TOP 40)':<52} {'COUNT':>8} {'PERCENT':>12}")
+print("-" * 76)
+for d, count in normalized_diags[:40]:
     print(f"{d:<52} {count:>8} {count/total*100:>11.2f}%")
 
 print("=" * 76)

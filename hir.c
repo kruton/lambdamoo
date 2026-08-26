@@ -1821,25 +1821,25 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	} else if (ssa_blocks[cfg_block->id] && !ssa_blocks[cfg_block->id]->first) {
 	    /* Empty reachable block (only contained load/store local) */
 	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
-	    HIRSSAInstr *tick = hir_alloc(ctx, sizeof(HIRSSAInstr));
-	    tick->kind = HIR_TAC_TICK;
-	    tick->source_lineno = cfg_block->first_lineno;
-	    tick->bytecode_pc = NO_BYTECODE_PC;
-	    tick->value = 0;
-	    tick->src1 = 0;
-	    tick->src2 = 0;
-	    tick->label = 0;
-	    tick->local_id = 0;
-	    tick->op = HIR_OP_ADD;
-	    tick->literal.type = TYPE_NONE;
-	    tick->num_stack_values = 0;
-	    tick->stack_values = 0;
-	    tick->num_local_values = 0;
-	    tick->local_values = 0;
-	    tick->phi_args = 0;
-	    tick->copies = 0;
-	    tick->next = 0;
-	    emit_ssa_instr(ssa, ssa_block, tick);
+	    HIRSSAInstr *label = hir_alloc(ctx, sizeof(HIRSSAInstr));
+	    label->kind = HIR_TAC_LABEL;
+	    label->source_lineno = cfg_block->first_lineno;
+	    label->bytecode_pc = NO_BYTECODE_PC;
+	    label->value = 0;
+	    label->src1 = 0;
+	    label->src2 = 0;
+	    label->label = 0;
+	    label->local_id = 0;
+	    label->op = HIR_OP_ADD;
+	    label->literal.type = TYPE_NONE;
+	    label->num_stack_values = 0;
+	    label->stack_values = 0;
+	    label->num_local_values = 0;
+	    label->local_values = 0;
+	    label->phi_args = 0;
+	    label->copies = 0;
+	    label->next = 0;
+	    emit_ssa_instr(ssa, ssa_block, label);
 	}
     }
 
