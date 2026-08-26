@@ -452,9 +452,10 @@ Completed in the first native-code milestone:
 * guarded SSA values for object (`TYPE_OBJ`) scalars, including object range
   loops, literal representations, comparisons, and exact deoptimization/return
   semantics; and
-* consistent native representation for floating-point (`TYPE_FLOAT`) values,
-  including boxed-local loads, arithmetic, zero-division error exits, comparisons,
-  branches, returns, and deoptimization.
+* native representation for double-precision, unboxed floating-point
+  (`TYPE_FLOAT`) values, including local loads, arithmetic, numeric error exits,
+  comparisons, branches, returns, and deoptimization; other configured float
+  representations currently make affected verbs ineligible.
 
 The next reviewable compiler milestones are:
 

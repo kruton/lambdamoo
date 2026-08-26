@@ -161,6 +161,47 @@ new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
 }
 
 static void
+append_float_result_check(MIRBuild *build, JITInstruction *instr,
+			  MIR_reg_t *values, MIR_reg_t deopt_values,
+			  JITStatusExit **status_exits,
+			  JITStatusExit **last_status_exit, int *copy_serial)
+{
+    char name[32];
+    MIR_reg_t bits;
+    MIR_reg_t exponent;
+    MIR_reg_t exponent_mask;
+    MIR_label_t float_error = new_status_exit(build, status_exits,
+	last_status_exit, JIT_RUN_ERROR, E_FLOAT, instr->bytecode_pc,
+	instr->source_lineno);
+
+    sprintf(name, "float_bits%d", *copy_serial);
+    bits = new_reg(build, name);
+    sprintf(name, "float_exp%d", (*copy_serial)++);
+    exponent = new_reg(build, name);
+    sprintf(name, "float_exp_mask%d", (*copy_serial)++);
+    exponent_mask = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_DMOV,
+	MIR_new_mem_op(build->context, MIR_T_D,
+			   instr->value * sizeof(Num), deopt_values, 0, 1),
+	MIR_new_reg_op(build->context, values[instr->value])));
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, bits),
+	MIR_new_mem_op(build->context, MIR_T_I64,
+			   instr->value * sizeof(Num), deopt_values, 0, 1)));
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, exponent_mask),
+	MIR_new_int_op(build->context, 0x7ff0000000000000LL)));
+    append(build, MIR_new_insn(build->context, MIR_AND,
+	MIR_new_reg_op(build->context, exponent),
+	MIR_new_reg_op(build->context, bits),
+	MIR_new_reg_op(build->context, exponent_mask)));
+    append(build, MIR_new_insn(build->context, MIR_BEQ,
+	MIR_new_label_op(build->context, float_error),
+	MIR_new_reg_op(build->context, exponent),
+	MIR_new_reg_op(build->context, exponent_mask)));
+}
+
+static void
 append_status_exits(MIRBuild *build, JITStatusExit *exit,
 		    MIR_reg_t source_location, MIR_reg_t error_out,
 		    MIR_reg_t status, MIR_label_t common_return)
@@ -634,6 +675,11 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_reg_op(build->context,
 								     values[instr->src2])));
 			}
+			if (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+			    || instr->op == HIR_OP_MUL || instr->op == HIR_OP_DIV)
+			    append_float_result_check(build, instr, values,
+				deopt_values, &status_exits, &last_status_exit,
+				&copy_serial);
 			break;
 		    }
 		    if (instr->op == HIR_OP_MIN) {
@@ -1245,24 +1291,6 @@ jit_program_deopt_map_count(JITProgram *program)
 }
 
 int
-jit_program_machine_code(JITProgram *program, const void **code, size_t *len)
-{
-    if (!program || program->state != JIT_STATE_COMPILED
-	|| !program->machine_code || !program->machine_code_len) {
-	if (code)
-	    *code = 0;
-	if (len)
-	    *len = 0;
-	return 0;
-    }
-    if (code)
-	*code = program->machine_code;
-    if (len)
-	*len = program->machine_code_len;
-    return 1;
-}
-
-int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
@@ -1316,6 +1344,7 @@ materialize_deopt_value(var_type type, Num raw)
 	FlNum f;
 	memcpy(&f, &raw, sizeof(FlNum));
 	value.v.fnum = box_fl(f);
+	return value;
     }
     else
 	value.v.num = raw;

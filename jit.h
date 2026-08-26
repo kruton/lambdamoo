@@ -53,6 +53,5 @@ extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 extern int jit_program_dump_machine(JITProgram *, void (*)(const char *, void *),
 				    void *);
-extern int jit_program_machine_code(JITProgram *, const void **, size_t *);
 
 #endif /* !JIT_H */

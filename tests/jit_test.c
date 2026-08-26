@@ -1,5 +1,6 @@
 #include "jit_internal.h"
 
+#include "my-math.h"
 #include "my-stdio.h"
 
 #include "integer_arithmetic.h"
@@ -1040,12 +1041,27 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 			memcpy(&b, &values[instr->src2], sizeof(FlNum));
 			if (instr->op == HIR_OP_ADD) {
 			    res = a + b;
+			    if (!IS_REAL(res)) {
+				*error = E_FLOAT;
+				myfree(values, M_PROGRAM);
+				return JIT_RUN_ERROR;
+			    }
 			    memcpy(&values[instr->value], &res, sizeof(FlNum));
 			} else if (instr->op == HIR_OP_SUB) {
 			    res = a - b;
+			    if (!IS_REAL(res)) {
+				*error = E_FLOAT;
+				myfree(values, M_PROGRAM);
+				return JIT_RUN_ERROR;
+			    }
 			    memcpy(&values[instr->value], &res, sizeof(FlNum));
 			} else if (instr->op == HIR_OP_MUL) {
 			    res = a * b;
+			    if (!IS_REAL(res)) {
+				*error = E_FLOAT;
+				myfree(values, M_PROGRAM);
+				return JIT_RUN_ERROR;
+			    }
 			    memcpy(&values[instr->value], &res, sizeof(FlNum));
 			} else if (instr->op == HIR_OP_DIV) {
 			    if (b == 0.0) {
@@ -1054,6 +1070,11 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 				return JIT_RUN_ERROR;
 			    }
 			    res = a / b;
+			    if (!IS_REAL(res)) {
+				*error = E_FLOAT;
+				myfree(values, M_PROGRAM);
+				return JIT_RUN_ERROR;
+			    }
 			    memcpy(&values[instr->value], &res, sizeof(FlNum));
 			} else if (instr->op == HIR_OP_EQ)
 			    values[instr->value] = (a == b);
@@ -1778,6 +1799,19 @@ main(void)
 	      "float add returned wrong value");
 	check_differential(fl_add, bin_env, 10, 0, "float add differential");
 	jit_program_free(fl_add);
+
+	/* Non-finite float results raise E_FLOAT. */
+	JITProgram *fl_overflow = float_binary_program(HIR_OP_MUL);
+	bin_env[0].v.fnum = box_fl(1.0e308);
+	bin_env[1].v.fnum = box_fl(1.0e308);
+	ticks = 10;
+	check(jit_program_execute(fl_overflow, bin_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_ERROR, "float overflow did not error");
+	check(error == E_FLOAT, "float overflow wrong error code");
+	check_differential(fl_overflow, bin_env, 10, 0,
+			   "float overflow differential");
+	jit_program_free(fl_overflow);
 
 	/* Float division and division by zero */
 	JITProgram *fl_div = float_binary_program(HIR_OP_DIV);

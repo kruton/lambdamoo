@@ -3762,6 +3762,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	jit_program_free(program);
 	return jit_program_unsupported("unsupported-value-types");
     }
+#if FLOATING_TYPE != FT_DOUBLE || FLOATS_ARE_BOXED
+    for (i = 1; i < program->num_values; i++)
+	if (value_types_known[i] && value_types[i] == TYPE_FLOAT) {
+	    myfree(value_types_known, M_PROGRAM);
+	    myfree(value_types, M_PROGRAM);
+	    jit_program_free(program);
+	    return jit_program_unsupported("unsupported-float-representation");
+	}
+#endif
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRBasicBlock *cfg_block = cfg_block_for_id(ssa->cfg, ssa_block->id);
