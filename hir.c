@@ -3227,8 +3227,7 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_CONST:
-		if (instr->literal.type == TYPE_LIST
-		    || instr->literal.type == TYPE_FLOAT)
+		if (instr->literal.type == TYPE_LIST)
 		    return 0;
 		break;
 	    case HIR_TAC_UNARY:
@@ -3618,7 +3617,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && value_types_known[si->src1]) {
 		    var_type inferred = value_types[si->src1];
 
-		    if (inferred != TYPE_INT)
+		    if (inferred != TYPE_INT && inferred != TYPE_FLOAT)
 			invalid_value_types = 1;
 		    else if (!value_types_known[si->value]) {
 			value_types[si->value] = inferred;
@@ -3652,6 +3651,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 			if (object_range_add)
 			    inferred = TYPE_OBJ;
+			else if (t1 == TYPE_FLOAT && t2 == TYPE_FLOAT
+				 && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
+				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
+			    inferred = TYPE_FLOAT;
 			else if (t1 != TYPE_INT || t2 != TYPE_INT) {
 			    invalid_value_types = 1;
 			    valid = 0;
@@ -3673,14 +3676,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    int src2_known = si->src2 > 0 && si->src2 < program->num_values
 			&& value_types_known[si->src2];
 
-		    if (src1_known && value_types[si->src1] == TYPE_OBJ
+		    if (src1_known && (value_types[si->src1] == TYPE_OBJ
+				       || value_types[si->src1] == TYPE_FLOAT)
 			&& !src2_known) {
-			value_types[si->src2] = TYPE_OBJ;
+			value_types[si->src2] = value_types[si->src1];
 			value_types_known[si->src2] = 1;
 			types_changed = 1;
-		    } else if (src2_known && value_types[si->src2] == TYPE_OBJ
+		    } else if (src2_known && (value_types[si->src2] == TYPE_OBJ
+					      || value_types[si->src2] == TYPE_FLOAT)
 			       && !src1_known) {
-			value_types[si->src1] = TYPE_OBJ;
+			value_types[si->src1] = value_types[si->src2];
 			value_types_known[si->src1] = 1;
 			types_changed = 1;
 		    } else if (src1_known && src2_known
@@ -3835,6 +3840,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    instr->literal = ssa_instr->literal.v.err;
 		else if (ssa_instr->literal.type == TYPE_INT)
 		    instr->literal = ssa_instr->literal.v.num;
+		else if (ssa_instr->literal.type == TYPE_FLOAT) {
+		    FlNum f = fl_unbox(ssa_instr->literal.v.fnum);
+		    memcpy(&instr->literal, &f, sizeof(Num));
+		}
 		else
 		    instr->literal = 0;
 	    }
@@ -3860,7 +3869,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     }
 
     myfree(value_types_known, M_PROGRAM);
-    myfree(value_types, M_PROGRAM);
+    program->value_types = value_types;
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */

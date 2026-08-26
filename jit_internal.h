@@ -72,6 +72,7 @@ struct JITProgram {
     void *machine_code;
     size_t machine_code_len;
     Num *deopt_values;
+    var_type *value_types;
 };
 
 #endif /* !JIT_Internal_H */
