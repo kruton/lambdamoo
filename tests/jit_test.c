@@ -539,13 +539,19 @@ deep_guard_program(void)
 }
 
 static JITProgram *
-list_constant_program(void)
+list_constant_program(int size)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *list_const = instruction(HIR_TAC_CONST);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
-    Var empty = new_list(0);
+    Var list = new_list(size);
+    int i;
+
+    for (i = 1; i <= size; i++) {
+	list.v.list[i].type = TYPE_INT;
+	list.v.list[i].v.num = i * 10;
+    }
 
     program->num_values = 2;
     program->num_blocks = 1;
@@ -556,7 +562,7 @@ list_constant_program(void)
     block->id = 1;
     list_const->value = 1;
     list_const->literal_type = TYPE_LIST;
-    list_const->literal = (uintptr_t) empty.v.list;
+    list_const->literal = (uintptr_t) list.v.list;
     ret->src1 = 1;
     ret->literal_type = TYPE_LIST;
     list_const->next = ret;
@@ -2994,23 +3000,32 @@ main(void)
     }
 
     {
-	JITProgram *list_const_p = list_constant_program();
-	int iter;
-	check(jit_program_compile(list_const_p) == 1,
-	      "list constant JIT compile failed");
-	for (iter = 0; iter < 50; iter++) {
-	    ticks = 50;
-	    timed_out = 0;
-	    error = E_NONE;
-	    JITRunResult res = jit_program_execute(list_const_p, 0, &result,
-						   &ticks, &timed_out, &error,
-						   0, 0, 0);
-	    check(res == JIT_RUN_RETURNED, "list constant return result");
-	    check(result.type == TYPE_LIST, "list constant result type");
-	    check(result.v.list[0].v.num == 0, "list constant length 0");
-	    free_var(result);
+	int size;
+
+	for (size = 0; size <= 2; size += 2) {
+	    JITProgram *list_const_p = list_constant_program(size);
+	    int iter;
+
+	    check(jit_program_compile(list_const_p) == 1,
+		  "list constant JIT compile failed");
+	    for (iter = 0; iter < 50; iter++) {
+		ticks = 50;
+		timed_out = 0;
+		error = E_NONE;
+		JITRunResult res = jit_program_execute(list_const_p, 0, &result,
+						       &ticks, &timed_out, &error,
+						       0, 0, 0);
+		check(res == JIT_RUN_RETURNED, "list constant return result");
+		check(result.type == TYPE_LIST, "list constant result type");
+		check(result.v.list[0].v.num == size, "list constant length");
+		if (size)
+		    check(result.v.list[1].v.num == 10
+			  && result.v.list[2].v.num == 20,
+			  "list constant elements");
+		free_var(result);
+	    }
+	    jit_program_free(list_const_p);
 	}
-	jit_program_free(list_const_p);
     }
 
     jit_program_free(program);
