@@ -89,5 +89,7 @@ extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
 extern int64_t jit_rt_seconds_left(void);
 extern int64_t jit_rt_time(void);
+extern int64_t jit_rt_index(const char *, const char *);
+extern int64_t jit_rt_rindex(const char *, const char *);
 
 #endif /* !JIT_Internal_H */

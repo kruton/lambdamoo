@@ -1852,6 +1852,88 @@ test_pure_builtin_inlining_tac_ssa(void)
 }
 
 static void
+test_string_search_builtin_inlining(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List a1, a2, a3;
+    Expr source, needle, case_matters, call;
+    Stmt ret;
+
+    memset(&source, 0, sizeof(source));
+    source.kind = EXPR_VAR;
+    source.lineno = 10;
+    source.e.var.type = TYPE_STR;
+    source.e.var.v.str = str_dup("LambdaMOO");
+    memset(&needle, 0, sizeof(needle));
+    needle.kind = EXPR_VAR;
+    needle.lineno = 10;
+    needle.e.var.type = TYPE_STR;
+    needle.e.var.v.str = str_dup("moo");
+    case_matters = int_expr(1, 10);
+
+    memset(&a2, 0, sizeof(a2));
+    a2.kind = ARG_NORMAL;
+    a2.expr = &needle;
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &source;
+    a1.next = &a2;
+    memset(&call, 0, sizeof(call));
+    call.kind = EXPR_CALL;
+    call.lineno = 10;
+    call.e.call.func = 7;
+    call.e.call.args = &a1;
+    call.bytecode_pc = 5;
+    ret = return_stmt(&call);
+    ret.bytecode_pc = 7;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("index inline binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX_BF), 1);
+    check_int("index inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    check_int("index inline verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+
+    call.e.call.func = 8;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("rindex inline binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_RINDEX_BF), 1);
+    check_int("rindex inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    hir_context_free(ctx);
+
+    memset(&a3, 0, sizeof(a3));
+    a3.kind = ARG_NORMAL;
+    a3.expr = &case_matters;
+    a2.next = &a3;
+    call.e.call.func = 7;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("three-argument index remains a call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    check_int("three-argument index is not inlined",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX_BF), 0);
+    hir_context_free(ctx);
+
+    a2.next = 0;
+    call.e.call.func = 9;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("other two-argument built-in remains a call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    hir_context_free(ctx);
+
+    free_str(source.e.var.v.str);
+    free_str(needle.e.var.v.str);
+}
+
+static void
 test_property_read_and_write_tac_ssa(void)
 {
     Names names;
@@ -3128,6 +3210,7 @@ main(void)
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
+    test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
     test_for_list_loop_tac_ssa();

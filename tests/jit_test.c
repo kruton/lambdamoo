@@ -3071,6 +3071,36 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == 1,
 	      "string less-than match");
 	jit_program_free(str_lt);
+
+	JITProgram *str_find = string_compare_program("h\xc3\xa9llo MOO", "moo",
+						     HIR_OP_INDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_find, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "index built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 7,
+	      "index built-in returned Unicode character position");
+	jit_program_free(str_find);
+
+	JITProgram *str_rfind = string_compare_program("MOO and moo", "moo",
+						      HIR_OP_RINDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_rfind, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "rindex built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 9,
+	      "rindex built-in returned last case-insensitive match");
+	jit_program_free(str_rfind);
+
+	JITProgram *str_missing = string_compare_program("LambdaMOO", "xyz",
+							HIR_OP_INDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_missing, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "missing index built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 0,
+	      "missing index built-in returned zero");
+	jit_program_free(str_missing);
     }
 
     /* Non-integer list indexing tests */

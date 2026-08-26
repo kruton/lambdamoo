@@ -3329,6 +3329,8 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_TICKS_LEFT:
     case HIR_OP_SECONDS_LEFT:
     case HIR_OP_TIME:
+    case HIR_OP_INDEX_BF:
+    case HIR_OP_RINDEX_BF:
 	return 1;
     default:
 	return 0;
@@ -3477,6 +3479,8 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_GET_PROP || op == OP_PUSH_GET_PROP;
 	case HIR_OP_MIN:
 	case HIR_OP_MAX:
+	case HIR_OP_INDEX_BF:
+	case HIR_OP_RINDEX_BF:
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
@@ -3851,7 +3855,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			       || si->op == HIR_OP_IN || si->op == HIR_OP_BITOR
 			       || si->op == HIR_OP_BITXOR || si->op == HIR_OP_BITAND
 			       || si->op == HIR_OP_SHL || si->op == HIR_OP_SHR
-			       || si->op == HIR_OP_LSHR) {
+			       || si->op == HIR_OP_LSHR
+			       || si->op == HIR_OP_INDEX_BF
+			       || si->op == HIR_OP_RINDEX_BF) {
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
 		    }
@@ -4048,6 +4054,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[property]) {
 		    value_types[property] = TYPE_STR;
 		    value_types_known[property] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_BINARY
+		&& (si->op == HIR_OP_INDEX_BF
+		    || si->op == HIR_OP_RINDEX_BF)) {
+		if (si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_STR;
+		    value_types_known[si->src1] = 1;
+		}
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_STR;
+		    value_types_known[si->src2] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -4830,6 +4850,10 @@ op_name(HIROp op)
 	return "SECONDS_LEFT";
     case HIR_OP_TIME:
 	return "TIME";
+    case HIR_OP_INDEX_BF:
+	return "INDEX";
+    case HIR_OP_RINDEX_BF:
+	return "RINDEX";
     }
 
     return "?";
@@ -6838,7 +6862,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		ctx->lower_stack[ctx->lower_stack_depth - 1] = dst_temp;
 		return dst_temp;
 	    }
-	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max"))
+	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max")
+			      || !strcmp(func_name, "index") || !strcmp(func_name, "rindex"))
 		&& args && args->kind == ARG_NORMAL
 		&& args->next && args->next->kind == ARG_NORMAL
 		&& !args->next->next) {
@@ -6849,7 +6874,14 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		tac->dst = dst_temp;
 		tac->src1 = arg1_temp;
 		tac->src2 = arg2_temp;
-		tac->op = (!strcmp(func_name, "min")) ? HIR_OP_MIN : HIR_OP_MAX;
+		if (!strcmp(func_name, "min"))
+		    tac->op = HIR_OP_MIN;
+		else if (!strcmp(func_name, "max"))
+		    tac->op = HIR_OP_MAX;
+		else if (!strcmp(func_name, "index"))
+		    tac->op = HIR_OP_INDEX_BF;
+		else
+		    tac->op = HIR_OP_RINDEX_BF;
 		tac->func = expr->u.call.func;
 		tac->bytecode_pc = expr->bytecode_pc;
 		snapshot_lower_stack(ctx, tac);

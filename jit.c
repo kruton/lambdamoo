@@ -267,6 +267,18 @@ jit_rt_time(void)
     return (int64_t) time(0);
 }
 
+int64_t
+jit_rt_index(const char *source, const char *what)
+{
+    return (int64_t) strindex(source, what, 0);
+}
+
+int64_t
+jit_rt_rindex(const char *source, const char *what)
+{
+    return (int64_t) strrindex(source, what, 0);
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *);
 
@@ -296,6 +308,10 @@ typedef struct {
     MIR_item_t import_seconds_left;
     MIR_item_t proto_time;
     MIR_item_t import_time;
+    MIR_item_t proto_index;
+    MIR_item_t import_index;
+    MIR_item_t proto_rindex;
+    MIR_item_t import_rindex;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -602,6 +618,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
     MIR_load_external(build->context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
     MIR_load_external(build->context, "jit_rt_time", (void *) jit_rt_time);
+    MIR_load_external(build->context, "jit_rt_index", (void *) jit_rt_index);
+    MIR_load_external(build->context, "jit_rt_rindex", (void *) jit_rt_rindex);
 
     build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
 					 MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -647,6 +665,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 
     build->proto_time = MIR_new_proto(build->context, "proto_time", 1, &res_i64, 0);
     build->import_time = MIR_new_import(build->context, "jit_rt_time");
+
+    build->proto_index = MIR_new_proto(build->context, "proto_index", 1, &res_i64, 2,
+				       MIR_T_P, "source", MIR_T_P, "what");
+    build->import_index = MIR_new_import(build->context, "jit_rt_index");
+
+    build->proto_rindex = MIR_new_proto(build->context, "proto_rindex", 1, &res_i64, 2,
+					MIR_T_P, "source", MIR_T_P, "what");
+    build->import_rindex = MIR_new_import(build->context, "jit_rt_rindex");
 
     build->function = MIR_new_func(build->context, "jit_verb", 1,
 				   &result_type, 8,
@@ -1148,6 +1174,28 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_reg_op(build->context, values[instr->src1]),
 				MIR_new_reg_op(build->context, in_type),
+				MIR_new_reg_op(build->context, values[instr->src2])));
+			    break;
+			}
+			append_deopt_exit(build, program, instr->deopt_map,
+					  values, deopt_map_out, deopt_values,
+					  status, common_return);
+			break;
+		    }
+		    if (instr->op == HIR_OP_INDEX_BF
+			|| instr->op == HIR_OP_RINDEX_BF) {
+			if (program->value_types
+			    && program->value_types[instr->src1] == TYPE_STR
+			    && program->value_types[instr->src2] == TYPE_STR) {
+			    MIR_item_t proto = (instr->op == HIR_OP_INDEX_BF)
+				? build->proto_index : build->proto_rindex;
+			    MIR_item_t import = (instr->op == HIR_OP_INDEX_BF)
+				? build->import_index : build->import_rindex;
+			    append(build, MIR_new_call_insn(build->context, 5,
+				MIR_new_ref_op(build->context, proto),
+				MIR_new_ref_op(build->context, import),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1]),
 				MIR_new_reg_op(build->context, values[instr->src2])));
 			    break;
 			}

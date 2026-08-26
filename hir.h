@@ -107,7 +107,9 @@ typedef enum {
     HIR_OP_CHARGE_TICK,
     HIR_OP_TICKS_LEFT,
     HIR_OP_SECONDS_LEFT,
-    HIR_OP_TIME
+    HIR_OP_TIME,
+    HIR_OP_INDEX_BF,
+    HIR_OP_RINDEX_BF
 } HIROp;
 
 typedef enum {
