@@ -33,6 +33,14 @@ infer_string_add_operand(HIROp op, int other_known, var_type other_type,
     return 1;
 }
 
+static int
+is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
+			    int local_id, int first_user_local)
+{
+    return kind == HIR_TAC_LOAD_LOCAL && bytecode_pc == NO_BYTECODE_PC
+	&& local_id >= first_user_local;
+}
+
 #ifdef HIR_TESTING
 static int
 is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
@@ -3814,6 +3822,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (si->kind == HIR_TAC_CONST) {
 		    value_types[si->value] = si->literal.type;
 		    value_types_known[si->value] = 1;
+		} else if (is_uninitialized_entry_load(si->kind,
+						       si->bytecode_pc,
+						       si->local_id,
+						       first_user_slot(bytecode_program->version))) {
+		    value_types[si->value] = TYPE_NONE;
+		    value_types_known[si->value] = 1;
 		} else if (si->kind == HIR_TAC_UNARY) {
 		    if (si->op == HIR_OP_MAKE_SINGLETON_LIST
 			|| si->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
@@ -4098,22 +4112,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types_known[args_val] = 1;
 		    }
 		}
-	    }
-	    if (si == ssa_block->last)
-		break;
-	}
-    }
-    /* Unconstrained VM locals retain their uninitialized runtime type. */
-    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
-	HIRSSAInstr *si;
-
-	for (si = ssa_block->first; si; si = si->next) {
-	    if (si->kind == HIR_TAC_LOAD_LOCAL
-		&& si->bytecode_pc == NO_BYTECODE_PC
-		&& si->value > 0 && si->value < program->num_values
-		&& !value_types_known[si->value]) {
-		value_types[si->value] = TYPE_NONE;
-		value_types_known[si->value] = 1;
 	    }
 	    if (si == ssa_block->last)
 		break;
@@ -7443,6 +7441,14 @@ hir_test_infer_string_add_operand(HIROp op, int other_known,
 				  var_type other_type, var_type *inferred_type)
 {
     return infer_string_add_operand(op, other_known, other_type, inferred_type);
+}
+
+int
+hir_test_is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
+				     int local_id, int first_user_local)
+{
+    return is_uninitialized_entry_load(kind, bytecode_pc, local_id,
+				       first_user_local);
 }
 
 static HIRTacProgram *

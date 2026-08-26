@@ -2962,6 +2962,28 @@ test_string_add_operand_inference(void)
 }
 
 static void
+test_uninitialized_entry_load_classification(void)
+{
+    int first_user = SLOT_FLOAT + 1;
+
+    check_int("user local entry load is uninitialized",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL,
+						   NO_BYTECODE_PC,
+						   first_user, first_user), 1);
+    check_int("built-in local entry load is initialized",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL,
+						   NO_BYTECODE_PC,
+						   SLOT_ARGS, first_user), 0);
+    check_int("anchored user local load is not an entry load",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL, 0,
+						   first_user, first_user), 0);
+    check_int("entry instruction must be a local load",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_CONST,
+						   NO_BYTECODE_PC,
+						   first_user, first_user), 0);
+}
+
+static void
 test_length_expr_in_stores_and_negatives(void)
 {
     Names names;
@@ -3081,6 +3103,7 @@ main(void)
 {
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
+    test_uninitialized_entry_load_classification();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();
