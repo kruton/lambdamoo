@@ -641,6 +641,55 @@ charge_tick_program(void)
     return program;
 }
 
+static JITProgram *
+call_verb_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_obj = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_verb = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
+    JITDeoptMap *map;
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 30;
+    map->stack_depth = 0;
+    map->ticks_charged = 0;
+    map->num_locals = 2;
+    map->local_values = allocate(sizeof(int) * 2);
+    map->local_values[0] = 1;
+    map->local_values[1] = 2;
+    load_obj->literal_type = TYPE_OBJ;
+    load_verb->literal_type = TYPE_STR;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_obj->value = 1;
+    load_obj->local_id = 0;
+    load_obj->next = load_verb;
+    load_verb->value = 2;
+    load_verb->local_id = 1;
+    load_verb->next = call_verb;
+    call_verb->value = 3;
+    call_verb->src1 = 1;
+    call_verb->src2 = 2;
+    call_verb->deopt_map = 1;
+    block->first = load_obj;
+    block->last = call_verb;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -1186,6 +1235,21 @@ main(void)
 	check(deopt_stack[0].v.num == 0, "get_prop wrong obj stack value");
 	check(deopt_stack[1].v.num == 123, "get_prop wrong prop stack value");
 	jit_program_free(get_prog);
+    }
+
+    /* Verb call deopt boundary tests */
+    {
+	JITProgram *call_prog = call_verb_program();
+	deep_env[0].type = TYPE_OBJ;
+	deep_env[0].v.obj = 0;
+	deep_env[1].type = TYPE_STR;
+	deep_env[1].v.str = "test";
+	ticks = 10;
+	check(jit_program_execute(call_prog, deep_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK, "call_verb did not return fallback");
+	check(ticks == 10, "call_verb consumed ticks on fallback");
+	jit_program_free(call_prog);
     }
 
     /* Pure inlined built-ins execution tests */

@@ -452,20 +452,20 @@ test_unsupported_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr verb_call, obj, name;
+    Expr catch_expr, try_expr, handler_expr;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    obj = id_expr(0, 30);
-    name = id_expr(1, 30);
-    memset(&verb_call, 0, sizeof(verb_call));
-    verb_call.kind = EXPR_VERB;
-    verb_call.lineno = 30;
-    verb_call.e.verb.obj = &obj;
-    verb_call.e.verb.verb = &name;
-    verb_call.e.verb.args = 0;
-    ret = return_stmt(&verb_call);
+    try_expr = id_expr(0, 30);
+    handler_expr = id_expr(1, 30);
+    memset(&catch_expr, 0, sizeof(catch_expr));
+    catch_expr.kind = EXPR_CATCH;
+    catch_expr.lineno = 30;
+    catch_expr.e.catch.try = &try_expr;
+    catch_expr.e.catch.codes = 0;
+    catch_expr.e.catch.except = &handler_expr;
+    ret = return_stmt(&catch_expr);
 
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
@@ -1990,6 +1990,46 @@ test_range_expr_and_assignment_tac_ssa(void)
 }
 
 static void
+test_verb_call_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr verb_call, obj, name, arg_val;
+    Arg_List arg;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    obj = id_expr(0, 30);
+    name = id_expr(1, 30);
+    arg_val = int_expr(42, 30);
+    memset(&arg, 0, sizeof(arg));
+    arg.kind = ARG_NORMAL;
+    arg.expr = &arg_val;
+    arg.next = 0;
+
+    memset(&verb_call, 0, sizeof(verb_call));
+    verb_call.kind = EXPR_VERB;
+    verb_call.lineno = 30;
+    verb_call.e.verb.obj = &obj;
+    verb_call.e.verb.verb = &name;
+    verb_call.e.verb.args = &arg;
+    ret = return_stmt(&verb_call);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("verb call tac not null", tac != 0, 1);
+    check_int("verb call count", hir_tac_count_kind(tac, HIR_TAC_CALL_VERB), 1);
+    check_int("verb call verify errors", hir_context_error_count(ctx), 0);
+    check_int("verb call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -2266,6 +2306,7 @@ main(void)
     test_break_and_continue_tac_ssa();
     test_labeled_break_nested_loops_tac_ssa();
     test_range_expr_and_assignment_tac_ssa();
+    test_verb_call_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
