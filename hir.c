@@ -7238,6 +7238,9 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	lower_stmt_list(ctx, program, stmt);
 	break;
     case HIR_STMT_EXPR:
+	if (stmt->u.expr && (stmt->u.expr->kind == HIR_EXPR_LITERAL
+			     || stmt->u.expr->kind == HIR_EXPR_LOCAL_LOAD))
+	    break;
 	(void) lower_expr(ctx, program, stmt->u.expr);
 	if (ctx->lower_stack_depth)
 	    ctx->lower_stack_depth--;
