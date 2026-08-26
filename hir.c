@@ -696,6 +696,97 @@ block_for_label(HIRContext *ctx, HIRBasicBlock **label_blocks, int max_label,
     return label_blocks[label];
 }
 
+static int
+max_cfg_block_id(HIRCFG *cfg)
+{
+    HIRBasicBlock *block;
+    int max = 0;
+
+    if (!cfg)
+	return 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	if (block->id > max)
+	    max = block->id;
+    }
+
+    return max;
+}
+
+static void
+mark_reachable_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
+{
+    int changed = 1;
+
+    if (cfg->entry)
+	reachable[cfg->entry->id] = 1;
+    while (changed) {
+	HIRBasicBlock *block;
+
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    int i;
+
+	    if (!reachable[block->id])
+		continue;
+	    for (i = 0; i < block->num_successors; i++) {
+		int successor = block->successors[i]->id;
+
+		if (!reachable[successor]) {
+		    reachable[successor] = 1;
+		    changed = 1;
+		}
+	    }
+	}
+    }
+}
+
+static void
+prune_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
+{
+    HIRBasicBlock *block = cfg->blocks;
+    HIRBasicBlock *previous = 0;
+
+    cfg->num_blocks = 0;
+    cfg->num_edges = 0;
+    cfg->last_block = 0;
+    while (block) {
+	HIRBasicBlock *next = block->next;
+
+	if (reachable[block->id]) {
+	    int source;
+	    int target = 0;
+
+	    for (source = 0; source < block->num_successors; source++)
+		if (reachable[block->successors[source]->id])
+		    block->successors[target++] = block->successors[source];
+	    block->num_successors = target;
+	    block->predecessor_count = 0;
+	    if (previous)
+		previous->next = block;
+	    else
+		cfg->blocks = block;
+	    previous = block;
+	    cfg->last_block = block;
+	    cfg->num_blocks++;
+	}
+	block = next;
+    }
+    if (previous)
+	previous->next = 0;
+    else
+	cfg->blocks = 0;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	int i;
+
+	for (i = 0; i < block->num_successors; i++) {
+	    block->successors[i]->predecessor_count++;
+	    cfg->num_edges++;
+	}
+    }
+}
+
 HIRCFG *
 hir_build_cfg(HIRContext *ctx, HIRTacProgram *program)
 {
@@ -792,6 +883,12 @@ hir_build_cfg(HIRContext *ctx, HIRTacProgram *program)
 	    add_edge(cfg, block, block->next);
 	    break;
 	}
+    }
+
+    if (cfg->entry) {
+	unsigned char *reachable = hir_calloc(ctx, (size_t) max_cfg_block_id(cfg) + 1, sizeof(unsigned char));
+	mark_reachable_cfg_blocks(cfg, reachable);
+	prune_cfg_blocks(cfg, reachable);
     }
 
     return cfg;
@@ -1014,23 +1111,6 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 	record_unsupported(ctx, "cfg: last block is not terminal");
 
     return ctx->error_count == errors_before;
-}
-
-static int
-max_cfg_block_id(HIRCFG *cfg)
-{
-    HIRBasicBlock *block;
-    int max = 0;
-
-    if (!cfg)
-	return 0;
-
-    for (block = cfg->blocks; block; block = block->next) {
-	if (block->id > max)
-	    max = block->id;
-    }
-
-    return max;
 }
 
 static void
@@ -1773,54 +1853,12 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			     ssa_blocks[cfg->entry->id], ssa, visited);
     }
 
-    /* Fill in default value for phi args from unreachable predecessors */
-    if (cfg->entry) {
-	for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
-	    HIRSSAInstr *phi;
-	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
-	    if (!ssa_block)
-		continue;
-	    for (phi = ssa_block->first; phi && phi->kind == HIR_TAC_PHI; phi = phi->next) {
-		HIRPhiArg *arg;
-		for (arg = phi->phi_args; arg; arg = arg->next) {
-		    if (arg->value == 0) {
-			arg->value = current_version(ctx, phi->local_id,
-						     num_locals, stacks,
-						     stack_tops, max_depth,
-						     ssa_blocks[cfg->entry->id],
-						     ssa);
-		    }
-		}
-	    }
-	}
-    }
-
-    /* Emit dummy instruction for unreachable blocks so they are valid SSA */
+    /* For reachable blocks that become instruction-empty because local
+       loads/stores disappear during SSA conversion, emit a non-semantic label
+       to preserve the block and its control-flow edges for phis and SSA destruction. */
     for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
-	if (!visited[cfg_block->id]) {
-	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
-	    HIRSSAInstr *ret = hir_alloc(ctx, sizeof(HIRSSAInstr));
-	    ret->kind = HIR_TAC_RETURN0;
-	    ret->source_lineno = cfg_block->first_lineno;
-	    ret->bytecode_pc = NO_BYTECODE_PC;
-	    ret->value = 0;
-	    ret->src1 = 0;
-	    ret->src2 = 0;
-	    ret->label = 0;
-	    ret->local_id = 0;
-	    ret->op = HIR_OP_ADD;
-	    ret->literal.type = TYPE_NONE;
-	    ret->num_stack_values = 0;
-	    ret->stack_values = 0;
-	    ret->num_local_values = 0;
-	    ret->local_values = 0;
-	    ret->phi_args = 0;
-	    ret->copies = 0;
-	    ret->next = 0;
-	    emit_ssa_instr(ssa, ssa_block, ret);
-	} else if (ssa_blocks[cfg_block->id] && !ssa_blocks[cfg_block->id]->first) {
-	    /* Empty reachable block (only contained load/store local) */
-	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
+	HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
+	if (ssa_block && !ssa_block->first) {
 	    HIRSSAInstr *label = hir_alloc(ctx, sizeof(HIRSSAInstr));
 	    label->kind = HIR_TAC_LABEL;
 	    label->source_lineno = cfg_block->first_lineno;
@@ -2552,80 +2590,6 @@ cfg_has_edge_id(HIRBasicBlock *from, int target_id)
 	if (from->successors[i]->id == target_id)
 	    return 1;
     return 0;
-}
-
-static void
-mark_reachable_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
-{
-    int changed = 1;
-
-    if (cfg->entry)
-	reachable[cfg->entry->id] = 1;
-    while (changed) {
-	HIRBasicBlock *block;
-
-	changed = 0;
-	for (block = cfg->blocks; block; block = block->next) {
-	    int i;
-
-	    if (!reachable[block->id])
-		continue;
-	    for (i = 0; i < block->num_successors; i++) {
-		int successor = block->successors[i]->id;
-
-		if (!reachable[successor]) {
-		    reachable[successor] = 1;
-		    changed = 1;
-		}
-	    }
-	}
-    }
-}
-
-static void
-prune_cfg_blocks(HIRCFG *cfg, unsigned char *reachable)
-{
-    HIRBasicBlock *block = cfg->blocks;
-    HIRBasicBlock *previous = 0;
-
-    cfg->num_blocks = 0;
-    cfg->num_edges = 0;
-    cfg->last_block = 0;
-    while (block) {
-	HIRBasicBlock *next = block->next;
-
-	if (reachable[block->id]) {
-	    int source;
-	    int target = 0;
-
-	    for (source = 0; source < block->num_successors; source++)
-		if (reachable[block->successors[source]->id])
-		    block->successors[target++] = block->successors[source];
-	    block->num_successors = target;
-	    block->predecessor_count = 0;
-	    if (previous)
-		previous->next = block;
-	    else
-		cfg->blocks = block;
-	    previous = block;
-	    cfg->last_block = block;
-	    cfg->num_blocks++;
-	}
-	block = next;
-    }
-    if (previous)
-	previous->next = 0;
-    else
-	cfg->blocks = 0;
-
-    for (block = cfg->blocks; block; block = block->next) {
-	int i;
-
-	for (i = 0; i < block->num_successors; i++) {
-	    block->successors[i]->predecessor_count++;
-	    cfg->num_edges++;
-	}
-    }
 }
 
 static void

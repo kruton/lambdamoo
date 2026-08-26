@@ -286,8 +286,8 @@ test_control_flow_tac(void)
     check_int("control tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 2);
     check_int("control line 20 count", hir_tac_count_lineno(tac, 20), 9);
     check_int("control line 21 count", hir_tac_count_lineno(tac, 21), 2);
-    check_int("control cfg blocks", hir_cfg_block_count(cfg), 5);
-    check_int("control cfg edges", hir_cfg_edge_count(cfg), 4);
+    check_int("control cfg blocks", hir_cfg_block_count(cfg), 4);
+    check_int("control cfg edges", hir_cfg_edge_count(cfg), 3);
     check_int("control dom reachable blocks",
 	      hir_dom_reachable_block_count(dom), 4);
     check_int("control dom entry idom", hir_dom_idom_block(dom, 1), 1);
@@ -295,8 +295,8 @@ test_control_flow_tac(void)
     check_int("control dom unreachable idom", hir_dom_idom_block(dom, 3), 0);
     check_int("control dom else-label idom", hir_dom_idom_block(dom, 4), 1);
     check_int("control dom done idom", hir_dom_idom_block(dom, 5), 4);
-    check_int("control ssa blocks", hir_ssa_block_count(ssa), 5);
-    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 11);
+    check_int("control ssa blocks", hir_ssa_block_count(ssa), 4);
+    check_int("control ssa instructions", hir_ssa_instruction_count(ssa), 10);
     check_int("control ssa values", hir_ssa_value_count(ssa), 4);
     check_int("control ssa branch count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 1);
@@ -2473,8 +2473,8 @@ test_try_except_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
     check_int("try except deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
-    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
-    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try except verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
