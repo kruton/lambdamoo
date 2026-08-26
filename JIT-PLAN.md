@@ -449,15 +449,18 @@ Completed in the first native-code milestone:
   interpreter stack reconstruction boundaries; and
 * deopt-before-call boundaries for verb calls (`obj:verb(args...)`), preserving
   argument stacks, permissions, traceback state, and activation-push semantics; and
-* guarded SSA values for object (`TYPE_OBJ`) and floating-point (`TYPE_FLOAT`)
-  scalars, including object range loops, literal representations, comparisons,
-  and exact deoptimization/return semantics.
+* guarded SSA values for object (`TYPE_OBJ`) scalars, including object range
+  loops, literal representations, comparisons, and exact deoptimization/return
+  semantics.
 
 The next reviewable compiler milestones are:
 
-1. Add ownership-aware string values and non-integer list elements so indexing,
+1. Add a consistent native representation for floating-point (`TYPE_FLOAT`)
+   values, including boxed-local loads, arithmetic, error checks, returns, and
+   deoptimization.
+2. Add ownership-aware string values and non-integer list elements so indexing,
    iteration, locals, returns, and deoptimization preserve reference counts.
-2. Model exception and `finally` stack markers before lowering catch expressions,
+3. Model exception and `finally` stack markers before lowering catch expressions,
    `try` statements, or other operations that unwind through native frames.
-3. Add fork and suspension boundaries only after native frames can materialize
+4. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.

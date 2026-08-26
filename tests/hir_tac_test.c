@@ -2030,7 +2030,7 @@ test_verb_call_tac_ssa(void)
 }
 
 static void
-test_object_and_float_scalars_tac_ssa(void)
+test_object_scalars_tac_ssa(void)
 {
     Names names;
     HIRContext *ctx;
@@ -2038,7 +2038,7 @@ test_object_and_float_scalars_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr from_expr, to_expr, float_lit, o_lhs, o_rhs, one, add, assign;
+    Expr from_expr, to_expr, o_lhs, o_rhs, one, add, assign, ret_expr;
     Stmt for_stmt, ret_stmt, body_stmt;
 
     memset(&names, 0, sizeof(names));
@@ -2066,13 +2066,8 @@ test_object_and_float_scalars_tac_ssa(void)
 
     for_stmt = range_stmt(1, &from_expr, &to_expr, &body_stmt, 10);
 
-    memset(&float_lit, 0, sizeof(float_lit));
-    float_lit.kind = EXPR_VAR;
-    float_lit.lineno = 12;
-    float_lit.e.var.type = TYPE_FLOAT;
-    float_lit.e.var.v.fnum = box_fl(3.14);
-
-    ret_stmt = return_stmt(&float_lit);
+    ret_expr = id_expr(1, 12);
+    ret_stmt = return_stmt(&ret_expr);
     ret_stmt.lineno = 12;
 
     for_stmt.next = &ret_stmt;
@@ -2363,7 +2358,7 @@ main(void)
     test_labeled_break_nested_loops_tac_ssa();
     test_range_expr_and_assignment_tac_ssa();
     test_verb_call_tac_ssa();
-    test_object_and_float_scalars_tac_ssa();
+    test_object_scalars_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();

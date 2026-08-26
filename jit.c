@@ -374,7 +374,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
-						  MIR_new_int_op(build->context, TYPE_INT)));
+						  MIR_new_int_op(build->context,
+								 instr->literal)));
 		    } else if (instr->op == HIR_OP_ABS) {
 			MIR_label_t is_pos = MIR_new_label(build->context);
 			MIR_label_t done = MIR_new_label(build->context);
@@ -1038,11 +1039,6 @@ materialize_deopt_value(var_type type, Num raw)
 	value.v.obj = raw;
     else if (type == TYPE_ERR)
 	value.v.err = raw;
-    else if (type == TYPE_FLOAT) {
-	FlNum f;
-	memcpy(&f, &raw, sizeof(FlNum));
-	value.v.fnum = box_fl(f);
-    }
     else
 	value.v.num = raw;
     return var_ref(value);
