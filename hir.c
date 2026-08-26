@@ -122,6 +122,12 @@ struct HIRExpr {
 	    HIRExpr *rhs;
 	} prop_store;
 	struct {
+	    HIRExpr *base;
+	    HIRExpr *from;
+	    HIRExpr *to;
+	    HIRExpr *rhs;
+	} range_store;
+	struct {
 	    HIRExpr *body;
 	    HIRArg *codes;
 	    HIRExpr *handler;
@@ -540,6 +546,8 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_PUT_PROP:
+	case HIR_TAC_RANGE_REF:
+	case HIR_TAC_RANGE_SET:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
@@ -1262,6 +1270,8 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_BINARY
 	    || instr->kind == HIR_TAC_CALL
 	    || instr->kind == HIR_TAC_PUT_PROP
+	    || instr->kind == HIR_TAC_RANGE_REF
+	    || instr->kind == HIR_TAC_RANGE_SET
 	    || instr->kind == HIR_TAC_UNSUPPORTED
 	    || instr->kind == HIR_TAC_PHI);
 }
@@ -1950,6 +1960,8 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
 					   order, 0, max_value,
 					   def_block, def_order);
@@ -2032,6 +2044,8 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
@@ -2362,6 +2376,8 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		    break;
 		case HIR_TAC_CALL:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_RANGE_REF:
+		case HIR_TAC_RANGE_SET:
 		case HIR_TAC_UNSUPPORTED:
 		    fact = unknown_fact();
 		    break;
@@ -3040,6 +3056,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		mark_out_ssa_def(instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3088,6 +3106,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
 		break;
@@ -3189,6 +3209,8 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 	    case HIR_TAC_LABEL:
 	    case HIR_TAC_JUMP:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3368,6 +3390,22 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    || instr->bytecode_pc >= bc->size)
 		    return 0;
 		if (bc->vector[instr->bytecode_pc] != OP_PUT_PROP)
+		    return 0;
+		break;
+	    case HIR_TAC_RANGE_REF:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_RANGE_REF)
+		    return 0;
+		break;
+	    case HIR_TAC_RANGE_SET:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
+		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
+						    EOP_RANGESET))
 		    return 0;
 		break;
 	    case HIR_TAC_LABEL:
@@ -3668,6 +3706,14 @@ hir_dump_tac(HIRTacProgram *program)
 	    fprintf(stderr, " t%d = prop_put(t%d, t%d)", instr->dst,
 		    instr->src1, instr->src2);
 	    break;
+	case HIR_TAC_RANGE_REF:
+	    fprintf(stderr, " t%d = range_ref(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
+	    break;
+	case HIR_TAC_RANGE_SET:
+	    fprintf(stderr, " t%d = range_set(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
+	    break;
 	case HIR_TAC_UNSUPPORTED:
 	    fprintf(stderr, " t%d", instr->dst);
 	    break;
@@ -3838,6 +3884,14 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " t%d = prop_put(t%d, t%d)", instr->value,
 			instr->src1, instr->src2);
 		break;
+	    case HIR_TAC_RANGE_REF:
+		fprintf(file, " t%d = range_ref(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
+	    case HIR_TAC_RANGE_SET:
+		fprintf(file, " t%d = range_set(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
 	    case HIR_TAC_UNSUPPORTED:
 		if (instr->value > 0)
 		    fprintf(file, " t%d", instr->value);
@@ -3910,6 +3964,10 @@ tac_kind_name(HIRTacKind kind)
 	return "call";
     case HIR_TAC_PUT_PROP:
 	return "put_prop";
+    case HIR_TAC_RANGE_REF:
+	return "range_ref";
+    case HIR_TAC_RANGE_SET:
+	return "range_set";
     case HIR_TAC_UNSUPPORTED:
 	    return "unsupported";
     case HIR_TAC_PHI:
@@ -4794,6 +4852,17 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.prop_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
+    if (ast->e.bin.lhs->kind == EXPR_RANGE) {
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_RANGE_STORE);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.range_store.base = lift_expr(ctx, ast->e.bin.lhs->e.range.base);
+	expr->u.range_store.from = lift_expr(ctx, ast->e.bin.lhs->e.range.from);
+	expr->u.range_store.to = lift_expr(ctx, ast->e.bin.lhs->e.range.to);
+	expr->u.range_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	return expr;
+    }
 
     record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
     return unsupported_expr(ctx, ast);
@@ -4903,10 +4972,10 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_RANGE:
 	expr = new_expr(ctx, HIR_EXPR_RANGE);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.range.base = lift_expr(ctx, ast->e.range.base);
 	expr->u.range.from = lift_expr(ctx, ast->e.range.from);
 	expr->u.range.to = lift_expr(ctx, ast->e.range.to);
-	record_unsupported(ctx, "Range expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_LIST:
 	expr = new_expr(ctx, HIR_EXPR_LIST);
@@ -5479,6 +5548,50 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    snapshot_lower_stack(ctx, instr);
 	    append_tac(program, instr);
 	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, dst_temp);
+	    return dst_temp;
+	}
+    case HIR_EXPR_RANGE:
+	{
+	    int base_temp = lower_expr(ctx, program, expr->u.range.base);
+	    int from_temp = lower_expr(ctx, program, expr->u.range.from);
+	    int to_temp = lower_expr(ctx, program, expr->u.range.to);
+	    int dst_temp = new_temp(ctx);
+	    (void) from_temp;
+	    (void) to_temp;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    instr = new_tac(ctx, HIR_TAC_RANGE_REF, expr->source_lineno);
+	    instr->bytecode_pc = expr->bytecode_pc;
+	    instr->dst = dst_temp;
+	    instr->src1 = base_temp;
+	    instr->src2 = from_temp;
+	    snapshot_lower_stack(ctx, instr);
+	    append_tac(program, instr);
+	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, dst_temp);
+	    return dst_temp;
+	}
+    case HIR_EXPR_RANGE_STORE:
+	{
+	    int base_temp = lower_expr(ctx, program, expr->u.range_store.base);
+	    int from_temp = lower_expr(ctx, program, expr->u.range_store.from);
+	    int to_temp = lower_expr(ctx, program, expr->u.range_store.to);
+	    int rhs_temp = lower_expr(ctx, program, expr->u.range_store.rhs);
+	    int dst_temp = new_temp(ctx);
+	    (void) from_temp;
+	    (void) to_temp;
+	    (void) rhs_temp;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    instr = new_tac(ctx, HIR_TAC_RANGE_SET, expr->source_lineno);
+	    instr->bytecode_pc = expr->bytecode_pc;
+	    instr->dst = dst_temp;
+	    instr->src1 = base_temp;
+	    instr->src2 = from_temp;
+	    snapshot_lower_stack(ctx, instr);
+	    append_tac(program, instr);
+	    ctx->lower_stack_depth -= 4;
 	    push_lower_stack(ctx, dst_temp);
 	    return dst_temp;
 	}

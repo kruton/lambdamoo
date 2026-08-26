@@ -815,6 +815,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    break;
 		case HIR_TAC_CALL:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_RANGE_REF:
+		case HIR_TAC_RANGE_SET:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);

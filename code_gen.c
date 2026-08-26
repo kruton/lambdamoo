@@ -899,6 +899,7 @@ generate_expr(Expr * expr, State * state)
 	    generate_expr(expr->e.range.from, state);
 	    generate_expr(expr->e.range.to, state);
 	    restore_stack_top(old, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_RANGE_REF, state);
 	    pop_stack(2, state);
 	}
