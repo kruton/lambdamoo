@@ -908,6 +908,7 @@ generate_expr(Expr * expr, State * state)
 	{
 	    unsigned saved = saved_stack_top(state);
 
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    if (saved != UINT_MAX) {
 		emit_extended_byte(EOP_LENGTH, state);
 		add_stack_ref(saved, state);
