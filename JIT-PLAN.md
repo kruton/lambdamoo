@@ -462,9 +462,13 @@ Completed in the first native-code milestone:
 * exception and `finally` stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) modeled
   before lowering catch expressions, `try-except`, and `try-finally` statements,
   with relocated handler PCs and pre-entry deoptimization boundaries preserving
-  exact interpreter stack-unwind and `finally` semantics.
+  exact interpreter stack-unwind and `finally` semantics; and
+* fork and suspension deoptimization boundaries (`HIR_TAC_DEOPT`) modeling time
+  expressions, argument stacks, and exact bytecode resume anchors, ensuring
+  native execution materializes every continuation field required by serialized
+  activations.
 
 The next reviewable compiler milestone is:
 
-1. Add fork and suspension boundaries only after native frames can materialize
-   every continuation field required by serialized activations.
+1. End-to-end integration and verification of the full JIT compiler pipeline
+   across all supported LambdaMOO language constructs.
