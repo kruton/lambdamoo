@@ -490,21 +490,25 @@ Completed in the first native-code milestone:
   its operands, tick refund, and bytecode resume state restored for interpreter
   evaluation; and
 * direct indexed local assignments accepted at `OP_PUT_TEMP` deoptimization
-  boundaries with their base, index, and right-hand-side stack values preserved.
+  boundaries with their base, index, and right-hand-side stack values preserved;
+  and
+* nested local- and property-rooted indexed assignments, with `OP_PUSH_REF` and
+  `OP_PUSH_GET_PROP` anchors preserving every intermediate value required by
+  interpreter write-back.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 4,858 (76.88%) are JIT-eligible, 1,026 report `unsupported-value-types`,
-370 report `unsupported-program`, and 65 report `invalid-bytecode-anchor`; no
+these, 5,031 (79.62%) are JIT-eligible, 1,086 report `unsupported-value-types`,
+143 report `unsupported-program`, and 59 report `invalid-bytecode-anchor`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
 * zero `ssa-support: list constant` rejections, down from 2,852;
 * zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
   from 1,004;
-* 234 unsupported non-local assignments, down from 412 after accepting direct
-  indexed local assignments at an exact deoptimization boundary;
-* 131 optional/rest scatter rejections; and
-* 65 remaining bytecode-anchor failures, down from 4,204 after correcting
+* zero unsupported non-local assignments, down from 412 after preserving local
+  and property-rooted indexed write-back chains;
+* 137 optional/rest scatter rejections; and
+* 59 remaining bytecode-anchor failures, down from 4,204 after correcting
   argument-list operation anchors.
 
 Counts describe the first reported failure in each verb. Fixing one category may
@@ -524,38 +528,33 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Continue classifying the 234 unsupported non-local assignments by left-hand
-   side shape. Direct `local[index] = value` now deoptimizes at `OP_PUT_TEMP`
-   with its base, index, and value intact. Model the preserved intermediate
-   values and write-back chain required by nested index/range/property lvalues
-   before accepting them.
-2. Lower optional, default, and rest scatter assignments
-   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 131
+1. Lower optional, default, and rest scatter assignments
+   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 137
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.
-3. Classify the 1,026 `unsupported-value-types` results by diagnostic and value
+2. Classify the 1,086 `unsupported-value-types` results by diagnostic and value
    producer, then improve inference or add guarded representations for the
    largest safe category before broadening complex-value operations.
-4. Add shared, ownership-audited runtime helpers for complex-value semantics,
+3. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
    identity out of language equality, truth, and ordering semantics, and test
    every helper on success, error, and deoptimization paths.
-5. Make code-unit identity explicit in native entry and deoptimization maps,
+4. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-6. Define declarative built-in effect metadata (pure, may raise, may allocate,
+5. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-7. Add profile-guided, semantics-preserving optimization only after the wider
+6. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-8. Finish with database-scale validation and performance work: multi-verb and
+7. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.

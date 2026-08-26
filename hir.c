@@ -3425,12 +3425,14 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
 	case HIR_OP_INDEX:
 	    return op == OP_REF
+		|| op == OP_PUSH_REF
 		|| op == OP_FOR_LIST
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_SCATTER);
 	case HIR_OP_LIST_ADD_TAIL: return op == OP_LIST_ADD_TAIL;
 	case HIR_OP_LIST_APPEND: return op == OP_LIST_APPEND;
-	case HIR_OP_GET_PROP: return op == OP_GET_PROP;
+	case HIR_OP_GET_PROP:
+	    return op == OP_GET_PROP || op == OP_PUSH_GET_PROP;
 	case HIR_OP_MIN:
 	case HIR_OP_MAX:
 	    return instr->bytecode_pc + 1 < bc->size
@@ -3908,6 +3910,29 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		else {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
+		int object = si->src1;
+		int property = si->src2;
+
+		if (object > 0 && object < program->num_values) {
+		    if (value_types_known[object]
+			&& value_types[object] != TYPE_OBJ)
+			invalid_value_types = 1;
+		    else {
+			value_types[object] = TYPE_OBJ;
+			value_types_known[object] = 1;
+		    }
+		}
+		if (property > 0 && property < program->num_values) {
+		    if (value_types_known[property]
+			&& value_types[property] != TYPE_STR)
+			invalid_value_types = 1;
+		    else {
+			value_types[property] = TYPE_STR;
+			value_types_known[property] = 1;
+		    }
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -5400,16 +5425,22 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.prop_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
-    if (ast->e.bin.lhs->kind == EXPR_INDEX
-	&& ast->e.bin.lhs->e.bin.lhs->kind == EXPR_ID) {
-	HIRExpr *expr = new_expr(ctx, HIR_EXPR_INDEX_STORE);
 
-	expr->source_lineno = ast->lineno;
-	expr->bytecode_pc = ast->bytecode_pc;
-	expr->u.index_store.base = lift_expr(ctx, ast->e.bin.lhs->e.bin.lhs);
-	expr->u.index_store.index = lift_expr(ctx, ast->e.bin.lhs->e.bin.rhs);
-	expr->u.index_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
-	return expr;
+    if (ast->e.bin.lhs->kind == EXPR_INDEX) {
+	Expr *base = ast->e.bin.lhs;
+
+	while (base->kind == EXPR_INDEX)
+	    base = base->e.bin.lhs;
+	if (base->kind == EXPR_ID || base->kind == EXPR_PROP) {
+	    HIRExpr *expr = new_expr(ctx, HIR_EXPR_INDEX_STORE);
+
+	    expr->source_lineno = ast->lineno;
+	    expr->bytecode_pc = ast->bytecode_pc;
+	    expr->u.index_store.base = lift_expr(ctx, ast->e.bin.lhs->e.bin.lhs);
+	    expr->u.index_store.index = lift_expr(ctx, ast->e.bin.lhs->e.bin.rhs);
+	    expr->u.index_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	    return expr;
+	}
     }
     if (ast->e.bin.lhs->kind == EXPR_RANGE) {
 	HIRExpr *expr = new_expr(ctx, HIR_EXPR_RANGE_STORE);
@@ -6126,6 +6157,46 @@ append_unsupported_tac(HIRContext *ctx, HIRTacProgram *program,
 }
 
 static int
+lower_index_lvalue_base(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    HIRTacInstr *instr;
+    int base;
+    int index;
+
+    if (expr->kind == HIR_EXPR_PROP) {
+	base = lower_expr(ctx, program, expr->u.pair.lhs);
+	index = lower_expr(ctx, program, expr->u.pair.rhs);
+	append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+	instr->bytecode_pc = expr->bytecode_pc;
+	instr->dst = new_temp(ctx);
+	instr->src1 = base;
+	instr->src2 = index;
+	instr->op = HIR_OP_GET_PROP;
+	snapshot_lower_stack(ctx, instr);
+	append_tac(program, instr);
+	push_lower_stack(ctx, instr->dst);
+	return instr->dst;
+    }
+    if (expr->kind != HIR_EXPR_INDEX)
+	return lower_expr(ctx, program, expr);
+
+    base = lower_index_lvalue_base(ctx, program, expr->u.pair.lhs);
+    index = lower_expr(ctx, program, expr->u.pair.rhs);
+    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+    instr = new_tac(ctx, HIR_TAC_BINARY, expr->source_lineno);
+    instr->bytecode_pc = expr->bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->src1 = base;
+    instr->src2 = index;
+    instr->op = HIR_OP_INDEX;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    push_lower_stack(ctx, instr->dst);
+    return instr->dst;
+}
+
+static int
 lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
     HIRTacInstr *instr;
@@ -6251,7 +6322,9 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	}
     case HIR_EXPR_INDEX_STORE:
 	{
-	    int base_temp = lower_expr(ctx, program, expr->u.index_store.base);
+	    int saved_depth = ctx->lower_stack_depth;
+	    int base_temp = lower_index_lvalue_base(ctx, program,
+					     expr->u.index_store.base);
 	    int index_temp = lower_expr(ctx, program, expr->u.index_store.index);
 	    int rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
 
@@ -6259,7 +6332,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    (void) index_temp;
 	    append_index_store_deopt(ctx, program, expr->source_lineno,
 				     expr->bytecode_pc);
-	    ctx->lower_stack_depth -= 3;
+	    ctx->lower_stack_depth = saved_depth;
 	    push_lower_stack(ctx, rhs_temp);
 	    return rhs_temp;
 	}

@@ -1289,6 +1289,98 @@ test_direct_index_assignment_deopt(void)
 }
 
 static void
+test_nested_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr list = id_expr(0, 10);
+    Expr first_index = int_expr(1, 10);
+    Expr inner = binary_expr(EXPR_INDEX, &list, &first_index);
+    Expr second_index = int_expr(2, 10);
+    Expr lhs = binary_expr(EXPR_INDEX, &inner, &second_index);
+    Expr value = int_expr(42, 10);
+    Expr assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    Stmt ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    list.bytecode_pc = 1;
+    first_index.bytecode_pc = 2;
+    inner.bytecode_pc = 3;
+    second_index.bytecode_pc = 4;
+    value.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    ret.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("nested index assignment accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("nested index assignment preserved ref",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 1);
+    check_int("nested index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 6), 5);
+    check_int("nested index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("nested index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_property_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr object = id_expr(0, 10);
+    Expr property;
+    Expr property_ref;
+    Expr index = int_expr(2, 10);
+    Expr lhs;
+    Expr value = int_expr(42, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&property, 0, sizeof(property));
+    property.kind = EXPR_VAR;
+    property.lineno = 10;
+    property.e.var.type = TYPE_STR;
+    property.e.var.v.str = "items";
+    property_ref = binary_expr(EXPR_PROP, &object, &property);
+    lhs = binary_expr(EXPR_INDEX, &property_ref, &index);
+    assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    object.bytecode_pc = 1;
+    property.bytecode_pc = 2;
+    property_ref.bytecode_pc = 3;
+    index.bytecode_pc = 4;
+    value.bytecode_pc = 5;
+    assign.bytecode_pc = 6;
+    ret.bytecode_pc = 7;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("property index assignment accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("property index assignment preserved property",
+	      hir_tac_count_binary_op(tac, HIR_OP_GET_PROP), 1);
+    check_int("property index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 6), 5);
+    check_int("property index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("property index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_list_index_in_arithmetic_tac_ssa(void)
 {
     Names names;
@@ -2778,6 +2870,8 @@ main(void)
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
     test_direct_index_assignment_deopt();
+    test_nested_index_assignment_deopt();
+    test_property_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_list_construction_and_splicing_tac_ssa();

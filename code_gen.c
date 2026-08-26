@@ -683,6 +683,7 @@ push_lvalue(Expr * expr, int indexed_above, State * state)
 	generate_expr(expr->e.bin.rhs, state);
 	restore_stack_top(old, state);
 	if (indexed_above) {
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_PUSH_REF, state);
 	    push_stack(1, state);
 	}
@@ -697,6 +698,7 @@ push_lvalue(Expr * expr, int indexed_above, State * state)
 	generate_expr(expr->e.bin.lhs, state);
 	generate_expr(expr->e.bin.rhs, state);
 	if (indexed_above) {
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_PUSH_GET_PROP, state);
 	    push_stack(1, state);
 	}
