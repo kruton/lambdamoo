@@ -494,11 +494,14 @@ Completed in the first native-code milestone:
   and
 * nested local- and property-rooted indexed assignments, with `OP_PUSH_REF` and
   `OP_PUSH_GET_PROP` anchors preserving every intermediate value required by
-  interpreter write-back.
+  interpreter write-back; and
+* all scatter assignments resumed at an exact `EOP_SCATTER` interpreter
+  boundary, preserving the RHS list while leaving arity checks, defaults, rest
+  construction, ownership, and errors to the existing VM implementation.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 5,031 (79.62%) are JIT-eligible, 1,086 report `unsupported-value-types`,
-143 report `unsupported-program`, and 59 report `invalid-bytecode-anchor`; no
+these, 5,130 (81.18%) are JIT-eligible, 1,116 report `unsupported-value-types`,
+65 report `invalid-bytecode-anchor`, and 8 report `unsupported-program`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
@@ -507,8 +510,8 @@ the detailed census identifies the highest-frequency blockers:
   from 1,004;
 * zero unsupported non-local assignments, down from 412 after preserving local
   and property-rooted indexed write-back chains;
-* 137 optional/rest scatter rejections; and
-* 59 remaining bytecode-anchor failures, down from 4,204 after correcting
+* zero optional/rest scatter rejections, down from 137; and
+* 65 remaining bytecode-anchor failures, down from 4,204 after correcting
   argument-list operation anchors.
 
 Counts describe the first reported failure in each verb. Fixing one category may
@@ -528,33 +531,30 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Lower optional, default, and rest scatter assignments
-   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 137
-   verbs, in separate reviewable steps with exact default-expression evaluation,
-   errors, ticks, ownership, and deoptimization stacks.
-2. Classify the 1,086 `unsupported-value-types` results by diagnostic and value
+1. Classify the 1,116 `unsupported-value-types` results by diagnostic and value
    producer, then improve inference or add guarded representations for the
    largest safe category before broadening complex-value operations.
-3. Add shared, ownership-audited runtime helpers for complex-value semantics,
+2. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
-   integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
-   identity out of language equality, truth, and ordering semantics, and test
-   every helper on success, error, and deoptimization paths.
-4. Make code-unit identity explicit in native entry and deoptimization maps,
+   broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until
+   a corpus or targeted workload demonstrates demand. Keep pointer identity out
+   of language equality, truth, and ordering semantics, and test every helper on
+   success, error, and deoptimization paths.
+3. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-5. Define declarative built-in effect metadata (pure, may raise, may allocate,
+4. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-6. Add profile-guided, semantics-preserving optimization only after the wider
+5. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-7. Finish with database-scale validation and performance work: multi-verb and
+6. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.

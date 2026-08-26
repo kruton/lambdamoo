@@ -1436,7 +1436,6 @@ test_scatter_destructuring_tac_ssa(void)
     HIRCFG *cfg;
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
-    HIRValueAnalysis *analysis;
     HIRTacProgram *tac;
     Scatter sc1, sc2;
     Expr scatter_lhs, args_rhs, asgn_expr, ret_add, ret_x, ret_y;
@@ -1480,20 +1479,73 @@ test_scatter_destructuring_tac_ssa(void)
     tac = lower_stmt(&names, &asgn_stmt_node, &ctx, &cfg, &dom, &ssa);
 
     check_int("scatter tac not null", tac != 0, 1);
-    check_int("scatter tac store count",
-	      hir_tac_count_kind(tac, HIR_TAC_STORE_LOCAL), 2);
-    check_int("scatter tac binary index count",
-	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 2);
+    check_int("scatter tac deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("scatter tac deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
     check_int("scatter tac binary add count",
 	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("scatter verify errors", hir_context_error_count(ctx), 0);
 
-    analysis = hir_analyze_ssa_values(ctx, ssa);
-    check_int("scatter return fact",
-	      hir_ssa_return_value_kind(ssa, analysis),
-	      HIR_VALUE_INT);
-
     check_int("scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_optional_rest_scatter_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Scatter required, optional, rest;
+    Expr default_value = int_expr(10, 10);
+    Expr scatter_lhs;
+    Expr rhs = id_expr(0, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&required, 0, sizeof(required));
+    required.kind = SCAT_REQUIRED;
+    required.id = 1;
+    required.next = &optional;
+    memset(&optional, 0, sizeof(optional));
+    optional.kind = SCAT_OPTIONAL;
+    optional.id = 2;
+    optional.expr = &default_value;
+    optional.next = &rest;
+    memset(&rest, 0, sizeof(rest));
+    rest.kind = SCAT_REST;
+    rest.id = 3;
+
+    memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+    scatter_lhs.kind = EXPR_SCATTER;
+    scatter_lhs.lineno = 10;
+    scatter_lhs.e.scatter = &required;
+    assign = binary_expr(EXPR_ASGN, &scatter_lhs, &rhs);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 4;
+    rhs.bytecode_pc = 1;
+    assign.bytecode_pc = 2;
+    ret.bytecode_pc = 3;
+    default_value.bytecode_pc = 99;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("optional rest scatter accepted",
+	      hir_context_error_count(ctx), 0);
+    check_int("optional rest scatter deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("optional rest scatter deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("optional rest scatter default not lowered",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 0);
+    check_int("optional rest scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("optional rest scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -2874,6 +2926,7 @@ main(void)
     test_property_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
+    test_optional_rest_scatter_deopt();
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();

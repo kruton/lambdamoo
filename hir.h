@@ -103,6 +103,7 @@ typedef enum {
     HIR_OP_TYPEOF,
     HIR_OP_LENGTH,
     HIR_OP_GET_PROP,
+    HIR_OP_SCATTER,
     HIR_OP_CHARGE_TICK
 } HIROp;
 

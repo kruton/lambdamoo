@@ -3959,6 +3959,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		}
 	    }
+	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_SCATTER
+		&& si->num_stack_values == 1) {
+		int rhs = si->stack_values[0];
+
+		if (rhs > 0 && rhs < program->num_values) {
+		    if (value_types_known[rhs]
+			&& value_types[rhs] != TYPE_LIST)
+			invalid_value_types = 1;
+		    else {
+			value_types[rhs] = TYPE_LIST;
+			value_types_known[rhs] = 1;
+		    }
+		}
+	    }
 	    if ((si->kind == HIR_TAC_RANGE_REF
 		 || si->kind == HIR_TAC_RANGE_SET)
 		&& si->src1 > 0 && si->src1 < program->num_values
@@ -4568,6 +4582,8 @@ op_name(HIROp op)
 	return "LENGTH";
     case HIR_OP_GET_PROP:
 	return "GET_PROP";
+    case HIR_OP_SCATTER:
+	return "SCATTER";
     case HIR_OP_CHARGE_TICK:
 	return "CHARGE_TICK";
     }
@@ -6078,6 +6094,18 @@ append_index_store_deopt(HIRContext *ctx, HIRTacProgram *program,
     append_tac(program, deopt);
 }
 
+static void
+append_scatter_deopt(HIRContext *ctx, HIRTacProgram *program,
+		     unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *deopt = new_tac(ctx, HIR_TAC_DEOPT, source_lineno);
+
+    deopt->op = HIR_OP_SCATTER;
+    deopt->bytecode_pc = bytecode_pc;
+    snapshot_lower_stack(ctx, deopt);
+    append_tac(program, deopt);
+}
+
 static int
 lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
@@ -6387,47 +6415,13 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	}
     case HIR_EXPR_SCATTER:
 	{
-	    HIRScatter *item;
+	    int saved_depth = ctx->lower_stack_depth;
 	    int rhs_temp = lower_expr(ctx, program, expr->u.scatter.rhs);
-	    int index = 1;
 
-	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
-	    for (item = expr->u.scatter.items; item; item = item->next) {
-		if (item->kind == SCAT_REQUIRED) {
-		    int idx_temp = new_temp(ctx);
-		    int elem_temp = new_temp(ctx);
-		    HIRTacInstr *const_tac = new_tac(ctx, HIR_TAC_CONST,
-						     expr->source_lineno);
-		    HIRTacInstr *idx_tac = new_tac(ctx, HIR_TAC_BINARY,
-						   expr->source_lineno);
-		    HIRTacInstr *store_tac = new_tac(ctx, HIR_TAC_STORE_LOCAL,
-						     expr->source_lineno);
-
-		    const_tac->dst = idx_temp;
-		    const_tac->literal.type = TYPE_INT;
-		    const_tac->literal.v.num = index;
-		    const_tac->bytecode_pc = expr->bytecode_pc;
-		    append_tac(program, const_tac);
-
-		    idx_tac->dst = elem_temp;
-		    idx_tac->src1 = rhs_temp;
-		    idx_tac->src2 = idx_temp;
-		    idx_tac->op = HIR_OP_INDEX;
-		    idx_tac->bytecode_pc = expr->bytecode_pc;
-		    snapshot_lower_stack(ctx, idx_tac);
-		    append_tac(program, idx_tac);
-
-		    store_tac->local_id = item->local_id;
-		    store_tac->src1 = elem_temp;
-		    store_tac->bytecode_pc = expr->bytecode_pc;
-		    append_tac(program, store_tac);
-		    index++;
-		} else {
-		    return append_unsupported_tac(ctx, program,
-						  "lowering: optional/rest scatter",
-						  expr->source_lineno);
-		}
-	    }
+	    append_scatter_deopt(ctx, program, expr->source_lineno,
+				 expr->bytecode_pc);
+	    ctx->lower_stack_depth = saved_depth;
+	    push_lower_stack(ctx, rhs_temp);
 	    return rhs_temp;
 	}
     case HIR_EXPR_LIST:
