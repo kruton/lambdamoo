@@ -469,11 +469,40 @@ Completed in the first native-code milestone:
   activations; and
 * length expression (`$`, `EXPR_LENGTH`) lowering in indexed (`expr[$]`) and range
   (`expr[from..$]`) contexts, maintaining context-sensitive base value tracking
-  and native length extraction.
+  and native length extraction; and
+* expanded differential validation harness comparing native and reference execution
+  across values, errors, source locations, ticks, full deoptimization state (including
+  bytecode PCs and runtime operand stacks), reference ownership, nested control flow,
+  forced fallbacks across all supported boundaries, and a continuous microbenchmark.
 
-The next reviewable compiler milestones are:
+The next reviewable compiler milestones, in dependency order, are:
 
-1. Lower optional, default, and rest scatter destructuring assignments (`{a, ?b = default, @rest} = expr`) with exact deoptimization boundaries.
-2. Integrate WAIF type (`TYPE_WAIF`) references and properties safely across HIR lowering and native frames.
-3. Expand native fast-path lowering and inlining for pure, continuation-free built-in functions.
-4. End-to-end multi-verb benchmark and differential validation across complex MOO database suites.
+1. Finish common core-expression and destructuring coverage. Add membership
+   (`in`) first, then optional, default, and rest scatter assignments
+   (`{a, ?b = default, @rest} = expr`) in separate commits, with exact evaluation
+   order, error behavior, ticks, and deoptimization stacks. These features use
+   the value and ownership machinery already present without first requiring a
+   new runtime object model.
+3. Make code-unit identity explicit in native entry and deoptimization maps,
+   then compile fork vectors independently. A fork statement should remain an
+   interpreter boundary, but its separately compiled body should be eligible
+   for native entry without confusing main-vector bytecode PCs, resume anchors,
+   or serialized activations.
+4. Add shared, ownership-audited runtime helpers for complex-value semantics,
+   then use them to broaden native string and nested-list operations and to
+   integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
+   identity out of language equality, truth, and ordering semantics, and test
+   every helper on success, error, and deoptimization paths.
+5. Define declarative built-in effect metadata (pure, may raise, may allocate,
+   may call, may suspend, ownership behavior) and make JIT eligibility consume
+   it. Only then expand fast paths for high-frequency, continuation-free
+   built-ins; all other built-ins remain deopt-before-call boundaries.
+6. Add profile-guided, semantics-preserving optimization only after the wider
+   differential suite is green: redundant guards and local traffic first,
+   followed by block-level tick batching where exact timeout and source-location
+   behavior can be proven. Measure each optimization against interpreter, JIT
+   O0, and optimized JIT runs.
+7. Finish with database-scale validation and performance work: multi-verb and
+   suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
+   comparison, compile-time and code-size accounting, and benchmarks that
+   identify the next coverage or optimization bottleneck.
