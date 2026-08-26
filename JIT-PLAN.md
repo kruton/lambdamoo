@@ -488,20 +488,23 @@ Completed in the first native-code milestone:
   reducing bytecode-anchor rejections without weakening anchor validation; and
 * membership (`HIR_OP_IN`) accepted at an exact deoptimization boundary, with
   its operands, tick refund, and bytecode resume state restored for interpreter
-  evaluation.
+  evaluation; and
+* direct indexed local assignments accepted at `OP_PUT_TEMP` deoptimization
+  boundaries with their base, index, and right-hand-side stack values preserved.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 4,761 (75.34%) are JIT-eligible, 963 report `unsupported-value-types`,
-537 report `unsupported-program`, and 58 report `invalid-bytecode-anchor`; no
+these, 4,858 (76.88%) are JIT-eligible, 1,026 report `unsupported-value-types`,
+370 report `unsupported-program`, and 65 report `invalid-bytecode-anchor`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
 * zero `ssa-support: list constant` rejections, down from 2,852;
 * zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
   from 1,004;
-* 412 unsupported non-local assignments;
-* 125 optional/rest scatter rejections; and
-* 58 remaining bytecode-anchor failures, down from 4,204 after correcting
+* 234 unsupported non-local assignments, down from 412 after accepting direct
+  indexed local assignments at an exact deoptimization boundary;
+* 131 optional/rest scatter rejections; and
+* 65 remaining bytecode-anchor failures, down from 4,204 after correcting
   argument-list operation anchors.
 
 Counts describe the first reported failure in each verb. Fixing one category may
@@ -521,15 +524,16 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Classify and lower the 412 unsupported non-local assignments by left-hand
-   side shape. Implement the most frequent missing assignment form first and
-   retain interpreter evaluation order, mutation ownership, errors, and bytecode
-   anchors; keep uncommon or unsafe forms as explicit deoptimization boundaries.
+1. Continue classifying the 234 unsupported non-local assignments by left-hand
+   side shape. Direct `local[index] = value` now deoptimizes at `OP_PUT_TEMP`
+   with its base, index, and value intact. Model the preserved intermediate
+   values and write-back chain required by nested index/range/property lvalues
+   before accepting them.
 2. Lower optional, default, and rest scatter assignments
-   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
+   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 131
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.
-3. Classify the 963 `unsupported-value-types` results by diagnostic and value
+3. Classify the 1,026 `unsupported-value-types` results by diagnostic and value
    producer, then improve inference or add guarded representations for the
    largest safe category before broadening complex-value operations.
 4. Add shared, ownership-audited runtime helpers for complex-value semantics,

@@ -1253,6 +1253,42 @@ test_list_index_tac_ssa(void)
 }
 
 static void
+test_direct_index_assignment_deopt(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr list = id_expr(0, 10);
+    Expr index = int_expr(2, 10);
+    Expr lhs = binary_expr(EXPR_INDEX, &list, &index);
+    Expr value = int_expr(42, 10);
+    Expr assign = binary_expr(EXPR_ASGN, &lhs, &value);
+    Stmt ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 1;
+    list.bytecode_pc = 1;
+    index.bytecode_pc = 2;
+    value.bytecode_pc = 3;
+    assign.bytecode_pc = 4;
+    ret.bytecode_pc = 5;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("index assignment accepted", hir_context_error_count(ctx), 0);
+    check_int("index assignment deopt count",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("index assignment deopt stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 4), 3);
+    check_int("index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_list_index_in_arithmetic_tac_ssa(void)
 {
     Names names;
@@ -2741,6 +2777,7 @@ main(void)
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
+    test_direct_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_list_construction_and_splicing_tac_ssa();

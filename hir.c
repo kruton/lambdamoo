@@ -126,6 +126,11 @@ struct HIRExpr {
 	} prop_store;
 	struct {
 	    HIRExpr *base;
+	    HIRExpr *index;
+	    HIRExpr *rhs;
+	} index_store;
+	struct {
+	    HIRExpr *base;
 	    HIRExpr *from;
 	    HIRExpr *to;
 	    HIRExpr *rhs;
@@ -3905,6 +3910,30 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[operand] = 1;
 		}
 	    }
+	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
+		&& si->num_stack_values >= 3) {
+		int base = si->stack_values[si->num_stack_values - 3];
+		int index = si->stack_values[si->num_stack_values - 2];
+
+		if (base > 0 && base < program->num_values) {
+		    if (value_types_known[base]
+			&& value_types[base] != TYPE_LIST)
+			invalid_value_types = 1;
+		    else {
+			value_types[base] = TYPE_LIST;
+			value_types_known[base] = 1;
+		    }
+		}
+		if (index > 0 && index < program->num_values) {
+		    if (value_types_known[index]
+			&& value_types[index] != TYPE_INT)
+			invalid_value_types = 1;
+		    else {
+			value_types[index] = TYPE_INT;
+			value_types_known[index] = 1;
+		    }
+		}
+	    }
 	    if ((si->kind == HIR_TAC_RANGE_REF
 		 || si->kind == HIR_TAC_RANGE_SET)
 		&& si->src1 > 0 && si->src1 < program->num_values
@@ -5371,6 +5400,17 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.prop_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
+    if (ast->e.bin.lhs->kind == EXPR_INDEX
+	&& ast->e.bin.lhs->e.bin.lhs->kind == EXPR_ID) {
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_INDEX_STORE);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.index_store.base = lift_expr(ctx, ast->e.bin.lhs->e.bin.lhs);
+	expr->u.index_store.index = lift_expr(ctx, ast->e.bin.lhs->e.bin.rhs);
+	expr->u.index_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	return expr;
+    }
     if (ast->e.bin.lhs->kind == EXPR_RANGE) {
 	HIRExpr *expr = new_expr(ctx, HIR_EXPR_RANGE_STORE);
 
@@ -5995,6 +6035,18 @@ append_deopt_boundary(HIRContext *ctx, HIRTacProgram *program,
     append_tac(program, deopt);
 }
 
+static void
+append_index_store_deopt(HIRContext *ctx, HIRTacProgram *program,
+			 unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *deopt = new_tac(ctx, HIR_TAC_DEOPT, source_lineno);
+
+    deopt->op = HIR_OP_INDEX;
+    deopt->bytecode_pc = bytecode_pc;
+    snapshot_lower_stack(ctx, deopt);
+    append_tac(program, deopt);
+}
+
 static int
 lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
@@ -6196,6 +6248,20 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    ctx->lower_stack_depth -= 3;
 	    push_lower_stack(ctx, dst_temp);
 	    return dst_temp;
+	}
+    case HIR_EXPR_INDEX_STORE:
+	{
+	    int base_temp = lower_expr(ctx, program, expr->u.index_store.base);
+	    int index_temp = lower_expr(ctx, program, expr->u.index_store.index);
+	    int rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
+
+	    (void) base_temp;
+	    (void) index_temp;
+	    append_index_store_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, rhs_temp);
+	    return rhs_temp;
 	}
     case HIR_EXPR_RANGE:
 	{
