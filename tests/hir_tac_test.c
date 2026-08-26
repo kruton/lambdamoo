@@ -1672,13 +1672,15 @@ test_cond_expr_tac_ssa(void)
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
 
-    /* x = 1 > 0 ? 10 | 20; return x; */
+    /* x = 1 > 0 ? 10 | (0 ? 20 | 30); return x; */
     Expr one = int_expr(1, 10);
     Expr zero = int_expr(0, 10);
     Expr cond = binary_expr(EXPR_GT, &one, &zero);
     Expr ten = int_expr(10, 10);
     Expr twenty = int_expr(20, 10);
-    Expr ternary = cond_expr_ast(&cond, &ten, &twenty, 10);
+    Expr thirty = int_expr(30, 10);
+    Expr nested = cond_expr_ast(&zero, &twenty, &thirty, 10);
+    Expr ternary = cond_expr_ast(&cond, &ten, &nested, 10);
     Expr x_lhs = id_expr(1, 10);
     Expr assign = binary_expr(EXPR_ASGN, &x_lhs, &ternary);
     Stmt assign_stmt = expr_stmt(&assign);
@@ -1694,11 +1696,18 @@ test_cond_expr_tac_ssa(void)
     check_int("cond expr tac not null", tac != 0, 1);
     check_int("cond expr verify errors", hir_context_error_count(ctx), 0);
     check_int("cond expr branch false count",
-	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 2);
     check_int("cond expr jump count",
-	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 2);
     check_int("cond expr ssa phi count",
-	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 1, 1);
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("cond expr tick count",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 4);
+    check_int("cond expr optimize", hir_optimize_ssa_constants(ctx, ssa) > 0,
+	      1);
+    check_int("cond expr optimized verify", hir_verify_ssa(ctx, ssa), 1);
+    check_int("cond expr optimized branches",
+	      hir_ssa_count_kind(ssa, HIR_TAC_BRANCH_FALSE), 0);
 
     check_int("cond expr destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
