@@ -546,6 +546,7 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_PUT_PROP:
+	case HIR_TAC_CALL_VERB:
 	case HIR_TAC_RANGE_REF:
 	case HIR_TAC_RANGE_SET:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
@@ -1269,6 +1270,7 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_UNARY
 	    || instr->kind == HIR_TAC_BINARY
 	    || instr->kind == HIR_TAC_CALL
+	    || instr->kind == HIR_TAC_CALL_VERB
 	    || instr->kind == HIR_TAC_PUT_PROP
 	    || instr->kind == HIR_TAC_RANGE_REF
 	    || instr->kind == HIR_TAC_RANGE_SET
@@ -1960,6 +1962,7 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
@@ -2044,6 +2047,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
@@ -2375,6 +2379,7 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		    }
 		    break;
 		case HIR_TAC_CALL:
+		case HIR_TAC_CALL_VERB:
 		case HIR_TAC_PUT_PROP:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
@@ -3055,6 +3060,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_CALL:
+	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
@@ -3106,6 +3112,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
@@ -3208,6 +3215,7 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
+	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
@@ -3385,6 +3393,13 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    || instr->bytecode_pc >= bc->size)
 		    return 0;
 		if (bc->vector[instr->bytecode_pc] != OP_BI_FUNC_CALL)
+		    return 0;
+		break;
+	    case HIR_TAC_CALL_VERB:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_CALL_VERB)
 		    return 0;
 		break;
 	    case HIR_TAC_PUT_PROP:
@@ -3620,6 +3635,27 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[rhs] = 1;
 		}
 	    }
+	    if (si->kind == HIR_TAC_CALL_VERB) {
+		if (si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_OBJ;
+		    value_types_known[si->src1] = 1;
+		}
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_STR;
+		    value_types_known[si->src2] = 1;
+		}
+		if (si->num_stack_values > 0) {
+		    int args_val = si->stack_values[si->num_stack_values - 1];
+
+		    if (args_val > 0 && args_val < program->num_values
+			&& !value_types_known[args_val]) {
+			value_types[args_val] = TYPE_LIST;
+			value_types_known[args_val] = 1;
+		    }
+		}
+	    }
 	    if (si == ssa_block->last)
 		break;
 	}
@@ -3791,6 +3827,10 @@ hir_dump_tac(HIRTacProgram *program)
 	    fprintf(stderr, " t%d = call func(%u) t%d", instr->dst,
 		    instr->func, instr->src1);
 	    break;
+	case HIR_TAC_CALL_VERB:
+	    fprintf(stderr, " t%d = call_verb(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
+	    break;
 	case HIR_TAC_PUT_PROP:
 	    fprintf(stderr, " t%d = prop_put(t%d, t%d)", instr->dst,
 		    instr->src1, instr->src2);
@@ -3851,8 +3891,8 @@ dump_ssa_block_list(FILE *file, HIRCFG *cfg, HIRSSABlock *block,
 		continue;
 	    for (j = 0; j < candidate->num_successors; j++) {
 		if (candidate->successors[j] == cfg_block) {
-		    has_edge = 1;
-		    break;
+			has_edge = 1;
+			break;
 		}
 	    }
 	} else if (cfg_block) {
@@ -3969,6 +4009,10 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " t%d = call func(%u) t%d", instr->value,
 			instr->func, instr->src1);
 		break;
+	    case HIR_TAC_CALL_VERB:
+		fprintf(file, " t%d = call_verb(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
 	    case HIR_TAC_PUT_PROP:
 		fprintf(file, " t%d = prop_put(t%d, t%d)", instr->value,
 			instr->src1, instr->src2);
@@ -4051,6 +4095,8 @@ tac_kind_name(HIRTacKind kind)
 	return "return0";
     case HIR_TAC_CALL:
 	return "call";
+    case HIR_TAC_CALL_VERB:
+	return "call_verb";
     case HIR_TAC_PUT_PROP:
 	return "put_prop";
     case HIR_TAC_RANGE_REF:
@@ -5036,13 +5082,13 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_VERB:
 	expr = new_expr(ctx, HIR_EXPR_VERB_CALL);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.verb_call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.verb_call.resume_key.site = ast->e.verb.resume_site;
 	expr->u.verb_call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.verb_call.obj = lift_expr(ctx, ast->e.verb.obj);
 	expr->u.verb_call.verb = lift_expr(ctx, ast->e.verb.verb);
 	expr->u.verb_call.args = lift_arg_list(ctx, ast->e.verb.args);
-	record_unsupported(ctx, "Verb-call expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_PROP:
 	expr = new_expr(ctx, HIR_EXPR_PROP);
@@ -5853,6 +5899,35 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    snapshot_lower_stack(ctx, call_tac);
 	    append_tac(program, call_tac);
 	    ctx->lower_stack[ctx->lower_stack_depth - 1] = call_tac->dst;
+	    return call_tac->dst;
+	}
+    case HIR_EXPR_VERB_CALL:
+	{
+	    int obj_temp = lower_expr(ctx, program, expr->u.verb_call.obj);
+	    int verb_temp = lower_expr(ctx, program, expr->u.verb_call.verb);
+	    HIRExpr list_expr;
+	    int args_temp;
+	    HIRTacInstr *call_tac;
+
+	    memset(&list_expr, 0, sizeof(list_expr));
+	    list_expr.kind = HIR_EXPR_LIST;
+	    list_expr.source_lineno = expr->source_lineno;
+	    list_expr.bytecode_pc = expr->bytecode_pc;
+	    list_expr.u.list.items = expr->u.verb_call.args;
+	    args_temp = lower_expr(ctx, program, &list_expr);
+	    (void) args_temp;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    call_tac = new_tac(ctx, HIR_TAC_CALL_VERB, expr->source_lineno);
+	    call_tac->dst = new_temp(ctx);
+	    call_tac->src1 = obj_temp;
+	    call_tac->src2 = verb_temp;
+	    call_tac->resume_key = expr->u.verb_call.resume_key;
+	    call_tac->bytecode_pc = expr->bytecode_pc;
+	    snapshot_lower_stack(ctx, call_tac);
+	    append_tac(program, call_tac);
+	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, call_tac->dst);
 	    return call_tac->dst;
 	}
     case HIR_EXPR_COND:

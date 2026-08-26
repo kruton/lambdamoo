@@ -803,6 +803,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_CALL:
+		case HIR_TAC_CALL_VERB:
 		case HIR_TAC_PUT_PROP:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:

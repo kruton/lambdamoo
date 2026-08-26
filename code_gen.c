@@ -934,6 +934,7 @@ generate_expr(Expr * expr, State * state)
 	generate_expr(expr->e.verb.obj, state);
 	generate_expr(expr->e.verb.verb, state);
 	generate_arg_list(expr->e.verb.args, state);
+	record_code_anchor(state, &expr->bytecode_pc);
 	emit_call_verb_op(OP_CALL_VERB, state);
 	if (state->cur_stack < 3)
 	    panic("Bad verb-call stack depth in GENERATE_EXPR()");
