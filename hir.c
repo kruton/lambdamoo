@@ -3677,6 +3677,31 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     return program->num_deopt_maps++;
 }
 
+static const char *
+var_type_name(var_type type)
+{
+    switch (type) {
+    case TYPE_INT:
+	return "int";
+    case TYPE_FLOAT:
+	return "float";
+    case TYPE_STR:
+	return "str";
+    case TYPE_LIST:
+	return "list";
+    case TYPE_OBJ:
+	return "obj";
+    case TYPE_ERR:
+	return "err";
+    case TYPE_WAIF:
+	return "waif";
+    case TYPE_NONE:
+	return "none";
+    default:
+	return "unknown";
+    }
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -3685,9 +3710,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     HIRSSABlock *ssa_block;
     var_type *value_types;
     unsigned char *value_types_known;
+    char value_type_diagnostic_buf[128];
     const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
+
+    value_type_diagnostic_buf[0] = '\0';
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ctx, ssa)) {
 	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
@@ -3791,8 +3819,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			    value_types_known[copy->dst] = 1;
 			    types_changed = 1;
 			} else if (value_types[copy->dst]
-				   != value_types[copy->src])
-			    value_type_diagnostic = "value-types: parallel-copy type conflict";
+				   != value_types[copy->src]) {
+			    snprintf(value_type_diagnostic_buf,
+				     sizeof(value_type_diagnostic_buf),
+				     "value-types: parallel-copy type conflict (%s vs %s)",
+				     var_type_name(value_types[copy->dst]),
+				     var_type_name(value_types[copy->src]));
+			    value_type_diagnostic = value_type_diagnostic_buf;
+			}
 		    }
 		if (si->kind == HIR_TAC_UNARY
 		    && (si->op == HIR_OP_NEGATE || si->op == HIR_OP_ABS)

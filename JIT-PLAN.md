@@ -517,6 +517,8 @@ the detailed census identifies the highest-frequency blockers:
 * zero unsupported non-local assignments, down from 412 after preserving local
   and property-rooted indexed write-back chains;
 * zero optional/rest scatter rejections, down from 137;
+* 106 parallel-copy type conflicts across control flow joins (50 int/str,
+  26 int/list, 10 list/str, 9 int/err, 7 list/err, 2 list/obj, 2 str/err);
 * 10 arithmetic type conflicts, down from 872 after deoptimizing known complex
   arithmetic at its exact VM boundary; and
 * 65 remaining bytecode-anchor failures, down from 4,204 after correcting
