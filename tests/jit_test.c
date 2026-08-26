@@ -1125,6 +1125,95 @@ string_compare_program(const char *lhs, const char *rhs, HIROp op)
 }
 
 static JITProgram *
+string_concat_program(const char *left_string, const char *right_string)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    char *ls = str_dup(left_string);
+    char *rs = str_dup(right_string);
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    left->value = 1;
+    left->literal = (uintptr_t) ls;
+    left->literal_type = TYPE_STR;
+    left->next = right;
+    right->value = 2;
+    right->literal = (uintptr_t) rs;
+    right->literal_type = TYPE_STR;
+    right->next = concat;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->deopt_map = 0;
+    concat->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_STR;
+    block->first = left;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+string_index_program(const char *s, int idx)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *str_const = instruction(HIR_TAC_CONST);
+    JITInstruction *idx_const = instruction(HIR_TAC_CONST);
+    JITInstruction *index_op = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    char *str = str_dup(s);
+
+    program->num_values = 4;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_STR;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    str_const->value = 1;
+    str_const->literal = (uintptr_t) str;
+    str_const->literal_type = TYPE_STR;
+    str_const->next = idx_const;
+    idx_const->value = 2;
+    idx_const->literal = idx;
+    idx_const->literal_type = TYPE_INT;
+    idx_const->next = index_op;
+    index_op->value = 3;
+    index_op->src1 = 1;
+    index_op->src2 = 2;
+    index_op->op = HIR_OP_INDEX;
+    index_op->deopt_map = 0;
+    index_op->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_STR;
+    block->first = str_const;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
 string_branch_program(void)
 {
     JITProgram *program = branch_program();
@@ -2904,7 +2993,9 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(str_eq, 0, &result, &ticks, &timed_out,
 				  &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "string equality did not fallback");
+	      == JIT_RUN_RETURNED, "string equality execution returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "string equality case-insensitive match");
 	jit_program_free(str_eq);
 
 	JITProgram *str_branch = string_branch_program();
@@ -2914,7 +3005,9 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(str_branch, branch_env, &result, &ticks,
 				  &timed_out, &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "empty string branch did not fallback");
+	      == JIT_RUN_RETURNED, "empty string branch executed natively");
+	check(result.type == TYPE_INT && result.v.num == 20,
+	      "empty string branch selected false arm");
 	free_var(branch_env[0]);
 	jit_program_free(str_branch);
 
@@ -2928,6 +3021,35 @@ main(void)
 	      "string length returned wrong configured character length");
 	check_differential(str_length, 0, 10, 0, "string length differential");
 	jit_program_free(str_length);
+
+	JITProgram *str_cat = string_concat_program("Hello, ", "world!");
+	ticks = 10;
+	check(jit_program_execute(str_cat, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string concat execution returned");
+	check(result.type == TYPE_STR && strcmp(result.v.str, "Hello, world!") == 0,
+	      "string concat returned expected string");
+	free_var(result);
+	jit_program_free(str_cat);
+
+	JITProgram *str_idx = string_index_program("LambdaMOO", 7);
+	ticks = 10;
+	check(jit_program_execute(str_idx, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string index execution returned");
+	check(result.type == TYPE_STR && strcmp(result.v.str, "M") == 0,
+	      "string index returned expected character");
+	free_var(result);
+	jit_program_free(str_idx);
+
+	JITProgram *str_lt = string_compare_program("abc", "def", HIR_OP_LT);
+	ticks = 10;
+	check(jit_program_execute(str_lt, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "string less-than execution returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "string less-than match");
+	jit_program_free(str_lt);
     }
 
     /* Non-integer list indexing tests */
@@ -3167,17 +3289,9 @@ main(void)
 	JITRunResult res = jit_program_execute(in_p, env, &result,
 					       &ticks, &timed_out, &error,
 					       0, &deopt_state, stack);
-	check(res == JIT_RUN_FALLBACK, "in deopt fallback result");
-	check(deopt_state.bytecode_pc == 12, "in deopt bytecode_pc");
-	check(deopt_state.stack_depth == 2, "in deopt stack depth");
-	check(ticks == 49 && deopt_state.ticks_charged == 1,
-	      "in deopt tick refund state");
-	check(stack[0].type == TYPE_INT && stack[0].v.num == 42,
-	      "in deopt stack[0] lhs");
-	check(stack[1].type == TYPE_LIST && stack[1].v.list[0].v.num == 2,
-	      "in deopt stack[1] rhs");
-	free_var(stack[0]);
-	free_var(stack[1]);
+	check(res == JIT_RUN_RETURNED, "in native execution result");
+	check(result.type == TYPE_INT && result.v.num == 2,
+	      "in native execution index value");
 	free_var(env[1]);
 	jit_program_free(in_p);
     }

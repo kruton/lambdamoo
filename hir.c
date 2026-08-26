@@ -3852,6 +3852,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 			if (object_range_add)
 			    inferred = TYPE_OBJ;
+			else if (t1 == TYPE_STR && t2 == TYPE_STR && si->op == HIR_OP_ADD)
+			    inferred = TYPE_STR;
 			else if (t1 == TYPE_FLOAT && t2 == TYPE_FLOAT
 				 && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
 				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
@@ -4104,15 +4106,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
 		&& value_types_known[ssa_instr->src1]
 		&& value_types[ssa_instr->src1] == TYPE_STR
-		&& ((ssa_instr->kind == HIR_TAC_BINARY
-		     && ssa_instr->op == HIR_OP_INDEX
-		     && bytecode_program->main_vector.vector[ssa_instr->bytecode_pc]
-		        == OP_REF)
-		    || (ssa_instr->kind == HIR_TAC_UNARY
-			&& ssa_instr->op == HIR_OP_LENGTH
-			&& jit_extended_anchor_matches(&bytecode_program->main_vector,
-						       ssa_instr->bytecode_pc,
-						       EOP_LENGTH))))
+		&& (ssa_instr->kind == HIR_TAC_UNARY
+		    && ssa_instr->op == HIR_OP_LENGTH
+		    && jit_extended_anchor_matches(&bytecode_program->main_vector,
+						   ssa_instr->bytecode_pc,
+						   EOP_LENGTH)))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_UNARY
 		&& (ssa_instr->op == HIR_OP_NOT || ssa_instr->op == HIR_OP_COMPLEMENT
@@ -4157,7 +4155,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if ((src1_known || src2_known)
 		    && !object_range_add
 		    && !(t1 == TYPE_INT && t2 == TYPE_INT)
-		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
+		    && !(ssa_instr->op == HIR_OP_ADD && t1 == TYPE_STR && t2 == TYPE_STR))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
@@ -4180,13 +4179,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    if ((src1_known || src2_known)
 			&& !(t1 == TYPE_INT && t2 == TYPE_INT)
 			&& !(t1 == TYPE_OBJ && t2 == TYPE_OBJ)
-			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
+			&& !(t1 == TYPE_STR && t2 == TYPE_STR)
+			&& !(t1 == TYPE_LIST && t2 == TYPE_LIST))
 			instr->kind = HIR_TAC_DEOPT;
 		} else if (ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
 			   || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE) {
 		    if ((src1_known || src2_known)
 			&& !(t1 == TYPE_INT && t2 == TYPE_INT)
-			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+			&& !(t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
+			&& !(t1 == TYPE_STR && t2 == TYPE_STR))
 			instr->kind = HIR_TAC_DEOPT;
 		} else {
 		    if ((src1_known || src2_known)
