@@ -524,6 +524,9 @@ Completed in the first native-code milestone:
   truth-value branching natively; and
 * direct native lowering for `ticks_left()`, `seconds_left()`, and `time()`,
   including exact built-in anchors and tick accounting; and
+* direct native lowering for continuation-free object built-ins (`valid()` and
+  `parent()`), including consumer-driven `TYPE_OBJ` inference and exact `E_INVARG`
+  error exits; and
 * entry-state modeling for uninitialized `TYPE_NONE` locals, with compiler-only
   locals kept out of the runtime environment and semantic reads deoptimized
   before the VM must raise `E_VARNF`; and
@@ -555,20 +558,24 @@ Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
 
 Compile eligibility is no longer the useful coverage bottleneck. The current
-runtime sample enters 320 JIT-compiled activations and completes 105 (32.81%)
-in native code; 213 (66.56%) deoptimize. The emergency workload suspends before
+runtime sample enters 252 JIT-compiled activations and completes 105 (41.67%)
+in native code; 144 (57.14%) deoptimize. The emergency workload suspends before
 finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
-* 20 `arithmetic_type` deopts (9.39%);
-* 38 entry or local `type_guard_failure` deopts (17.84%), down from 227 after
+* 19 `arithmetic_type` deopts (13.19%);
+* 15 entry or local `type_guard_failure` deopts (10.42%), down from 227 after
   separating compiler-only locals from VM locals and preserving `TYPE_NONE`
   for user-local entry values before consumer-driven inference;
-* 84 `unsupported_operation` deopts (39.44%);
-* 51 `property_read` deopts (23.94%);
-* 6 `range_operation` deopts (2.82%);
-* 10 `builtin_call` deopts (4.69%); and
-* 4 `verb_call` deopts (1.88%).
+* 52 `unsupported_operation` deopts (36.11%), down from 190;
+* 41 `property_read` deopts (28.47%);
+* 9 `range_operation` deopts (6.25%);
+* 6 `builtin_call` deopts (4.17%); and
+* 2 `verb_call` deopts (1.39%).
+
+The former top deoptimization site `#61:valid` (18 deopts) has been completely
+eliminated with native inlining of `valid()` and `parent()`, allowing `#61:valid`
+to run 100% natively without fallback.
 
 The line-1 string expression in `#59:verbname_match` is correctly omitted from
 HIR. Its old line 1/PC 0 report was an entry guard failure, not execution of the
