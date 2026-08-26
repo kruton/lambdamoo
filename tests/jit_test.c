@@ -306,6 +306,7 @@ index_program(Num index_val)
     block->id = 1;
     load->value = 1;
     load->local_id = 0;
+    load->literal_type = TYPE_LIST;
     constant->value = 2;
     constant->literal = index_val;
     tick->source_lineno = 7;
@@ -352,6 +353,7 @@ scatter_destructure_program(void)
 
     load->value = 1;
     load->local_id = 0;
+    load->literal_type = TYPE_LIST;
 
     c1->value = 2;
     c1->literal = 1;
@@ -678,9 +680,13 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		values[instr->value] = instr->literal;
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
-		if (env[instr->local_id].type == TYPE_INT)
+		if (env[instr->local_id].type != instr->literal_type) {
+		    myfree(values, M_PROGRAM);
+		    return JIT_RUN_FALLBACK;
+		}
+		if (instr->literal_type == TYPE_INT)
 		    values[instr->value] = env[instr->local_id].v.num;
-		else if (env[instr->local_id].type == TYPE_LIST)
+		else if (instr->literal_type == TYPE_LIST)
 		    values[instr->value] = (Num) env[instr->local_id].v.list;
 		else {
 		    myfree(values, M_PROGRAM);
@@ -1111,6 +1117,19 @@ main(void)
     check(error == E_RANGE, "list index 3 gave wrong error code");
     check_differential(list_index_high, env, 10, 0,
 		       "list index 3 differed from reference execution");
+
+    env[0].type = TYPE_INT;
+    env[0].v.num = 1;
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "list input guard did not fallback");
+    check(ticks == 10 && deopt.bytecode_pc == 0,
+	  "list input guard fallback had wrong state");
+    check_differential(list_index1, env, 10, 0,
+		       "list input guard differed from reference execution");
+    env[0].type = TYPE_LIST;
+    env[0].v.list = list_elems;
 
     /* Non-integer element in list falls back to interpreter */
     list_elems[1].type = TYPE_STR;

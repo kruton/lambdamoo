@@ -1983,6 +1983,7 @@ test_range_expr_and_assignment_tac_ssa(void)
     check_int("range tac not null", tac != 0, 1);
     check_int("range ref count", hir_tac_count_kind(tac, HIR_TAC_RANGE_REF), 1);
     check_int("range set count", hir_tac_count_kind(tac, HIR_TAC_RANGE_SET), 1);
+    check_int("range tick count", hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
     check_int("range verify errors", hir_context_error_count(ctx), 0);
     check_int("range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);

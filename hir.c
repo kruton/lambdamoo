@@ -3219,6 +3219,8 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_CONST:
+		if (instr->literal.type == TYPE_LIST)
+		    return 0;
 		break;
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
@@ -3536,6 +3538,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		else if (si->kind == HIR_TAC_UNARY
 			 && si->op == HIR_OP_MAKE_SINGLETON_LIST)
 		    value_types[si->value] = TYPE_LIST;
+		else if (si->kind == HIR_TAC_BINARY
+			 && (si->op == HIR_OP_LIST_ADD_TAIL
+			     || si->op == HIR_OP_LIST_APPEND))
+		    value_types[si->value] = TYPE_LIST;
 	    }
 	    if (si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH
 		&& si->src1 > 0 && si->src1 < program->num_values)
@@ -3543,6 +3549,18 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
 		&& si->src1 > 0 && si->src1 < program->num_values)
 		value_types[si->src1] = TYPE_LIST;
+	    if ((si->kind == HIR_TAC_RANGE_REF
+		 || si->kind == HIR_TAC_RANGE_SET)
+		&& si->src1 > 0 && si->src1 < program->num_values
+		&& value_types[si->src1] != TYPE_STR)
+		value_types[si->src1] = TYPE_LIST;
+	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
+		int rhs = si->stack_values[si->num_stack_values - 1];
+
+		if (rhs > 0 && rhs < program->num_values
+		    && value_types[rhs] != TYPE_STR)
+		    value_types[rhs] = TYPE_LIST;
+	    }
 	    if (si == ssa_block->last)
 		break;
 	}
@@ -3599,7 +3617,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    || ssa_instr->op == HIR_OP_INDEX))
 		program->may_error = 1;
 	    instr->literal_type = ssa_instr->kind == HIR_TAC_CONST
-		? ssa_instr->literal.type : TYPE_INT;
+		? ssa_instr->literal.type
+		: (ssa_instr->kind == HIR_TAC_LOAD_LOCAL
+		   && ssa_instr->value > 0
+		   && ssa_instr->value < program->num_values
+		   ? value_types[ssa_instr->value] : TYPE_INT);
 	    if (ssa_instr->kind == HIR_TAC_CONST) {
 		if (ssa_instr->literal.type == TYPE_STR) {
 		    const char *str = str_ref(ssa_instr->literal.v.str);
@@ -5583,7 +5605,6 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    (void) to_temp;
 	    (void) rhs_temp;
 
-	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
 	    instr = new_tac(ctx, HIR_TAC_RANGE_SET, expr->source_lineno);
 	    instr->bytecode_pc = expr->bytecode_pc;
 	    instr->dst = dst_temp;
