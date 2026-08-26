@@ -322,6 +322,15 @@ struct HIRValueAnalysis {
     int num_facts;
 };
 
+typedef struct HIRLoopContext HIRLoopContext;
+struct HIRLoopContext {
+    int loop_id;
+    int cont_label;
+    int done_label;
+    int saved_depth;
+    HIRLoopContext *parent;
+};
+
 struct HIRContext {
     Arena *arena;
     Names *var_names;
@@ -334,6 +343,7 @@ struct HIRContext {
     int lower_stack_depth;
     int lower_stack_capacity;
     int *lower_stack;
+    HIRLoopContext *current_loop;
 };
 
 static void *hir_alloc(HIRContext *, size_t);
@@ -368,6 +378,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack_depth = 0;
     ctx->lower_stack_capacity = 0;
     ctx->lower_stack = 0;
+    ctx->current_loop = 0;
 
     return ctx;
 }
@@ -3331,6 +3342,7 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
+	    case HIR_TAC_JUMP:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
 		    && instr->bytecode_pc >= bc->size)
 		    return 0;
@@ -3350,7 +3362,6 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    return 0;
 		break;
 	    case HIR_TAC_LABEL:
-	    case HIR_TAC_JUMP:
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_STORE_LOCAL:
@@ -5047,14 +5058,14 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_BREAK:
 	stmt = new_stmt(ctx, HIR_STMT_BREAK);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.exit_id = ast->s.exit;
-	record_unsupported(ctx, "Break statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_CONTINUE:
 	stmt = new_stmt(ctx, HIR_STMT_CONTINUE);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.exit_id = ast->s.exit;
-	record_unsupported(ctx, "Continue statement is not yet lowerable to TAC");
 	return stmt;
     default:
 	return unsupported_stmt(ctx, ast);
@@ -5657,6 +5668,14 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int top_label = new_label(ctx);
     int done_label = new_label(ctx);
     int cond;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.loop.loop_id;
+    loop.cont_label = top_label;
+    loop.done_label = done_label;
+    loop.saved_depth = ctx->lower_stack_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
 
     append_label(ctx, program, top_label, stmt->source_lineno);
     cond = lower_expr(ctx, program, stmt->u.loop.condition);
@@ -5666,6 +5685,8 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     lower_stmt_list(ctx, program, stmt->u.loop.body);
     append_jump(ctx, program, top_label, stmt->source_lineno);
     append_label(ctx, program, done_label, stmt->source_lineno);
+
+    ctx->current_loop = loop.parent;
 }
 
 static void
@@ -5673,6 +5694,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     int base_depth = ctx->lower_stack_depth;
     int top_label = new_label(ctx);
+    int cont_label = new_label(ctx);
     int done_label = new_label(ctx);
     int from_temp = lower_expr(ctx, program, stmt->u.for_range.from);
     int to_temp = lower_expr(ctx, program, stmt->u.for_range.to);
@@ -5684,6 +5706,14 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     HIRTacInstr *instr;
     HIRTacInstr *const_tac;
     HIRTacInstr *add_tac;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.for_range.local_id;
+    loop.cont_label = cont_label;
+    loop.done_label = done_label;
+    loop.saved_depth = base_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
 
     append_internal_store(ctx, program, stmt->u.for_range.local_id, from_temp,
 			  stmt->source_lineno);
@@ -5715,6 +5745,9 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 
     /* Lower loop body */
     lower_stmt_list(ctx, program, stmt->u.for_range.body);
+
+    /* cont_label: continue lands here to step to next iteration */
+    append_label(ctx, program, cont_label, stmt->source_lineno);
 
     /* Check if current loop variable has reached or exceeded to_temp */
     curr_local = append_internal_load(ctx, program, stmt->u.for_range.local_id,
@@ -5760,6 +5793,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     /* done_label: loop exit */
     append_label(ctx, program, done_label, stmt->source_lineno);
     ctx->lower_stack_depth = base_depth;
+    ctx->current_loop = loop.parent;
 }
 
 static void
@@ -5777,6 +5811,14 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int one_temp;
     int next_index;
     HIRTacInstr *instr;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.for_list.local_id;
+    loop.cont_label = top_label;
+    loop.done_label = done_label;
+    loop.saved_depth = base_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
 
     instr = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
     instr->dst = index_temp;
@@ -5853,6 +5895,53 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_jump(ctx, program, top_label, stmt->source_lineno);
     append_label(ctx, program, done_label, stmt->source_lineno);
     ctx->lower_stack_depth = base_depth;
+    ctx->current_loop = loop.parent;
+}
+
+static void
+lower_break(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    HIRLoopContext *loop = ctx->current_loop;
+    HIRTacInstr *instr;
+
+    if (stmt->u.exit_id != -1) {
+	while (loop && loop->loop_id != stmt->u.exit_id)
+	    loop = loop->parent;
+    }
+
+    if (!loop) {
+	record_unsupported(ctx, "Unmatched break statement target");
+	return;
+    }
+
+    ctx->lower_stack_depth = loop->saved_depth;
+    instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
+    instr->label = loop->done_label;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    append_tac(program, instr);
+}
+
+static void
+lower_continue(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    HIRLoopContext *loop = ctx->current_loop;
+    HIRTacInstr *instr;
+
+    if (stmt->u.exit_id != -1) {
+	while (loop && loop->loop_id != stmt->u.exit_id)
+	    loop = loop->parent;
+    }
+
+    if (!loop) {
+	record_unsupported(ctx, "Unmatched continue statement target");
+	return;
+    }
+
+    ctx->lower_stack_depth = loop->saved_depth;
+    instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
+    instr->label = loop->cont_label;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    append_tac(program, instr);
 }
 
 static void
@@ -5893,6 +5982,12 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	break;
     case HIR_STMT_FOR_LIST:
 	lower_for_list(ctx, program, stmt);
+	break;
+    case HIR_STMT_BREAK:
+	lower_break(ctx, program, stmt);
+	break;
+    case HIR_STMT_CONTINUE:
+	lower_continue(ctx, program, stmt);
 	break;
     default:
 	(void) append_unsupported_tac(ctx, program,

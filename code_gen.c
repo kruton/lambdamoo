@@ -1282,6 +1282,7 @@ generate_stmt(Stmt * stmt, State * state)
 		int i;
 		Loop *loop = 0;	/* silence warnings */
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		if (stmt->s.exit == -1) {
 		    emit_extended_byte(EOP_EXIT, state);
 		    if (state->num_loops == 0)
