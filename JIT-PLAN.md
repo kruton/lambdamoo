@@ -497,10 +497,13 @@ Completed in the first native-code milestone:
   interpreter write-back; and
 * all scatter assignments resumed at an exact `EOP_SCATTER` interpreter
   boundary, preserving the RHS list while leaving arity checks, defaults, rest
-  construction, ownership, and errors to the existing VM implementation.
+  construction, ownership, and errors to the existing VM implementation; and
+* arithmetic on known complex values resumed at its exact interpreter boundary,
+  preserving native integer and float arithmetic while allowing string and list
+  operations to remain under the VM's ownership and error semantics.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 5,130 (81.18%) are JIT-eligible, 1,116 report `unsupported-value-types`,
+these, 5,982 (94.67%) are JIT-eligible, 264 report `unsupported-value-types`,
 65 report `invalid-bytecode-anchor`, and 8 report `unsupported-program`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
@@ -510,7 +513,9 @@ the detailed census identifies the highest-frequency blockers:
   from 1,004;
 * zero unsupported non-local assignments, down from 412 after preserving local
   and property-rooted indexed write-back chains;
-* zero optional/rest scatter rejections, down from 137; and
+* zero optional/rest scatter rejections, down from 137;
+* 10 arithmetic type conflicts, down from 872 after deoptimizing known complex
+  arithmetic at its exact VM boundary; and
 * 65 remaining bytecode-anchor failures, down from 4,204 after correcting
   argument-list operation anchors.
 
@@ -531,9 +536,12 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Classify the 1,116 `unsupported-value-types` results by diagnostic and value
-   producer, then improve inference or add guarded representations for the
-   largest safe category before broadening complex-value operations.
+1. Resolve the remaining value-type conflicts in census order: 131 list
+   operand conflicts, then 91 parallel-copy conflicts. Distinguish string
+   indexing/length from list operations at deoptimization boundaries before
+   changing native ownership behavior. Treat the remaining property, equality,
+   arithmetic, scatter, and comparison conflicts as follow-up cases rather than
+   broadening types speculatively.
 2. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until

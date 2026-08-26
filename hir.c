@@ -3828,8 +3828,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				 && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
 				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
 			    inferred = TYPE_FLOAT;
-			else if (t1 != TYPE_INT || t2 != TYPE_INT) {
+			else if (t1 == TYPE_FLOAT || t2 == TYPE_FLOAT) {
 			    value_type_diagnostic = "value-types: arithmetic operand conflict";
+			    valid = 0;
+			} else if (t1 != TYPE_INT || t2 != TYPE_INT) {
 			    valid = 0;
 			}
 			if (valid && !value_types_known[si->value]) {
@@ -4067,6 +4069,33 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    if (ssa_instr->kind == HIR_TAC_BINARY
+		&& (ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
+		    || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
+		    || ssa_instr->op == HIR_OP_MOD || ssa_instr->op == HIR_OP_EXP)) {
+		int src1_known = ssa_instr->src1 > 0
+		    && ssa_instr->src1 < program->num_values
+		    && value_types_known[ssa_instr->src1];
+		int src2_known = ssa_instr->src2 > 0
+		    && ssa_instr->src2 < program->num_values
+		    && value_types_known[ssa_instr->src2];
+		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
+		var_type t2 = src2_known ? value_types[ssa_instr->src2] : TYPE_INT;
+		int float_op = ssa_instr->op == HIR_OP_ADD
+		    || ssa_instr->op == HIR_OP_SUB || ssa_instr->op == HIR_OP_MUL
+		    || ssa_instr->op == HIR_OP_DIV;
+		int object_range_add = ssa_instr->op == HIR_OP_ADD
+		    && ssa_instr->bytecode_pc != NO_BYTECODE_PC
+		    && bytecode_program->main_vector.vector[ssa_instr->bytecode_pc]
+		       == OP_FOR_RANGE
+		    && t1 == TYPE_OBJ && t2 == TYPE_INT;
+
+		if ((src1_known || src2_known)
+		    && !object_range_add
+		    && !(t1 == TYPE_INT && t2 == TYPE_INT)
+		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT))
+		    instr->kind = HIR_TAC_DEOPT;
+	    }
 	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
 						  &bytecode_program->main_vector,
 						  value_types);
