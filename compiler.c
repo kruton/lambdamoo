@@ -67,10 +67,11 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 #ifdef ENABLE_JIT
     if (hir_valid)
 	jit_program = hir_create_jit_program(hir_ctx, ssa_program, program);
-    else
-	jit_program = jit_program_unsupported(hir_supported
-					      ? "invalid-ir"
-					      : "unsupported-program");
+    else {
+	const char *reason = hir_supported ? "invalid-ir" : "unsupported-program";
+	const char *diag = hir_context_error_message(hir_ctx);
+	jit_program = jit_program_unsupported_with_diagnostic(reason, diag);
+    }
 #else
     (void) hir_valid;
     (void) hir_supported;

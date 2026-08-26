@@ -54,9 +54,21 @@ add_entry_deopt_map(JITProgram *program)
 }
 
 static JITProgram *
-arithmetic_program(void)
+new_jit_program(void)
 {
     JITProgram *program = allocate(sizeof(JITProgram));
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = str_dup("none");
+    program->diagnostic = str_dup("none");
+    program->eligible = 1;
+    return program;
+}
+
+static JITProgram *
+arithmetic_program(void)
+{
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *one = instruction(HIR_TAC_CONST);
     JITInstruction *two = instruction(HIR_TAC_CONST);
@@ -64,9 +76,6 @@ arithmetic_program(void)
     JITInstruction *add = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
@@ -114,15 +123,12 @@ binary_program(Num lhs, Num rhs, HIROp op)
 static JITProgram *
 unary_program(Num operand, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c = instruction(HIR_TAC_CONST);
     JITInstruction *unary = instruction(HIR_TAC_UNARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -186,14 +192,11 @@ arithmetic_operation(HIROp op, IntegerArithmeticOperation *operation)
 static JITProgram *
 guard_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -212,7 +215,7 @@ guard_program(void)
 static JITProgram *
 local_arithmetic_program(Num constant_val, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *constant = instruction(HIR_TAC_CONST);
@@ -220,9 +223,6 @@ local_arithmetic_program(Num constant_val, HIROp op)
     JITInstruction *binary = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -257,7 +257,7 @@ local_arithmetic_program(Num constant_val, HIROp op)
 static JITProgram *
 two_local_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load0 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load1 = instruction(HIR_TAC_LOAD_LOCAL);
@@ -265,9 +265,6 @@ two_local_program(HIROp op)
     JITInstruction *binary = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -302,7 +299,7 @@ two_local_program(HIROp op)
 static JITProgram *
 index_program(Num index_val)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *constant = instruction(HIR_TAC_CONST);
@@ -310,9 +307,6 @@ index_program(Num index_val)
     JITInstruction *index = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->may_error = 1;
     program->num_values = 4;
     program->num_vars = 1;
@@ -346,7 +340,7 @@ index_program(Num index_val)
 static JITProgram *
 scatter_destructure_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
@@ -356,9 +350,6 @@ scatter_destructure_program(void)
     JITInstruction *add = instruction(HIR_TAC_BINARY);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->may_error = 1;
     program->num_values = 7;
     program->num_vars = 1;
@@ -409,15 +400,12 @@ scatter_destructure_program(void)
 static JITProgram *
 call_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
     JITInstruction *call = instruction(HIR_TAC_CALL);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -456,16 +444,13 @@ call_boundary_program(void)
 static JITProgram *
 get_prop_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *c1 = instruction(HIR_TAC_CONST);
     JITInstruction *c2 = instruction(HIR_TAC_CONST);
     JITInstruction *get = instruction(HIR_TAC_BINARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -511,7 +496,7 @@ get_prop_program(void)
 static JITProgram *
 deep_guard_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
@@ -519,9 +504,6 @@ deep_guard_program(void)
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -558,7 +540,7 @@ deep_guard_program(void)
 static JITProgram *
 branch_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *entry = allocate(sizeof(JITBlock));
     JITBlock *truth = allocate(sizeof(JITBlock));
     JITBlock *falsehood = allocate(sizeof(JITBlock));
@@ -576,9 +558,6 @@ branch_program(void)
     JITCopy *copy1 = allocate(sizeof(JITCopy));
     JITCopy *copy2 = allocate(sizeof(JITCopy));
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 1;
     program->num_blocks = 4;
@@ -632,15 +611,12 @@ branch_program(void)
 static JITProgram *
 charge_tick_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
@@ -660,7 +636,7 @@ charge_tick_program(void)
 static JITProgram *
 call_verb_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_obj = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_verb = instruction(HIR_TAC_LOAD_LOCAL);
@@ -669,9 +645,6 @@ call_verb_program(void)
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 3;
     program->num_blocks = 1;
@@ -730,14 +703,11 @@ call_verb_program(void)
 static JITProgram *
 object_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -758,16 +728,13 @@ object_return_program(void)
 static JITProgram *
 object_compare_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_obj1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_obj2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *cmp = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -797,14 +764,11 @@ object_compare_program(HIROp op)
 static JITProgram *
 float_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -828,16 +792,13 @@ float_return_program(void)
 static JITProgram *
 float_binary_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_f1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_f2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *bin = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -872,16 +833,13 @@ float_binary_program(HIROp op)
 static JITProgram *
 float_compare_program(HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_f1 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_f2 = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *cmp = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -916,15 +874,12 @@ float_compare_program(HIROp op)
 static JITProgram *
 float_unary_program(double val, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *unary = instruction(HIR_TAC_UNARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -955,14 +910,11 @@ float_unary_program(double val, HIROp op)
 static JITProgram *
 string_return_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_local = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -990,14 +942,11 @@ string_return_program(void)
 static JITProgram *
 string_const_program(const char *s)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *constant = instruction(HIR_TAC_CONST);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1027,7 +976,7 @@ string_const_program(const char *s)
 static JITProgram *
 string_compare_program(const char *lhs, const char *rhs, HIROp op)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *left = instruction(HIR_TAC_CONST);
     JITInstruction *right = instruction(HIR_TAC_CONST);
@@ -1036,9 +985,6 @@ string_compare_program(const char *lhs, const char *rhs, HIROp op)
     char *left_string = str_dup(lhs);
     char *right_string = str_dup(rhs);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_blocks = 1;
     program->value_types = allocate(sizeof(var_type) * 4);
@@ -1114,7 +1060,7 @@ string_not_program(const char *s)
 static JITProgram *
 catch_stack_marker_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_codes = instruction(HIR_TAC_CONST);
     JITInstruction *const_pc = instruction(HIR_TAC_CONST);
@@ -1122,9 +1068,6 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 5;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1184,14 +1127,11 @@ catch_stack_marker_deopt_program(void)
 static JITProgram *
 exception_boundary_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 1;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
@@ -1210,15 +1150,12 @@ exception_boundary_deopt_program(void)
 static JITProgram *
 fork_boundary_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_time = instruction(HIR_TAC_CONST);
     JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 2;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
@@ -1257,15 +1194,12 @@ fork_boundary_deopt_program(void)
 static JITProgram *
 finally_stack_marker_deopt_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_finally = instruction(HIR_TAC_CONST);
     JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 3;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1309,16 +1243,13 @@ finally_stack_marker_deopt_program(void)
 static JITProgram *
 list_index_typed_program(var_type elem_type)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *const_idx = instruction(HIR_TAC_CONST);
     JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 1;
     program->num_blocks = 1;
@@ -1360,14 +1291,11 @@ list_index_typed_program(var_type elem_type)
 static JITProgram *
 verb_call_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1387,14 +1315,11 @@ verb_call_boundary_program(void)
 static JITProgram *
 prop_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *put_prop = instruction(HIR_TAC_PUT_PROP);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1414,14 +1339,11 @@ prop_boundary_program(void)
 static JITProgram *
 range_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *range_ref = instruction(HIR_TAC_RANGE_REF);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1441,14 +1363,11 @@ range_boundary_program(void)
 static JITProgram *
 range_set_boundary_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *range_set = instruction(HIR_TAC_RANGE_SET);
     JITDeoptMap *map;
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
@@ -1468,7 +1387,7 @@ range_set_boundary_program(void)
 static JITProgram *
 nested_loop_branch_program(void)
 {
-    JITProgram *program = allocate(sizeof(JITProgram));
+    JITProgram *program = new_jit_program();
     JITBlock *b1 = allocate(sizeof(JITBlock));
     JITBlock *b2 = allocate(sizeof(JITBlock));
     JITBlock *b3 = allocate(sizeof(JITBlock));
@@ -1477,9 +1396,6 @@ nested_loop_branch_program(void)
     JITBlock *b6 = allocate(sizeof(JITBlock));
     JITBlock *b7 = allocate(sizeof(JITBlock));
 
-    program->state = JIT_STATE_PENDING;
-    program->reason = "none";
-    program->eligible = 1;
     program->num_values = 20;
     program->num_vars = 0;
     program->num_blocks = 7;

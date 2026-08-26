@@ -16,6 +16,7 @@
 #include "program.h"
 #include "storage.h"
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -364,6 +365,7 @@ static HIRStmt *lift_stmt_list(HIRContext *, Stmt *);
 static int lower_expr(HIRContext *, HIRTacProgram *, HIRExpr *);
 static void lower_stmt_list(HIRContext *, HIRTacProgram *, HIRStmt *);
 static void record_unsupported(HIRContext *, const char *);
+static void record_unsupported_fmt(HIRContext *, const char *, ...);
 static void *
 hir_calloc(HIRContext *ctx, size_t count, size_t size)
 {
@@ -444,7 +446,7 @@ static void
 verify_local(HIRContext *ctx, int local_id)
 {
     if (local_id < 0 || local_id >= ctx->next_local)
-	record_unsupported(ctx, "Invalid local id in TAC");
+	record_unsupported_fmt(ctx, "tac: invalid local id %d", local_id);
 }
 
 static void
@@ -452,7 +454,7 @@ verify_temp_use(HIRContext *ctx, int temp, unsigned char *defined,
 		int max_temp)
 {
     if (temp <= 0 || temp > max_temp || !defined[temp])
-	record_unsupported(ctx, "TAC temp used before definition");
+	record_unsupported_fmt(ctx, "tac: temp %d used before definition", temp);
 }
 
 static void
@@ -460,12 +462,12 @@ verify_temp_def(HIRContext *ctx, int temp, unsigned char *defined,
 		int max_temp)
 {
     if (temp <= 0 || temp > max_temp) {
-	record_unsupported(ctx, "Invalid TAC temp definition");
+	record_unsupported_fmt(ctx, "tac: invalid temp definition %d", temp);
 	return;
     }
 
     if (defined[temp])
-	record_unsupported(ctx, "Duplicate TAC temp definition");
+	record_unsupported_fmt(ctx, "tac: duplicate temp definition %d", temp);
     defined[temp] = 1;
 }
 
@@ -474,12 +476,12 @@ verify_label_def(HIRContext *ctx, int label, unsigned char *defined,
 		 int max_label)
 {
     if (label <= 0 || label > max_label) {
-	record_unsupported(ctx, "Invalid TAC label definition");
+	record_unsupported_fmt(ctx, "tac: invalid label definition %d", label);
 	return;
     }
 
     if (defined[label])
-	record_unsupported(ctx, "Duplicate TAC label definition");
+	record_unsupported_fmt(ctx, "tac: duplicate label definition %d", label);
     defined[label] = 1;
 }
 
@@ -488,7 +490,7 @@ verify_label_use(HIRContext *ctx, int label, unsigned char *referenced,
 		 int max_label)
 {
     if (label <= 0 || label > max_label) {
-	record_unsupported(ctx, "Invalid TAC label reference");
+	record_unsupported_fmt(ctx, "tac: invalid label reference %d", label);
 	return;
     }
 
@@ -577,22 +579,22 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_RETURN0:
 	    break;
 	case HIR_TAC_UNSUPPORTED:
-	    record_unsupported(ctx, "Unsupported TAC instruction");
+	    record_unsupported(ctx, "tac: unsupported instruction");
 	    if (instr->dst > 0)
 		verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_PHI:
-	    record_unsupported(ctx, "Phi node in TAC");
+	    record_unsupported(ctx, "tac: phi node in TAC");
 	    break;
 	case HIR_TAC_PARALLEL_COPY:
-	    record_unsupported(ctx, "Parallel copy in TAC");
+	    record_unsupported(ctx, "tac: parallel copy in TAC");
 	    break;
 	}
     }
 
     for (i = 1; i <= max_label; i++) {
 	if (referenced_labels[i] && !defined_labels[i])
-	    record_unsupported(ctx, "TAC label referenced but not defined");
+	    record_unsupported_fmt(ctx, "tac: label %d referenced but not defined", i);
     }
 
     return ctx->error_count == errors_before;
@@ -687,7 +689,7 @@ block_for_label(HIRContext *ctx, HIRBasicBlock **label_blocks, int max_label,
 		int label)
 {
     if (label <= 0 || label > max_label || !label_blocks[label]) {
-	record_unsupported(ctx, "CFG edge target label has no block");
+	record_unsupported(ctx, "cfg: edge target label has no block");
 	return 0;
     }
 
@@ -967,7 +969,7 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 	return 1;
 
     if (!cfg->entry || cfg->entry != cfg->blocks)
-	record_unsupported(ctx, "CFG has invalid entry block");
+	record_unsupported(ctx, "cfg: invalid entry block");
 
     for (block = cfg->blocks; block; block = block->next) {
 	HIRBasicBlock *other;
@@ -976,40 +978,40 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 
 	block_count++;
 	if (block->id <= 0)
-	    record_unsupported(ctx, "CFG block has invalid id");
+	    record_unsupported_fmt(ctx, "cfg: block has invalid id %d", block->id);
 	for (other = cfg->blocks; other && other != block; other = other->next) {
 	    if (other->id == block->id)
-		record_unsupported(ctx, "CFG has duplicate block id");
+		record_unsupported_fmt(ctx, "cfg: duplicate block id %d", block->id);
 	}
 
 	if (!block->first || !block->last)
-	    record_unsupported(ctx, "CFG block has missing TAC bounds");
+	    record_unsupported_fmt(ctx, "cfg: block %d has missing TAC bounds", block->id);
 
 	if (block->num_successors < 0 || block->num_successors > 2)
-	    record_unsupported(ctx, "CFG block has invalid successor count");
+	    record_unsupported_fmt(ctx, "cfg: block %d has invalid successor count %d", block->id, block->num_successors);
 
 	for (i = 0; i < block->num_successors; i++) {
 	    if (!block->successors[i])
-		record_unsupported(ctx, "CFG block has missing successor");
+		record_unsupported_fmt(ctx, "cfg: block %d has missing successor", block->id);
 	    else if (!cfg_contains_block_ptr(cfg, block->successors[i]))
-		record_unsupported(ctx, "CFG successor is not in CFG block list");
+		record_unsupported_fmt(ctx, "cfg: block %d successor is not in block list", block->id);
 	}
 
 	expected_successors = cfg_expected_successors(block->last);
 	if (expected_successors >= 0
 	    && block->num_successors != expected_successors)
-	    record_unsupported(ctx, "CFG block has invalid terminator successors");
+	    record_unsupported_fmt(ctx, "cfg: block %d has invalid terminator successors", block->id);
 
 	if (block->predecessor_count
 	    != cfg_actual_predecessor_count(cfg, block))
-	    record_unsupported(ctx, "CFG predecessor count mismatch");
+	    record_unsupported_fmt(ctx, "cfg: block %d predecessor count mismatch", block->id);
 
     }
 
     if (block_count != cfg->num_blocks)
-	record_unsupported(ctx, "CFG block count mismatch");
+	record_unsupported(ctx, "cfg: block count mismatch");
     if (cfg->last_block && cfg->last_block->next)
-	record_unsupported(ctx, "CFG last block is not terminal");
+	record_unsupported(ctx, "cfg: last block is not terminal");
 
     return ctx->error_count == errors_before;
 }
@@ -1226,9 +1228,9 @@ hir_verify_dominator_tree(HIRContext *ctx, HIRCFG *cfg, HIRDominatorTree *dom)
 	return dom->num_reachable == 0;
 
     if (!cfg->entry || dom->num_reachable <= 0)
-	record_unsupported(ctx, "Dominator tree has no reachable entry");
+	record_unsupported(ctx, "dom-tree: no reachable entry");
     else if (dom->idom[cfg->entry->id] != cfg->entry)
-	record_unsupported(ctx, "Dominator tree entry idom is invalid");
+	record_unsupported(ctx, "dom-tree: entry idom is invalid");
 
     for (i = 0; i < dom->num_reachable; i++) {
 	HIRBasicBlock *block = dom->rpo[i];
@@ -1236,22 +1238,22 @@ hir_verify_dominator_tree(HIRContext *ctx, HIRCFG *cfg, HIRDominatorTree *dom)
 	int steps;
 
 	if (!block || block->id <= 0 || block->id > dom->max_block_id) {
-	    record_unsupported(ctx, "Dominator tree has invalid RPO block");
+	    record_unsupported(ctx, "dom-tree: invalid RPO block");
 	    continue;
 	}
 	if (dom->block_by_id[block->id] != block)
-	    record_unsupported(ctx, "Dominator tree block index mismatch");
+	    record_unsupported_fmt(ctx, "dom-tree: block %d index mismatch", block->id);
 	if (dom->rpo_index[block->id] != i)
-	    record_unsupported(ctx, "Dominator tree RPO index mismatch");
+	    record_unsupported_fmt(ctx, "dom-tree: block %d RPO index mismatch", block->id);
 	if (!dom->idom[block->id]) {
-	    record_unsupported(ctx, "Dominator tree missing reachable idom");
+	    record_unsupported_fmt(ctx, "dom-tree: block %d missing reachable idom", block->id);
 	    continue;
 	}
 	if (!dom_contains_block(dom, dom->idom[block->id])
 	    || dom->rpo_index[dom->idom[block->id]->id] < 0)
-	    record_unsupported(ctx, "Dominator tree idom is unreachable");
+	    record_unsupported_fmt(ctx, "dom-tree: block %d idom is unreachable", block->id);
 	if (block != cfg->entry && dom->idom[block->id] == block)
-	    record_unsupported(ctx, "Dominator tree non-entry self idom");
+	    record_unsupported_fmt(ctx, "dom-tree: non-entry block %d self idom", block->id);
 
 	runner = block;
 	steps = 0;
@@ -1263,7 +1265,7 @@ hir_verify_dominator_tree(HIRContext *ctx, HIRCFG *cfg, HIRDominatorTree *dom)
 	    steps++;
 	}
 	if (runner != cfg->entry || steps > dom->num_reachable)
-	    record_unsupported(ctx, "Dominator tree idom chain misses entry");
+	    record_unsupported_fmt(ctx, "dom-tree: block %d idom chain misses entry", block->id);
     }
 
     return ctx->error_count == errors_before;
@@ -1390,7 +1392,7 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 		HIRSSAProgram *ssa)
 {
     if (v < 0 || v >= num_locals) {
-	record_unsupported(ctx, "Invalid SSA local version stack");
+	record_unsupported_fmt(ctx, "ssa-build: invalid local id %d in version stack", v);
 	return 0;
     }
 
@@ -1468,7 +1470,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 		stacks[curr_phi->local_id * max_depth
 		       + stack_tops[curr_phi->local_id]++] = curr_phi->value;
 	    else
-		record_unsupported(ctx, "Invalid SSA phi local id");
+		record_unsupported_fmt(ctx, "ssa-build: invalid phi local id %d", curr_phi->local_id);
 	    last_phi = curr_phi;
 	    curr_phi = curr_phi->next;
 	    ssa->num_instructions++;
@@ -1493,7 +1495,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 		stacks[tac->local_id * max_depth
 		       + stack_tops[tac->local_id]++] = src1_renamed;
 	    else
-		record_unsupported(ctx, "Invalid SSA store local id");
+		record_unsupported_fmt(ctx, "ssa-build: invalid store local id %d", tac->local_id);
 	} else {
 	    HIRSSAInstr *ssa_inst = new_ssa_instr(ctx, tac);
 	    int j;
@@ -1787,7 +1789,7 @@ verify_ssa_value_use(HIRContext *ctx, int value, unsigned char *defined,
 		     int max_value)
 {
     if (value <= 0 || value > max_value || !defined[value])
-	record_unsupported(ctx, "SSA value used before definition");
+	record_unsupported_fmt(ctx, "ssa: value %d used before definition", value);
 }
 
 static void
@@ -1795,12 +1797,12 @@ verify_ssa_value_def(HIRContext *ctx, int value, unsigned char *defined,
 		     int max_value)
 {
     if (value <= 0 || value > max_value) {
-	record_unsupported(ctx, "Invalid SSA value definition");
+	record_unsupported_fmt(ctx, "ssa: invalid value definition %d", value);
 	return;
     }
 
     if (defined[value])
-	record_unsupported(ctx, "Duplicate SSA value definition");
+	record_unsupported_fmt(ctx, "ssa: duplicate value definition %d", value);
     defined[value] = 1;
 }
 
@@ -1856,7 +1858,7 @@ verify_phi_shape(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
 
     cfg_block = cfg_block_for_id(ssa->cfg, block->id);
     if (!cfg_block) {
-	record_unsupported(ctx, "SSA phi block is not in CFG");
+	record_unsupported_fmt(ctx, "ssa: phi block %d is not in CFG", block->id);
 	return;
     }
 
@@ -1867,18 +1869,18 @@ verify_phi_shape(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
 
 	count++;
 	if (!pred || arg->block_id <= 0 || arg->block_id > max_block_id) {
-	    record_unsupported(ctx, "SSA phi has invalid predecessor arg");
+	    record_unsupported_fmt(ctx, "ssa: phi has invalid predecessor arg %d", arg->block_id);
 	    continue;
 	}
 	if (seen[arg->block_id])
-	    record_unsupported(ctx, "SSA phi has duplicate predecessor arg");
+	    record_unsupported_fmt(ctx, "ssa: phi has duplicate predecessor arg %d", arg->block_id);
 	seen[arg->block_id] = 1;
 	if (!cfg_has_predecessor(ssa->cfg, cfg_block, arg->block_id))
-	    record_unsupported(ctx, "SSA phi arg is not a CFG predecessor");
+	    record_unsupported_fmt(ctx, "ssa: phi arg %d is not a CFG predecessor", arg->block_id);
     }
 
     if (count != cfg_block->predecessor_count)
-	record_unsupported(ctx, "SSA phi predecessor count mismatch");
+	record_unsupported_fmt(ctx, "ssa: phi predecessor count mismatch in block %d", block->id);
 }
 
 static int
@@ -1914,9 +1916,9 @@ verify_ssa_dominating_use(HIRContext *ctx, HIRDominatorTree *dom, int value,
 
     if (def_block[value] == use_block_id) {
 	if (!phi_edge && def_order[value] >= use_order)
-	    record_unsupported(ctx, "SSA definition does not precede use");
+	    record_unsupported_fmt(ctx, "ssa: definition of value %d in block %d does not precede use", value, def_block[value]);
     } else if (!dom_block_dominates(dom, def_block[value], use_block_id)) {
-	record_unsupported(ctx, "SSA definition does not dominate use");
+	record_unsupported_fmt(ctx, "ssa: definition of value %d in block %d does not dominate use in block %d", value, def_block[value], use_block_id);
     }
 }
 
@@ -2016,7 +2018,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 
     errors_before = ctx->error_count;
     if (ssa->form != HIR_FORM_SSA)
-	record_unsupported(ctx, "SSA verifier requires SSA form");
+	record_unsupported(ctx, "ssa: verifier requires SSA form");
 
     max_value = ctx->next_temp - 1;
     defined = hir_alloc(ctx, (size_t) max_value + 1);
@@ -2029,7 +2031,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 
 	block_count++;
 	if (!block->first || !block->last)
-	    record_unsupported(ctx, "SSA block has no instructions");
+	    record_unsupported_fmt(ctx, "ssa: block %d has no instructions", block->id);
 
 	for (instr = block->first; instr; instr = instr->next) {
 	    instruction_count++;
@@ -2083,7 +2085,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_PHI:
 		if (seen_non_phi)
-		    record_unsupported(ctx, "SSA phi appears after non-phi");
+		    record_unsupported_fmt(ctx, "ssa: phi appears after non-phi in block %d", block->id);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -2092,7 +2094,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_RETURN0:
 		break;
 	    case HIR_TAC_PARALLEL_COPY:
-		record_unsupported(ctx, "Parallel copy in SSA form");
+		record_unsupported(ctx, "ssa: parallel copy in SSA form");
 		break;
 	    }
 
@@ -2956,13 +2958,13 @@ materialize_destruction_moves(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *copy_instr;
 
 	if (!copy_cfg_block) {
-	    record_unsupported(ctx, "SSA destruction could not find copy edge");
+	    record_unsupported(ctx, "ssa-destroy: could not find copy edge");
 	    continue;
 	}
 
 	copy_block = ssa_block_for_id(ssa, copy_cfg_block->id);
 	if (!copy_block) {
-	    record_unsupported(ctx, "SSA destruction missing copy block");
+	    record_unsupported(ctx, "ssa-destroy: missing copy block");
 	    continue;
 	}
 
@@ -3000,7 +3002,7 @@ hir_destroy_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     if (ssa->form == HIR_FORM_OUT_OF_SSA)
 	return 1;
     if (ssa->form != HIR_FORM_SSA) {
-	record_unsupported(ctx, "Cannot destroy unknown SSA form");
+	record_unsupported(ctx, "ssa-destroy: cannot destroy non-SSA form");
 	return 0;
     }
 
@@ -3024,7 +3026,7 @@ verify_out_ssa_use(HIRContext *ctx, int value, unsigned char *defined,
 		   int max_value)
 {
     if (value <= 0 || value > max_value || !defined[value])
-	record_unsupported(ctx, "Out-of-SSA value used before definition");
+	record_unsupported_fmt(ctx, "out-of-ssa: value %d used before definition", value);
 }
 
 int
@@ -3044,7 +3046,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 
     errors_before = ctx->error_count;
     if (ssa->form != HIR_FORM_OUT_OF_SSA)
-	record_unsupported(ctx, "Out-of-SSA verifier requires out-of-SSA form");
+	record_unsupported(ctx, "out-of-ssa: verifier requires out-of-SSA form");
     (void) hir_verify_cfg(ctx, ssa->cfg);
 
     max_value = ctx->next_temp - 1;
@@ -3057,7 +3059,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 
 	block_count++;
 	if (!block->first || !block->last)
-	    record_unsupported(ctx, "Out-of-SSA block has no instructions");
+	    record_unsupported_fmt(ctx, "out-of-ssa: block %d has no instructions", block->id);
 
 	for (instr = block->first; instr; instr = instr->next) {
 	    instruction_count++;
@@ -3093,7 +3095,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		}
 		break;
 	    case HIR_TAC_PHI:
-		record_unsupported(ctx, "Phi node in out-of-SSA form");
+		record_unsupported_fmt(ctx, "out-of-ssa: phi node in block %d", block->id);
 		break;
 	    case HIR_TAC_STORE_LOCAL:
 	    case HIR_TAC_LABEL:
@@ -3140,8 +3142,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		    for (copy = instr->copies; copy; copy = copy->next) {
 			verify_out_ssa_use(ctx, copy->src, defined, max_value);
 			if (copy->dst <= 0 || copy->dst > max_value)
-			    record_unsupported(ctx,
-					       "Invalid out-of-SSA copy destination");
+			    record_unsupported_fmt(ctx,
+						   "out-of-ssa: invalid copy destination %d in block %d", copy->dst, block->id);
 		    }
 		}
 		break;
@@ -3154,13 +3156,13 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     }
 
     if (block_count != ssa->num_blocks)
-	record_unsupported(ctx, "Out-of-SSA block count mismatch");
+	record_unsupported_fmt(ctx, "out-of-ssa: block count mismatch (got %d, expected %d)", block_count, ssa->num_blocks);
     if (instruction_count != ssa->num_instructions)
-	record_unsupported(ctx, "Out-of-SSA instruction count mismatch");
+	record_unsupported_fmt(ctx, "out-of-ssa: instruction count mismatch (got %d, expected %d)", instruction_count, ssa->num_instructions);
     if (value_count != ssa->num_values)
-	record_unsupported(ctx, "Out-of-SSA value count mismatch");
+	record_unsupported_fmt(ctx, "out-of-ssa: value count mismatch (got %d, expected %d)", value_count, ssa->num_values);
     if (cfg_critical_edge_count(ssa->cfg) != 0)
-	record_unsupported(ctx, "Out-of-SSA CFG still has critical edges");
+	record_unsupported(ctx, "out-of-ssa: CFG still has critical edges");
 
     return ctx->error_count == errors_before;
 }
@@ -3209,13 +3211,43 @@ jit_op_is_supported(HIROp op)
     }
 }
 
+static const char *
+tac_kind_name(HIRTacKind kind)
+{
+    switch (kind) {
+    case HIR_TAC_TICK: return "tick";
+    case HIR_TAC_DEOPT: return "deopt";
+    case HIR_TAC_CONST: return "const";
+    case HIR_TAC_LOAD_LOCAL: return "load-local";
+    case HIR_TAC_STORE_LOCAL: return "store-local";
+    case HIR_TAC_UNARY: return "unary";
+    case HIR_TAC_BINARY: return "binary";
+    case HIR_TAC_CALL: return "call";
+    case HIR_TAC_CALL_VERB: return "call-verb";
+    case HIR_TAC_PUT_PROP: return "put-prop";
+    case HIR_TAC_RANGE_REF: return "range-ref";
+    case HIR_TAC_RANGE_SET: return "range-set";
+    case HIR_TAC_LABEL: return "label";
+    case HIR_TAC_JUMP: return "jump";
+    case HIR_TAC_BRANCH_FALSE: return "branch-false";
+    case HIR_TAC_RETURN: return "return";
+    case HIR_TAC_RETURN0: return "return0";
+    case HIR_TAC_PHI: return "phi";
+    case HIR_TAC_PARALLEL_COPY: return "parallel-copy";
+    case HIR_TAC_UNSUPPORTED: return "unsupported";
+    }
+    return "unknown";
+}
+
 static int
-jit_ssa_is_supported(HIRSSAProgram *ssa)
+jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 {
     HIRSSABlock *block;
 
-    if (!ssa || ssa->form != HIR_FORM_OUT_OF_SSA)
+    if (!ssa || ssa->form != HIR_FORM_OUT_OF_SSA) {
+	record_unsupported(ctx, "ssa-support: program is not in out-of-ssa form");
 	return 0;
+    }
 
     for (block = ssa->blocks; block; block = block->next) {
 	HIRSSAInstr *instr;
@@ -3238,17 +3270,26 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_CONST:
-		if (instr->literal.type == TYPE_LIST)
+		if (instr->literal.type == TYPE_LIST) {
+		    record_unsupported(ctx, "ssa-support: list constant");
 		    return 0;
+		}
 		break;
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
-		if (!jit_op_is_supported(instr->op))
+		if (!jit_op_is_supported(instr->op)) {
+		    record_unsupported_fmt(ctx, "ssa-support: unsupported operation %d", (int) instr->op);
 		    return 0;
+		}
 		break;
 	    case HIR_TAC_STORE_LOCAL:
+		record_unsupported(ctx, "ssa-support: store-local instruction in out-of-ssa");
+		return 0;
 	    case HIR_TAC_UNSUPPORTED:
+		record_unsupported(ctx, "ssa-support: unsupported instruction kind");
+		return 0;
 	    case HIR_TAC_PHI:
+		record_unsupported(ctx, "ssa-support: phi instruction in out-of-ssa");
 		return 0;
 	    }
 	    if (instr == block->last)
@@ -3344,13 +3385,15 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 }
 
 static int
-jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
+jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode_program)
 {
     HIRSSABlock *block;
     Bytecodes *bc;
 
-    if (!bytecode_program || !bytecode_program->main_vector.vector)
+    if (!bytecode_program || !bytecode_program->main_vector.vector) {
+	record_unsupported(ctx, "anchor: missing bytecode program vector");
 	return 0;
+    }
     bc = &bytecode_program->main_vector;
     for (block = ssa->blocks; block; block = block->next) {
 	HIRSSAInstr *instr;
@@ -3364,19 +3407,32 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 	    case HIR_TAC_BRANCH_FALSE:
 	    case HIR_TAC_RETURN:
 	    case HIR_TAC_RETURN0:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC) {
+		    record_unsupported_fmt(ctx, "anchor: %s missing bytecode pc", tac_kind_name(instr->kind));
 		    return 0;
-		if ((instr->kind == HIR_TAC_UNARY
-		     || instr->kind == HIR_TAC_BINARY)
-		    && !jit_operation_anchor_matches(bc, instr))
+		}
+		if (instr->bytecode_pc >= bc->size) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u out of bounds (size %u)", instr->bytecode_pc, bc->size);
 		    return 0;
+		}
+		if ((instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY)
+		    && !jit_operation_anchor_matches(bc, instr)) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u op %d mismatch (got opcode %u)",
+					   instr->bytecode_pc, (int) instr->op, (unsigned) bc->vector[instr->bytecode_pc]);
+		    return 0;
+		}
 		if (instr->kind == HIR_TAC_RETURN
-		    && bc->vector[instr->bytecode_pc] != OP_RETURN)
+		    && bc->vector[instr->bytecode_pc] != OP_RETURN) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u return expected OP_RETURN (got opcode %u)",
+					   instr->bytecode_pc, (unsigned) bc->vector[instr->bytecode_pc]);
 		    return 0;
+		}
 		if (instr->kind == HIR_TAC_RETURN0
-		    && bc->vector[instr->bytecode_pc] != OP_RETURN0)
+		    && bc->vector[instr->bytecode_pc] != OP_RETURN0) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u return0 expected OP_RETURN0 (got opcode %u)",
+					   instr->bytecode_pc, (unsigned) bc->vector[instr->bytecode_pc]);
 		    return 0;
+		}
 		if (instr->kind == HIR_TAC_BRANCH_FALSE
 		    && bc->vector[instr->bytecode_pc] != OP_AND
 		    && bc->vector[instr->bytecode_pc] != OP_OR
@@ -3387,14 +3443,19 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_RANGE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_LIST
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
-						    EOP_WHILE_ID))
+						    EOP_WHILE_ID)) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u branch_false opcode mismatch (got opcode %u)",
+					   instr->bytecode_pc, (unsigned) bc->vector[instr->bytecode_pc]);
 		    return 0;
+		}
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
-		    && instr->bytecode_pc >= bc->size)
+		    && instr->bytecode_pc >= bc->size) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u out of bounds (size %u)", instr->bytecode_pc, bc->size);
 		    return 0;
+		}
 		break;
 	    case HIR_TAC_JUMP:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
@@ -3403,45 +3464,52 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 						 instr->bytecode_pc, EOP_EXIT)
 			    && !jit_extended_anchor_matches(bc,
 						    instr->bytecode_pc,
-						    EOP_EXIT_ID))))
+						    EOP_EXIT_ID)))) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u jump expected EOP_EXIT/EOP_EXIT_ID (got opcode %u)",
+					   instr->bytecode_pc, (unsigned) bc->vector[instr->bytecode_pc]);
 		    return 0;
+		}
 		break;
 	    case HIR_TAC_CALL:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_BI_FUNC_CALL) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u call expected OP_BI_FUNC_CALL (got opcode %u)",
+					   instr->bytecode_pc, instr->bytecode_pc < bc->size ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
 		    return 0;
-		if (bc->vector[instr->bytecode_pc] != OP_BI_FUNC_CALL)
-		    return 0;
+		}
 		break;
 	    case HIR_TAC_CALL_VERB:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_CALL_VERB) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u call_verb expected OP_CALL_VERB (got opcode %u)",
+					   instr->bytecode_pc, instr->bytecode_pc < bc->size ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
 		    return 0;
-		if (bc->vector[instr->bytecode_pc] != OP_CALL_VERB)
-		    return 0;
+		}
 		break;
 	    case HIR_TAC_PUT_PROP:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_PUT_PROP) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u put_prop expected OP_PUT_PROP (got opcode %u)",
+					   instr->bytecode_pc, instr->bytecode_pc < bc->size ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
 		    return 0;
-		if (bc->vector[instr->bytecode_pc] != OP_PUT_PROP)
-		    return 0;
+		}
 		break;
 	    case HIR_TAC_RANGE_REF:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_RANGE_REF) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u range_ref expected OP_RANGE_REF (got opcode %u)",
+					   instr->bytecode_pc, instr->bytecode_pc < bc->size ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
 		    return 0;
-		if (bc->vector[instr->bytecode_pc] != OP_RANGE_REF)
-		    return 0;
+		}
 		break;
 	    case HIR_TAC_RANGE_SET:
-		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size)
+		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
+		    || (bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
+			&& !jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_RANGESET))) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u range_set expected OP_PUT_TEMP/EOP_RANGESET (got opcode %u)",
+					   instr->bytecode_pc, instr->bytecode_pc < bc->size ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
 		    return 0;
-		if (bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
-		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
-						    EOP_RANGESET))
-		    return 0;
+		}
 		break;
 	    case HIR_TAC_LABEL:
 	    case HIR_TAC_PARALLEL_COPY:
@@ -3449,6 +3517,7 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 	    case HIR_TAC_STORE_LOCAL:
 	    case HIR_TAC_UNSUPPORTED:
 	    case HIR_TAC_PHI:
+		record_unsupported_fmt(ctx, "anchor: unexpected instruction %s", tac_kind_name(instr->kind));
 		return 0;
 	    }
 	    if (instr == block->last)
@@ -3528,15 +3597,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     int types_changed;
     int i;
 
-    if (!ctx || ctx->error_count || !jit_ssa_is_supported(ssa))
-	return jit_program_unsupported("unsupported-program");
-    if (!jit_ssa_anchors_are_valid(ssa, bytecode_program))
-	return jit_program_unsupported("invalid-bytecode-anchor");
+    if (!ctx || ctx->error_count || !jit_ssa_is_supported(ctx, ssa)) {
+	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
+	return jit_program_unsupported_with_diagnostic("unsupported-program", diag);
+    }
+    if (!jit_ssa_anchors_are_valid(ctx, ssa, bytecode_program)) {
+	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
+	return jit_program_unsupported_with_diagnostic("invalid-bytecode-anchor", diag);
+    }
 
     program = mymalloc(sizeof(JITProgram), M_PROGRAM);
     memset(program, 0, sizeof(JITProgram));
     program->state = JIT_STATE_PENDING;
-    program->reason = "none";
+    program->reason = str_dup("none");
+    program->diagnostic = str_dup("none");
     program->eligible = 1;
     program->num_values = ctx->next_temp;
     program->num_vars = ctx->var_names ? ctx->var_names->size : 0;
@@ -3802,7 +3876,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	myfree(value_types_known, M_PROGRAM);
 	myfree(value_types, M_PROGRAM);
 	jit_program_free(program);
-	return jit_program_unsupported("unsupported-value-types");
+	return jit_program_unsupported_with_diagnostic("unsupported-value-types",
+						       "value-types: invalid type tag in inferred value types");
     }
 #if FLOATING_TYPE != FT_DOUBLE || FLOATS_ARE_BOXED
     for (i = 1; i < program->num_values; i++)
@@ -3810,7 +3885,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    myfree(value_types_known, M_PROGRAM);
 	    myfree(value_types, M_PROGRAM);
 	    jit_program_free(program);
-	    return jit_program_unsupported("unsupported-float-representation");
+	    return jit_program_unsupported_with_diagnostic("unsupported-float-representation",
+							   "float-representation: unsupported float boxing");
 	}
 #endif
 
@@ -3857,7 +3933,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		myfree(value_types_known, M_PROGRAM);
 		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
-		return jit_program_unsupported("invalid-deopt-map");
+		return jit_program_unsupported_with_diagnostic("invalid-deopt-map",
+							       "deopt-map: map allocation or stack value failed");
 	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
@@ -4934,6 +5011,21 @@ record_unsupported(HIRContext *ctx, const char *message)
 	ctx->error_msg = message;
 }
 
+static void
+record_unsupported_fmt(HIRContext *ctx, const char *fmt, ...)
+{
+    char buf[256];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    char *copy = hir_alloc(ctx, strlen(buf) + 1);
+    strcpy(copy, buf);
+    record_unsupported(ctx, copy);
+}
+
 static HIRTypeTag
 type_tag_for_var_type(var_type type)
 {
@@ -5075,6 +5167,51 @@ binary_op_for_expr(enum Expr_Kind kind, HIROp *op)
     }
 }
 
+static const char *
+ast_expr_kind_name(enum Expr_Kind kind)
+{
+    switch (kind) {
+    case EXPR_VAR: return "var";
+    case EXPR_ID: return "id";
+    case EXPR_PROP: return "prop";
+    case EXPR_VERB: return "verb";
+    case EXPR_INDEX: return "index";
+    case EXPR_RANGE: return "range";
+    case EXPR_CALL: return "call";
+    case EXPR_PLUS: return "plus";
+    case EXPR_MINUS: return "minus";
+    case EXPR_TIMES: return "times";
+    case EXPR_DIVIDE: return "divide";
+    case EXPR_MOD: return "mod";
+    case EXPR_EXP: return "exp";
+    case EXPR_NEGATE: return "negate";
+    case EXPR_NOT: return "not";
+    case EXPR_AND: return "and";
+    case EXPR_OR: return "or";
+    case EXPR_COND: return "cond";
+    case EXPR_LIST: return "list";
+    case EXPR_LENGTH: return "length";
+    case EXPR_CATCH: return "catch";
+    case EXPR_ASGN: return "asgn";
+    case EXPR_SCATTER: return "scatter";
+    case EXPR_EQ: return "eq";
+    case EXPR_NE: return "ne";
+    case EXPR_LT: return "lt";
+    case EXPR_LE: return "le";
+    case EXPR_GT: return "gt";
+    case EXPR_GE: return "ge";
+    case EXPR_IN: return "in";
+    case EXPR_BITOR: return "bitor";
+    case EXPR_BITXOR: return "bitxor";
+    case EXPR_BITAND: return "bitand";
+    case EXPR_COMPLEMENT: return "complement";
+    case EXPR_SHL: return "shl";
+    case EXPR_SHR: return "shr";
+    case EXPR_LSHR: return "lshr";
+    default: return "unknown";
+    }
+}
+
 static HIRExpr *
 unsupported_expr(HIRContext *ctx, Expr *ast)
 {
@@ -5082,7 +5219,7 @@ unsupported_expr(HIRContext *ctx, Expr *ast)
 
     expr->source_lineno = ast ? ast->lineno : 0;
     expr->u.unsupported.expr_kind = ast ? ast->kind : SizeOf_Expr_Kind;
-    record_unsupported(ctx, "Unsupported AST expression in HIR lift");
+    record_unsupported_fmt(ctx, "ast-expr: %s", ast ? ast_expr_kind_name(ast->kind) : "unknown");
     return expr;
 }
 
@@ -5163,7 +5300,7 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	return expr;
     }
 
-    record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
+    record_unsupported(ctx, "ast-asgn: unsupported non-local assignment");
     return unsupported_expr(ctx, ast);
 }
 
@@ -5354,6 +5491,25 @@ lift_except_arms(HIRContext *ctx, Except_Arm *excepts)
     return first;
 }
 
+static const char *
+ast_stmt_kind_name(enum Stmt_Kind kind)
+{
+    switch (kind) {
+    case STMT_COND: return "cond";
+    case STMT_LIST: return "for-list";
+    case STMT_RANGE: return "for-range";
+    case STMT_WHILE: return "while";
+    case STMT_FORK: return "fork";
+    case STMT_EXPR: return "expr";
+    case STMT_RETURN: return "return";
+    case STMT_TRY_EXCEPT: return "try-except";
+    case STMT_TRY_FINALLY: return "try-finally";
+    case STMT_BREAK: return "break";
+    case STMT_CONTINUE: return "continue";
+    default: return "unknown";
+    }
+}
+
 static HIRStmt *
 unsupported_stmt(HIRContext *ctx, Stmt *ast)
 {
@@ -5361,7 +5517,7 @@ unsupported_stmt(HIRContext *ctx, Stmt *ast)
 
     stmt->source_lineno = ast ? ast->lineno : 0;
     stmt->u.stmt_kind = ast ? ast->kind : STMT_EXPR;
-    record_unsupported(ctx, "Unsupported AST statement in HIR lift");
+    record_unsupported_fmt(ctx, "ast-stmt: %s", ast ? ast_stmt_kind_name(ast->kind) : "unknown");
     return stmt;
 }
 
@@ -6046,7 +6202,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		    index++;
 		} else {
 		    return append_unsupported_tac(ctx, program,
-						  "Optional/rest scatter is not yet supported",
+						  "lowering: optional/rest scatter",
 						  expr->source_lineno);
 		}
 	    }

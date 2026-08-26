@@ -36,11 +36,13 @@ typedef struct {
 } JITSourceLocation;
 
 extern JITProgram *jit_program_unsupported(const char *);
+extern JITProgram *jit_program_unsupported_with_diagnostic(const char *, const char *);
 extern void jit_program_free(JITProgram *);
 extern int jit_program_bytes(JITProgram *);
 extern JITState jit_program_state(JITProgram *);
 extern const char *jit_program_state_name(JITProgram *);
 extern const char *jit_program_reason(JITProgram *);
+extern const char *jit_program_diagnostic(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);

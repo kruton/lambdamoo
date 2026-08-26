@@ -1218,14 +1218,21 @@ build_mir(JITProgram *program, MIRBuild *build)
 }
 
 JITProgram *
-jit_program_unsupported(const char *reason)
+jit_program_unsupported_with_diagnostic(const char *reason, const char *diagnostic)
 {
     JITProgram *program = mymalloc(sizeof(JITProgram), M_PROGRAM);
 
     memset(program, 0, sizeof(JITProgram));
     program->state = JIT_STATE_UNSUPPORTED;
-    program->reason = reason;
+    program->reason = str_dup(reason ? reason : "unsupported-program");
+    program->diagnostic = str_dup(diagnostic ? diagnostic : "none");
     return program;
+}
+
+JITProgram *
+jit_program_unsupported(const char *reason)
+{
+    return jit_program_unsupported_with_diagnostic(reason, 0);
 }
 
 void
@@ -1280,6 +1287,10 @@ jit_program_free(JITProgram *program)
 	myfree(block, M_PROGRAM);
 	block = next_block;
     }
+    if (program->reason)
+	free_str(program->reason);
+    if (program->diagnostic)
+	free_str(program->diagnostic);
     myfree(program, M_PROGRAM);
 }
 
@@ -1341,6 +1352,12 @@ jit_program_reason(JITProgram *program)
     return program ? program->reason : "unsupported-program";
 }
 
+const char *
+jit_program_diagnostic(JITProgram *program)
+{
+    return (program && program->diagnostic) ? program->diagnostic : "none";
+}
+
 int
 jit_program_is_eligible(JITProgram *program)
 {
@@ -1377,7 +1394,12 @@ jit_program_compile(JITProgram *program)
 	return 1;
     if (!build_mir(program, &build)) {
 	program->state = JIT_STATE_FAILED;
-	program->reason = "code-generation-failed";
+	if (program->reason)
+	    free_str(program->reason);
+	program->reason = str_dup("code-generation-failed");
+	if (program->diagnostic)
+	    free_str(program->diagnostic);
+	program->diagnostic = str_dup("mir build module failed");
 	return 0;
     }
     MIR_load_module(build.context, build.module);
@@ -1388,7 +1410,12 @@ jit_program_compile(JITProgram *program)
 	MIR_gen_finish(build.context);
 	MIR_finish(build.context);
 	program->state = JIT_STATE_FAILED;
-	program->reason = "code-generation-failed";
+	if (program->reason)
+	    free_str(program->reason);
+	program->reason = str_dup("code-generation-failed");
+	if (program->diagnostic)
+	    free_str(program->diagnostic);
+	program->diagnostic = str_dup("mir generator failed");
 	return 0;
     }
     program->machine_code = build.function->u.func->machine_code;

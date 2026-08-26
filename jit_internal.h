@@ -57,6 +57,7 @@ struct JITBlock {
 struct JITProgram {
     JITState state;
     const char *reason;
+    const char *diagnostic;
     int eligible;
     int may_error;
     int num_values;
