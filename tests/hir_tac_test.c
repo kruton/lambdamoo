@@ -2623,6 +2623,50 @@ test_length_expr_in_index_tac_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_unreachable_dead_code_and_folded_phi_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr cond, one, two, comment, dead_var;
+    Stmt then_stmt, else_stmt, if_stmt_node, dead_stmt, final_ret;
+    Cond_Arm arm;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    cond = int_expr(1, 80);
+    one = int_expr(1, 81);
+    two = int_expr(2, 82);
+    then_stmt = return_stmt(&one);
+    else_stmt = return_stmt(&two);
+    arm = cond_arm_ast(&cond, &then_stmt);
+    if_stmt_node = cond_stmt_ast(&arm, &else_stmt, 80);
+
+    comment = int_expr(999, 85);
+    dead_var = id_expr(0, 85);
+    dead_stmt = expr_stmt(&comment);
+    final_ret = return_stmt(&dead_var);
+    if_stmt_node.next = &dead_stmt;
+    dead_stmt.next = &final_ret;
+
+    tac = lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+    (void) tac;
+
+    check_int("dead code verify errors", hir_context_error_count(ctx), 0);
+    check_int("dead code ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    (void) hir_optimize_ssa_constants(ctx, ssa);
+    check_int("dead code ssa valid after opt", hir_verify_ssa(ctx, ssa), 1);
+    check_int("dead code out-of-ssa destroy", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("dead code out-of-ssa verify", hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2667,6 +2711,7 @@ main(void)
     test_loop_ssa_destruction();
     test_critical_edge_ssa_destruction();
     test_repeated_local_assignment_ssa();
+    test_unreachable_dead_code_and_folded_phi_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
     test_negative_cfg_verifier_cases();

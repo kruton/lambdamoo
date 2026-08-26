@@ -1461,8 +1461,9 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 
     /* 1. Prepend Phi nodes and push their definitions onto version stacks */
     if (placed_phis[b->id]) {
-	ssa_block->first = placed_phis[b->id];
+	HIRSSAInstr *prev_first = ssa_block->first;
 	HIRSSAInstr *last_phi = 0;
+	ssa_block->first = placed_phis[b->id];
 	curr_phi = placed_phis[b->id];
 	while (curr_phi) {
 	    curr_phi->value = ctx->next_temp++;
@@ -1476,7 +1477,11 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 	    ssa->num_instructions++;
 	    ssa->num_values++;
 	}
-	ssa_block->last = last_phi;
+	if (last_phi) {
+	    last_phi->next = prev_first;
+	    if (!ssa_block->last)
+		ssa_block->last = last_phi;
+	}
     }
 
     /* 2. Traverse instructions of b */
@@ -1768,16 +1773,73 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			     ssa_blocks[cfg->entry->id], ssa, visited);
     }
 
-    /* Copy instructions of unreachable blocks as-is */
+    /* Fill in default value for phi args from unreachable predecessors */
+    if (cfg->entry) {
+	for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
+	    HIRSSAInstr *phi;
+	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
+	    if (!ssa_block)
+		continue;
+	    for (phi = ssa_block->first; phi && phi->kind == HIR_TAC_PHI; phi = phi->next) {
+		HIRPhiArg *arg;
+		for (arg = phi->phi_args; arg; arg = arg->next) {
+		    if (arg->value == 0) {
+			arg->value = current_version(ctx, phi->local_id,
+						     num_locals, stacks,
+						     stack_tops, max_depth,
+						     ssa_blocks[cfg->entry->id],
+						     ssa);
+		    }
+		}
+	    }
+	}
+    }
+
+    /* Emit dummy instruction for unreachable blocks so they are valid SSA */
     for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
 	if (!visited[cfg_block->id]) {
 	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
-	    HIRTacInstr *tac;
-	    for (tac = cfg_block->first; tac; tac = tac->next) {
-		emit_ssa_instr(ssa, ssa_block, new_ssa_instr(ctx, tac));
-		if (tac == cfg_block->last)
-		    break;
-	    }
+	    HIRSSAInstr *ret = hir_alloc(ctx, sizeof(HIRSSAInstr));
+	    ret->kind = HIR_TAC_RETURN0;
+	    ret->source_lineno = cfg_block->first_lineno;
+	    ret->bytecode_pc = NO_BYTECODE_PC;
+	    ret->value = 0;
+	    ret->src1 = 0;
+	    ret->src2 = 0;
+	    ret->label = 0;
+	    ret->local_id = 0;
+	    ret->op = HIR_OP_ADD;
+	    ret->literal.type = TYPE_NONE;
+	    ret->num_stack_values = 0;
+	    ret->stack_values = 0;
+	    ret->num_local_values = 0;
+	    ret->local_values = 0;
+	    ret->phi_args = 0;
+	    ret->copies = 0;
+	    ret->next = 0;
+	    emit_ssa_instr(ssa, ssa_block, ret);
+	} else if (ssa_blocks[cfg_block->id] && !ssa_blocks[cfg_block->id]->first) {
+	    /* Empty reachable block (only contained load/store local) */
+	    HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
+	    HIRSSAInstr *tick = hir_alloc(ctx, sizeof(HIRSSAInstr));
+	    tick->kind = HIR_TAC_TICK;
+	    tick->source_lineno = cfg_block->first_lineno;
+	    tick->bytecode_pc = NO_BYTECODE_PC;
+	    tick->value = 0;
+	    tick->src1 = 0;
+	    tick->src2 = 0;
+	    tick->label = 0;
+	    tick->local_id = 0;
+	    tick->op = HIR_OP_ADD;
+	    tick->literal.type = TYPE_NONE;
+	    tick->num_stack_values = 0;
+	    tick->stack_values = 0;
+	    tick->num_local_values = 0;
+	    tick->local_values = 0;
+	    tick->phi_args = 0;
+	    tick->copies = 0;
+	    tick->next = 0;
+	    emit_ssa_instr(ssa, ssa_block, tick);
 	}
     }
 
@@ -1912,6 +1974,10 @@ verify_ssa_dominating_use(HIRContext *ctx, HIRDominatorTree *dom, int value,
 			   int max_value, int *def_block, int *def_order)
 {
     if (value <= 0 || value > max_value || def_block[value] == 0)
+	return;
+
+    if (!dom || use_block_id <= 0 || use_block_id > dom->max_block_id
+	|| dom->rpo_index[use_block_id] < 0)
 	return;
 
     if (def_block[value] == use_block_id) {
@@ -2640,6 +2706,50 @@ prune_phi_arguments(HIRSSAProgram *ssa, unsigned char *reachable)
     }
 }
 
+static void
+ssa_block_normalize_phi_order(HIRSSABlock *block)
+{
+    HIRSSAInstr *instr;
+    HIRSSAInstr *phis_head = 0, *phis_tail = 0;
+    HIRSSAInstr *non_phis_head = 0, *non_phis_tail = 0;
+    HIRSSAInstr *next;
+
+    if (!block || !block->first)
+	return;
+
+    for (instr = block->first; instr; instr = next) {
+	next = (instr == block->last) ? 0 : instr->next;
+	instr->next = 0;
+
+	if (instr->kind == HIR_TAC_PHI) {
+	    if (phis_tail)
+		phis_tail->next = instr;
+	    else
+		phis_head = instr;
+	    phis_tail = instr;
+	} else {
+	    if (non_phis_tail)
+		non_phis_tail->next = instr;
+	    else
+		non_phis_head = instr;
+	    non_phis_tail = instr;
+	}
+    }
+
+    if (phis_head) {
+	block->first = phis_head;
+	if (non_phis_head) {
+	    phis_tail->next = non_phis_head;
+	    block->last = non_phis_tail;
+	} else {
+	    block->last = phis_tail;
+	}
+    } else {
+	block->first = non_phis_head;
+	block->last = non_phis_tail;
+    }
+}
+
 int
 hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 {
@@ -2676,6 +2786,7 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 	    if (instr == block->last)
 		break;
 	}
+	ssa_block_normalize_phi_order(block);
 	if (block->last && block->last->kind == HIR_TAC_BRANCH_FALSE
 	    && hir_value_kind(analysis, block->last->src1)
 	    == HIR_VALUE_INT_CONSTANT) {
