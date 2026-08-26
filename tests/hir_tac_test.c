@@ -2553,6 +2553,38 @@ test_fork_stmt_tac_ssa(void)
     hir_context_free(ctx);
 }
 
+static void
+test_length_expr_in_index_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr local_base, len_expr, idx_expr;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    local_base = id_expr(0, 70);
+    memset(&len_expr, 0, sizeof(len_expr));
+    len_expr.kind = EXPR_LENGTH;
+    len_expr.lineno = 70;
+    idx_expr = binary_expr(EXPR_INDEX, &local_base, &len_expr);
+    ret = return_stmt(&idx_expr);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("length in index tac returns",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    check_int("length in index tac unaries",
+	      hir_tac_count_kind(tac, HIR_TAC_UNARY), 1);
+    check_int("length in index verify errors", hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
 int
 main(void)
 {
@@ -2590,6 +2622,7 @@ main(void)
     test_try_except_tac_ssa();
     test_try_finally_tac_ssa();
     test_fork_stmt_tac_ssa();
+    test_length_expr_in_index_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
