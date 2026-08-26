@@ -3455,6 +3455,35 @@ main(void)
 	jit_program_free(tagged_in);
     }
 
+    /* Sublist from runtime helper tests */
+    {
+	Var base = new_list(3);
+	base.v.list[1].type = TYPE_INT;
+	base.v.list[1].v.num = 10;
+	base.v.list[2].type = TYPE_INT;
+	base.v.list[2].v.num = 20;
+	base.v.list[3].type = TYPE_INT;
+	base.v.list[3].v.num = 30;
+
+	Var *sub2 = jit_rt_sublist_from(base.v.list, 2);
+	check(sub2 != 0 && sub2[0].v.num == 2 && sub2[1].v.num == 20 && sub2[2].v.num == 30,
+	      "jit_rt_sublist_from start 2 failed");
+	Var v_sub2;
+	v_sub2.type = TYPE_LIST;
+	v_sub2.v.list = sub2;
+	free_var(v_sub2);
+
+	Var *sub4 = jit_rt_sublist_from(base.v.list, 4);
+	check(sub4 != 0 && sub4[0].v.num == 0,
+	      "jit_rt_sublist_from start 4 failed");
+	Var v_sub4;
+	v_sub4.type = TYPE_LIST;
+	v_sub4.v.list = sub4;
+	free_var(v_sub4);
+
+	free_var(base);
+    }
+
     /* Exception and finally stack marker deoptimization tests */
     {
 	JITProgram *boundary = exception_boundary_deopt_program();

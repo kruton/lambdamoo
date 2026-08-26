@@ -87,6 +87,7 @@ extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
 extern int64_t jit_rt_seconds_left(void);

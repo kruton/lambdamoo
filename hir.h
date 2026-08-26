@@ -111,7 +111,8 @@ typedef enum {
     HIR_OP_INDEX_BF,
     HIR_OP_RINDEX_BF,
     HIR_OP_VALID,
-    HIR_OP_PARENT
+    HIR_OP_PARENT,
+    HIR_OP_SUBLIST_FROM
 } HIROp;
 
 typedef enum {

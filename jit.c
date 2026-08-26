@@ -215,6 +215,26 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
     return res.v.list;
 }
 
+Var *
+jit_rt_sublist_from(Var *list, int64_t start)
+{
+    int len;
+    int count;
+    Var r;
+    int i;
+
+    if (!list)
+	return new_list(0).v.list;
+    len = list[0].v.num;
+    if (start > len || start < 1)
+	return new_list(0).v.list;
+    count = len - start + 1;
+    r = new_list(count);
+    for (i = 0; i < count; i++)
+	r.v.list[i + 1] = var_ref(list[start + i]);
+    return r.v.list;
+}
+
 int64_t
 jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
 {
@@ -341,6 +361,8 @@ typedef struct {
     MIR_item_t import_singleton_list;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
+    MIR_item_t proto_sublist_from;
+    MIR_item_t import_sublist_from;
     MIR_item_t proto_list_in;
     MIR_item_t import_list_in;
     MIR_item_t proto_get_prop;
@@ -660,6 +682,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(build->context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(build->context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(build->context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(build->context, "jit_rt_list_in", (void *) jit_rt_list_in);
     MIR_load_external(build->context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
     MIR_load_external(build->context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
@@ -702,6 +725,10 @@ build_mir(JITProgram *program, MIRBuild *build)
     build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 3,
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
+
+    build->proto_sublist_from = MIR_new_proto(build->context, "proto_sublist_from", 1, &res_p, 2,
+					     MIR_T_P, "list", MIR_T_I64, "start");
+    build->import_sublist_from = MIR_new_import(build->context, "jit_rt_sublist_from");
 
     build->proto_list_in = MIR_new_proto(build->context, "proto_list_in", 1, &res_i64, 3,
 					 MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type", MIR_T_P, "l");
@@ -1365,6 +1392,15 @@ build_mir(JITProgram *program, MIRBuild *build)
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
 					  status, common_return);
+			break;
+		    }
+		    if (instr->op == HIR_OP_SUBLIST_FROM) {
+			append(build, MIR_new_call_insn(build->context, 5,
+			    MIR_new_ref_op(build->context, build->proto_sublist_from),
+			    MIR_new_ref_op(build->context, build->import_sublist_from),
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, values[instr->src2])));
 			break;
 		    }
 		    if (instr->op == HIR_OP_LIST_APPEND) {

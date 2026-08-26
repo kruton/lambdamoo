@@ -3961,7 +3961,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		} else if (si->kind == HIR_TAC_BINARY) {
 		    if (si->op == HIR_OP_LIST_ADD_TAIL
-			|| si->op == HIR_OP_LIST_APPEND) {
+			|| si->op == HIR_OP_LIST_APPEND
+			|| si->op == HIR_OP_SUBLIST_FROM) {
 			value_types[si->value] = TYPE_LIST;
 			value_types_known[si->value] = 1;
 		    } else if (si->op == HIR_OP_EQ || si->op == HIR_OP_NE
@@ -4149,12 +4150,22 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 	    if ((si->kind == HIR_TAC_UNARY
 		 && unary_operand_defaults_to_list(si->op))
-		|| (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX))
+		|| (si->kind == HIR_TAC_BINARY
+		    && (si->op == HIR_OP_INDEX || si->op == HIR_OP_SUBLIST_FROM)))
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
 		if (!value_types_known[operand]) {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_SUBLIST_FROM) {
+		value_types[si->value] = TYPE_LIST;
+		value_types_known[si->value] = 1;
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_INT;
+		    value_types_known[si->src2] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
@@ -4419,6 +4430,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		     && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 			 || ssa_instr->op == HIR_OP_IN
 			 || ssa_instr->op == HIR_OP_GET_PROP
+			 || ssa_instr->op == HIR_OP_SUBLIST_FROM
 			 || (ssa_instr->op == HIR_OP_INDEX
 			     && ssa_instr->src1 > 0
 			     && value_is_tagged[ssa_instr->src1]
@@ -5060,6 +5072,8 @@ op_name(HIROp op)
 	return "VALID";
     case HIR_OP_PARENT:
 	return "PARENT";
+    case HIR_OP_SUBLIST_FROM:
+	return "SUBLIST_FROM";
     }
 
     return "?";
@@ -6658,7 +6672,9 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int scatter_depth = ctx->lower_stack_depth;
     int required = 0;
     int optional = 0;
+    int have_rest = 0;
     int seen_optional = 0;
+    int seen_rest = 0;
     int position = 0;
     int invalid_label = new_label(ctx);
     int done_label = new_label(ctx);
@@ -6668,14 +6684,18 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 
     for (item = expr->u.scatter.items; item; item = item->next) {
 	if (item->kind == SCAT_REST) {
-	    append_scatter_deopt(ctx, program, expr->source_lineno,
-				 expr->bytecode_pc);
-	    ctx->lower_stack_depth = saved_depth;
-	    push_lower_stack(ctx, rhs);
-	    return rhs;
+	    if (seen_rest) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	    seen_rest = 1;
+	    have_rest = 1;
 	}
-	if (item->kind == SCAT_REQUIRED) {
-	    if (seen_optional) {
+	else if (item->kind == SCAT_REQUIRED) {
+	    if (seen_optional || seen_rest) {
 		append_scatter_deopt(ctx, program, expr->source_lineno,
 				     expr->bytecode_pc);
 		ctx->lower_stack_depth = saved_depth;
@@ -6685,6 +6705,13 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    required++;
 	}
 	else if (item->kind == SCAT_OPTIONAL) {
+	    if (seen_rest) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
 	    seen_optional = 1;
 	    optional++;
 	    if (!item->expr) {
@@ -6707,12 +6734,14 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     append_unticked_branch_false(ctx, program, condition, invalid_label,
 				 expr->source_lineno, expr->bytecode_pc);
 
-    limit = append_scatter_constant(ctx, program, required + optional,
-				    expr->source_lineno, expr->bytecode_pc);
-    condition = append_scatter_binary(ctx, program, HIR_OP_LE, length, limit,
-				      expr->source_lineno, expr->bytecode_pc);
-    append_unticked_branch_false(ctx, program, condition, invalid_label,
-				 expr->source_lineno, expr->bytecode_pc);
+    if (!have_rest) {
+	limit = append_scatter_constant(ctx, program, required + optional,
+					expr->source_lineno, expr->bytecode_pc);
+	condition = append_scatter_binary(ctx, program, HIR_OP_LE, length, limit,
+					  expr->source_lineno, expr->bytecode_pc);
+	append_unticked_branch_false(ctx, program, condition, invalid_label,
+				     expr->source_lineno, expr->bytecode_pc);
+    }
 
     for (item = expr->u.scatter.items; item; item = item->next) {
 	int index;
@@ -6743,6 +6772,12 @@ lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 				  expr->source_lineno);
 	    ctx->lower_stack_depth = scatter_depth;
 	    append_label(ctx, program, item_done_label, expr->source_lineno);
+	} else if (item->kind == SCAT_REST) {
+	    value = append_scatter_binary(ctx, program, HIR_OP_SUBLIST_FROM,
+					  rhs, index, expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
 	} else {
 	    value = append_scatter_binary(ctx, program, HIR_OP_INDEX, rhs, index,
 					  expr->source_lineno,

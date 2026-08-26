@@ -1575,8 +1575,10 @@ test_optional_rest_scatter_deopt(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional rest scatter deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
-    check_int("optional rest scatter default not lowered",
-	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 0);
+    check_int("optional rest scatter default lowered",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc) > 0, 1);
+    check_int("optional rest scatter sublist op",
+	      hir_tac_count_binary_op(tac, HIR_OP_SUBLIST_FROM), 1);
     check_int("optional rest scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
     check_int("optional rest scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
