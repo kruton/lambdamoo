@@ -6314,7 +6314,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		single_tac->dst = new_temp(ctx);
 		single_tac->src1 = elem_temp;
 		single_tac->op = HIR_OP_MAKE_SINGLETON_LIST;
-		single_tac->bytecode_pc = expr->bytecode_pc;
+		single_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, single_tac);
 		append_tac(program, single_tac);
 		ctx->lower_stack[ctx->lower_stack_depth - 1] = single_tac->dst;
@@ -6328,7 +6328,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		single_tac->dst = new_temp(ctx);
 		single_tac->src1 = elem_temp;
 		single_tac->op = HIR_OP_MAKE_SINGLETON_LIST;
-		single_tac->bytecode_pc = expr->bytecode_pc;
+		single_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, single_tac);
 		append_tac(program, single_tac);
 		ctx->lower_stack[ctx->lower_stack_depth - 1] = single_tac->dst;
@@ -6340,7 +6340,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		check_tac->dst = new_temp(ctx);
 		check_tac->src1 = elem_temp;
 		check_tac->op = HIR_OP_CHECK_LIST_FOR_SPLICE;
-		check_tac->bytecode_pc = expr->bytecode_pc;
+		check_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, check_tac);
 		append_tac(program, check_tac);
 		ctx->lower_stack[ctx->lower_stack_depth - 1] = check_tac->dst;

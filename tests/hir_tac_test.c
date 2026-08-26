@@ -1472,6 +1472,10 @@ test_builtin_call_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
     check_int("builtin call singleton count",
 	      hir_tac_count_unary_op(tac, HIR_OP_MAKE_SINGLETON_LIST), 1);
+    check_int("builtin call singleton pc",
+	      hir_tac_count_bytecode_pc(tac, 2), 1);
+    check_int("builtin call call pc",
+	      hir_tac_count_bytecode_pc(tac, 3), 1);
     check_int("builtin call verify errors", hir_context_error_count(ctx), 0);
 
     check_int("builtin call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
