@@ -2081,6 +2081,45 @@ test_object_scalars_tac_ssa(void)
 }
 
 static void
+test_float_scalars_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr f1, f2, add;
+    Stmt ret_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    memset(&f1, 0, sizeof(f1));
+    f1.kind = EXPR_VAR;
+    f1.lineno = 10;
+    f1.e.var.type = TYPE_FLOAT;
+    f1.e.var.v.fnum = box_fl(3.14);
+
+    memset(&f2, 0, sizeof(f2));
+    f2.kind = EXPR_VAR;
+    f2.lineno = 10;
+    f2.e.var.type = TYPE_FLOAT;
+    f2.e.var.v.fnum = box_fl(2.71);
+
+    add = binary_expr(EXPR_PLUS, &f1, &f2);
+    ret_stmt = return_stmt(&add);
+    ret_stmt.lineno = 10;
+
+    tac = lower_stmt(&names, &ret_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("float scalar tac not null", tac != 0, 1);
+    check_int("float scalar verify errors", hir_context_error_count(ctx), 0);
+    check_int("float scalar destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -2359,6 +2398,7 @@ main(void)
     test_range_expr_and_assignment_tac_ssa();
     test_verb_call_tac_ssa();
     test_object_scalars_tac_ssa();
+    test_float_scalars_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
