@@ -3489,6 +3489,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     JITProgram *program;
     HIRSSABlock *ssa_block;
     var_type *value_types;
+    unsigned char *value_types_known;
+    int invalid_value_types = 0;
+    int types_changed;
     int i;
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ssa))
@@ -3526,44 +3529,106 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     value_types = mymalloc(sizeof(var_type) * (program->num_values > 0
 					       ? program->num_values : 1),
 			   M_PROGRAM);
+    value_types_known = mymalloc(program->num_values > 0
+				 ? program->num_values : 1, M_PROGRAM);
     for (i = 0; i < program->num_values; i++)
 	value_types[i] = TYPE_INT;
+    memset(value_types_known, 0, program->num_values > 0
+	   ? program->num_values : 1);
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
 	    if (si->value > 0 && si->value < program->num_values) {
-		if (si->kind == HIR_TAC_CONST)
+		if (si->kind == HIR_TAC_CONST) {
 		    value_types[si->value] = si->literal.type;
-		else if (si->kind == HIR_TAC_UNARY
-			 && si->op == HIR_OP_MAKE_SINGLETON_LIST)
-		    value_types[si->value] = TYPE_LIST;
-		else if (si->kind == HIR_TAC_BINARY
-			 && (si->op == HIR_OP_LIST_ADD_TAIL
-			     || si->op == HIR_OP_LIST_APPEND))
-		    value_types[si->value] = TYPE_LIST;
-	    }
-	    if (si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH
-		&& si->src1 > 0 && si->src1 < program->num_values)
-		value_types[si->src1] = TYPE_LIST;
-	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
-		&& si->src1 > 0 && si->src1 < program->num_values)
-		value_types[si->src1] = TYPE_LIST;
-	    if ((si->kind == HIR_TAC_RANGE_REF
-		 || si->kind == HIR_TAC_RANGE_SET)
-		&& si->src1 > 0 && si->src1 < program->num_values
-		&& value_types[si->src1] != TYPE_STR)
-		value_types[si->src1] = TYPE_LIST;
-	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
-		int rhs = si->stack_values[si->num_stack_values - 1];
-
-		if (rhs > 0 && rhs < program->num_values
-		    && value_types[rhs] != TYPE_STR)
-		    value_types[rhs] = TYPE_LIST;
+		    value_types_known[si->value] = 1;
+		} else if (si->kind == HIR_TAC_UNARY) {
+		    value_types[si->value] =
+			(si->op == HIR_OP_MAKE_SINGLETON_LIST
+			 || si->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+			? TYPE_LIST : TYPE_INT;
+		    value_types_known[si->value] = 1;
+		} else if (si->kind == HIR_TAC_BINARY) {
+		    value_types[si->value] =
+			(si->op == HIR_OP_LIST_ADD_TAIL
+			 || si->op == HIR_OP_LIST_APPEND)
+			? TYPE_LIST : TYPE_INT;
+		    value_types_known[si->value] = 1;
+		}
 	    }
 	    if (si == ssa_block->last)
 		break;
 	}
+    }
+
+    do {
+	types_changed = 0;
+	for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	    HIRSSAInstr *si;
+	    for (si = ssa_block->first; si; si = si->next) {
+		HIRParallelCopy *copy;
+
+		for (copy = si->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& value_types_known[copy->src]) {
+			if (!value_types_known[copy->dst]) {
+			    value_types[copy->dst] = value_types[copy->src];
+			    value_types_known[copy->dst] = 1;
+			    types_changed = 1;
+			} else if (value_types[copy->dst]
+				   != value_types[copy->src])
+			    invalid_value_types = 1;
+		    }
+		if (si == ssa_block->last)
+		    break;
+	    }
+	}
+    } while (types_changed);
+
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+	for (si = ssa_block->first; si; si = si->next) {
+	    int operand = 0;
+
+	    if ((si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH)
+		|| (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX))
+		operand = si->src1;
+	    if (operand > 0 && operand < program->num_values) {
+		if (value_types_known[operand]
+		    && value_types[operand] != TYPE_LIST)
+		    invalid_value_types = 1;
+		else {
+		    value_types[operand] = TYPE_LIST;
+		    value_types_known[operand] = 1;
+		}
+	    }
+	    if ((si->kind == HIR_TAC_RANGE_REF
+		 || si->kind == HIR_TAC_RANGE_SET)
+		&& si->src1 > 0 && si->src1 < program->num_values
+		&& !value_types_known[si->src1]) {
+		value_types[si->src1] = TYPE_LIST;
+		value_types_known[si->src1] = 1;
+	    }
+	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
+		int rhs = si->stack_values[si->num_stack_values - 1];
+
+		if (rhs > 0 && rhs < program->num_values
+		    && !value_types_known[rhs]) {
+		    value_types[rhs] = TYPE_LIST;
+		    value_types_known[rhs] = 1;
+		}
+	    }
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
+    if (invalid_value_types) {
+	myfree(value_types_known, M_PROGRAM);
+	myfree(value_types, M_PROGRAM);
+	jit_program_free(program);
+	return jit_program_unsupported("unsupported-value-types");
     }
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
@@ -3606,6 +3671,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 						  value_types);
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
+		myfree(value_types_known, M_PROGRAM);
 		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
 		return jit_program_unsupported("invalid-deopt-map");
@@ -3657,6 +3723,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	}
     }
 
+    myfree(value_types_known, M_PROGRAM);
     myfree(value_types, M_PROGRAM);
     return program;
 }
