@@ -4418,6 +4418,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& !(ssa_instr->kind == HIR_TAC_BINARY
 		     && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 			 || ssa_instr->op == HIR_OP_IN
+			 || ssa_instr->op == HIR_OP_GET_PROP
 			 || (ssa_instr->op == HIR_OP_INDEX
 			     && ssa_instr->src1 > 0
 			     && value_is_tagged[ssa_instr->src1]
@@ -6774,9 +6775,6 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int try_val;
     int handler_val;
     int result_temp;
-
-    append_deopt_boundary(ctx, program, expr->source_lineno,
-			  expr->bytecode_pc);
 
     codes_val = lower_codes(ctx, program, expr->u.catch_expr.codes,
 			    expr->source_lineno, expr->bytecode_pc);

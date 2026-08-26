@@ -2851,7 +2851,7 @@ test_catch_expr_tac_ssa(void)
     check_int("catch expr tac returns",
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("catch expr deopt boundary",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     check_int("catch expr cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
     check_int("catch expr ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("catch expr verify errors", hir_context_error_count(ctx), 0);

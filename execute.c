@@ -919,7 +919,8 @@ do {								\
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
-					     RUN_ACTIV.base_rt_stack);
+					     RUN_ACTIV.base_rt_stack,
+					     RUN_ACTIV.progr);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		jit_profile_record_completed();
 		STORE_STATE_VARIABLES();

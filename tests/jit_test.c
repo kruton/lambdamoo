@@ -12,6 +12,9 @@
 
 #include <limits.h>
 
+#define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2)
+
 static int failures;
 
 static void check(int, const char *);
@@ -1288,20 +1291,19 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *const_codes = instruction(HIR_TAC_CONST);
     JITInstruction *const_pc = instruction(HIR_TAC_CONST);
     JITInstruction *const_catch = instruction(HIR_TAC_CONST);
-    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 5;
+    program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types = allocate(sizeof(var_type) * 4);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_INT;
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_CATCH;
-    program->value_types[4] = TYPE_INT;
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 25;
@@ -1336,9 +1338,6 @@ catch_stack_marker_deopt_program(void)
     const_catch->literal_type = TYPE_CATCH;
     const_catch->next = deopt_op;
 
-    deopt_op->value = 4;
-    deopt_op->src1 = 1;
-    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
     deopt_op->deopt_map = 1;
     deopt_op->bytecode_pc = 25;
 
@@ -1420,18 +1419,17 @@ finally_stack_marker_deopt_program(void)
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_finally = instruction(HIR_TAC_CONST);
-    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 3;
+    program->num_values = 2;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types = allocate(sizeof(var_type) * 2);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_FINALLY;
-    program->value_types[2] = TYPE_INT;
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 40;
@@ -1452,9 +1450,6 @@ finally_stack_marker_deopt_program(void)
     const_finally->literal_type = TYPE_FINALLY;
     const_finally->next = deopt_op;
 
-    deopt_op->value = 2;
-    deopt_op->src1 = 1;
-    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
     deopt_op->deopt_map = 1;
     deopt_op->bytecode_pc = 40;
 
