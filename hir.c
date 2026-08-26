@@ -3342,9 +3342,18 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_LOCAL:
-	    case HIR_TAC_JUMP:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
 		    && instr->bytecode_pc >= bc->size)
+		    return 0;
+		break;
+	    case HIR_TAC_JUMP:
+		if (instr->bytecode_pc != NO_BYTECODE_PC
+		    && (instr->bytecode_pc >= bc->size
+			|| (!jit_extended_anchor_matches(bc,
+						 instr->bytecode_pc, EOP_EXIT)
+			    && !jit_extended_anchor_matches(bc,
+						    instr->bytecode_pc,
+						    EOP_EXIT_ID))))
 		    return 0;
 		break;
 	    case HIR_TAC_CALL:
@@ -3988,6 +3997,8 @@ op_name(HIROp op)
 	return "LENGTH";
     case HIR_OP_GET_PROP:
 	return "GET_PROP";
+    case HIR_OP_CHARGE_TICK:
+	return "CHARGE_TICK";
     }
 
     return "?";
@@ -5179,6 +5190,18 @@ append_tick(HIRContext *ctx, HIRTacProgram *program, unsigned source_lineno,
 }
 
 static void
+append_charge_tick(HIRContext *ctx, HIRTacProgram *program,
+		   unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_TICK, source_lineno);
+
+    instr->op = HIR_OP_CHARGE_TICK;
+    instr->bytecode_pc = bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+}
+
+static void
 append_label(HIRContext *ctx, HIRTacProgram *program, int label,
 	     unsigned source_lineno)
 {
@@ -5915,6 +5938,7 @@ lower_break(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     }
 
     ctx->lower_stack_depth = loop->saved_depth;
+    append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
     instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
     instr->label = loop->done_label;
     instr->bytecode_pc = stmt->bytecode_pc;
@@ -5938,6 +5962,7 @@ lower_continue(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     }
 
     ctx->lower_stack_depth = loop->saved_depth;
+    append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
     instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
     instr->label = loop->cont_label;
     instr->bytecode_pc = stmt->bytecode_pc;

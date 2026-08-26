@@ -207,7 +207,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_reg_t *values;
     MIR_label_t *labels;
     MIR_label_t fallback;
-    MIR_label_t tick_abort, seconds_abort;
+    MIR_label_t tick_abort = 0, seconds_abort = 0;
     MIR_label_t common_return;
     JITStatusExit *status_exits = 0;
     JITStatusExit *last_status_exit = 0;
@@ -266,12 +266,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 	    for (instr = block->first; instr; instr = instr->next) {
 		switch (instr->kind) {
 		case HIR_TAC_TICK:
-		    tick_abort = new_status_exit(build, &status_exits,
-			&last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
-			instr->bytecode_pc, instr->source_lineno);
-		    seconds_abort = new_status_exit(build, &status_exits,
-			&last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
-			instr->bytecode_pc, instr->source_lineno);
+		    if (instr->op != HIR_OP_CHARGE_TICK) {
+			tick_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
+			    instr->bytecode_pc, instr->source_lineno);
+			seconds_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
+			    instr->bytecode_pc, instr->source_lineno);
+		    }
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 tick_result),
@@ -288,6 +290,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 								 0, ticks, 0, 1),
 						  MIR_new_reg_op(build->context,
 								 tick_result)));
+		    if (instr->op == HIR_OP_CHARGE_TICK)
+			break;
 		    append(build, MIR_new_insn(build->context, MIR_BLE,
 						  MIR_new_label_op(build->context,
 								   tick_abort),

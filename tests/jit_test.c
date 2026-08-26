@@ -611,6 +611,34 @@ branch_program(void)
     return program;
 }
 
+static JITProgram *
+charge_tick_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    constant->value = 1;
+    constant->literal = 7;
+    constant->next = tick;
+    tick->op = HIR_OP_CHARGE_TICK;
+    tick->next = ret;
+    ret->src1 = 1;
+    block->first = constant;
+    block->last = ret;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -636,11 +664,12 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
-		if (--*ticks <= 0) {
+		--*ticks;
+		if (instr->op != HIR_OP_CHARGE_TICK && *ticks <= 0) {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_TICKS;
 		}
-		if (*timed_out) {
+		if (instr->op != HIR_OP_CHARGE_TICK && *timed_out) {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_SECONDS;
 		}
@@ -799,6 +828,7 @@ main(void)
     JITProgram *guard = guard_program();
     JITProgram *deep_guard = deep_guard_program();
     JITProgram *branch = branch_program();
+    JITProgram *charge_tick = charge_tick_program();
     JITProgram *divide = binary_program(20, 4, HIR_OP_DIV);
     JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
     JITProgram *divide_overflow = binary_program(NUM_MIN, -1, HIR_OP_DIV);
@@ -923,6 +953,8 @@ main(void)
 		       "tick abort differed from reference execution");
     check_differential(branch, env, 10, 1,
 		       "seconds abort differed from reference execution");
+    check_differential(charge_tick, env, 1, 1,
+		       "charge-only tick differed from reference execution");
 
     env[0].type = TYPE_INT;
     env[0].v.num = 42;
@@ -1196,6 +1228,7 @@ main(void)
     jit_program_free(list_index_high);
     jit_program_free(deep_guard);
     jit_program_free(branch);
+    jit_program_free(charge_tick);
     jit_program_free(divide);
     jit_program_free(divide_zero);
     jit_program_free(divide_overflow);

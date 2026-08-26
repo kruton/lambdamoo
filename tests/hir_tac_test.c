@@ -1829,6 +1829,8 @@ test_break_and_continue_tac_ssa(void)
     check_int("break/cont verify errors", hir_context_error_count(ctx), 0);
     check_int("break/cont ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("break/cont tick count",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 9);
 
     check_int("break/cont destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
@@ -1892,6 +1894,8 @@ test_labeled_break_nested_loops_tac_ssa(void)
     check_int("labeled break verify errors", hir_context_error_count(ctx), 0);
     check_int("labeled break ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("labeled break tick count",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 7);
 
     check_int("labeled break destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
