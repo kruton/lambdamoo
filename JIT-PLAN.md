@@ -466,9 +466,14 @@ Completed in the first native-code milestone:
 * fork and suspension deoptimization boundaries (`HIR_TAC_DEOPT`) modeling time
   expressions, argument stacks, and exact bytecode resume anchors, ensuring
   native execution materializes every continuation field required by serialized
-  activations.
+  activations; and
+* length expression (`$`, `EXPR_LENGTH`) lowering in indexed (`expr[$]`) and range
+  (`expr[from..$]`) contexts, maintaining context-sensitive base value tracking
+  and native length extraction.
 
-The next reviewable compiler milestone is:
+The next reviewable compiler milestones are:
 
-1. End-to-end integration and verification of the full JIT compiler pipeline
-   across all supported LambdaMOO language constructs.
+1. Lower optional, default, and rest scatter destructuring assignments (`{a, ?b = default, @rest} = expr`) with exact deoptimization boundaries.
+2. Integrate WAIF type (`TYPE_WAIF`) references and properties safely across HIR lowering and native frames.
+3. Expand native fast-path lowering and inlining for pure, continuation-free built-in functions.
+4. End-to-end multi-verb benchmark and differential validation across complex MOO database suites.
