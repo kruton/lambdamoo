@@ -428,11 +428,12 @@ Completed in the first native-code milestone:
   carry source lines without adding location stores to tick hot paths;
 * guarded integer locals whose values enter through the runtime environment; and
 * checked native list and argument-list indexing with bounds checking and
-  element-type guards; and
+  either element-type guards or a runtime type tag for values whose type cannot
+  be inferred statically; and
 * list destructuring (scatter assignment) and list construction/splicing lowered
   to TAC/SSA with bytecode anchors and native destructuring execution, including
-  one trailing optional item with a lazily evaluated default; rest scatter,
-  multiple optionals, and untyped elements retain exact interpreter fallback;
+  trailing optional items with lazily evaluated defaults; rest scatter and
+  optionals without explicit defaults retain exact interpreter fallback;
 * deopt-before-call boundaries for built-in functions with seamless runtime state
   handoff at `OP_BI_FUNC_CALL`; and
 * direct native inlining for pure continuation-free built-ins (`abs()`, `min()`,
@@ -557,14 +558,12 @@ in native code; 213 (66.56%) deoptimize. The emergency workload suspends before
 finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
-* 81 `arithmetic_type` deopts (38.03%), including statically untyped scatter
-  elements as well as the remaining arithmetic sites;
-  string type backward through concatenation into indexed operands;
-* 57 entry or local `type_guard_failure` deopts (26.76%), down from 227 after
+* 28 `arithmetic_type` deopts (13.15%);
+* 58 entry or local `type_guard_failure` deopts (27.23%), down from 227 after
   separating compiler-only locals from VM locals and preserving `TYPE_NONE`
   for user-local entry values before consumer-driven inference;
-* 33 `unsupported_operation` deopts (15.49%);
-* 25 `property_read` deopts (11.74%);
+* 76 `unsupported_operation` deopts (35.68%);
+* 34 `property_read` deopts (15.96%);
 * 6 `range_operation` deopts (2.82%);
 * 7 `builtin_call` deopts (3.29%); and
 * 4 `verb_call` deopts (1.88%).
@@ -581,11 +580,11 @@ values. It now preserves their entry type as `TYPE_NONE` and reaches the exact
 scatter boundary at line 8/PC 22 before deoptimizing.
 
 Trailing optional scatter defaults now have native list-shape control flow and
-lazy default evaluation. The hot `#52:has_callable_verb` case still exits at
-its scatter anchor because `verbname` has no statically known type before the
-following unconditional built-in boundary. Moving that mixed-type case further
-requires tagged scatter-element SSA values; weakening its element guard would
-mis-materialize deoptimization state.
+lazy default evaluation. Indexed elements whose type cannot be inferred carry
+their runtime tag through SSA copies and deoptimization maps. Consequently, the
+hot `#52:has_callable_verb` case now passes its scatter anchor and exits at its
+later unsupported operation on line 6/PC 30 with `verbname` reconstructed as a
+string. Multiple trailing optionals with explicit defaults are also lowered.
 
 Reproduce the census from the repository root with a JIT-enabled build using:
 
@@ -614,33 +613,29 @@ The next reviewable compiler milestones, in priority order, are:
 1. Finish reducing the remaining `arithmetic_type` runtime category. Backward
    string inference through concatenation has removed the indexed-access
    failures in `#59:verbname_match`; next classify the remaining 28 sites and
-   use a precise element guard or tagged result where an indexed value cannot
-   be inferred from its consumers.
-2. Split and reduce the remaining 59 type-guard failures. Report the guarded
+   lower the most frequent type-safe case.
+2. Split and reduce the remaining 58 type-guard failures. Report the guarded
    local slot plus expected and actual type, then distinguish true argument
    specialization failures from inert entry-state values. Do not weaken guards
    for values that can be semantically read before assignment.
-3. Add tagged SSA values for mixed-type scatter and indexed results, then use
-   them to finish optional scatter and remove the remaining scatter element
-   guards without weakening deoptimization state reconstruction.
-4. Classify the 33 unsupported-operation sites by operation and call-site
+3. Classify the 76 unsupported-operation sites by operation and call-site
    frequency. Lower the highest-frequency continuation-free operation first,
    retaining exact bytecode anchors and deopt state for everything else.
-5. Define declarative built-in effect metadata (pure, may raise, may allocate,
+4. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-6. Make code-unit identity explicit in native entry and deoptimization maps,
+5. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-7. Add profile-guided, semantics-preserving optimization only after the wider
+6. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-8. Finish with database-scale validation and performance work: multi-verb and
+7. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
