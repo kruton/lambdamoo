@@ -3303,6 +3303,9 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_GT:
     case HIR_OP_GE:
     case HIR_OP_IN:
+    case HIR_OP_TICKS_LEFT:
+    case HIR_OP_SECONDS_LEFT:
+    case HIR_OP_TIME:
 	return 1;
     default:
 	return 0;
@@ -3421,7 +3424,8 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_LENGTH);
 	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
-	    || instr->op == HIR_OP_TYPEOF)
+	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_TICKS_LEFT
+	    || instr->op == HIR_OP_SECONDS_LEFT || instr->op == HIR_OP_TIME)
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
@@ -3797,7 +3801,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->value] = TYPE_LIST;
 			value_types_known[si->value] = 1;
 		    } else if (si->op == HIR_OP_NOT || si->op == HIR_OP_TYPEOF
-			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH) {
+			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH
+			       || si->op == HIR_OP_ABS || si->op == HIR_OP_TICKS_LEFT
+			       || si->op == HIR_OP_SECONDS_LEFT || si->op == HIR_OP_TIME) {
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
 		    }
@@ -4756,6 +4762,12 @@ op_name(HIROp op)
 	return "SCATTER";
     case HIR_OP_CHARGE_TICK:
 	return "CHARGE_TICK";
+    case HIR_OP_TICKS_LEFT:
+	return "TICKS_LEFT";
+    case HIR_OP_SECONDS_LEFT:
+	return "SECONDS_LEFT";
+    case HIR_OP_TIME:
+	return "TIME";
     }
 
     return "?";
@@ -6692,6 +6704,29 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	{
 	    const char *func_name = name_func_by_num(expr->u.call.func);
 	    HIRArg *args = expr->u.call.args;
+
+	    if (func_name && (!strcmp(func_name, "ticks_left")
+			      || !strcmp(func_name, "seconds_left")
+			      || !strcmp(func_name, "time"))
+		&& !args) {
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
+		append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+		tac->dst = dst_temp;
+		tac->src1 = 0;
+		if (!strcmp(func_name, "ticks_left"))
+		    tac->op = HIR_OP_TICKS_LEFT;
+		else if (!strcmp(func_name, "seconds_left"))
+		    tac->op = HIR_OP_SECONDS_LEFT;
+		else
+		    tac->op = HIR_OP_TIME;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		push_lower_stack(ctx, dst_temp);
+		return dst_temp;
+	    }
 
 	    if (func_name && (!strcmp(func_name, "abs")
 			      || !strcmp(func_name, "toint")

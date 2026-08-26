@@ -3009,12 +3009,18 @@ bf_read(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     return make_suspend_pack(make_reading_task, &connection);
 }
 
+int
+current_task_seconds_left(void)
+{
+    return timer_wakeup_interval(task_alarm_id);
+}
+
 static package
 bf_seconds_left(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr UNUSED_)
 {
     Var r;
     r.type = TYPE_INT;
-    r.v.num = timer_wakeup_interval(task_alarm_id);
+    r.v.num = current_task_seconds_left();
     free_var(arglist);
     return make_var_pack(r);
 }

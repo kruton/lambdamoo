@@ -1,4 +1,5 @@
 #include "db.h"
+#include "execute.h"
 #include "functions.h"
 #include "list.h"
 #include "log.h"
@@ -29,6 +30,12 @@ refcount_overhead(Memory_Type type)
     default:
 	return 0;
     }
+}
+
+int
+current_task_seconds_left(void)
+{
+    return 5;
 }
 
 void

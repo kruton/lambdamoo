@@ -2716,6 +2716,24 @@ main(void)
 	      "abs returned wrong value");
 	jit_program_free(abs_p);
 
+	JITProgram *ticks_left_p = unary_program(0, HIR_OP_TICKS_LEFT);
+	ticks = 37;
+	check(jit_program_execute(ticks_left_p, env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "ticks_left execution failed");
+	check(result.type == TYPE_INT && result.v.num == 37,
+	      "ticks_left returned wrong value");
+	jit_program_free(ticks_left_p);
+
+	JITProgram *seconds_left_p = unary_program(0, HIR_OP_SECONDS_LEFT);
+	ticks = 10;
+	check(jit_program_execute(seconds_left_p, env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "seconds_left execution failed");
+	check(result.type == TYPE_INT && result.v.num == 5,
+	      "seconds_left returned wrong value");
+	jit_program_free(seconds_left_p);
+
 	JITProgram *min_p = binary_program(10, 20, HIR_OP_MIN);
 	ticks = 10;
 	check(jit_program_execute(min_p, env, &result, &ticks, &timed_out,

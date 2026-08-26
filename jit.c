@@ -255,6 +255,18 @@ jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
     return 1;
 }
 
+int64_t
+jit_rt_seconds_left(void)
+{
+    return (int64_t) current_task_seconds_left();
+}
+
+int64_t
+jit_rt_time(void)
+{
+    return (int64_t) time(0);
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *);
 
@@ -280,6 +292,10 @@ typedef struct {
     MIR_item_t import_list_in;
     MIR_item_t proto_get_prop;
     MIR_item_t import_get_prop;
+    MIR_item_t proto_seconds_left;
+    MIR_item_t import_seconds_left;
+    MIR_item_t proto_time;
+    MIR_item_t import_time;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -584,6 +600,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_list_append", (void *) jit_rt_list_append);
     MIR_load_external(build->context, "jit_rt_list_in", (void *) jit_rt_list_in);
     MIR_load_external(build->context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
+    MIR_load_external(build->context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
+    MIR_load_external(build->context, "jit_rt_time", (void *) jit_rt_time);
 
     build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
 					 MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -623,6 +641,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  MIR_T_I64, "oid", MIR_T_P, "pname", MIR_T_I64, "progr",
 					  MIR_T_P, "out_raw", MIR_T_P, "out_type", MIR_T_P, "err");
     build->import_get_prop = MIR_new_import(build->context, "jit_rt_get_prop");
+
+    build->proto_seconds_left = MIR_new_proto(build->context, "proto_seconds_left", 1, &res_i64, 0);
+    build->import_seconds_left = MIR_new_import(build->context, "jit_rt_seconds_left");
+
+    build->proto_time = MIR_new_proto(build->context, "proto_time", 1, &res_i64, 0);
+    build->import_time = MIR_new_import(build->context, "jit_rt_time");
 
     build->function = MIR_new_func(build->context, "jit_verb", 1,
 				   &result_type, 8,
@@ -837,7 +861,27 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  status, common_return);
 			break;
 		    }
-		    if (instr->op == HIR_OP_TOINT) {
+		    if (instr->op == HIR_OP_TICKS_LEFT) {
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+					  MIR_new_reg_op(build->context,
+							 values[instr->value]),
+					  MIR_new_mem_op(build->context, MIR_T_I32,
+							 0, ticks, 0, 1)));
+		    } else if (instr->op == HIR_OP_SECONDS_LEFT) {
+			append(build, MIR_new_call_insn(build->context, 3,
+				MIR_new_ref_op(build->context,
+					       build->proto_seconds_left),
+				MIR_new_ref_op(build->context,
+					       build->import_seconds_left),
+				MIR_new_reg_op(build->context,
+					       values[instr->value])));
+		    } else if (instr->op == HIR_OP_TIME) {
+			append(build, MIR_new_call_insn(build->context, 3,
+				MIR_new_ref_op(build->context, build->proto_time),
+				MIR_new_ref_op(build->context, build->import_time),
+				MIR_new_reg_op(build->context,
+					       values[instr->value])));
+		    } else if (instr->op == HIR_OP_TOINT) {
 			int val_fl = program->value_types
 			    && program->value_types[instr->value] == TYPE_FLOAT;
 			int src_fl = program->value_types

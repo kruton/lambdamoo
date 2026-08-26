@@ -139,6 +139,7 @@ Var *reorder_rt_env(Var * old_rt_env, const char **old_names,
 		    unsigned old_size, Program * prog);
 extern void write_activ(activation a, int which_vector);
 extern int read_activ(activation * a, int which_vector);
+extern int current_task_seconds_left(void);
 
 #endif		/* !Execute_H */
 
