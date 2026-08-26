@@ -3674,7 +3674,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     HIRSSABlock *ssa_block;
     var_type *value_types;
     unsigned char *value_types_known;
-    int invalid_value_types = 0;
+    const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
 
@@ -3781,7 +3781,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			    types_changed = 1;
 			} else if (value_types[copy->dst]
 				   != value_types[copy->src])
-			    invalid_value_types = 1;
+			    value_type_diagnostic = "value-types: parallel-copy type conflict";
 		    }
 		if (si->kind == HIR_TAC_UNARY
 		    && (si->op == HIR_OP_NEGATE || si->op == HIR_OP_ABS)
@@ -3791,13 +3791,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    var_type inferred = value_types[si->src1];
 
 		    if (inferred != TYPE_INT && inferred != TYPE_FLOAT)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: unary numeric operand conflict";
 		    else if (!value_types_known[si->value]) {
 			value_types[si->value] = inferred;
 			value_types_known[si->value] = 1;
 			types_changed = 1;
 		    } else if (value_types[si->value] != inferred)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: unary numeric result conflict";
 		}
 		if (si->kind == HIR_TAC_BINARY
 		    && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
@@ -3829,7 +3829,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
 			    inferred = TYPE_FLOAT;
 			else if (t1 != TYPE_INT || t2 != TYPE_INT) {
-			    invalid_value_types = 1;
+			    value_type_diagnostic = "value-types: arithmetic operand conflict";
 			    valid = 0;
 			}
 			if (valid && !value_types_known[si->value]) {
@@ -3837,7 +3837,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			    value_types_known[si->value] = 1;
 			    types_changed = 1;
 			} else if (valid && value_types[si->value] != inferred)
-			    invalid_value_types = 1;
+			    value_type_diagnostic = "value-types: arithmetic result conflict";
 		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
@@ -3863,7 +3863,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			types_changed = 1;
 		    } else if (src1_known && src2_known
 			       && value_types[si->src1] != value_types[si->src2])
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: equality operand conflict";
 		}
 		if (si->kind == HIR_TAC_BINARY
 		    && (si->op == HIR_OP_LT || si->op == HIR_OP_LE
@@ -3887,7 +3887,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			types_changed = 1;
 		    } else if (src1_known && src2_known
 			       && value_types[si->src1] != value_types[si->src2])
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: comparison operand conflict";
 		}
 		if (si == ssa_block->last)
 		    break;
@@ -3906,7 +3906,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if (operand > 0 && operand < program->num_values) {
 		if (value_types_known[operand]
 		    && value_types[operand] != TYPE_LIST)
-		    invalid_value_types = 1;
+		    value_type_diagnostic = "value-types: list operand conflict";
 		else {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
@@ -3919,7 +3919,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (object > 0 && object < program->num_values) {
 		    if (value_types_known[object]
 			&& value_types[object] != TYPE_OBJ)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: property object conflict";
 		    else {
 			value_types[object] = TYPE_OBJ;
 			value_types_known[object] = 1;
@@ -3928,7 +3928,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (property > 0 && property < program->num_values) {
 		    if (value_types_known[property]
 			&& value_types[property] != TYPE_STR)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: property name conflict";
 		    else {
 			value_types[property] = TYPE_STR;
 			value_types_known[property] = 1;
@@ -3943,7 +3943,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (base > 0 && base < program->num_values) {
 		    if (value_types_known[base]
 			&& value_types[base] != TYPE_LIST)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: index-store base conflict";
 		    else {
 			value_types[base] = TYPE_LIST;
 			value_types_known[base] = 1;
@@ -3952,7 +3952,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (index > 0 && index < program->num_values) {
 		    if (value_types_known[index]
 			&& value_types[index] != TYPE_INT)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: index-store index conflict";
 		    else {
 			value_types[index] = TYPE_INT;
 			value_types_known[index] = 1;
@@ -3966,7 +3966,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (rhs > 0 && rhs < program->num_values) {
 		    if (value_types_known[rhs]
 			&& value_types[rhs] != TYPE_LIST)
-			invalid_value_types = 1;
+			value_type_diagnostic = "value-types: scatter rhs conflict";
 		    else {
 			value_types[rhs] = TYPE_LIST;
 			value_types_known[rhs] = 1;
@@ -4014,12 +4014,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
-    if (invalid_value_types) {
+    if (value_type_diagnostic) {
 	myfree(value_types_known, M_PROGRAM);
 	myfree(value_types, M_PROGRAM);
 	jit_program_free(program);
 	return jit_program_unsupported_with_diagnostic("unsupported-value-types",
-						       "value-types: invalid type tag in inferred value types");
+						       value_type_diagnostic);
     }
 #if FLOATING_TYPE != FT_DOUBLE || FLOATS_ARE_BOXED
     for (i = 1; i < program->num_values; i++)
