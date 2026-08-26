@@ -648,14 +648,16 @@ call_verb_program(void)
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *load_obj = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *load_verb = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
     JITDeoptMap *map;
 
     program->state = JIT_STATE_PENDING;
     program->reason = "none";
     program->eligible = 1;
-    program->num_values = 4;
-    program->num_vars = 2;
+    program->num_values = 5;
+    program->num_vars = 3;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
     program->deopt_maps = myrealloc(program->deopt_maps,
@@ -664,14 +666,28 @@ call_verb_program(void)
     memset(map, 0, sizeof(JITDeoptMap));
     program->num_deopt_maps = 2;
     map->bytecode_pc = map->error_pc = 30;
-    map->stack_depth = 0;
-    map->ticks_charged = 0;
-    map->num_locals = 2;
-    map->local_values = allocate(sizeof(int) * 2);
+    map->stack_depth = 3;
+    map->ticks_charged = 1;
+    map->num_locals = 3;
+    map->local_values = allocate(sizeof(int) * 3);
+    map->local_types = allocate(sizeof(var_type) * 3);
     map->local_values[0] = 1;
     map->local_values[1] = 2;
+    map->local_values[2] = 3;
+    map->local_types[0] = TYPE_OBJ;
+    map->local_types[1] = TYPE_STR;
+    map->local_types[2] = TYPE_LIST;
+    map->stack_values = allocate(sizeof(int) * 3);
+    map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_types[0] = TYPE_OBJ;
+    map->stack_types[1] = TYPE_STR;
+    map->stack_types[2] = TYPE_LIST;
     load_obj->literal_type = TYPE_OBJ;
     load_verb->literal_type = TYPE_STR;
+    load_args->literal_type = TYPE_LIST;
 
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -680,8 +696,13 @@ call_verb_program(void)
     load_obj->next = load_verb;
     load_verb->value = 2;
     load_verb->local_id = 1;
-    load_verb->next = call_verb;
-    call_verb->value = 3;
+    load_verb->next = load_args;
+    load_args->value = 3;
+    load_args->local_id = 2;
+    load_args->next = tick;
+    tick->bytecode_pc = 30;
+    tick->next = call_verb;
+    call_verb->value = 4;
     call_verb->src1 = 1;
     call_verb->src2 = 2;
     call_verb->deopt_map = 1;
@@ -909,8 +930,9 @@ main(void)
     JITProgram *bit_or = binary_program(0x55, 0x0f, HIR_OP_BITOR);
     JITProgram *scatter = scatter_destructure_program();
     Var env[1];
-    Var deep_env[2];
+    Var deep_env[3];
     Var deopt_stack[4];
+    Var call_args[1];
     Var list_elems[3];
     Var result;
     int ticks = 10;
@@ -1244,11 +1266,26 @@ main(void)
 	deep_env[0].v.obj = 0;
 	deep_env[1].type = TYPE_STR;
 	deep_env[1].v.str = "test";
+	call_args[0].type = TYPE_INT;
+	call_args[0].v.num = 0;
+	deep_env[2].type = TYPE_LIST;
+	deep_env[2].v.list = call_args;
 	ticks = 10;
 	check(jit_program_execute(call_prog, deep_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, deopt_stack)
 	      == JIT_RUN_FALLBACK, "call_verb did not return fallback");
-	check(ticks == 10, "call_verb consumed ticks on fallback");
+	check(ticks == 9 && deopt.ticks_charged == 1,
+	      "call_verb reported the wrong charged tick count");
+	check(deopt.bytecode_pc == 30, "call_verb wrong bytecode_pc");
+	check(deopt.stack_depth == 3, "call_verb wrong stack depth");
+	check(deopt_stack[0].type == TYPE_OBJ && deopt_stack[0].v.obj == 0,
+	      "call_verb wrong object stack value");
+	check(deopt_stack[1].type == TYPE_STR
+	      && !strcmp(deopt_stack[1].v.str, "test"),
+	      "call_verb wrong verb stack value");
+	check(deopt_stack[2].type == TYPE_LIST
+	      && deopt_stack[2].v.list[0].v.num == 0,
+	      "call_verb wrong argument stack value");
 	jit_program_free(call_prog);
     }
 

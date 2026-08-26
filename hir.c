@@ -3472,7 +3472,8 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->stack_depth = instr->num_stack_values;
     map->ticks_charged = instr->kind == HIR_TAC_UNARY
 	|| instr->kind == HIR_TAC_BINARY
-	|| instr->kind == HIR_TAC_BRANCH_FALSE;
+	|| instr->kind == HIR_TAC_BRANCH_FALSE
+	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
     if (map->num_locals) {
 	map->local_values = mymalloc(sizeof(int) * map->num_locals, M_PROGRAM);
@@ -3891,8 +3892,8 @@ dump_ssa_block_list(FILE *file, HIRCFG *cfg, HIRSSABlock *block,
 		continue;
 	    for (j = 0; j < candidate->num_successors; j++) {
 		if (candidate->successors[j] == cfg_block) {
-			has_edge = 1;
-			break;
+		    has_edge = 1;
+		    break;
 		}
 	    }
 	} else if (cfg_block) {
