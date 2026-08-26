@@ -695,6 +695,22 @@ list_stmt(int id, Expr *iterable, Stmt *body, unsigned lineno)
     return stmt;
 }
 
+static Expr
+cond_expr_ast(Expr *cond, Expr *consequent, Expr *alternate, unsigned lineno)
+{
+    Expr expr;
+
+    memset(&expr, 0, sizeof(expr));
+    expr.kind = EXPR_COND;
+    expr.lineno = lineno;
+    expr.bytecode_pc = NO_BYTECODE_PC;
+    expr.e.cond.condition = cond;
+    expr.e.cond.consequent = consequent;
+    expr.e.cond.alternate = alternate;
+
+    return expr;
+}
+
 static void
 test_loop_dominator_tree(void)
 {
@@ -1647,6 +1663,48 @@ test_for_list_loop_tac_ssa(void)
 }
 
 static void
+test_cond_expr_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /* x = 1 > 0 ? 10 | 20; return x; */
+    Expr one = int_expr(1, 10);
+    Expr zero = int_expr(0, 10);
+    Expr cond = binary_expr(EXPR_GT, &one, &zero);
+    Expr ten = int_expr(10, 10);
+    Expr twenty = int_expr(20, 10);
+    Expr ternary = cond_expr_ast(&cond, &ten, &twenty, 10);
+    Expr x_lhs = id_expr(1, 10);
+    Expr assign = binary_expr(EXPR_ASGN, &x_lhs, &ternary);
+    Stmt assign_stmt = expr_stmt(&assign);
+    Expr x_ret = id_expr(1, 11);
+    Stmt ret = return_stmt(&x_ret);
+
+    assign_stmt.next = &ret;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &assign_stmt, &ctx, &cfg, &dom, &ssa);
+
+    check_int("cond expr tac not null", tac != 0, 1);
+    check_int("cond expr verify errors", hir_context_error_count(ctx), 0);
+    check_int("cond expr branch false count",
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
+    check_int("cond expr jump count",
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
+    check_int("cond expr ssa phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 1, 1);
+
+    check_int("cond expr destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_cfg_critical_edge_splitting(void)
 {
     Names names;
@@ -1919,6 +1977,7 @@ main(void)
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
     test_for_list_loop_tac_ssa();
+    test_cond_expr_tac_ssa();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
     test_loop_ssa_destruction();
