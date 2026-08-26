@@ -474,81 +474,87 @@ Completed in the first native-code milestone:
   across values, errors, source locations, ticks, full deoptimization state (including
   bytecode PCs and runtime operand stacks), reference ownership, nested control flow,
   forced fallbacks across all supported boundaries, and repeated-execution smoke
-  coverage.
+  coverage; and
+* actionable JIT rejection diagnostics exposed through `verb_info(..., 1)`, plus
+  `tests/census.sh` for aggregating top-level reasons and detailed diagnostics
+  across Opal.db without modifying the source database; and
+* SSA construction fixes for unreachable dead code, unreachable phi inputs, and
+  folded-phi ordering, eliminating the `invalid-ir` category from Opal.db without
+  adding synthetic tick charges to structural SSA blocks.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 422 (6.68%) are JIT-eligible, 3,583 report `unsupported-program`, 1,913
-report `invalid-bytecode-anchor`, 382 report `invalid-ir`, and 19 report
-`unsupported-value-types`. These top-level reasons are mutually exclusive but
-too coarse to select individual lowering work, so the next milestones first
-improve rejection diagnostics and address failures in the existing supported
-subset.
+these, 429 (6.79%) are JIT-eligible, 3,897 report `unsupported-program`, 1,974
+report `invalid-bytecode-anchor`, and 19 report `unsupported-value-types`; no
+verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
+the detailed census identifies the highest-frequency blockers:
 
-Reproduce the top-level census from the repository root with a JIT-enabled
-build using:
+* 2,852 `ssa-support: list constant` rejections;
+* 508 `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections;
+* 412 unsupported non-local assignments;
+* 125 optional/rest scatter rejections; and
+* 1,974 bytecode-anchor failures, dominated by 1,011 singleton-list operations
+  anchored at `OP_CALL_VERB`, 515 anchored at `OP_BI_FUNC_CALL`, and 294
+  splice-check operations anchored at those two call opcodes.
+
+Counts describe the first reported failure in each verb. Fixing one category may
+expose a later rejection, so the census must be rerun after every milestone.
+
+Reproduce the census from the repository root with a JIT-enabled build using:
 
 ```sh
-audit_dir=$(mktemp -d /tmp/opal-jit-census.XXXXXX)
-cp Opal.db "$audit_dir/input.db"
-printf '%s\n' \
-  ';; total = eligible = 0; reasons = {}; counts = {}; for o in [#0..max_object()]; if (valid(o)); vs = verbs(o); for i in [1..length(vs)]; info = verb_info(o, i, 1); total = total + 1; meta = info[4]; if (meta[2][2]); eligible = eligible + 1; endif; reason = meta[6][2]; ri = reason in reasons; if (ri); counts[ri] = counts[ri] + 1; else; reasons = {@reasons, reason}; counts = {@counts, 1}; endif; endfor; endif; endfor; return {total, eligible, reasons, counts};' \
-  'quit' \
-  | ./moo -e -l "$audit_dir/census.log" \
-      "$audit_dir/input.db" "$audit_dir/output.db"
+./tests/census.sh Opal.db ./moo
 ```
 
-The returned value is
-`{total, eligible, reason_names, corresponding_reason_counts}`. Numeric verb
-descriptors avoid ambiguity from aliases or overlapping verb names. The server
-may require permission to create its listening socket even though the census
-uses emergency mode and makes no network connections.
+The optional arguments select another database and server binary. The script
+uses numeric verb descriptors to avoid ambiguity from aliases or overlapping
+verb names and removes its temporary output database on exit. The server may
+require permission to create its listening socket even though the census uses
+emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Make JIT rejection reasons actionable. Replace the coarse `invalid-ir`,
-   `invalid-bytecode-anchor`, and `unsupported-program` results with diagnostics
-   that identify the failing verifier or pass, TAC operation, expected and
-   actual bytecode opcode, and unsupported AST/HIR construct. Add an automated
-   Opal.db census that reports both the top-level reasons and these detailed
-   categories without modifying the source database.
-2. Investigate and correct the `invalid-ir` population before expanding the
-   supported language. In the current Opal.db census this is 382 of 6,319 verbs.
-   Each fix should include a minimized source-level regression test and retain
-   all TAC, CFG, SSA, and out-of-SSA verifier checks; cases that are intentionally
-   unsupported should be reclassified instead of reported as invalid IR.
-3. Investigate and correct bytecode-anchor failures, ranked by failing operation
-   and opcode pattern. The current census reports 1,913 verbs in this category,
-   making it the largest potentially recoverable group. Distinguish incorrect
-   AST anchors, synthetic HIR operations that need explicit anchor rules, and
-   operations that should deoptimize rather than validate as native. Re-run the
-   corpus census after each reviewable group of fixes.
-4. Split `unsupported-program` into feature-specific counts and choose the next
-   language-coverage work from measured frequency. Membership (`in`) and
-   optional, default, and rest scatter assignments
-   (`{a, ?b = default, @rest} = expr`) remain likely candidates, but should be
-   prioritized using the corpus results. Lower each feature in separate commits
-   with exact evaluation order, errors, ticks, ownership, and deoptimization
-   stacks.
-5. Add shared, ownership-audited runtime helpers for complex-value semantics,
+1. Support ownership-correct list constants, currently the first rejection for
+   2,852 verbs. Distinguish the empty list used for argument and exception-code
+   construction from persistent literal lists, and ensure native return,
+   deoptimization, and program teardown each retain or release the constant
+   exactly once.
+2. Correct argument-list bytecode anchors. Use the normalized census categories
+   to fix singleton-list (`HIR_OP_MAKE_SINGLETON_LIST`) and splice-check
+   (`HIR_OP_CHECK_LIST_FOR_SPLICE`) instructions whose enclosing synthetic list
+   currently carries a call opcode anchor. Preserve per-argument tick and
+   deoptimization stack state.
+3. Add membership (`HIR_OP_IN`), currently the first unsupported operation for
+   508 verbs, using interpreter-equivalent equality, error, tick, and ownership
+   semantics for strings and lists. Use a runtime helper and deoptimize types
+   whose membership semantics are not yet modeled safely.
+4. Classify and lower the 412 unsupported non-local assignments by left-hand
+   side shape. Implement the most frequent missing assignment form first and
+   retain interpreter evaluation order, mutation ownership, errors, and bytecode
+   anchors; keep uncommon or unsafe forms as explicit deoptimization boundaries.
+5. Lower optional, default, and rest scatter assignments
+   (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
+   verbs, in separate reviewable steps with exact default-expression evaluation,
+   errors, ticks, ownership, and deoptimization stacks.
+6. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
    identity out of language equality, truth, and ordering semantics, and test
    every helper on success, error, and deoptimization paths.
-6. Make code-unit identity explicit in native entry and deoptimization maps,
+7. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-7. Define declarative built-in effect metadata (pure, may raise, may allocate,
+8. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-8. Add profile-guided, semantics-preserving optimization only after the wider
+9. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-9. Finish with database-scale validation and performance work: multi-verb and
+10. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
