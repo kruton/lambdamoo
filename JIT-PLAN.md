@@ -480,21 +480,23 @@ Completed in the first native-code milestone:
   across Opal.db without modifying the source database; and
 * SSA construction fixes for unreachable dead code, unreachable phi inputs, and
   folded-phi ordering, eliminating the `invalid-ir` category from Opal.db without
-  adding synthetic tick charges to structural SSA blocks.
+  adding synthetic tick charges to structural SSA blocks; and
+* ownership-correct empty and persistent list constants, with JIT-program
+  references retained across repeated native execution and released at program
+  teardown.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 429 (6.79%) are JIT-eligible, 3,897 report `unsupported-program`, 1,974
-report `invalid-bytecode-anchor`, and 19 report `unsupported-value-types`; no
+these, 553 (8.75%) are JIT-eligible, 4,204 report `invalid-bytecode-anchor`,
+1,541 report `unsupported-program`, and 21 report `unsupported-value-types`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
-* 2,852 `ssa-support: list constant` rejections;
-* 508 `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections;
+* zero `ssa-support: list constant` rejections, down from 2,852;
+* 1,004 `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections;
 * 412 unsupported non-local assignments;
 * 125 optional/rest scatter rejections; and
-* 1,974 bytecode-anchor failures, dominated by 1,011 singleton-list operations
-  anchored at `OP_CALL_VERB`, 515 anchored at `OP_BI_FUNC_CALL`, and 294
-  splice-check operations anchored at those two call opcodes.
+* 4,204 bytecode-anchor failures, including 2,230 singleton-list and 1,139
+  splice-check anchor mismatches reported by the normalized census.
 
 Counts describe the first reported failure in each verb. Fixing one category may
 expose a later rejection, so the census must be rerun after every milestone.
@@ -516,8 +518,8 @@ The next reviewable compiler milestones, in dependency order, are:
 1. Correct argument-list bytecode anchors. Use the normalized census categories
    to fix singleton-list (`HIR_OP_MAKE_SINGLETON_LIST`) and splice-check
    (`HIR_OP_CHECK_LIST_FOR_SPLICE`) instructions whose enclosing synthetic list
-   currently carries a call opcode anchor (e.g. 2,230 `pc * op 25` and 1,139 `pc * op 25`
-   anchor mismatches). Preserve per-argument tick and deoptimization stack state.
+   currently carries a call opcode anchor. Preserve per-argument tick and
+   deoptimization stack state.
 2. Add membership (`HIR_OP_IN`), currently the first unsupported operation for
    1,004 verbs, using interpreter-equivalent equality, error, tick, and ownership
    semantics for strings and lists. Use a runtime helper and deoptimize types
@@ -530,26 +532,26 @@ The next reviewable compiler milestones, in dependency order, are:
    (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.
-6. Add shared, ownership-audited runtime helpers for complex-value semantics,
+5. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
    identity out of language equality, truth, and ordering semantics, and test
    every helper on success, error, and deoptimization paths.
-7. Make code-unit identity explicit in native entry and deoptimization maps,
+6. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-8. Define declarative built-in effect metadata (pure, may raise, may allocate,
+7. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-9. Add profile-guided, semantics-preserving optimization only after the wider
+8. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-10. Finish with database-scale validation and performance work: multi-verb and
+9. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
