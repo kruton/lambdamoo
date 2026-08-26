@@ -1573,6 +1573,140 @@ list_index_tagged_deopt_program(void)
 }
 
 static JITProgram *
+list_index_tagged_base_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_outer = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_one = instruction(HIR_TAC_CONST);
+    JITInstruction *load_base = instruction(HIR_TAC_BINARY);
+    JITInstruction *const_two = instruction(HIR_TAC_CONST);
+    JITInstruction *load_index = instruction(HIR_TAC_BINARY);
+    JITInstruction *load_value = instruction(HIR_TAC_BINARY);
+    JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->num_values = 7;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 7);
+    program->value_is_tagged = allocate(7);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[4] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[5] = 1;
+    program->value_is_tagged[6] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 6;
+    map->stack_types[0] = TYPE_ANY;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_outer->value = 1;
+    load_outer->local_id = 0;
+    load_outer->literal_type = TYPE_LIST;
+    load_outer->next = const_one;
+    const_one->value = 2;
+    const_one->literal = 1;
+    const_one->literal_type = TYPE_INT;
+    const_one->next = load_base;
+    load_base->value = 3;
+    load_base->src1 = 1;
+    load_base->src2 = 2;
+    load_base->op = HIR_OP_INDEX;
+    load_base->next = const_two;
+    const_two->value = 4;
+    const_two->literal = 2;
+    const_two->literal_type = TYPE_INT;
+    const_two->next = load_index;
+    load_index->value = 5;
+    load_index->src1 = 1;
+    load_index->src2 = 4;
+    load_index->op = HIR_OP_INDEX;
+    load_index->next = load_value;
+    load_value->value = 6;
+    load_value->src1 = 3;
+    load_value->src2 = 5;
+    load_value->op = HIR_OP_INDEX;
+    load_value->next = deopt;
+    deopt->deopt_map = 1;
+    block->first = load_outer;
+    block->last = deopt;
+    return program;
+}
+
+static JITProgram *
+list_index_tagged_consumer_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *rhs_instr = instruction(op == HIR_OP_IN
+					    ? HIR_TAC_LOAD_LOCAL : HIR_TAC_CONST);
+    JITInstruction *consumer = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 6;
+    program->num_vars = op == HIR_OP_IN ? 2 : 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 6);
+    program->value_is_tagged = allocate(6);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_types[4] = op == HIR_OP_IN ? TYPE_LIST : TYPE_STR;
+    program->value_types[5] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = rhs_instr;
+    rhs_instr->value = 4;
+    if (op == HIR_OP_IN) {
+	rhs_instr->local_id = 1;
+	rhs_instr->literal_type = TYPE_LIST;
+    } else {
+	const char *literal = str_dup("tagged element");
+	rhs_instr->literal = (Num) (intptr_t) literal;
+	rhs_instr->literal_type = TYPE_STR;
+    }
+    rhs_instr->next = consumer;
+    consumer->value = 5;
+    consumer->src1 = 3;
+    consumer->src2 = 4;
+    consumer->op = op;
+    consumer->next = ret;
+    ret->src1 = 5;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 verb_call_boundary_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3249,6 +3383,81 @@ main(void)
 	free_var(tagged_stack[0]);
 	free_var(tagged_env[0]);
 	jit_program_free(tagged);
+    }
+
+    /* Tagged list bases and indexes are guarded before native indexing. */
+    {
+	JITProgram *tagged = list_index_tagged_base_program();
+	Var tagged_env[1];
+	Var tagged_stack[1];
+	Var inner = new_list(1);
+
+	inner.v.list[1].type = TYPE_STR;
+	inner.v.list[1].v.str = str_dup("nested tagged element");
+	tagged_env[0] = new_list(2);
+	tagged_env[0].v.list[1] = inner;
+	tagged_env[0].v.list[2].type = TYPE_INT;
+	tagged_env[0].v.list[2].v.num = 1;
+	memset(tagged_stack, 0, sizeof(tagged_stack));
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt,
+				  tagged_stack) == JIT_RUN_FALLBACK,
+	      "tagged base indexing did not reach deopt boundary");
+	check(tagged_stack[0].type == TYPE_STR
+	      && !strcmp(tagged_stack[0].v.str, "nested tagged element"),
+	      "tagged base indexing reconstructed the wrong value");
+	free_var(tagged_stack[0]);
+	tagged_env[0].v.list[2].type = TYPE_STR;
+	tagged_env[0].v.list[2].v.str = str_dup("not an index");
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer index did not fallback");
+	free_var(tagged_env[0].v.list[2]);
+	tagged_env[0].v.list[2].type = TYPE_INT;
+	tagged_env[0].v.list[2].v.num = 1;
+	free_var(tagged_env[0].v.list[1]);
+	tagged_env[0].v.list[1].type = TYPE_INT;
+	tagged_env[0].v.list[1].v.num = 7;
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-list base did not fallback");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* Equality and membership consume dynamically tagged values natively. */
+    {
+	JITProgram *tagged_eq = list_index_tagged_consumer_program(HIR_OP_EQ);
+	JITProgram *tagged_in = list_index_tagged_consumer_program(HIR_OP_IN);
+	Var tagged_env[2];
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_STR;
+	tagged_env[0].v.list[1].v.str = str_dup("tagged element");
+	tagged_env[1] = new_list(1);
+	tagged_env[1].v.list[1].type = TYPE_STR;
+	tagged_env[1].v.list[1].v.str = str_dup("tagged element");
+	ticks = 10;
+	check(jit_program_execute(tagged_eq, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED && result.type == TYPE_INT
+	      && result.v.num == 1,
+	      "tagged equality returned the wrong value");
+	ticks = 10;
+	check(jit_program_execute(tagged_in, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED && result.type == TYPE_INT
+	      && result.v.num == 1,
+	      "tagged membership returned the wrong value");
+	free_var(tagged_env[0]);
+	free_var(tagged_env[1]);
+	jit_program_free(tagged_eq);
+	jit_program_free(tagged_in);
     }
 
     /* Exception and finally stack marker deoptimization tests */

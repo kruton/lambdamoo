@@ -4289,10 +4289,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    JITInstruction *instr = mymalloc(sizeof(JITInstruction), M_PROGRAM);
 	    int uses_conflicted = (ssa_instr->src1 > 0
 				   && ssa_instr->src1 < program->num_values
-				   && value_types_conflicted[ssa_instr->src1])
+				   && value_types_conflicted[ssa_instr->src1]
+				   && !value_is_tagged[ssa_instr->src1])
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
-		    && value_types_conflicted[ssa_instr->src2]);
+		    && value_types_conflicted[ssa_instr->src2]
+		    && !value_is_tagged[ssa_instr->src2]);
 	    int uses_tagged = (ssa_instr->src1 > 0
 			       && ssa_instr->src1 < program->num_values
 			       && value_is_tagged[ssa_instr->src1])
@@ -4313,10 +4315,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->op = ssa_instr->op;
 	    if (((ssa_instr->src1 > 0
 		  && ssa_instr->src1 < program->num_values
-		  && value_types[ssa_instr->src1] == TYPE_NONE)
+		  && value_types[ssa_instr->src1] == TYPE_NONE
+		  && !value_is_tagged[ssa_instr->src1])
 		 || (ssa_instr->src2 > 0
 		     && ssa_instr->src2 < program->num_values
-		     && value_types[ssa_instr->src2] == TYPE_NONE))
+		     && value_types[ssa_instr->src2] == TYPE_NONE
+		     && !value_is_tagged[ssa_instr->src2]))
 		&& (ssa_instr->kind == HIR_TAC_UNARY
 		    || ssa_instr->kind == HIR_TAC_BINARY
 		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE
@@ -4327,10 +4331,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				    || ssa_instr->kind == HIR_TAC_RETURN
 				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
-	    if (uses_tagged && (ssa_instr->kind == HIR_TAC_UNARY
-			       || ssa_instr->kind == HIR_TAC_BINARY
-			       || ssa_instr->kind == HIR_TAC_RETURN
-			       || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
+	    if (uses_tagged
+		&& !(ssa_instr->kind == HIR_TAC_BINARY
+		     && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
+			 || ssa_instr->op == HIR_OP_IN
+			 || (ssa_instr->op == HIR_OP_INDEX
+			     && ssa_instr->src1 > 0
+			     && value_is_tagged[ssa_instr->src1]
+			     && ssa_instr->src2 > 0
+			     && (value_is_tagged[ssa_instr->src2]
+				 || value_types[ssa_instr->src2] == TYPE_INT))))
+		&& (ssa_instr->kind == HIR_TAC_UNARY
+		    || ssa_instr->kind == HIR_TAC_BINARY
+		    || ssa_instr->kind == HIR_TAC_RETURN
+		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
 		&& value_types_known[ssa_instr->src1]
@@ -4388,7 +4402,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !(ssa_instr->op == HIR_OP_ADD && t1 == TYPE_STR && t2 == TYPE_STR))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
-	    if (ssa_instr->kind == HIR_TAC_BINARY
+	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 		    || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
 		    || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
