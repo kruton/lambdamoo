@@ -3560,17 +3560,30 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types[si->value] = si->literal.type;
 		    value_types_known[si->value] = 1;
 		} else if (si->kind == HIR_TAC_UNARY) {
-		    value_types[si->value] =
-			(si->op == HIR_OP_MAKE_SINGLETON_LIST
-			 || si->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
-			? TYPE_LIST : TYPE_INT;
-		    value_types_known[si->value] = 1;
+		    if (si->op == HIR_OP_MAKE_SINGLETON_LIST
+			|| si->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
+			value_types[si->value] = TYPE_LIST;
+			value_types_known[si->value] = 1;
+		    } else if (si->op == HIR_OP_NOT || si->op == HIR_OP_TYPEOF
+			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH) {
+			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    }
 		} else if (si->kind == HIR_TAC_BINARY) {
-		    value_types[si->value] =
-			(si->op == HIR_OP_LIST_ADD_TAIL
-			 || si->op == HIR_OP_LIST_APPEND)
-			? TYPE_LIST : TYPE_INT;
-		    value_types_known[si->value] = 1;
+		    if (si->op == HIR_OP_LIST_ADD_TAIL
+			|| si->op == HIR_OP_LIST_APPEND) {
+			value_types[si->value] = TYPE_LIST;
+			value_types_known[si->value] = 1;
+		    } else if (si->op == HIR_OP_EQ || si->op == HIR_OP_NE
+			       || si->op == HIR_OP_LT || si->op == HIR_OP_LE
+			       || si->op == HIR_OP_GT || si->op == HIR_OP_GE
+			       || si->op == HIR_OP_IN || si->op == HIR_OP_BITOR
+			       || si->op == HIR_OP_BITXOR || si->op == HIR_OP_BITAND
+			       || si->op == HIR_OP_SHL || si->op == HIR_OP_SHR
+			       || si->op == HIR_OP_LSHR) {
+			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    }
 		}
 	    }
 	    if (si == ssa_block->last)
@@ -3597,6 +3610,47 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				   != value_types[copy->src])
 			    invalid_value_types = 1;
 		    }
+		if (si->kind == HIR_TAC_UNARY
+		    && (si->op == HIR_OP_NEGATE || si->op == HIR_OP_ABS)
+		    && si->value > 0 && si->value < program->num_values
+		    && si->src1 > 0 && si->src1 < program->num_values
+		    && value_types_known[si->src1]) {
+		    var_type inferred = value_types[si->src1];
+		    if (!value_types_known[si->value]) {
+			value_types[si->value] = inferred;
+			value_types_known[si->value] = 1;
+			types_changed = 1;
+		    } else if (value_types[si->value] != inferred)
+			invalid_value_types = 1;
+		}
+		if (si->kind == HIR_TAC_BINARY
+		    && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
+			|| si->op == HIR_OP_MUL || si->op == HIR_OP_DIV
+			|| si->op == HIR_OP_MOD || si->op == HIR_OP_EXP)
+		    && si->value > 0 && si->value < program->num_values) {
+		    int src1_known = si->src1 > 0 && si->src1 < program->num_values && value_types_known[si->src1];
+		    int src2_known = si->src2 > 0 && si->src2 < program->num_values && value_types_known[si->src2];
+
+		    if (src1_known || src2_known) {
+			var_type t1 = src1_known ? value_types[si->src1] : TYPE_INT;
+			var_type t2 = src2_known ? value_types[si->src2] : TYPE_INT;
+			var_type inferred;
+
+			if (t1 == TYPE_FLOAT || t2 == TYPE_FLOAT)
+			    inferred = TYPE_FLOAT;
+			else if (si->op == HIR_OP_ADD && t1 == TYPE_OBJ)
+			    inferred = TYPE_OBJ;
+			else
+			    inferred = TYPE_INT;
+
+			if (!value_types_known[si->value]) {
+			    value_types[si->value] = inferred;
+			    value_types_known[si->value] = 1;
+			    types_changed = 1;
+			} else if (value_types[si->value] != inferred)
+			    invalid_value_types = 1;
+		    }
+		}
 		if (si == ssa_block->last)
 		    break;
 	    }
@@ -3724,7 +3778,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		: (ssa_instr->kind == HIR_TAC_LOAD_LOCAL
 		   && ssa_instr->value > 0
 		   && ssa_instr->value < program->num_values
-		   ? value_types[ssa_instr->value] : TYPE_INT);
+		   ? value_types[ssa_instr->value]
+		   : (ssa_instr->kind == HIR_TAC_RETURN
+		      && ssa_instr->src1 > 0
+		      && ssa_instr->src1 < program->num_values
+		      ? value_types[ssa_instr->src1] : TYPE_INT));
 	    if (ssa_instr->kind == HIR_TAC_CONST) {
 		if (ssa_instr->literal.type == TYPE_STR) {
 		    const char *str = str_ref(ssa_instr->literal.v.str);
@@ -3736,6 +3794,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    instr->literal = ssa_instr->literal.v.err;
 		else if (ssa_instr->literal.type == TYPE_INT)
 		    instr->literal = ssa_instr->literal.v.num;
+		else if (ssa_instr->literal.type == TYPE_FLOAT) {
+		    FlNum f = fl_unbox(ssa_instr->literal.v.fnum);
+		    memcpy(&instr->literal, &f, sizeof(Num));
+		}
 		else
 		    instr->literal = 0;
 	    }

@@ -786,7 +786,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_mem_op(build->context, MIR_T_I32,
 								 offsetof(Var, type), result, 0, 1),
-						  MIR_new_int_op(build->context, TYPE_INT)));
+						  MIR_new_int_op(build->context, instr->literal_type)));
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_RETURN0:
@@ -1038,6 +1038,11 @@ materialize_deopt_value(var_type type, Num raw)
 	value.v.obj = raw;
     else if (type == TYPE_ERR)
 	value.v.err = raw;
+    else if (type == TYPE_FLOAT) {
+	FlNum f;
+	memcpy(&f, &raw, sizeof(FlNum));
+	value.v.fnum = box_fl(f);
+    }
     else
 	value.v.num = raw;
     return var_ref(value);
