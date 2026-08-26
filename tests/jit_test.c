@@ -293,7 +293,7 @@ two_local_program(HIROp op)
     block->last = ret;
     program->may_error = op == HIR_OP_DIV || op == HIR_OP_MOD
 	|| op == HIR_OP_EXP || op == HIR_OP_SHL || op == HIR_OP_SHR
-	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX || op == HIR_OP_IN;
+	|| op == HIR_OP_LSHR || op == HIR_OP_INDEX;
     return program;
 }
 
@@ -583,7 +583,6 @@ in_program(void)
     JITInstruction *ret = instruction(HIR_TAC_RETURN);
     JITDeoptMap *map;
 
-    program->may_error = 1;
     program->num_values = 4;
     program->num_vars = 2;
     program->num_blocks = 1;
@@ -3116,6 +3115,8 @@ main(void)
 	env[1].v.list[2].v.num = 42;
 
 	check(jit_program_compile(in_p) == 1, "in JIT compile failed");
+	check(jit_program_may_error(in_p) == 0,
+	      "deoptimized in operation should not mark program may-error");
 	ticks = 50;
 	timed_out = 0;
 	error = E_NONE;
@@ -3126,6 +3127,8 @@ main(void)
 	check(res == JIT_RUN_FALLBACK, "in deopt fallback result");
 	check(deopt_state.bytecode_pc == 12, "in deopt bytecode_pc");
 	check(deopt_state.stack_depth == 2, "in deopt stack depth");
+	check(ticks == 49 && deopt_state.ticks_charged == 1,
+	      "in deopt tick refund state");
 	check(stack[0].type == TYPE_INT && stack[0].v.num == 42,
 	      "in deopt stack[0] lhs");
 	check(stack[1].type == TYPE_LIST && stack[1].v.list[0].v.num == 2,

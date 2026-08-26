@@ -485,19 +485,23 @@ Completed in the first native-code milestone:
   references retained across repeated native execution and released at program
   teardown; and
 * argument-list operation anchors taken from individual argument bytecode PCs,
-  reducing bytecode-anchor rejections without weakening anchor validation.
+  reducing bytecode-anchor rejections without weakening anchor validation; and
+* membership (`HIR_OP_IN`) accepted at an exact deoptimization boundary, with
+  its operands, tick refund, and bytecode resume state restored for interpreter
+  evaluation.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, 4,001 (63.32%) are JIT-eligible, 1,541 report `unsupported-program`, 730
-report `unsupported-value-types`, and 47 report `invalid-bytecode-anchor`; no
+these, 4,761 (75.34%) are JIT-eligible, 963 report `unsupported-value-types`,
+537 report `unsupported-program`, and 58 report `invalid-bytecode-anchor`; no
 verbs report `invalid-ir`. These top-level reasons are mutually exclusive but
 the detailed census identifies the highest-frequency blockers:
 
 * zero `ssa-support: list constant` rejections, down from 2,852;
-* 1,004 `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections;
+* zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
+  from 1,004;
 * 412 unsupported non-local assignments;
 * 125 optional/rest scatter rejections; and
-* 47 remaining bytecode-anchor failures, down from 4,204 after correcting
+* 58 remaining bytecode-anchor failures, down from 4,204 after correcting
   argument-list operation anchors.
 
 Counts describe the first reported failure in each verb. Fixing one category may
@@ -528,26 +532,26 @@ The next reviewable compiler milestones, in dependency order, are:
 3. Classify the 963 `unsupported-value-types` results by diagnostic and value
    producer, then improve inference or add guarded representations for the
    largest safe category before broadening complex-value operations.
-5. Add shared, ownership-audited runtime helpers for complex-value semantics,
+4. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
    identity out of language equality, truth, and ordering semantics, and test
    every helper on success, error, and deoptimization paths.
-6. Make code-unit identity explicit in native entry and deoptimization maps,
+5. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-7. Define declarative built-in effect metadata (pure, may raise, may allocate,
+6. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-8. Add profile-guided, semantics-preserving optimization only after the wider
+7. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-9. Finish with database-scale validation and performance work: multi-verb and
+8. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.

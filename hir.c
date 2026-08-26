@@ -4014,7 +4014,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
 		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
-		    || ssa_instr->op == HIR_OP_INDEX || ssa_instr->op == HIR_OP_IN))
+		    || ssa_instr->op == HIR_OP_INDEX))
 		program->may_error = 1;
 	    instr->literal_type = ssa_instr->kind == HIR_TAC_CONST
 		? ssa_instr->literal.type
