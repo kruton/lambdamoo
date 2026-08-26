@@ -3420,6 +3420,24 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
     return 1;
 }
 
+static HIRSSAInstr *
+ssa_definition_for_value(HIRSSAProgram *ssa, int value)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value && ssa_defines_value(instr))
+		return instr;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
 static int
 jit_extended_anchor_matches(Bytecodes *bc, unsigned pc, Extended_Opcode op)
 {
@@ -3446,6 +3464,8 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 		    && bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		    && bc->vector[instr->bytecode_pc + 1] == instr->func)
 		|| op == OP_FOR_LIST
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER)
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_LENGTH);
 	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
@@ -3484,14 +3504,24 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
-	case HIR_OP_EQ: return op == OP_EQ;
+	case HIR_OP_EQ:
+	    return op == OP_EQ
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT:
-	    return op == OP_LT || op == OP_FOR_RANGE || op == OP_FOR_LIST;
+	    return op == OP_LT || op == OP_FOR_RANGE || op == OP_FOR_LIST
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_LE:
-	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST;
+	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_GT: return op == OP_GT;
-	case HIR_OP_GE: return op == OP_GE;
+	case HIR_OP_GE:
+	    return op == OP_GE
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_IN: return op == OP_IN;
 	case HIR_OP_BITOR:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITOR);
@@ -3569,6 +3599,8 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_RANGE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_LIST
+		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
+						    EOP_SCATTER)
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
 						    EOP_WHILE_ID)) {
 		    record_unsupported_fmt(ctx, "anchor: pc %u branch_false opcode mismatch (got opcode %u)",
@@ -4131,6 +4163,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[args_val] = TYPE_LIST;
 			value_types_known[args_val] = 1;
 		    }
+		}
+	    }
+	    if (si->kind == HIR_TAC_CALL) {
+		const char *func_name = name_func_by_num(si->func);
+		HIRSSAInstr *args = ssa_definition_for_value(ssa, si->src1);
+
+		if (func_name && !strcmp(func_name, "valid")
+		    && args && args->kind == HIR_TAC_UNARY
+		    && args->op == HIR_OP_MAKE_SINGLETON_LIST
+		    && args->src1 > 0 && args->src1 < program->num_values
+		    && !value_types_known[args->src1]) {
+		    value_types[args->src1] = TYPE_OBJ;
+		    value_types_known[args->src1] = 1;
 		}
 	    }
 	    if (si == ssa_block->last)
@@ -6397,6 +6442,167 @@ append_scatter_deopt(HIRContext *ctx, HIRTacProgram *program,
 }
 
 static int
+append_scatter_constant(HIRContext *ctx, HIRTacProgram *program, Num value,
+			unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_CONST, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->literal.type = TYPE_INT;
+    instr->literal.v.num = value;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+append_scatter_unary(HIRContext *ctx, HIRTacProgram *program, HIROp op,
+		     int src, unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_UNARY, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->src1 = src;
+    instr->op = op;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+append_scatter_binary(HIRContext *ctx, HIRTacProgram *program, HIROp op,
+		      int lhs, int rhs, unsigned source_lineno,
+		      unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BINARY, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->src1 = lhs;
+    instr->src2 = rhs;
+    instr->op = op;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    HIRScatter *item;
+    int saved_depth = ctx->lower_stack_depth;
+    int rhs = lower_expr(ctx, program, expr->u.scatter.rhs);
+    int scatter_depth = ctx->lower_stack_depth;
+    int required = 0;
+    int optional = 0;
+    int seen_optional = 0;
+    int position = 0;
+    int invalid_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int length;
+    int limit;
+    int condition;
+
+    /* Multiple optionals can run an earlier default before a later element
+       guard fails.  Keep those in the interpreter until scatter elements have
+       tagged SSA values, so deoptimization cannot repeat default side effects. */
+    for (item = expr->u.scatter.items; item; item = item->next) {
+	if (item->kind == SCAT_REST) {
+	    append_scatter_deopt(ctx, program, expr->source_lineno,
+				 expr->bytecode_pc);
+	    ctx->lower_stack_depth = saved_depth;
+	    push_lower_stack(ctx, rhs);
+	    return rhs;
+	}
+	if (item->kind == SCAT_REQUIRED) {
+	    if (seen_optional) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	    required++;
+	}
+	else if (item->kind == SCAT_OPTIONAL) {
+	    seen_optional = 1;
+	    optional++;
+	    if (optional > 1 || !item->expr) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	}
+    }
+
+    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+    length = append_scatter_unary(ctx, program, HIR_OP_LENGTH, rhs,
+				  expr->source_lineno, expr->bytecode_pc);
+    limit = append_scatter_constant(ctx, program, required,
+				    expr->source_lineno, expr->bytecode_pc);
+    condition = append_scatter_binary(ctx, program, HIR_OP_GE, length, limit,
+				      expr->source_lineno, expr->bytecode_pc);
+    append_unticked_branch_false(ctx, program, condition, invalid_label,
+				 expr->source_lineno, expr->bytecode_pc);
+
+    limit = append_scatter_constant(ctx, program, required + optional,
+				    expr->source_lineno, expr->bytecode_pc);
+    condition = append_scatter_binary(ctx, program, HIR_OP_LE, length, limit,
+				      expr->source_lineno, expr->bytecode_pc);
+    append_unticked_branch_false(ctx, program, condition, invalid_label,
+				 expr->source_lineno, expr->bytecode_pc);
+
+    for (item = expr->u.scatter.items; item; item = item->next) {
+	int index;
+	int value;
+
+	position++;
+	index = append_scatter_constant(ctx, program, position,
+					 expr->source_lineno, expr->bytecode_pc);
+	if (item->kind == SCAT_OPTIONAL) {
+	    int default_label = new_label(ctx);
+	    int item_done_label = new_label(ctx);
+
+	    condition = append_scatter_binary(ctx, program, HIR_OP_GE,
+					 length, index, expr->source_lineno,
+					 expr->bytecode_pc);
+	    append_unticked_branch_false(ctx, program, condition, default_label,
+					 expr->source_lineno, expr->bytecode_pc);
+	    value = append_scatter_binary(ctx, program, HIR_OP_INDEX, rhs, index,
+					  expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	    append_jump(ctx, program, item_done_label, expr->source_lineno);
+	    append_label(ctx, program, default_label, expr->source_lineno);
+	    ctx->lower_stack_depth = scatter_depth;
+	    value = lower_expr(ctx, program, item->expr);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	    ctx->lower_stack_depth = scatter_depth;
+	    append_label(ctx, program, item_done_label, expr->source_lineno);
+	} else {
+	    value = append_scatter_binary(ctx, program, HIR_OP_INDEX, rhs, index,
+					  expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	}
+    }
+    append_jump(ctx, program, done_label, expr->source_lineno);
+    append_label(ctx, program, invalid_label, expr->source_lineno);
+    append_scatter_deopt(ctx, program, expr->source_lineno,
+			 expr->bytecode_pc);
+    append_label(ctx, program, done_label, expr->source_lineno);
+    ctx->lower_stack_depth = scatter_depth;
+    return rhs;
+}
+
+static int
 lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
     int base_depth = ctx->lower_stack_depth;
@@ -6720,16 +6926,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    return dst_temp;
 	}
     case HIR_EXPR_SCATTER:
-	{
-	    int saved_depth = ctx->lower_stack_depth;
-	    int rhs_temp = lower_expr(ctx, program, expr->u.scatter.rhs);
-
-	    append_scatter_deopt(ctx, program, expr->source_lineno,
-				 expr->bytecode_pc);
-	    ctx->lower_stack_depth = saved_depth;
-	    push_lower_stack(ctx, rhs_temp);
-	    return rhs_temp;
-	}
+	return lower_scatter(ctx, program, expr);
     case HIR_EXPR_LIST:
 	{
 	    HIRArg *item = expr->u.list.items;

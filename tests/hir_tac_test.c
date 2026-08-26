@@ -1583,6 +1583,69 @@ test_optional_rest_scatter_deopt(void)
 }
 
 static void
+test_optional_scatter_default_lowering(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Scatter required1, required2, optional;
+    Expr default_value = int_expr(0, 10);
+    Expr scatter_lhs;
+    Expr rhs = id_expr(0, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&required1, 0, sizeof(required1));
+    required1.kind = SCAT_REQUIRED;
+    required1.id = 1;
+    required1.next = &required2;
+    memset(&required2, 0, sizeof(required2));
+    required2.kind = SCAT_REQUIRED;
+    required2.id = 2;
+    required2.next = &optional;
+    memset(&optional, 0, sizeof(optional));
+    optional.kind = SCAT_OPTIONAL;
+    optional.id = 3;
+    optional.expr = &default_value;
+
+    memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+    scatter_lhs.kind = EXPR_SCATTER;
+    scatter_lhs.lineno = 10;
+    scatter_lhs.e.scatter = &required1;
+    assign = binary_expr(EXPR_ASGN, &scatter_lhs, &rhs);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 4;
+    rhs.bytecode_pc = 1;
+    assign.bytecode_pc = 2;
+    default_value.bytecode_pc = 3;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("optional scatter accepted", hir_context_error_count(ctx), 0);
+    check_int("optional scatter indexes all targets",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 3);
+    check_int("optional scatter lowers default",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 1);
+    check_int("optional scatter charges one opcode tick",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("optional scatter has invalid-shape deopt",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("optional scatter invalid deopt preserves rhs",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, assign.bytecode_pc), 1);
+    check_int("optional scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("optional scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("optional scatter out-of-ssa valid",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_list_construction_and_splicing_tac_ssa(void)
 {
     Names names;
@@ -3206,6 +3269,7 @@ main(void)
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_optional_rest_scatter_deopt();
+    test_optional_scatter_default_lowering();
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
