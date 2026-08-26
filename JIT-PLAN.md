@@ -458,11 +458,12 @@ Completed in the first native-code milestone:
   representations currently make affected verbs ineligible; and
 * ownership-aware string values (`TYPE_STR`) and non-integer list elements
   (`TYPE_OBJ`, `TYPE_FLOAT`, `TYPE_STR`, `TYPE_LIST`) so indexing, iteration,
-  locals, returns, and deoptimization preserve reference counts.
+  locals, returns, and deoptimization preserve reference counts; and
+* exception and `finally` stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) modeled
+  before lowering catch expressions, `try-except`, and `try-finally` statements,
+  preserving exact interpreter stack-unwind state on deoptimization.
 
-The next reviewable compiler milestones are:
+The next reviewable compiler milestone is:
 
-1. Model exception and `finally` stack markers before lowering catch expressions,
-   `try` statements, or other operations that unwind through native frames.
-2. Add fork and suspension boundaries only after native frames can materialize
+1. Add fork and suspension boundaries only after native frames can materialize
    every continuation field required by serialized activations.
