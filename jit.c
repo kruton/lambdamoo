@@ -207,7 +207,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_reg_t *values;
     MIR_label_t *labels;
     MIR_label_t fallback;
-    MIR_label_t tick_abort, seconds_abort;
+    MIR_label_t tick_abort = 0, seconds_abort = 0;
     MIR_label_t common_return;
     JITStatusExit *status_exits = 0;
     JITStatusExit *last_status_exit = 0;
@@ -266,12 +266,14 @@ build_mir(JITProgram *program, MIRBuild *build)
 	    for (instr = block->first; instr; instr = instr->next) {
 		switch (instr->kind) {
 		case HIR_TAC_TICK:
-		    tick_abort = new_status_exit(build, &status_exits,
-			&last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
-			instr->bytecode_pc, instr->source_lineno);
-		    seconds_abort = new_status_exit(build, &status_exits,
-			&last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
-			instr->bytecode_pc, instr->source_lineno);
+		    if (instr->op != HIR_OP_CHARGE_TICK) {
+			tick_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
+			    instr->bytecode_pc, instr->source_lineno);
+			seconds_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
+			    instr->bytecode_pc, instr->source_lineno);
+		    }
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 tick_result),
@@ -288,6 +290,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 								 0, ticks, 0, 1),
 						  MIR_new_reg_op(build->context,
 								 tick_result)));
+		    if (instr->op == HIR_OP_CHARGE_TICK)
+			break;
 		    append(build, MIR_new_insn(build->context, MIR_BLE,
 						  MIR_new_label_op(build->context,
 								   tick_abort),
@@ -315,8 +319,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 		case HIR_TAC_LOAD_LOCAL:
 		    {
 			MIR_label_t deopt = MIR_new_label(build->context);
-			MIR_label_t is_list = MIR_new_label(build->context);
 			MIR_label_t loaded = MIR_new_label(build->context);
+			var_type expected_type = instr->literal_type;
 			char name[32];
 			sprintf(name, "var_type%d", copy_serial++);
 			MIR_reg_t var_type = new_reg(build, name);
@@ -326,33 +330,22 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_mem_op(build->context, MIR_T_I32,
 					instr->local_id * sizeof(Var)
 					+ offsetof(Var, type), env, 0, 1)));
-			append(build, MIR_new_insn(build->context, MIR_BEQ,
-				MIR_new_label_op(build->context, is_list),
-				MIR_new_reg_op(build->context, var_type),
-				MIR_new_int_op(build->context, TYPE_LIST)));
 			append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, var_type),
-				MIR_new_int_op(build->context, TYPE_INT)));
+				MIR_new_int_op(build->context, expected_type)));
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
 								 values[instr->value]),
 						  MIR_new_mem_op(build->context,
-								 sizeof(Num) == 8
-								 ? MIR_T_I64 : MIR_T_I32,
+								 expected_type == TYPE_LIST
+								 ? MIR_T_P
+								 : (sizeof(Num) == 8
+								 ? MIR_T_I64 : MIR_T_I32),
 								 instr->local_id * sizeof(Var)
-								 + offsetof(Var, v.num),
-								 env, 0, 1)));
-			append(build, MIR_new_insn(build->context, MIR_JMP,
-					      MIR_new_label_op(build->context, loaded)));
-			append(build, is_list);
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context,
-								 values[instr->value]),
-						  MIR_new_mem_op(build->context,
-								 MIR_T_P,
-								 instr->local_id * sizeof(Var)
-								 + offsetof(Var, v.list),
+								 + (expected_type == TYPE_LIST
+								    ? offsetof(Var, v.list)
+								    : offsetof(Var, v.num)),
 								 env, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 					      MIR_new_label_op(build->context, loaded)));
@@ -811,6 +804,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    break;
 		case HIR_TAC_CALL:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_RANGE_REF:
+		case HIR_TAC_RANGE_SET:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);
@@ -1028,6 +1023,25 @@ jit_program_compile(JITProgram *program)
     return 1;
 }
 
+static Var
+materialize_deopt_value(var_type type, Num raw)
+{
+    Var value;
+
+    value.type = type;
+    if (type == TYPE_STR)
+	value.v.str = (const char *) (intptr_t) raw;
+    else if (type == TYPE_LIST)
+	value.v.list = (Var *) (intptr_t) raw;
+    else if (type == TYPE_OBJ)
+	value.v.obj = raw;
+    else if (type == TYPE_ERR)
+	value.v.err = raw;
+    else
+	value.v.num = raw;
+    return var_ref(value);
+}
+
 JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
 		    int *ticks, int *timed_out, enum error *error,
@@ -1069,28 +1083,17 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	for (i = 0; i < map->num_locals; i++)
 	    if (map->local_values[i] > 0) {
 		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
+		Var value = materialize_deopt_value(type,
+			program->deopt_values[map->local_values[i]]);
+
 		free_var(env[i]);
-		env[i].type = type;
-		if (type == TYPE_STR)
-		    env[i].v.str = str_ref((const char *) (intptr_t) program->deopt_values[map->local_values[i]]);
-		else if (type == TYPE_OBJ)
-		    env[i].v.obj = program->deopt_values[map->local_values[i]];
-		else if (type == TYPE_ERR)
-		    env[i].v.err = program->deopt_values[map->local_values[i]];
-		else
-		    env[i].v.num = program->deopt_values[map->local_values[i]];
+		env[i] = value;
 	    }
 	for (i = 0; deopt_stack && i < (int) map->stack_depth; i++) {
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
-	    deopt_stack[i].type = type;
-	    if (type == TYPE_STR)
-		deopt_stack[i].v.str = str_ref((const char *) (intptr_t) program->deopt_values[map->stack_values[i]]);
-	    else if (type == TYPE_OBJ)
-		deopt_stack[i].v.obj = program->deopt_values[map->stack_values[i]];
-	    else if (type == TYPE_ERR)
-		deopt_stack[i].v.err = program->deopt_values[map->stack_values[i]];
-	    else
-		deopt_stack[i].v.num = program->deopt_values[map->stack_values[i]];
+
+	    deopt_stack[i] = materialize_deopt_value(type,
+		program->deopt_values[map->stack_values[i]]);
 	}
 	if (deopt) {
 	    deopt->bytecode_pc = map->bytecode_pc;

@@ -122,6 +122,12 @@ struct HIRExpr {
 	    HIRExpr *rhs;
 	} prop_store;
 	struct {
+	    HIRExpr *base;
+	    HIRExpr *from;
+	    HIRExpr *to;
+	    HIRExpr *rhs;
+	} range_store;
+	struct {
 	    HIRExpr *body;
 	    HIRArg *codes;
 	    HIRExpr *handler;
@@ -322,6 +328,15 @@ struct HIRValueAnalysis {
     int num_facts;
 };
 
+typedef struct HIRLoopContext HIRLoopContext;
+struct HIRLoopContext {
+    int loop_id;
+    int cont_label;
+    int done_label;
+    int saved_depth;
+    HIRLoopContext *parent;
+};
+
 struct HIRContext {
     Arena *arena;
     Names *var_names;
@@ -334,6 +349,7 @@ struct HIRContext {
     int lower_stack_depth;
     int lower_stack_capacity;
     int *lower_stack;
+    HIRLoopContext *current_loop;
 };
 
 static void *hir_alloc(HIRContext *, size_t);
@@ -368,6 +384,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack_depth = 0;
     ctx->lower_stack_capacity = 0;
     ctx->lower_stack = 0;
+    ctx->current_loop = 0;
 
     return ctx;
 }
@@ -529,6 +546,8 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_PUT_PROP:
+	case HIR_TAC_RANGE_REF:
+	case HIR_TAC_RANGE_SET:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
@@ -1251,6 +1270,8 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_BINARY
 	    || instr->kind == HIR_TAC_CALL
 	    || instr->kind == HIR_TAC_PUT_PROP
+	    || instr->kind == HIR_TAC_RANGE_REF
+	    || instr->kind == HIR_TAC_RANGE_SET
 	    || instr->kind == HIR_TAC_UNSUPPORTED
 	    || instr->kind == HIR_TAC_PHI);
 }
@@ -1939,6 +1960,8 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
 					   order, 0, max_value,
 					   def_block, def_order);
@@ -2021,6 +2044,8 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
@@ -2351,6 +2376,8 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		    break;
 		case HIR_TAC_CALL:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_RANGE_REF:
+		case HIR_TAC_RANGE_SET:
 		case HIR_TAC_UNSUPPORTED:
 		    fact = unknown_fact();
 		    break;
@@ -3029,6 +3056,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		mark_out_ssa_def(instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3077,6 +3106,8 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
 		break;
@@ -3178,6 +3209,8 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_RANGE_REF:
+	    case HIR_TAC_RANGE_SET:
 	    case HIR_TAC_LABEL:
 	    case HIR_TAC_JUMP:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3186,6 +3219,8 @@ jit_ssa_is_supported(HIRSSAProgram *ssa)
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_CONST:
+		if (instr->literal.type == TYPE_LIST)
+		    return 0;
 		break;
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
@@ -3227,15 +3262,17 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_CHECK_LIST_FOR_SPLICE;
 	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
 	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_LENGTH)
-	    return instr->bytecode_pc + 1 < bc->size
-		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
-		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
+	    return (instr->bytecode_pc + 1 < bc->size
+		    && bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
+		    && bc->vector[instr->bytecode_pc + 1] == instr->func)
+		|| op == OP_FOR_LIST;
 	return jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					   EOP_COMPLEMENT);
     }
     if (instr->kind == HIR_TAC_BINARY) {
 	switch (instr->op) {
-	case HIR_OP_ADD: return op == OP_ADD;
+	case HIR_OP_ADD:
+	    return op == OP_ADD || op == OP_FOR_RANGE || op == OP_FOR_LIST;
 	case HIR_OP_SUB: return op == OP_MINUS;
 	case HIR_OP_MUL: return op == OP_MULT;
 	case HIR_OP_DIV: return op == OP_DIV;
@@ -3244,6 +3281,7 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_EXP);
 	case HIR_OP_INDEX:
 	    return op == OP_REF
+		|| op == OP_FOR_LIST
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_SCATTER);
 	case HIR_OP_LIST_ADD_TAIL: return op == OP_LIST_ADD_TAIL;
@@ -3256,8 +3294,10 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
 	case HIR_OP_EQ: return op == OP_EQ;
 	case HIR_OP_NE: return op == OP_NE;
-	case HIR_OP_LT: return op == OP_LT;
-	case HIR_OP_LE: return op == OP_LE;
+	case HIR_OP_LT:
+	    return op == OP_LT || op == OP_FOR_RANGE || op == OP_FOR_LIST;
+	case HIR_OP_LE:
+	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST;
 	case HIR_OP_GT: return op == OP_GT;
 	case HIR_OP_GE: return op == OP_GE;
 	case HIR_OP_BITOR:
@@ -3293,7 +3333,6 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
-	    case HIR_TAC_CONST:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -3316,10 +3355,29 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		    && bc->vector[instr->bytecode_pc] != OP_AND
 		    && bc->vector[instr->bytecode_pc] != OP_OR
 		    && bc->vector[instr->bytecode_pc] != OP_IF
+		    && bc->vector[instr->bytecode_pc] != OP_IF_QUES
 		    && bc->vector[instr->bytecode_pc] != OP_EIF
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
+		    && bc->vector[instr->bytecode_pc] != OP_FOR_RANGE
+		    && bc->vector[instr->bytecode_pc] != OP_FOR_LIST
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
 						    EOP_WHILE_ID))
+		    return 0;
+		break;
+	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_LOCAL:
+		if (instr->bytecode_pc != NO_BYTECODE_PC
+		    && instr->bytecode_pc >= bc->size)
+		    return 0;
+		break;
+	    case HIR_TAC_JUMP:
+		if (instr->bytecode_pc != NO_BYTECODE_PC
+		    && (instr->bytecode_pc >= bc->size
+			|| (!jit_extended_anchor_matches(bc,
+						 instr->bytecode_pc, EOP_EXIT)
+			    && !jit_extended_anchor_matches(bc,
+						    instr->bytecode_pc,
+						    EOP_EXIT_ID))))
 		    return 0;
 		break;
 	    case HIR_TAC_CALL:
@@ -3336,13 +3394,23 @@ jit_ssa_anchors_are_valid(HIRSSAProgram *ssa, Program *bytecode_program)
 		if (bc->vector[instr->bytecode_pc] != OP_PUT_PROP)
 		    return 0;
 		break;
-	    case HIR_TAC_LOAD_LOCAL:
-		if (instr->bytecode_pc != NO_BYTECODE_PC
-		    && instr->bytecode_pc >= bc->size)
+	    case HIR_TAC_RANGE_REF:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_RANGE_REF)
+		    return 0;
+		break;
+	    case HIR_TAC_RANGE_SET:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size)
+		    return 0;
+		if (bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
+		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
+						    EOP_RANGESET))
 		    return 0;
 		break;
 	    case HIR_TAC_LABEL:
-	    case HIR_TAC_JUMP:
 	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_STORE_LOCAL:
@@ -3470,6 +3538,28 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		else if (si->kind == HIR_TAC_UNARY
 			 && si->op == HIR_OP_MAKE_SINGLETON_LIST)
 		    value_types[si->value] = TYPE_LIST;
+		else if (si->kind == HIR_TAC_BINARY
+			 && (si->op == HIR_OP_LIST_ADD_TAIL
+			     || si->op == HIR_OP_LIST_APPEND))
+		    value_types[si->value] = TYPE_LIST;
+	    }
+	    if (si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH
+		&& si->src1 > 0 && si->src1 < program->num_values)
+		value_types[si->src1] = TYPE_LIST;
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
+		&& si->src1 > 0 && si->src1 < program->num_values)
+		value_types[si->src1] = TYPE_LIST;
+	    if ((si->kind == HIR_TAC_RANGE_REF
+		 || si->kind == HIR_TAC_RANGE_SET)
+		&& si->src1 > 0 && si->src1 < program->num_values
+		&& value_types[si->src1] != TYPE_STR)
+		value_types[si->src1] = TYPE_LIST;
+	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
+		int rhs = si->stack_values[si->num_stack_values - 1];
+
+		if (rhs > 0 && rhs < program->num_values
+		    && value_types[rhs] != TYPE_STR)
+		    value_types[rhs] = TYPE_LIST;
 	    }
 	    if (si == ssa_block->last)
 		break;
@@ -3527,7 +3617,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    || ssa_instr->op == HIR_OP_INDEX))
 		program->may_error = 1;
 	    instr->literal_type = ssa_instr->kind == HIR_TAC_CONST
-		? ssa_instr->literal.type : TYPE_INT;
+		? ssa_instr->literal.type
+		: (ssa_instr->kind == HIR_TAC_LOAD_LOCAL
+		   && ssa_instr->value > 0
+		   && ssa_instr->value < program->num_values
+		   ? value_types[ssa_instr->value] : TYPE_INT);
 	    if (ssa_instr->kind == HIR_TAC_CONST) {
 		if (ssa_instr->literal.type == TYPE_STR) {
 		    const char *str = str_ref(ssa_instr->literal.v.str);
@@ -3632,6 +3726,14 @@ hir_dump_tac(HIRTacProgram *program)
 	    break;
 	case HIR_TAC_PUT_PROP:
 	    fprintf(stderr, " t%d = prop_put(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
+	    break;
+	case HIR_TAC_RANGE_REF:
+	    fprintf(stderr, " t%d = range_ref(t%d, t%d)", instr->dst,
+		    instr->src1, instr->src2);
+	    break;
+	case HIR_TAC_RANGE_SET:
+	    fprintf(stderr, " t%d = range_set(t%d, t%d)", instr->dst,
 		    instr->src1, instr->src2);
 	    break;
 	case HIR_TAC_UNSUPPORTED:
@@ -3804,6 +3906,14 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " t%d = prop_put(t%d, t%d)", instr->value,
 			instr->src1, instr->src2);
 		break;
+	    case HIR_TAC_RANGE_REF:
+		fprintf(file, " t%d = range_ref(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
+	    case HIR_TAC_RANGE_SET:
+		fprintf(file, " t%d = range_set(t%d, t%d)", instr->value,
+			instr->src1, instr->src2);
+		break;
 	    case HIR_TAC_UNSUPPORTED:
 		if (instr->value > 0)
 		    fprintf(file, " t%d", instr->value);
@@ -3876,6 +3986,10 @@ tac_kind_name(HIRTacKind kind)
 	return "call";
     case HIR_TAC_PUT_PROP:
 	return "put_prop";
+    case HIR_TAC_RANGE_REF:
+	return "range_ref";
+    case HIR_TAC_RANGE_SET:
+	return "range_set";
     case HIR_TAC_UNSUPPORTED:
 	    return "unsupported";
     case HIR_TAC_PHI:
@@ -3963,6 +4077,8 @@ op_name(HIROp op)
 	return "LENGTH";
     case HIR_OP_GET_PROP:
 	return "GET_PROP";
+    case HIR_OP_CHARGE_TICK:
+	return "CHARGE_TICK";
     }
 
     return "?";
@@ -4758,6 +4874,17 @@ lift_assignment(HIRContext *ctx, Expr *ast)
 	expr->u.prop_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
 	return expr;
     }
+    if (ast->e.bin.lhs->kind == EXPR_RANGE) {
+	HIRExpr *expr = new_expr(ctx, HIR_EXPR_RANGE_STORE);
+
+	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
+	expr->u.range_store.base = lift_expr(ctx, ast->e.bin.lhs->e.range.base);
+	expr->u.range_store.from = lift_expr(ctx, ast->e.bin.lhs->e.range.from);
+	expr->u.range_store.to = lift_expr(ctx, ast->e.bin.lhs->e.range.to);
+	expr->u.range_store.rhs = lift_expr(ctx, ast->e.bin.rhs);
+	return expr;
+    }
 
     record_unsupported(ctx, "Unsupported non-local assignment in HIR lift");
     return unsupported_expr(ctx, ast);
@@ -4824,6 +4951,7 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_COND:
 	expr = new_expr(ctx, HIR_EXPR_COND);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.cond.condition = lift_expr(ctx, ast->e.cond.condition);
 	expr->u.cond.consequent = lift_expr(ctx, ast->e.cond.consequent);
 	expr->u.cond.alternate = lift_expr(ctx, ast->e.cond.alternate);
@@ -4864,10 +4992,10 @@ lift_expr(HIRContext *ctx, Expr *ast)
     case EXPR_RANGE:
 	expr = new_expr(ctx, HIR_EXPR_RANGE);
 	expr->source_lineno = ast->lineno;
+	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.range.base = lift_expr(ctx, ast->e.range.base);
 	expr->u.range.from = lift_expr(ctx, ast->e.range.from);
 	expr->u.range.to = lift_expr(ctx, ast->e.range.to);
-	record_unsupported(ctx, "Range expression is not yet lowerable to TAC");
 	return expr;
     case EXPR_LIST:
 	expr = new_expr(ctx, HIR_EXPR_LIST);
@@ -4985,19 +5113,19 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_LIST:
 	stmt = new_stmt(ctx, HIR_STMT_FOR_LIST);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.for_list.local_id = ast->s.list.id;
 	stmt->u.for_list.iterable = lift_expr(ctx, ast->s.list.expr);
 	stmt->u.for_list.body = lift_stmt_list(ctx, ast->s.list.body);
-	record_unsupported(ctx, "For-list statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_RANGE:
 	stmt = new_stmt(ctx, HIR_STMT_FOR_RANGE);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.for_range.local_id = ast->s.range.id;
 	stmt->u.for_range.from = lift_expr(ctx, ast->s.range.from);
 	stmt->u.for_range.to = lift_expr(ctx, ast->s.range.to);
 	stmt->u.for_range.body = lift_stmt_list(ctx, ast->s.range.body);
-	record_unsupported(ctx, "For-range statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_FORK:
 	{
@@ -5030,14 +5158,14 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
     case STMT_BREAK:
 	stmt = new_stmt(ctx, HIR_STMT_BREAK);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.exit_id = ast->s.exit;
-	record_unsupported(ctx, "Break statement is not yet lowerable to TAC");
 	return stmt;
     case STMT_CONTINUE:
 	stmt = new_stmt(ctx, HIR_STMT_CONTINUE);
 	stmt->source_lineno = ast->lineno;
+	stmt->bytecode_pc = ast->bytecode_pc;
 	stmt->u.exit_id = ast->s.exit;
-	record_unsupported(ctx, "Continue statement is not yet lowerable to TAC");
 	return stmt;
     default:
 	return unsupported_stmt(ctx, ast);
@@ -5151,6 +5279,18 @@ append_tick(HIRContext *ctx, HIRTacProgram *program, unsigned source_lineno,
 }
 
 static void
+append_charge_tick(HIRContext *ctx, HIRTacProgram *program,
+		   unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_TICK, source_lineno);
+
+    instr->op = HIR_OP_CHARGE_TICK;
+    instr->bytecode_pc = bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+}
+
+static void
 append_label(HIRContext *ctx, HIRTacProgram *program, int label,
 	     unsigned source_lineno)
 {
@@ -5171,17 +5311,36 @@ append_jump(HIRContext *ctx, HIRTacProgram *program, int label,
 }
 
 static void
-append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
-		    unsigned source_lineno, unsigned bytecode_pc)
+append_branch_false_internal(HIRContext *ctx, HIRTacProgram *program, int src,
+			     int label, unsigned source_lineno,
+			     unsigned bytecode_pc, int tick)
 {
     HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BRANCH_FALSE, source_lineno);
 
-    append_tick(ctx, program, source_lineno, bytecode_pc);
+    if (tick)
+	append_tick(ctx, program, source_lineno, bytecode_pc);
     instr->bytecode_pc = bytecode_pc;
     snapshot_lower_stack(ctx, instr);
     instr->src1 = src;
     instr->label = label;
     append_tac(program, instr);
+}
+
+static void
+append_branch_false(HIRContext *ctx, HIRTacProgram *program, int src, int label,
+		    unsigned source_lineno, unsigned bytecode_pc)
+{
+    append_branch_false_internal(ctx, program, src, label, source_lineno,
+				 bytecode_pc, 1);
+}
+
+static void
+append_unticked_branch_false(HIRContext *ctx, HIRTacProgram *program, int src,
+			     int label, unsigned source_lineno,
+			     unsigned bytecode_pc)
+{
+    append_branch_false_internal(ctx, program, src, label, source_lineno,
+				 bytecode_pc, 0);
 }
 
 static void
@@ -5246,6 +5405,38 @@ lower_short_circuit(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     ctx->lower_stack_depth = base_depth;
     push_lower_stack(ctx, lhs);
     return lhs;
+}
+
+static int
+lower_cond_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int cond = lower_expr(ctx, program, expr->u.cond.condition);
+    int result_local = ctx->next_local++;
+    int alt_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int cons_val;
+    int alt_val;
+    int result_temp;
+
+    append_branch_false(ctx, program, cond, alt_label,
+			expr->source_lineno, expr->bytecode_pc);
+    ctx->lower_stack_depth = base_depth;
+    cons_val = lower_expr(ctx, program, expr->u.cond.consequent);
+    append_internal_store(ctx, program, result_local, cons_val,
+			  expr->source_lineno);
+    append_jump(ctx, program, done_label, expr->source_lineno);
+    append_label(ctx, program, alt_label, expr->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    alt_val = lower_expr(ctx, program, expr->u.cond.alternate);
+    append_internal_store(ctx, program, result_local, alt_val,
+			  expr->source_lineno);
+    append_label(ctx, program, done_label, expr->source_lineno);
+    result_temp = append_internal_load(ctx, program, result_local,
+				       expr->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    push_lower_stack(ctx, result_temp);
+    return result_temp;
 }
 
 static int
@@ -5377,6 +5568,49 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    snapshot_lower_stack(ctx, instr);
 	    append_tac(program, instr);
 	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, dst_temp);
+	    return dst_temp;
+	}
+    case HIR_EXPR_RANGE:
+	{
+	    int base_temp = lower_expr(ctx, program, expr->u.range.base);
+	    int from_temp = lower_expr(ctx, program, expr->u.range.from);
+	    int to_temp = lower_expr(ctx, program, expr->u.range.to);
+	    int dst_temp = new_temp(ctx);
+	    (void) from_temp;
+	    (void) to_temp;
+
+	    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+	    instr = new_tac(ctx, HIR_TAC_RANGE_REF, expr->source_lineno);
+	    instr->bytecode_pc = expr->bytecode_pc;
+	    instr->dst = dst_temp;
+	    instr->src1 = base_temp;
+	    instr->src2 = from_temp;
+	    snapshot_lower_stack(ctx, instr);
+	    append_tac(program, instr);
+	    ctx->lower_stack_depth -= 3;
+	    push_lower_stack(ctx, dst_temp);
+	    return dst_temp;
+	}
+    case HIR_EXPR_RANGE_STORE:
+	{
+	    int base_temp = lower_expr(ctx, program, expr->u.range_store.base);
+	    int from_temp = lower_expr(ctx, program, expr->u.range_store.from);
+	    int to_temp = lower_expr(ctx, program, expr->u.range_store.to);
+	    int rhs_temp = lower_expr(ctx, program, expr->u.range_store.rhs);
+	    int dst_temp = new_temp(ctx);
+	    (void) from_temp;
+	    (void) to_temp;
+	    (void) rhs_temp;
+
+	    instr = new_tac(ctx, HIR_TAC_RANGE_SET, expr->source_lineno);
+	    instr->bytecode_pc = expr->bytecode_pc;
+	    instr->dst = dst_temp;
+	    instr->src1 = base_temp;
+	    instr->src2 = from_temp;
+	    snapshot_lower_stack(ctx, instr);
+	    append_tac(program, instr);
+	    ctx->lower_stack_depth -= 4;
 	    push_lower_stack(ctx, dst_temp);
 	    return dst_temp;
 	}
@@ -5553,9 +5787,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    return call_tac->dst;
 	}
     case HIR_EXPR_COND:
-	return append_unsupported_tac(ctx, program,
-				      "Conditional expression is not yet lowerable to TAC",
-				      expr->source_lineno);
+	return lower_cond_expr(ctx, program, expr);
     default:
 	return append_unsupported_tac(ctx, program,
 				      "Unsupported HIR expression in TAC lowering",
@@ -5591,6 +5823,14 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int top_label = new_label(ctx);
     int done_label = new_label(ctx);
     int cond;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.loop.loop_id;
+    loop.cont_label = top_label;
+    loop.done_label = done_label;
+    loop.saved_depth = ctx->lower_stack_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
 
     append_label(ctx, program, top_label, stmt->source_lineno);
     cond = lower_expr(ctx, program, stmt->u.loop.condition);
@@ -5600,6 +5840,265 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     lower_stmt_list(ctx, program, stmt->u.loop.body);
     append_jump(ctx, program, top_label, stmt->source_lineno);
     append_label(ctx, program, done_label, stmt->source_lineno);
+
+    ctx->current_loop = loop.parent;
+}
+
+static void
+lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int top_label = new_label(ctx);
+    int cont_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int from_temp = lower_expr(ctx, program, stmt->u.for_range.from);
+    int to_temp = lower_expr(ctx, program, stmt->u.for_range.to);
+    int cond_temp;
+    int curr_local;
+    int is_last;
+    int one_temp;
+    int next_local;
+    HIRTacInstr *instr;
+    HIRTacInstr *const_tac;
+    HIRTacInstr *add_tac;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.for_range.local_id;
+    loop.cont_label = cont_label;
+    loop.done_label = done_label;
+    loop.saved_depth = base_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
+
+    append_internal_store(ctx, program, stmt->u.for_range.local_id, from_temp,
+			  stmt->source_lineno);
+
+    /* top_label: start of each iteration */
+    append_label(ctx, program, top_label, stmt->source_lineno);
+
+    /* OP_FOR_RANGE charges one tick at the start of each iteration. */
+    append_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+
+    /* Check if current loop variable <= to_temp (handles from > to on entry) */
+    curr_local = append_internal_load(ctx, program, stmt->u.for_range.local_id,
+				     stmt->source_lineno);
+    ctx->lower_stack[base_depth] = curr_local;
+    cond_temp = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    instr->dst = cond_temp;
+    instr->src1 = curr_local;
+    instr->src2 = to_temp;
+    instr->op = HIR_OP_LE;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    append_unticked_branch_false(ctx, program, cond_temp, done_label,
+				 stmt->source_lineno, stmt->bytecode_pc);
+
+    append_internal_store(ctx, program, stmt->u.for_range.local_id, curr_local,
+			  stmt->source_lineno);
+
+    /* Lower loop body */
+    lower_stmt_list(ctx, program, stmt->u.for_range.body);
+
+    /* cont_label: continue lands here to step to next iteration */
+    append_label(ctx, program, cont_label, stmt->source_lineno);
+
+    /* Check if current loop variable has reached or exceeded to_temp */
+    curr_local = append_internal_load(ctx, program, stmt->u.for_range.local_id,
+				     stmt->source_lineno);
+    is_last = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    instr->dst = is_last;
+    instr->src1 = curr_local;
+    instr->src2 = to_temp;
+    instr->op = HIR_OP_LT;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+
+    /* If !(curr_local < to_temp), i.e. curr_local >= to_temp, exit loop */
+    append_unticked_branch_false(ctx, program, is_last, done_label,
+				 stmt->source_lineno, stmt->bytecode_pc);
+
+    /* Increment loop variable */
+    one_temp = new_temp(ctx);
+    const_tac = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
+    const_tac->dst = one_temp;
+    const_tac->literal.type = TYPE_INT;
+    const_tac->literal.v.num = 1;
+    const_tac->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, const_tac);
+    append_tac(program, const_tac);
+
+    next_local = new_temp(ctx);
+    add_tac = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    add_tac->dst = next_local;
+    add_tac->src1 = curr_local;
+    add_tac->src2 = one_temp;
+    add_tac->op = HIR_OP_ADD;
+    add_tac->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, add_tac);
+    append_tac(program, add_tac);
+
+    append_internal_store(ctx, program, stmt->u.for_range.local_id, next_local,
+			  stmt->source_lineno);
+    append_jump(ctx, program, top_label, stmt->source_lineno);
+
+    /* done_label: loop exit */
+    append_label(ctx, program, done_label, stmt->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    ctx->current_loop = loop.parent;
+}
+
+static void
+lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    int base_depth = ctx->lower_stack_depth;
+    int top_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int list_temp = lower_expr(ctx, program, stmt->u.for_list.iterable);
+    int index_local = ctx->next_local++;
+    int index_temp = new_temp(ctx);
+    int length_temp;
+    int cond_temp;
+    int value_temp;
+    int one_temp;
+    int next_index;
+    HIRTacInstr *instr;
+    HIRLoopContext loop;
+
+    loop.loop_id = stmt->u.for_list.local_id;
+    loop.cont_label = top_label;
+    loop.done_label = done_label;
+    loop.saved_depth = base_depth;
+    loop.parent = ctx->current_loop;
+    ctx->current_loop = &loop;
+
+    instr = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
+    instr->dst = index_temp;
+    instr->literal.type = TYPE_INT;
+    instr->literal.v.num = 1;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    push_lower_stack(ctx, index_temp);
+    append_internal_store(ctx, program, index_local, index_temp,
+			  stmt->source_lineno);
+
+    append_label(ctx, program, top_label, stmt->source_lineno);
+    append_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+    index_temp = append_internal_load(ctx, program, index_local,
+				      stmt->source_lineno);
+    ctx->lower_stack[ctx->lower_stack_depth - 1] = index_temp;
+
+    length_temp = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_UNARY, stmt->source_lineno);
+    instr->dst = length_temp;
+    instr->src1 = list_temp;
+    instr->op = HIR_OP_LENGTH;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+
+    cond_temp = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    instr->dst = cond_temp;
+    instr->src1 = index_temp;
+    instr->src2 = length_temp;
+    instr->op = HIR_OP_LE;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    append_unticked_branch_false(ctx, program, cond_temp, done_label,
+				 stmt->source_lineno, stmt->bytecode_pc);
+
+    value_temp = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    instr->dst = value_temp;
+    instr->src1 = list_temp;
+    instr->src2 = index_temp;
+    instr->op = HIR_OP_INDEX;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    append_internal_store(ctx, program, stmt->u.for_list.local_id, value_temp,
+			  stmt->source_lineno);
+
+    one_temp = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
+    instr->dst = one_temp;
+    instr->literal.type = TYPE_INT;
+    instr->literal.v.num = 1;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+
+    next_index = new_temp(ctx);
+    instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
+    instr->dst = next_index;
+    instr->src1 = index_temp;
+    instr->src2 = one_temp;
+    instr->op = HIR_OP_ADD;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    append_internal_store(ctx, program, index_local, next_index,
+			  stmt->source_lineno);
+
+    lower_stmt_list(ctx, program, stmt->u.for_list.body);
+    append_jump(ctx, program, top_label, stmt->source_lineno);
+    append_label(ctx, program, done_label, stmt->source_lineno);
+    ctx->lower_stack_depth = base_depth;
+    ctx->current_loop = loop.parent;
+}
+
+static void
+lower_break(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    HIRLoopContext *loop = ctx->current_loop;
+    HIRTacInstr *instr;
+
+    if (stmt->u.exit_id != -1) {
+	while (loop && loop->loop_id != stmt->u.exit_id)
+	    loop = loop->parent;
+    }
+
+    if (!loop) {
+	record_unsupported(ctx, "Unmatched break statement target");
+	return;
+    }
+
+    ctx->lower_stack_depth = loop->saved_depth;
+    append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+    instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
+    instr->label = loop->done_label;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    append_tac(program, instr);
+}
+
+static void
+lower_continue(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    HIRLoopContext *loop = ctx->current_loop;
+    HIRTacInstr *instr;
+
+    if (stmt->u.exit_id != -1) {
+	while (loop && loop->loop_id != stmt->u.exit_id)
+	    loop = loop->parent;
+    }
+
+    if (!loop) {
+	record_unsupported(ctx, "Unmatched continue statement target");
+	return;
+    }
+
+    ctx->lower_stack_depth = loop->saved_depth;
+    append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+    instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
+    instr->label = loop->cont_label;
+    instr->bytecode_pc = stmt->bytecode_pc;
+    append_tac(program, instr);
 }
 
 static void
@@ -5634,6 +6133,18 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	break;
     case HIR_STMT_WHILE:
 	lower_while(ctx, program, stmt);
+	break;
+    case HIR_STMT_FOR_RANGE:
+	lower_for_range(ctx, program, stmt);
+	break;
+    case HIR_STMT_FOR_LIST:
+	lower_for_list(ctx, program, stmt);
+	break;
+    case HIR_STMT_BREAK:
+	lower_break(ctx, program, stmt);
+	break;
+    case HIR_STMT_CONTINUE:
+	lower_continue(ctx, program, stmt);
 	break;
     default:
 	(void) append_unsupported_tac(ctx, program,

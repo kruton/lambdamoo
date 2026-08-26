@@ -435,10 +435,28 @@ Completed in the first native-code milestone:
   `max()`, `toint()`, `typeof()`, `length()`) eliminating deopt boundaries for
   pure operations; and
 * direct native lowering for property reads (`obj.prop`) and property assignments
-  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration.
+  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration;
+* range-based `for` loop lowering (`for i in [start..end]`) with exact opcode
+  tick accounting and interpreter stack reconstruction; and
+* integer list iteration lowering (`for x in (list)`) with guarded list access,
+  bytecode anchors, and interpreter fallback for non-integer elements; and
+* conditional expressions (`EXPR_COND` `c ? t | f`) with bytecode anchors,
+  nested evaluation, and clean SSA phi join; and
+* `break` and `continue`, including labeled exits from nested `while`, range,
+  and list loops without losing bytecode resume anchors; and
+* range expressions (`base[from..to]`) for list and string slicing, plus range
+  assignments (`base[from..to] = rhs`), lowered through exact deoptimization and
+  interpreter stack reconstruction boundaries.
 
 The next reviewable compiler milestones are:
 
-1. Range-based `for` loop lowering (`for i in [start..end]`).
-2. List iteration `for` loop lowering (`for x in (list)`).
-3. Conditional expressions (`EXPR_COND` `c ? t | f`).
+1. Deopt-before-call boundaries for verb calls, preserving argument stacks,
+   permissions, traceback state, and activation-push semantics.
+2. Extend guarded SSA values beyond integers to object and floating-point
+   scalars, including object ranges and exact arithmetic/error behavior.
+3. Add ownership-aware string values and non-integer list elements so indexing,
+   iteration, locals, returns, and deoptimization preserve reference counts.
+4. Model exception and `finally` stack markers before lowering catch expressions,
+   `try` statements, or other operations that unwind through native frames.
+5. Add fork and suspension boundaries only after native frames can materialize
+   every continuation field required by serialized activations.

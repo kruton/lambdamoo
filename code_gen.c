@@ -935,6 +935,7 @@ generate_expr(Expr * expr, State * state)
 	    generate_expr(expr->e.range.from, state);
 	    generate_expr(expr->e.range.to, state);
 	    restore_stack_top(old, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_RANGE_REF, state);
 	    pop_stack(2, state);
 	}
@@ -981,6 +982,7 @@ generate_expr(Expr * expr, State * state)
 	    int else_label, end_label;
 
 	    generate_expr(expr->e.cond.condition, state);
+	    record_code_anchor(state, &expr->bytecode_pc);
 	    emit_byte(OP_IF_QUES, state);
 	    else_label = add_label(state);
 	    pop_stack(1, state);
@@ -1157,6 +1159,7 @@ generate_stmt(Stmt * stmt, State * state)
 		emit_byte(OPTIM_NUM_TO_OPCODE(1), state);	/* loop list index */
 		push_stack(1, state);
 		loop_top = capture_label(state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_byte(OP_FOR_LIST, state);
 		add_var_ref(stmt->s.list.id, state);
 		end_label = add_label(state);
@@ -1178,6 +1181,7 @@ generate_stmt(Stmt * stmt, State * state)
 		generate_expr(stmt->s.range.from, state);
 		generate_expr(stmt->s.range.to, state);
 		loop_top = capture_label(state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		emit_byte(OP_FOR_RANGE, state);
 		add_var_ref(stmt->s.range.id, state);
 		end_label = add_label(state);
@@ -1319,6 +1323,7 @@ generate_stmt(Stmt * stmt, State * state)
 		int i;
 		Loop *loop = 0;	/* silence warnings */
 
+		record_code_anchor(state, &stmt->bytecode_pc);
 		if (stmt->s.exit == -1) {
 		    emit_extended_byte(EOP_EXIT, state);
 		    if (state->num_loops == 0)

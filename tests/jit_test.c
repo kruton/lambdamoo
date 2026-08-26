@@ -306,6 +306,7 @@ index_program(Num index_val)
     block->id = 1;
     load->value = 1;
     load->local_id = 0;
+    load->literal_type = TYPE_LIST;
     constant->value = 2;
     constant->literal = index_val;
     tick->source_lineno = 7;
@@ -352,6 +353,7 @@ scatter_destructure_program(void)
 
     load->value = 1;
     load->local_id = 0;
+    load->literal_type = TYPE_LIST;
 
     c1->value = 2;
     c1->literal = 1;
@@ -611,6 +613,34 @@ branch_program(void)
     return program;
 }
 
+static JITProgram *
+charge_tick_program(void)
+{
+    JITProgram *program = allocate(sizeof(JITProgram));
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->state = JIT_STATE_PENDING;
+    program->reason = "none";
+    program->eligible = 1;
+    program->num_values = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    constant->value = 1;
+    constant->literal = 7;
+    constant->next = tick;
+    tick->op = HIR_OP_CHARGE_TICK;
+    tick->next = ret;
+    ret->src1 = 1;
+    block->first = constant;
+    block->last = ret;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -636,11 +666,12 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
-		if (--*ticks <= 0) {
+		--*ticks;
+		if (instr->op != HIR_OP_CHARGE_TICK && *ticks <= 0) {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_TICKS;
 		}
-		if (*timed_out) {
+		if (instr->op != HIR_OP_CHARGE_TICK && *timed_out) {
 		    myfree(values, M_PROGRAM);
 		    return JIT_RUN_ABORT_SECONDS;
 		}
@@ -649,9 +680,13 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		values[instr->value] = instr->literal;
 		break;
 	    case HIR_TAC_LOAD_LOCAL:
-		if (env[instr->local_id].type == TYPE_INT)
+		if (env[instr->local_id].type != instr->literal_type) {
+		    myfree(values, M_PROGRAM);
+		    return JIT_RUN_FALLBACK;
+		}
+		if (instr->literal_type == TYPE_INT)
 		    values[instr->value] = env[instr->local_id].v.num;
-		else if (env[instr->local_id].type == TYPE_LIST)
+		else if (instr->literal_type == TYPE_LIST)
 		    values[instr->value] = (Num) env[instr->local_id].v.list;
 		else {
 		    myfree(values, M_PROGRAM);
@@ -799,6 +834,7 @@ main(void)
     JITProgram *guard = guard_program();
     JITProgram *deep_guard = deep_guard_program();
     JITProgram *branch = branch_program();
+    JITProgram *charge_tick = charge_tick_program();
     JITProgram *divide = binary_program(20, 4, HIR_OP_DIV);
     JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
     JITProgram *divide_overflow = binary_program(NUM_MIN, -1, HIR_OP_DIV);
@@ -923,6 +959,8 @@ main(void)
 		       "tick abort differed from reference execution");
     check_differential(branch, env, 10, 1,
 		       "seconds abort differed from reference execution");
+    check_differential(charge_tick, env, 1, 1,
+		       "charge-only tick differed from reference execution");
 
     env[0].type = TYPE_INT;
     env[0].v.num = 42;
@@ -1080,6 +1118,19 @@ main(void)
     check_differential(list_index_high, env, 10, 0,
 		       "list index 3 differed from reference execution");
 
+    env[0].type = TYPE_INT;
+    env[0].v.num = 1;
+    ticks = 10;
+    check(jit_program_execute(list_index1, env, &result, &ticks, &timed_out,
+			      &error, 0, &deopt, 0)
+	  == JIT_RUN_FALLBACK, "list input guard did not fallback");
+    check(ticks == 10 && deopt.bytecode_pc == 0,
+	  "list input guard fallback had wrong state");
+    check_differential(list_index1, env, 10, 0,
+		       "list input guard differed from reference execution");
+    env[0].type = TYPE_LIST;
+    env[0].v.list = list_elems;
+
     /* Non-integer element in list falls back to interpreter */
     list_elems[1].type = TYPE_STR;
     list_elems[1].v.str = "hello";
@@ -1196,6 +1247,7 @@ main(void)
     jit_program_free(list_index_high);
     jit_program_free(deep_guard);
     jit_program_free(branch);
+    jit_program_free(charge_tick);
     jit_program_free(divide);
     jit_program_free(divide_zero);
     jit_program_free(divide_overflow);

@@ -48,6 +48,12 @@ complex_free_var(Var value)
     (void) value;
 }
 
+Var
+complex_var_ref(Var value)
+{
+    return value;
+}
+
 const char *
 name_func_by_num(unsigned id)
 {
