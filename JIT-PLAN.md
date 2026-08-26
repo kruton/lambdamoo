@@ -555,18 +555,21 @@ in native code; 312 (97.50%) deoptimize. The emergency workload suspends before
 finishing the requested object range, so these figures are a repeatable sample,
 not a database-wide execution census. Its current reason distribution is:
 
-* 138 `arithmetic_type` deopts (44.23%), including 104 calls to
-  `#59:verbname_match` at its first `args[1]` indexed access;
+* 24 `arithmetic_type` deopts (7.69%), down from 138 after propagating a known
+  string type backward through concatenation into indexed operands;
 * 98 entry or local `type_guard_failure` deopts (31.41%), down from 227 after
   separating compiler-only locals from VM locals and modeling `TYPE_NONE`;
-* 45 `unsupported_operation` deopts (14.42%);
+* 159 `unsupported_operation` deopts (50.96%), including 104 calls to
+  `#59:verbname_match` at singleton-list construction on line 3;
 * 22 `property_read` deopts (7.05%);
 * 6 `builtin_call` deopts (1.92%); and
 * 3 `verb_call` deopts (0.96%).
 
 The line-1 string expression in `#59:verbname_match` is correctly omitted from
 HIR. Its old line 1/PC 0 report was an entry guard failure, not execution of the
-side-effect-free expression. It now reaches line 2/PC 7 before deoptimizing.
+side-effect-free expression. Backward string inference now carries its indexed
+argument accesses through line 2; the verb reaches line 3/PC 15 before
+deoptimizing on unsupported singleton-list construction.
 
 Reproduce the census from the repository root with a JIT-enabled build using:
 
@@ -592,16 +595,16 @@ suspends the emergency task before the range is complete.
 
 The next reviewable compiler milestones, in priority order, are:
 
-1. Reduce the dominant `arithmetic_type` runtime category. Start with indexed
-   values whose element type is currently guessed as integer: propagate known
-   argument/list element types where possible and otherwise use a precise
-   element guard or tagged result instead of deoptimizing every string result.
-   Use `#59:verbname_match` as the first differential regression case.
+1. Finish reducing the remaining `arithmetic_type` runtime category. Backward
+   string inference through concatenation has removed the indexed-access
+   failures in `#59:verbname_match`; next classify the remaining 24 sites and
+   use a precise element guard or tagged result where an indexed value cannot
+   be inferred from its consumers.
 2. Split and reduce the remaining 98 type-guard failures. Report the guarded
    local slot plus expected and actual type, then distinguish true argument
    specialization failures from inert entry-state values. Do not weaken guards
    for values that can be semantically read before assignment.
-3. Classify the 45 unsupported-operation sites by operation and call-site
+3. Classify the 159 unsupported-operation sites by operation and call-site
    frequency. Lower the highest-frequency continuation-free operation first,
    retaining exact bytecode anchors and deopt state for everything else.
 4. Define declarative built-in effect metadata (pure, may raise, may allocate,
