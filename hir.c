@@ -34,6 +34,12 @@ infer_string_add_operand(HIROp op, int other_known, var_type other_type,
 }
 
 static int
+unary_operand_defaults_to_list(HIROp op)
+{
+    return op == HIR_OP_LENGTH || op == HIR_OP_CHECK_LIST_FOR_SPLICE;
+}
+
+static int
 is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
 			    int local_id, int first_user_local)
 {
@@ -4072,7 +4078,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	for (si = ssa_block->first; si; si = si->next) {
 	    int operand = 0;
 
-	    if ((si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH)
+	    if ((si->kind == HIR_TAC_UNARY
+		 && unary_operand_defaults_to_list(si->op))
 		|| (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX))
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
@@ -7740,6 +7747,12 @@ hir_test_infer_string_add_operand(HIROp op, int other_known,
 				  var_type other_type, var_type *inferred_type)
 {
     return infer_string_add_operand(op, other_known, other_type, inferred_type);
+}
+
+int
+hir_test_unary_operand_defaults_to_list(HIROp op)
+{
+    return unary_operand_defaults_to_list(op);
 }
 
 int

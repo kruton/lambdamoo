@@ -3116,6 +3116,18 @@ test_string_add_operand_inference(void)
 }
 
 static void
+test_list_operand_inference(void)
+{
+    check_int("splice check infers list operand",
+	      hir_test_unary_operand_defaults_to_list(
+		  HIR_OP_CHECK_LIST_FOR_SPLICE), 1);
+    check_int("length defaults unknown operand to list",
+	      hir_test_unary_operand_defaults_to_list(HIR_OP_LENGTH), 1);
+    check_int("unrelated unary op does not infer list operand",
+	      hir_test_unary_operand_defaults_to_list(HIR_OP_NOT), 0);
+}
+
+static void
 test_uninitialized_entry_load_classification(void)
 {
     int first_user = SLOT_FLOAT + 1;
@@ -3257,6 +3269,7 @@ main(void)
 {
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
+    test_list_operand_inference();
     test_uninitialized_entry_load_classification();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
