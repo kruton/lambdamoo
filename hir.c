@@ -3703,7 +3703,11 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
 	break;
     case HIR_TAC_UNARY:
-	map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST
+	    || instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+	    map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+	else
+	    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
 	break;
     case HIR_TAC_LOAD_LOCAL:
     case HIR_TAC_STORE_LOCAL:
