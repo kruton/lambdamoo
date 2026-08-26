@@ -5408,12 +5408,12 @@ lift_stmt(HIRContext *ctx, Stmt *ast)
 
 	    stmt = new_stmt(ctx, HIR_STMT_FORK);
 	    stmt->source_lineno = ast->lineno;
+	    stmt->bytecode_pc = ast->bytecode_pc;
 	    stmt->u.fork.local_id = ast->s.fork.id;
 	    stmt->u.fork.time = lift_expr(ctx, ast->s.fork.time);
 	    ctx->current_code_unit = ast->s.fork.code_unit;
 	    stmt->u.fork.body = lift_stmt_list(ctx, ast->s.fork.body);
 	    ctx->current_code_unit = enclosing_code_unit;
-	    record_unsupported(ctx, "Fork statement is not yet lowerable to TAC");
 	    return stmt;
 	}
     case STMT_TRY_EXCEPT:
@@ -6603,6 +6603,15 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 static void
+lower_fork(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
+{
+    (void) lower_expr(ctx, program, stmt->u.fork.time);
+    append_deopt_boundary(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
+    if (ctx->lower_stack_depth)
+	ctx->lower_stack_depth--;
+}
+
+static void
 lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     HIRTacInstr *instr;
@@ -6640,6 +6649,9 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	break;
     case HIR_STMT_FOR_LIST:
 	lower_for_list(ctx, program, stmt);
+	break;
+    case HIR_STMT_FORK:
+	lower_fork(ctx, program, stmt);
 	break;
     case HIR_STMT_TRY_FINALLY:
 	lower_try_finally(ctx, program, stmt);

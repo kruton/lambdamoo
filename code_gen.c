@@ -1193,6 +1193,7 @@ generate_stmt(Stmt * stmt, State * state)
 		unsigned code_unit, fork_index;
 
 		generate_expr(stmt->s.fork.time, state);
+		record_code_anchor(state, &stmt->bytecode_pc);
 		if (stmt->s.fork.id >= 0)
 		    emit_byte(OP_FORK_WITH_ID, state);
 		else
