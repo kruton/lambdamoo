@@ -476,34 +476,79 @@ Completed in the first native-code milestone:
   forced fallbacks across all supported boundaries, and repeated-execution smoke
   coverage.
 
+The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
+these, 422 (6.68%) are JIT-eligible, 3,583 report `unsupported-program`, 1,913
+report `invalid-bytecode-anchor`, 382 report `invalid-ir`, and 19 report
+`unsupported-value-types`. These top-level reasons are mutually exclusive but
+too coarse to select individual lowering work, so the next milestones first
+improve rejection diagnostics and address failures in the existing supported
+subset.
+
+Reproduce the top-level census from the repository root with a JIT-enabled
+build using:
+
+```sh
+audit_dir=$(mktemp -d /tmp/opal-jit-census.XXXXXX)
+cp Opal.db "$audit_dir/input.db"
+printf '%s\n' \
+  ';; total = eligible = 0; reasons = {}; counts = {}; for o in [#0..max_object()]; if (valid(o)); vs = verbs(o); for i in [1..length(vs)]; info = verb_info(o, i, 1); total = total + 1; meta = info[4]; if (meta[2][2]); eligible = eligible + 1; endif; reason = meta[6][2]; ri = reason in reasons; if (ri); counts[ri] = counts[ri] + 1; else; reasons = {@reasons, reason}; counts = {@counts, 1}; endif; endfor; endif; endfor; return {total, eligible, reasons, counts};' \
+  'quit' \
+  | ./moo -e -l "$audit_dir/census.log" \
+      "$audit_dir/input.db" "$audit_dir/output.db"
+```
+
+The returned value is
+`{total, eligible, reason_names, corresponding_reason_counts}`. Numeric verb
+descriptors avoid ambiguity from aliases or overlapping verb names. The server
+may require permission to create its listening socket even though the census
+uses emergency mode and makes no network connections.
+
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Finish common core-expression and destructuring coverage. Add membership
-   (`in`) first, then optional, default, and rest scatter assignments
-   (`{a, ?b = default, @rest} = expr`) in separate commits, with exact evaluation
-   order, error behavior, ticks, and deoptimization stacks. These features use
-   the value and ownership machinery already present without first requiring a
-   new runtime object model.
-3. Make code-unit identity explicit in native entry and deoptimization maps,
-   then compile fork vectors independently. A fork statement should remain an
-   interpreter boundary, but its separately compiled body should be eligible
-   for native entry without confusing main-vector bytecode PCs, resume anchors,
-   or serialized activations.
-4. Add shared, ownership-audited runtime helpers for complex-value semantics,
+1. Make JIT rejection reasons actionable. Replace the coarse `invalid-ir`,
+   `invalid-bytecode-anchor`, and `unsupported-program` results with diagnostics
+   that identify the failing verifier or pass, TAC operation, expected and
+   actual bytecode opcode, and unsupported AST/HIR construct. Add an automated
+   Opal.db census that reports both the top-level reasons and these detailed
+   categories without modifying the source database.
+2. Investigate and correct the `invalid-ir` population before expanding the
+   supported language. In the current Opal.db census this is 382 of 6,319 verbs.
+   Each fix should include a minimized source-level regression test and retain
+   all TAC, CFG, SSA, and out-of-SSA verifier checks; cases that are intentionally
+   unsupported should be reclassified instead of reported as invalid IR.
+3. Investigate and correct bytecode-anchor failures, ranked by failing operation
+   and opcode pattern. The current census reports 1,913 verbs in this category,
+   making it the largest potentially recoverable group. Distinguish incorrect
+   AST anchors, synthetic HIR operations that need explicit anchor rules, and
+   operations that should deoptimize rather than validate as native. Re-run the
+   corpus census after each reviewable group of fixes.
+4. Split `unsupported-program` into feature-specific counts and choose the next
+   language-coverage work from measured frequency. Membership (`in`) and
+   optional, default, and rest scatter assignments
+   (`{a, ?b = default, @rest} = expr`) remain likely candidates, but should be
+   prioritized using the corpus results. Lower each feature in separate commits
+   with exact evaluation order, errors, ticks, ownership, and deoptimization
+   stacks.
+5. Add shared, ownership-audited runtime helpers for complex-value semantics,
    then use them to broaden native string and nested-list operations and to
    integrate WAIF (`TYPE_WAIF`) references and property access. Keep pointer
    identity out of language equality, truth, and ordering semantics, and test
    every helper on success, error, and deoptimization paths.
-5. Define declarative built-in effect metadata (pure, may raise, may allocate,
+6. Make code-unit identity explicit in native entry and deoptimization maps,
+   then compile fork vectors independently. A fork statement should remain an
+   interpreter boundary, but its separately compiled body should be eligible
+   for native entry without confusing main-vector bytecode PCs, resume anchors,
+   or serialized activations.
+7. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-6. Add profile-guided, semantics-preserving optimization only after the wider
+8. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-7. Finish with database-scale validation and performance work: multi-verb and
+9. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
