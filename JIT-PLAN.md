@@ -513,25 +513,20 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Support ownership-correct list constants, currently the first rejection for
-   2,852 verbs. Distinguish the empty list used for argument and exception-code
-   construction from persistent literal lists, and ensure native return,
-   deoptimization, and program teardown each retain or release the constant
-   exactly once.
-2. Correct argument-list bytecode anchors. Use the normalized census categories
+1. Correct argument-list bytecode anchors. Use the normalized census categories
    to fix singleton-list (`HIR_OP_MAKE_SINGLETON_LIST`) and splice-check
    (`HIR_OP_CHECK_LIST_FOR_SPLICE`) instructions whose enclosing synthetic list
-   currently carries a call opcode anchor. Preserve per-argument tick and
-   deoptimization stack state.
-3. Add membership (`HIR_OP_IN`), currently the first unsupported operation for
-   508 verbs, using interpreter-equivalent equality, error, tick, and ownership
+   currently carries a call opcode anchor (e.g. 2,230 `pc * op 25` and 1,139 `pc * op 25`
+   anchor mismatches). Preserve per-argument tick and deoptimization stack state.
+2. Add membership (`HIR_OP_IN`), currently the first unsupported operation for
+   1,004 verbs, using interpreter-equivalent equality, error, tick, and ownership
    semantics for strings and lists. Use a runtime helper and deoptimize types
    whose membership semantics are not yet modeled safely.
-4. Classify and lower the 412 unsupported non-local assignments by left-hand
+3. Classify and lower the 412 unsupported non-local assignments by left-hand
    side shape. Implement the most frequent missing assignment form first and
    retain interpreter evaluation order, mutation ownership, errors, and bytecode
    anchors; keep uncommon or unsafe forms as explicit deoptimization boundaries.
-5. Lower optional, default, and rest scatter assignments
+4. Lower optional, default, and rest scatter assignments
    (`{a, ?b = default, @rest} = expr`), currently the first rejection for 125
    verbs, in separate reviewable steps with exact default-expression evaluation,
    errors, ticks, ownership, and deoptimization stacks.

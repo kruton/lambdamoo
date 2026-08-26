@@ -12,9 +12,11 @@
 #include "arena.h"
 #include "functions.h"
 #include "integer_arithmetic.h"
+#include "list.h"
 #include "opcode.h"
 #include "program.h"
 #include "storage.h"
+#include "utils.h"
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -3342,13 +3344,8 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_BRANCH_FALSE:
 	    case HIR_TAC_RETURN:
 	    case HIR_TAC_RETURN0:
-	    case HIR_TAC_PARALLEL_COPY:
-		break;
 	    case HIR_TAC_CONST:
-		if (instr->literal.type == TYPE_LIST) {
-		    record_unsupported(ctx, "ssa-support: list constant");
-		    return 0;
-		}
+	    case HIR_TAC_PARALLEL_COPY:
 		break;
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
@@ -4036,6 +4033,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (ssa_instr->literal.type == TYPE_STR) {
 		    const char *str = str_ref(ssa_instr->literal.v.str);
 		    instr->literal = (uintptr_t) str;
+		}
+		else if (ssa_instr->literal.type == TYPE_LIST) {
+		    if (ssa_instr->literal.v.list == 0) {
+			Var empty = new_list(0);
+			instr->literal = (uintptr_t) empty.v.list;
+		    } else {
+			Var list_var = var_ref(ssa_instr->literal);
+			instr->literal = (uintptr_t) list_var.v.list;
+		    }
 		}
 		else if (ssa_instr->literal.type == TYPE_OBJ)
 		    instr->literal = ssa_instr->literal.v.obj;

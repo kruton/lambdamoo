@@ -1,4 +1,5 @@
 #include "functions.h"
+#include "list.h"
 #include "ref_count.h"
 #include "storage.h"
 #include "utils.h"
@@ -133,4 +134,28 @@ str_dup(const char *s)
     r = (char *) mymalloc(strlen(s) + 1, M_STRING);
     strcpy(r, s);
     return r;
+}
+
+Var
+new_list(int size)
+{
+    Var new;
+
+    if (size == 0) {
+	static Var emptylist;
+
+	if (emptylist.v.list == 0) {
+	    emptylist.type = TYPE_LIST;
+	    emptylist.v.list = (Var *) mymalloc(1 * sizeof(Var), M_LIST);
+	    emptylist.v.list[0].type = TYPE_INT;
+	    emptylist.v.list[0].v.num = 0;
+	}
+	addref(emptylist.v.list);
+	return emptylist;
+    }
+    new.type = TYPE_LIST;
+    new.v.list = (Var *) mymalloc((size + 1) * sizeof(Var), M_LIST);
+    new.v.list[0].type = TYPE_INT;
+    new.v.list[0].v.num = size;
+    return new;
 }

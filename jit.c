@@ -1281,6 +1281,13 @@ jit_program_free(JITProgram *program)
 	    if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_STR
 		&& instr->literal)
 		free_str((const char *) (intptr_t) instr->literal);
+	    else if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_LIST
+		&& instr->literal) {
+		Var list_var;
+		list_var.type = TYPE_LIST;
+		list_var.v.list = (Var *) (intptr_t) instr->literal;
+		free_var(list_var);
+	    }
 	    myfree(instr, M_PROGRAM);
 	    instr = next_instr;
 	}

@@ -5,6 +5,7 @@
 #include "my-string.h"
 
 #include "integer_arithmetic.h"
+#include "list.h"
 #include "storage.h"
 #include "utils.h"
 
@@ -533,6 +534,33 @@ deep_guard_program(void)
     load->next = ret;
     ret->src1 = 2;
     block->first = constant;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+list_constant_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *list_const = instruction(HIR_TAC_CONST);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    Var empty = new_list(0);
+
+    program->num_values = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 2);
+    program->value_types[1] = TYPE_LIST;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    list_const->value = 1;
+    list_const->literal_type = TYPE_LIST;
+    list_const->literal = (uintptr_t) empty.v.list;
+    ret->src1 = 1;
+    ret->literal_type = TYPE_LIST;
+    list_const->next = ret;
+    block->first = list_const;
     block->last = ret;
     return program;
 }
@@ -2963,6 +2991,26 @@ main(void)
 	check(jit_program_state(bench_p) == JIT_STATE_COMPILED,
 	      "repeated execution lost JIT compiled state");
 	jit_program_free(bench_p);
+    }
+
+    {
+	JITProgram *list_const_p = list_constant_program();
+	int iter;
+	check(jit_program_compile(list_const_p) == 1,
+	      "list constant JIT compile failed");
+	for (iter = 0; iter < 50; iter++) {
+	    ticks = 50;
+	    timed_out = 0;
+	    error = E_NONE;
+	    JITRunResult res = jit_program_execute(list_const_p, 0, &result,
+						   &ticks, &timed_out, &error,
+						   0, 0, 0);
+	    check(res == JIT_RUN_RETURNED, "list constant return result");
+	    check(result.type == TYPE_LIST, "list constant result type");
+	    check(result.v.list[0].v.num == 0, "list constant length 0");
+	    free_var(result);
+	}
+	jit_program_free(list_const_p);
     }
 
     jit_program_free(program);
