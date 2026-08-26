@@ -508,7 +508,13 @@ Completed in the first native-code milestone:
   property operations, index stores, and mixed arithmetic deoptimized at exact
   VM boundaries, eliminating all value-type rejections; and
 * length expressions (`$`, `EXPR_LENGTH`) supported in all indexed assignments,
-  range stores, and chained lvalue contexts, achieving full database coverage.
+  range stores, and chained lvalue contexts, achieving full database coverage; and
+* shared ownership-audited runtime helpers implemented for complex-value semantics
+  (`jit_rt_is_true`, `jit_rt_equality`, `jit_rt_str_cmp`, `jit_rt_str_concat`,
+  `jit_rt_str_ref`, `jit_rt_list_concat`, `jit_rt_list_append`, `jit_rt_list_in`,
+  `jit_rt_get_prop`), with MIR call integration lowering string concatenation,
+  string comparisons, list equality, string indexing, list membership, and
+  truth-value branching natively.
 
 The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
 these, all 6,319 (100.00%) are JIT-eligible and compiled; zero verbs report
@@ -548,27 +554,21 @@ emergency mode and makes no network connections.
 
 The next reviewable compiler milestones, in dependency order, are:
 
-1. Add shared, ownership-audited runtime helpers for complex-value semantics,
-   then use them to broaden native string and nested-list operations and to
-   broaden property access. Defer WAIF (`TYPE_WAIF`) representation work until
-   a corpus or targeted workload demonstrates demand. Keep pointer identity out
-   of language equality, truth, and ordering semantics, and test every helper on
-   success, error, and deoptimization paths.
-2. Make code-unit identity explicit in native entry and deoptimization maps,
+1. Make code-unit identity explicit in native entry and deoptimization maps,
    then compile fork vectors independently. A fork statement should remain an
    interpreter boundary, but its separately compiled body should be eligible
    for native entry without confusing main-vector bytecode PCs, resume anchors,
    or serialized activations.
-3. Define declarative built-in effect metadata (pure, may raise, may allocate,
+2. Define declarative built-in effect metadata (pure, may raise, may allocate,
    may call, may suspend, ownership behavior) and make JIT eligibility consume
    it. Only then expand fast paths for high-frequency, continuation-free
    built-ins; all other built-ins remain deopt-before-call boundaries.
-4. Add profile-guided, semantics-preserving optimization only after the wider
+3. Add profile-guided, semantics-preserving optimization only after the wider
    differential suite is green: redundant guards and local traffic first,
    followed by block-level tick batching where exact timeout and source-location
    behavior can be proven. Measure each optimization against interpreter, JIT
    O0, and optimized JIT runs.
-5. Finish with database-scale validation and performance work: multi-verb and
+4. Finish with database-scale validation and performance work: multi-verb and
    suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
    comparison, compile-time and code-size accounting, and benchmarks that
    identify the next coverage or optimization bottleneck.
