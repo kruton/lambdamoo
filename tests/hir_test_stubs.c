@@ -13,6 +13,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+static unsigned test_protection_generation = 1;
+static int test_length_protected;
+
+void hir_test_set_length_protected(int);
+
+unsigned
+builtin_protection_generation(void)
+{
+    return test_protection_generation;
+}
+
+int
+builtin_function_is_protected(unsigned n)
+{
+    return n == 6 && test_length_protected;
+}
+
+void
+hir_test_set_length_protected(int protected)
+{
+    if (test_length_protected != protected) {
+	test_length_protected = protected;
+	test_protection_generation++;
+    }
+}
+
 static inline int
 refcount_overhead(Memory_Type type)
 {

@@ -3788,6 +3788,15 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
     map->builtin_func = -1;
+    map->builtin_args = -1;
+    if (instr->kind == HIR_TAC_UNARY && instr->func < FUNC_NOT_FOUND) {
+	map->builtin_func = instr->func;
+	map->builtin_args = instr->src1 ? 1 : 0;
+    } else if (instr->kind == HIR_TAC_BINARY
+	       && instr->func < FUNC_NOT_FOUND) {
+	map->builtin_func = instr->func;
+	map->builtin_args = 2;
+    }
 
     switch (instr->kind) {
     case HIR_TAC_CALL:
@@ -4048,8 +4057,8 @@ jit_build_resume_liveness(JITProgram *program)
 	    if (instr->deopt_map > 0
 		&& instr->deopt_map < program->num_deopt_maps
 		&& (instr->kind == HIR_TAC_CALL_VERB
-		 || (instr->kind == HIR_TAC_CALL
-		     && jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])))) {
+		 || jit_deopt_map_can_bridge_builtin(
+		     &program->deopt_maps[instr->deopt_map]))) {
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
 		int call_operands = jit_call_stack_operands(map);
 		for (value = 1; value < program->num_values; value++)
@@ -4127,6 +4136,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     memset(&program->deopt_maps[0], 0, sizeof(JITDeoptMap));
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].builtin_func = -1;
+    program->deopt_maps[0].builtin_args = -1;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].source_lineno = 1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
@@ -4666,6 +4676,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src1 = ssa_instr->src1;
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
+	    instr->func = ssa_instr->func;
 	    instr->op = ssa_instr->op;
 	    if (((ssa_instr->src1 > 0
 		  && ssa_instr->src1 < program->num_values
@@ -6608,6 +6619,7 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
     instr->label = 0;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;
+    instr->func = FUNC_NOT_FOUND;
     instr->num_stack_values = 0;
     instr->stack_values = 0;
     return instr;

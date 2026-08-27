@@ -916,8 +916,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 	    if (instr->deopt_map > 0
 		&& instr->deopt_map < program->num_deopt_maps
 		&& (instr->kind == HIR_TAC_CALL_VERB
-		 || (instr->kind == HIR_TAC_CALL
-		     && jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])))
+		 || jit_deopt_map_bridges_builtin(
+		     &program->deopt_maps[instr->deopt_map]))
 		&& jit_call_has_native_continuation(program, instr)
 		&& program->deopt_maps[instr->deopt_map].stack_depth
 		   >= (unsigned) jit_call_stack_operands(
@@ -1148,6 +1148,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_UNARY:
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& jit_deopt_map_bridges_builtin(
+			    &program->deopt_maps[instr->deopt_map])) {
+			append_materialized_exit(build, program, instr->deopt_map,
+			 values, deopt_map_out, deopt_values, status,
+			 common_return, JIT_RUN_CALL_VERB);
+			if (resume_continuations[instr->deopt_map])
+			    append(build, resume_continuations[instr->deopt_map]);
+			break;
+		    }
 		    if (instr->kind == HIR_TAC_DEOPT) {
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
@@ -1635,6 +1646,17 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    }
 		    break;
 		case HIR_TAC_BINARY:
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& jit_deopt_map_bridges_builtin(
+			    &program->deopt_maps[instr->deopt_map])) {
+			append_materialized_exit(build, program, instr->deopt_map,
+			 values, deopt_map_out, deopt_values, status,
+			 common_return, JIT_RUN_CALL_VERB);
+			if (resume_continuations[instr->deopt_map])
+			    append(build, resume_continuations[instr->deopt_map]);
+			break;
+		    }
 		    if (instr->kind == HIR_TAC_DEOPT) {
 			append_deopt_exit(build, program, instr->deopt_map,
 					  values, deopt_map_out, deopt_values,
@@ -3317,6 +3339,23 @@ jit_program_unsupported(const char *reason)
     return jit_program_unsupported_with_diagnostic(reason, 0);
 }
 
+static void
+jit_program_release_native(JITProgram *program)
+{
+    if (program->mir_context) {
+	MIR_gen_finish((MIR_context_t) program->mir_context);
+	MIR_finish((MIR_context_t) program->mir_context);
+	program->mir_context = 0;
+    }
+    if (program->deopt_values) {
+	myfree(program->deopt_values, M_PROGRAM);
+	program->deopt_values = 0;
+    }
+    program->native_function = 0;
+    program->machine_code = 0;
+    program->machine_code_len = 0;
+}
+
 void
 jit_program_free(JITProgram *program)
 {
@@ -3324,10 +3363,8 @@ jit_program_free(JITProgram *program)
 
     if (!program)
 	return;
-    if (program->mir_context) {
-	MIR_gen_finish((MIR_context_t) program->mir_context);
-	MIR_finish((MIR_context_t) program->mir_context);
-    }
+
+    jit_program_release_native(program);
     if (program->deopt_maps)
 	{
 	    int i;
@@ -3346,8 +3383,6 @@ jit_program_free(JITProgram *program)
 	    }
 	    myfree(program->deopt_maps, M_PROGRAM);
 	}
-    if (program->deopt_values)
-	myfree(program->deopt_values, M_PROGRAM);
     if (program->value_types)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
@@ -3498,8 +3533,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 
 		for (instr = block->first; instr; instr = instr->next) {
 		    if ((instr->kind == HIR_TAC_CALL_VERB
-			 || (instr->kind == HIR_TAC_CALL
-			     && jit_deopt_map_bridges_builtin(map)))
+			 || jit_deopt_map_bridges_builtin(map))
 			&& instr->deopt_map == i
 			&& jit_call_has_native_continuation(program, instr))
 			return i;
@@ -3516,10 +3550,17 @@ int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
+    unsigned generation;
 
     if (!program || program->state == JIT_STATE_UNSUPPORTED
 	|| program->state == JIT_STATE_FAILED)
 	return 0;
+    generation = builtin_protection_generation();
+    if (program->state == JIT_STATE_COMPILED
+	&& program->protection_generation != generation) {
+	jit_program_release_native(program);
+	program->state = JIT_STATE_PENDING;
+    }
     if (program->state == JIT_STATE_COMPILED)
 	return 1;
     if (!build_mir(program, &build)) {
@@ -3555,6 +3596,7 @@ jit_program_compile(JITProgram *program)
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
     memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
+    program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
     return 1;
 }
@@ -3627,8 +3669,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 
 	if (map->reason == JIT_DEOPT_VERB_CALL && map->stack_depth >= 3)
 	    resume_depth = map->stack_depth - 2;
-	else if (jit_deopt_map_bridges_builtin(map) && map->stack_depth >= 1)
-	    resume_depth = map->stack_depth;
+	else if (jit_deopt_map_bridges_builtin(map)
+		 && map->stack_depth >= (unsigned) jit_call_stack_operands(map))
+	    resume_depth = map->stack_depth - jit_call_stack_operands(map) + 1;
     }
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
@@ -3639,11 +3682,13 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	|| native_result == JIT_RUN_CALL_VERB) {
 	JITDeoptMap *map;
 	Var *new_stack = 0;
+	unsigned materialized_depth;
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
 	    return JIT_RUN_FALLBACK;
 	map = &program->deopt_maps[deopt_map];
+	materialized_depth = map->stack_depth;
 	for (i = 0; i < map->num_locals; i++)
 	    if (map->local_values[i] > 0) {
 		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
@@ -3656,8 +3701,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		free_var(env[i]);
 		env[i] = value;
 	    }
-	if (deopt_stack && map->stack_depth)
-	    new_stack = mymalloc(sizeof(Var) * map->stack_depth, M_PROGRAM);
+	if (deopt_stack && (map->stack_depth || (native_result == JIT_RUN_CALL_VERB
+					       && map->builtin_args == 0)))
+	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
 	for (i = 0; new_stack && i < (int) map->stack_depth; i++) {
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
 	    if (type == TYPE_ANY)
@@ -3667,17 +3713,27 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    new_stack[i] = materialize_deopt_value(type,
 		program->deopt_values[map->stack_values[i]]);
 	}
+	if (new_stack && native_result == JIT_RUN_CALL_VERB
+	    && jit_deopt_map_is_specialized_builtin(map)) {
+	    int outer_depth = map->stack_depth - map->builtin_args;
+	    Var args = new_list(map->builtin_args);
+
+	    for (i = 0; i < map->builtin_args; i++)
+		args.v.list[i + 1] = new_stack[outer_depth + i];
+	    new_stack[outer_depth] = args;
+	    materialized_depth = outer_depth + 1;
+	}
 	if (new_stack) {
 	    for (i = 0; i < resume_depth; i++)
 		free_var(deopt_stack[i]);
-	    memcpy(deopt_stack, new_stack, sizeof(Var) * map->stack_depth);
+	    memcpy(deopt_stack, new_stack, sizeof(Var) * materialized_depth);
 	    myfree(new_stack, M_PROGRAM);
 	}
 	if (deopt) {
 	    deopt->bytecode_pc = map->bytecode_pc;
 	    deopt->error_pc = map->error_pc;
 	    deopt->source_lineno = map->source_lineno;
-	    deopt->stack_depth = map->stack_depth;
+	    deopt->stack_depth = materialized_depth;
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
 	    deopt->reason = map->reason;

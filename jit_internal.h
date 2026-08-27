@@ -46,6 +46,7 @@ struct JITDeoptMap {
     JITResumeValue *resume_values;
     int native_resume_valid;
     int builtin_func;
+    int builtin_args;
     JITDeoptReason reason;
 };
 
@@ -57,14 +58,32 @@ jit_deopt_map_is_builtin(JITDeoptMap *map, const char *name)
 }
 
 static inline int
+jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
+{
+    return map->reason == JIT_DEOPT_ARITHMETIC_TYPE
+	&& map->builtin_func >= 0 && map->builtin_args >= 0;
+}
+
+static inline int
+jit_deopt_map_can_bridge_builtin(JITDeoptMap *map)
+{
+    return jit_deopt_map_is_builtin(map, "pass")
+	|| jit_deopt_map_is_specialized_builtin(map);
+}
+
+static inline int
 jit_deopt_map_bridges_builtin(JITDeoptMap *map)
 {
-    return jit_deopt_map_is_builtin(map, "pass");
+    return jit_deopt_map_is_builtin(map, "pass")
+	|| (jit_deopt_map_is_specialized_builtin(map)
+	    && builtin_function_is_protected((unsigned) map->builtin_func));
 }
 
 static inline int
 jit_call_stack_operands(JITDeoptMap *map)
 {
+    if (jit_deopt_map_is_specialized_builtin(map))
+	return map->builtin_args;
     return map->reason == JIT_DEOPT_BUILTIN_CALL ? 1 : 3;
 }
 
@@ -83,6 +102,7 @@ struct JITInstruction {
     int src1;
     int src2;
     int local_id;
+    unsigned func;
     HIROp op;
     Num literal;
     var_type literal_type;
@@ -121,6 +141,7 @@ struct JITProgram {
     Num *deopt_values;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    unsigned protection_generation;
 };
 
 extern int jit_rt_is_true(int64_t, int);

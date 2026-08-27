@@ -18,6 +18,7 @@
 static int failures;
 
 static void check(int, const char *);
+extern void hir_test_set_length_protected(int);
 
 struct machine_dump {
     int lines;
@@ -48,6 +49,7 @@ instruction(HIRTacKind kind)
     JITInstruction *result = allocate(sizeof(JITInstruction));
 
     result->kind = kind;
+    result->func = FUNC_NOT_FOUND;
     return result;
 }
 
@@ -56,6 +58,7 @@ add_entry_deopt_map(JITProgram *program)
 {
     program->num_deopt_maps = 1;
     program->deopt_maps = allocate(sizeof(JITDeoptMap));
+    program->deopt_maps[0].builtin_args = -1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
 }
 
@@ -1349,8 +1352,22 @@ string_length_program(const char *s)
     JITInstruction *constant = program->blocks->first;
     JITInstruction *return_instr = constant->next;
     JITInstruction *length_instr = instruction(HIR_TAC_UNARY);
+    JITDeoptMap *map;
 
     program->num_values = 3;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    memset(&program->deopt_maps[1], 0, sizeof(JITDeoptMap));
+    map = &program->deopt_maps[1];
+    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+    map->builtin_func = 6;
+    map->builtin_args = 1;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_STR;
     myfree(program->value_types, M_PROGRAM);
     program->value_types = allocate(sizeof(var_type) * 3);
     program->value_types[0] = TYPE_INT;
@@ -1359,8 +1376,9 @@ string_length_program(const char *s)
     constant->next = length_instr;
     length_instr->value = 2;
     length_instr->src1 = 1;
+    length_instr->func = 6;
     length_instr->op = HIR_OP_LENGTH;
-    length_instr->deopt_map = 0;
+    length_instr->deopt_map = 1;
     length_instr->next = return_instr;
     return_instr->src1 = 2;
     return_instr->literal_type = TYPE_INT;
@@ -3517,6 +3535,33 @@ main(void)
 	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
 	      "string length returned wrong configured character length");
 	check_differential(str_length, 0, 10, 0, "string length differential");
+
+	/* Protection changes regenerate code and bridge the builtin through the VM. */
+	hir_test_set_length_protected(1);
+	{
+	    JITDeoptState protected_deopt;
+	    Var protected_stack[1];
+
+	    ticks = 10;
+	    check(jit_program_execute(str_length, 0, &result, &ticks,
+				      &timed_out, &error, 0, &protected_deopt,
+				      protected_stack)
+		  == JIT_RUN_CALL_VERB, "protected length did not enter VM");
+	    check(protected_deopt.stack_depth == 1
+		  && protected_stack[0].type == TYPE_LIST
+		  && protected_stack[0].v.list[0].v.num == 1
+		  && protected_stack[0].v.list[1].type == TYPE_STR,
+		  "protected length did not materialize its arguments");
+	    free_var(protected_stack[0]);
+	}
+	hir_test_set_length_protected(0);
+	ticks = 10;
+	check(jit_program_execute(str_length, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "unprotected length did not return to native");
+	check(result.type == TYPE_INT
+	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
+	      "recompiled length returned the wrong value");
 	jit_program_free(str_length);
 
 	JITProgram *str_cat = string_concat_program("Hello, ", "world!");
