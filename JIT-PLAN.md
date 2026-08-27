@@ -228,13 +228,16 @@ seconds exhaustion.
 Built-ins can return, raise, call another verb, suspend, or abort. Verb calls
 can push new activations and affect permissions, traceback, and suspension.
 
-The current tier deoptimizes before general built-in and verb calls, but directly
-lowers a reviewed set of continuation-free built-ins and runtime operations.
+The current tier deoptimizes before general built-in calls, but directly lowers
+a reviewed set of continuation-free built-ins and runtime operations.
 These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
 `index()`, `rindex()`, `ticks_left()`, `seconds_left()`, `time()`, `valid()`, and
-`parent()`. General calls continue in the interpreter, which owns
-`bi_func_pc`, `bi_func_id`, `bi_func_data`, activation creation, suspension, and
-traceback behavior.
+`parent()`. Verb calls use a distinct VM-call exit that materializes the exact
+`OP_CALL_VERB` stack and transfers to the canonical activation-push path without
+counting the transfer as a deoptimization. The callee can therefore enter JIT,
+but the caller currently resumes in the interpreter after the callee returns.
+The interpreter continues to own `bi_func_pc`, `bi_func_id`, `bi_func_data`,
+activation creation, suspension, and traceback behavior.
 
 Built-in inlining must be opt-in and metadata-driven. A built-in may be inlined
 only if its registered contract declares it continuation-free:
@@ -425,7 +428,8 @@ The current native execution surface includes:
   tagged values;
 * selected continuation-free built-ins, including resource-query, string,
   numeric, and object predicates; and
-* safe deopt-before-call handling for general built-ins and verb calls.
+* safe deopt-before-call handling for general built-ins and a dedicated VM-call
+  bridge for verb calls.
 
 Recent tagged-value work allows runtime-typed scalar and complex values to flow
 through concatenation, indexing, list construction, comparisons, branches,
@@ -453,8 +457,9 @@ same database, object range, and server configuration. Record both entered and
 completed activation counts: a lower raw deopt count can otherwise hide reduced
 coverage.
 
-A recent codepoint.db sample over objects #0 through #50 entered 1,418 compiled
-activations, completed 236 natively, and deoptimized 1,131. Its distribution was:
+A codepoint.db sample over objects #0 through #50 before the VM-call bridge
+entered 1,418 compiled activations, completed 236 natively, and deoptimized
+1,131. Its distribution was:
 
 * 363 unsupported operations (32.10%);
 * 345 verb calls (30.50%);
@@ -468,6 +473,14 @@ These figures are workload-specific. They show that expanding complete native
 execution now depends primarily on operation/call coverage and guard quality,
 not on compiling more verb bodies.
 
+After the first VM-call bridge stage, an Opal.db objects #0 through #25 sample
+entered 130 compiled activations, completed 27 natively, and recorded 68
+deoptimizations. No `verb_call` deoptimizations remained; the 68 exits comprised
+27 built-in calls, 16 unsupported operations, 15 type guards, eight arithmetic
+guards, and two range operations. The task suspended before exhausting the
+range, so this confirms removal of the verb-call reason but is not a performance
+comparison with the earlier codepoint.db workload.
+
 ### 14.3 Priorities for programs that remain entirely native
 
 1. **Classify unsupported operations by HIR operation and call site.**
@@ -477,13 +490,15 @@ not on compiling more verb bodies.
    and controls paths. Do not implement an operation until its resume stack,
    error behavior, tick charge, and ownership contract are known.
 
-2. **Keep native callers native across ordinary verb calls.**
-   Verb calls are the largest well-defined boundary. Add a native-to-runtime
-   call bridge that can push a normal activation and dispatch a JIT-compiled
-   callee, while retaining an interpreter continuation for suspension,
-   traceback, recursion, permissions, and a callee that deoptimizes. Begin with
-   non-tail calls that return normally; add tail calls only after activation
-   replacement is modeled. This is likely the single largest improvement to
+2. **Resume native callers after ordinary verb calls.**
+   The first bridge stage now materializes the canonical `OP_CALL_VERB` stack,
+   pushes a normal activation, and dispatches an eligible callee through JIT
+   without reporting a caller deoptimization. Add a native continuation entry
+   for the caller's `RESUME_PHASE_AFTER_CALL` key so a normal callee return can
+   restore the result and live values and continue in native code. Retain the
+   interpreter continuation for suspension, traceback, recursion, permissions,
+   and a callee that deoptimizes. Add tail calls only after activation
+   replacement is modeled. This remains the largest likely improvement to
    whole-program native completion.
 
 3. **Replace the built-in name allowlist with effect metadata.**
