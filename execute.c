@@ -965,12 +965,15 @@ do {								\
 	    JITDeoptState deopt;
 	    enum error jit_error = E_NONE;
 
+	    jit_profile_record_entry();
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
-					     RUN_ACTIV.base_rt_stack);
+					     RUN_ACTIV.base_rt_stack,
+					     RUN_ACTIV.progr);
 	    if (jit_result == JIT_RUN_RETURNED) {
+		jit_profile_record_completed();
 		STORE_STATE_VARIABLES();
 		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
 		    if (result && outcome == OUTCOME_DONE)
@@ -998,6 +1001,8 @@ do {								\
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK) {
+		jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
+					 &deopt);
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;
@@ -2141,7 +2146,7 @@ do {								\
 				if (i == rest) {	/* rest */
 				    free_var(RUN_ACTIV.rt_env[id]);
 				    RUN_ACTIV.rt_env[id] =
-				        sublist(var_ref(list), i, i + nrest);
+					sublist(var_ref(list), i, i + nrest);
 				    offset += nrest - 1;
 				} else if (label == 0) {	/* required */
 				    free_var(RUN_ACTIV.rt_env[id]);
@@ -3064,12 +3069,18 @@ bf_read(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     return make_suspend_pack(make_reading_task, &connection);
 }
 
+int
+current_task_seconds_left(void)
+{
+    return timer_wakeup_interval(task_alarm_id);
+}
+
 static package
 bf_seconds_left(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr UNUSED_)
 {
     Var r;
     r.type = TYPE_INT;
-    r.v.num = timer_wakeup_interval(task_alarm_id);
+    r.v.num = current_task_seconds_left();
     free_var(arglist);
     return make_var_pack(r);
 }

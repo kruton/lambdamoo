@@ -1,11 +1,14 @@
 #include "db.h"
+#include "execute.h"
 #include "functions.h"
 #include "list.h"
+#include "log.h"
 #include "ref_count.h"
 #include "server.h"
 #include "storage.h"
 #include "utils.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +30,12 @@ refcount_overhead(Memory_Type type)
     default:
 	return 0;
     }
+}
+
+int
+current_task_seconds_left(void)
+{
+    return 5;
 }
 
 void
@@ -127,6 +136,8 @@ name_func_by_num(unsigned id)
     case 4: return "min";
     case 5: return "max";
     case 6: return "length";
+    case 7: return "index";
+    case 8: return "rindex";
     default: return "unknown_func";
     }
 }
@@ -184,6 +195,70 @@ mystrcasecmp(const char *s1, const char *s2)
     if (!s2)
 	s2 = "";
     return strcasecmp(s1, s2);
+}
+
+static int
+test_strncasecmp(const char *s1, const char *s2, size_t length)
+{
+    while (length-- > 0) {
+	unsigned char c1 = *s1++;
+	unsigned char c2 = *s2++;
+
+	if (c1 >= 'A' && c1 <= 'Z')
+	    c1 += 'a' - 'A';
+	if (c2 >= 'A' && c2 <= 'Z')
+	    c2 += 'a' - 'A';
+	if (c1 != c2 || c1 == '\0')
+	    return (int) c1 - (int) c2;
+    }
+    return 0;
+}
+
+static int
+test_utf_continuation(unsigned char c)
+{
+    return (c & 0xc0) == 0x80;
+}
+
+int
+strindex(const char *source, const char *what, int case_counts)
+{
+    const char *s, *end;
+    size_t what_length = strlen(what);
+    int index = 0;
+
+    for (s = source, end = source + strlen(source) - what_length; s <= end;
+	 index++) {
+	if (!(case_counts ? strncmp(s, what, what_length)
+	      : test_strncasecmp(s, what, what_length)))
+	    return index + 1;
+	do
+	    s++;
+	while (s <= end && test_utf_continuation((unsigned char) *s));
+    }
+    return 0;
+}
+
+int
+strrindex(const char *source, const char *what, int case_counts)
+{
+    const char *s, *p;
+    size_t what_length = strlen(what);
+
+    for (s = source + strlen(source) - what_length; s >= source; s--) {
+	int index = 1;
+
+	if (test_utf_continuation((unsigned char) *s))
+	    continue;
+	if (case_counts ? strncmp(s, what, what_length)
+	    : test_strncasecmp(s, what, what_length))
+	    continue;
+	for (p = source; p < s; p++)
+	    if (!test_utf_continuation((unsigned char) *p))
+		index++;
+	return index;
+    }
+    return 0;
 }
 
 
@@ -268,6 +343,12 @@ valid(Objid oid)
     return oid >= 0;
 }
 
+Objid
+db_object_parent(Objid oid)
+{
+    return oid > 0 ? 0 : -1;
+}
+
 int
 is_wizard(Objid oid)
 {
@@ -297,4 +378,17 @@ db_property_allows(db_prop_handle h, Objid progr, db_prop_flag flag)
     (void) progr;
     (void) flag;
     return 1;
+}
+
+Num
+server_int_option(const char *name, Num defallt)
+{
+    (void) name;
+    return defallt;
+}
+
+void
+oklog(const char *fmt, ...)
+{
+    (void) fmt;
 }

@@ -104,7 +104,15 @@ typedef enum {
     HIR_OP_LENGTH,
     HIR_OP_GET_PROP,
     HIR_OP_SCATTER,
-    HIR_OP_CHARGE_TICK
+    HIR_OP_CHARGE_TICK,
+    HIR_OP_TICKS_LEFT,
+    HIR_OP_SECONDS_LEFT,
+    HIR_OP_TIME,
+    HIR_OP_INDEX_BF,
+    HIR_OP_RINDEX_BF,
+    HIR_OP_VALID,
+    HIR_OP_PARENT,
+    HIR_OP_SUBLIST_FROM
 } HIROp;
 
 typedef enum {
@@ -197,6 +205,7 @@ extern int hir_ssa_block_count(HIRSSAProgram *);
 extern int hir_ssa_instruction_count(HIRSSAProgram *);
 extern int hir_ssa_value_count(HIRSSAProgram *);
 extern int hir_ssa_count_kind(HIRSSAProgram *, HIRTacKind);
+extern int hir_ssa_out_of_range_load_count(HIRSSAProgram *, int);
 extern int hir_ssa_count_bytecode_pc(HIRSSAProgram *, unsigned);
 extern int hir_ssa_stack_depth_at_bytecode_pc(HIRSSAProgram *, unsigned);
 extern int hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
@@ -212,6 +221,12 @@ extern int hir_ssa_cfg_edge_count(HIRSSAProgram *);
 extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
 						 unsigned, HIROp);
+extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
+extern int hir_test_unary_operand_defaults_to_list(HIROp);
+extern int hir_test_is_uninitialized_entry_load(HIRTacKind, unsigned, int,
+						int);
+extern int hir_test_builtin_entry_type(HIRTacKind, unsigned, int, int,
+				       var_type *);
 extern HIRValueKind hir_ssa_return_value_kind(HIRSSAProgram *,
 					       HIRValueAnalysis *);
 extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);

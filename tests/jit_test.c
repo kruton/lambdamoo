@@ -12,6 +12,9 @@
 
 #include <limits.h>
 
+#define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2)
+
 static int failures;
 
 static void check(int, const char *);
@@ -53,6 +56,7 @@ add_entry_deopt_map(JITProgram *program)
 {
     program->num_deopt_maps = 1;
     program->deopt_maps = allocate(sizeof(JITDeoptMap));
+    program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
 }
 
 static JITProgram *
@@ -1287,20 +1291,19 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *const_codes = instruction(HIR_TAC_CONST);
     JITInstruction *const_pc = instruction(HIR_TAC_CONST);
     JITInstruction *const_catch = instruction(HIR_TAC_CONST);
-    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 5;
+    program->num_values = 4;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types = allocate(sizeof(var_type) * 4);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_INT;
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_CATCH;
-    program->value_types[4] = TYPE_INT;
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 25;
@@ -1335,9 +1338,6 @@ catch_stack_marker_deopt_program(void)
     const_catch->literal_type = TYPE_CATCH;
     const_catch->next = deopt_op;
 
-    deopt_op->value = 4;
-    deopt_op->src1 = 1;
-    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
     deopt_op->deopt_map = 1;
     deopt_op->bytecode_pc = 25;
 
@@ -1419,18 +1419,17 @@ finally_stack_marker_deopt_program(void)
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
     JITInstruction *const_finally = instruction(HIR_TAC_CONST);
-    JITInstruction *deopt_op = instruction(HIR_TAC_UNARY);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 3;
+    program->num_values = 2;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_types = allocate(sizeof(var_type) * 2);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_FINALLY;
-    program->value_types[2] = TYPE_INT;
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 40;
@@ -1451,9 +1450,6 @@ finally_stack_marker_deopt_program(void)
     const_finally->literal_type = TYPE_FINALLY;
     const_finally->next = deopt_op;
 
-    deopt_op->value = 2;
-    deopt_op->src1 = 1;
-    deopt_op->op = HIR_OP_MAKE_SINGLETON_LIST;
     deopt_op->deopt_map = 1;
     deopt_op->bytecode_pc = 40;
 
@@ -1507,6 +1503,312 @@ list_index_typed_program(var_type elem_type)
 
     block->first = load_list;
     block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+list_index_tagged_deopt_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *copy_instr = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *deopt_instr = instruction(HIR_TAC_DEOPT);
+    JITCopy *copy = allocate(sizeof(JITCopy));
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_is_tagged = allocate(5);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[4] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = 12;
+    map->source_lineno = 4;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 4;
+    map->stack_types[0] = TYPE_ANY;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = copy_instr;
+    copy->src = 3;
+    copy->dst = 4;
+    copy_instr->copies = copy;
+    copy_instr->next = deopt_instr;
+    deopt_instr->deopt_map = 1;
+    block->first = load_list;
+    block->last = deopt_instr;
+    return program;
+}
+
+static JITProgram *
+list_index_tagged_return_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_is_tagged = allocate(4);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+list_index_tagged_base_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_outer = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_one = instruction(HIR_TAC_CONST);
+    JITInstruction *load_base = instruction(HIR_TAC_BINARY);
+    JITInstruction *const_two = instruction(HIR_TAC_CONST);
+    JITInstruction *load_index = instruction(HIR_TAC_BINARY);
+    JITInstruction *load_value = instruction(HIR_TAC_BINARY);
+    JITInstruction *deopt = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->num_values = 7;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 7);
+    program->value_is_tagged = allocate(7);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[4] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[5] = 1;
+    program->value_is_tagged[6] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 6;
+    map->stack_types[0] = TYPE_ANY;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_outer->value = 1;
+    load_outer->local_id = 0;
+    load_outer->literal_type = TYPE_LIST;
+    load_outer->next = const_one;
+    const_one->value = 2;
+    const_one->literal = 1;
+    const_one->literal_type = TYPE_INT;
+    const_one->next = load_base;
+    load_base->value = 3;
+    load_base->src1 = 1;
+    load_base->src2 = 2;
+    load_base->op = HIR_OP_INDEX;
+    load_base->next = const_two;
+    const_two->value = 4;
+    const_two->literal = 2;
+    const_two->literal_type = TYPE_INT;
+    const_two->next = load_index;
+    load_index->value = 5;
+    load_index->src1 = 1;
+    load_index->src2 = 4;
+    load_index->op = HIR_OP_INDEX;
+    load_index->next = load_value;
+    load_value->value = 6;
+    load_value->src1 = 3;
+    load_value->src2 = 5;
+    load_value->op = HIR_OP_INDEX;
+    load_value->next = deopt;
+    deopt->deopt_map = 1;
+    block->first = load_outer;
+    block->last = deopt;
+    return program;
+}
+
+static JITProgram *
+list_index_tagged_consumer_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *rhs_instr = instruction(op == HIR_OP_IN
+					    ? HIR_TAC_LOAD_LOCAL : HIR_TAC_CONST);
+    JITInstruction *consumer = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 6;
+    program->num_vars = op == HIR_OP_IN ? 2 : 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 6);
+    program->value_is_tagged = allocate(6);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_types[4] = op == HIR_OP_IN ? TYPE_LIST : TYPE_STR;
+    program->value_types[5] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = rhs_instr;
+    rhs_instr->value = 4;
+    if (op == HIR_OP_IN) {
+	rhs_instr->local_id = 1;
+	rhs_instr->literal_type = TYPE_LIST;
+    } else {
+	const char *literal = str_dup("tagged element");
+	rhs_instr->literal = (Num) (intptr_t) literal;
+	rhs_instr->literal_type = TYPE_STR;
+    }
+    rhs_instr->next = consumer;
+    consumer->value = 5;
+    consumer->src1 = 3;
+    consumer->src2 = 4;
+    consumer->op = op;
+    consumer->next = ret;
+    ret->src1 = 5;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_string_pipeline_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_one = instruction(HIR_TAC_CONST);
+    JITInstruction *load_subject = instruction(HIR_TAC_BINARY);
+    JITInstruction *const_two = instruction(HIR_TAC_CONST);
+    JITInstruction *load_delim = instruction(HIR_TAC_BINARY);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *index = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 8;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 8);
+    program->value_is_tagged = allocate(8);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[4] = TYPE_INT;
+    program->value_types[7] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[5] = 1;
+    program->value_is_tagged[6] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_one;
+    const_one->value = 2;
+    const_one->literal = 1;
+    const_one->literal_type = TYPE_INT;
+    const_one->next = load_subject;
+    load_subject->value = 3;
+    load_subject->src1 = 1;
+    load_subject->src2 = 2;
+    load_subject->op = HIR_OP_INDEX;
+    load_subject->next = const_two;
+    const_two->value = 4;
+    const_two->literal = 2;
+    const_two->literal_type = TYPE_INT;
+    const_two->next = load_delim;
+    load_delim->value = 5;
+    load_delim->src1 = 1;
+    load_delim->src2 = 4;
+    load_delim->op = HIR_OP_INDEX;
+    load_delim->next = concat;
+    concat->value = 6;
+    concat->src1 = 3;
+    concat->src2 = 5;
+    concat->op = HIR_OP_ADD;
+    concat->next = index;
+    index->value = 7;
+    index->src1 = 6;
+    index->src2 = 5;
+    index->op = HIR_OP_INDEX_BF;
+    index->next = ret;
+    ret->src1 = 7;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
     return program;
 }
 
@@ -2506,6 +2808,8 @@ main(void)
     check(ticks == 10, "entry guard fallback consumed ticks");
     check(deopt.bytecode_pc == 0 && deopt.error_pc == 0
 	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
+    check(deopt.reason == JIT_DEOPT_TYPE_GUARD,
+	  "entry guard returned the wrong deopt reason");
     check_differential(guard, env, 10, 0,
 		       "guard fallback differed from reference execution");
     free_var(env[0]);
@@ -2715,6 +3019,24 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == 42,
 	      "abs returned wrong value");
 	jit_program_free(abs_p);
+
+	JITProgram *ticks_left_p = unary_program(0, HIR_OP_TICKS_LEFT);
+	ticks = 37;
+	check(jit_program_execute(ticks_left_p, env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "ticks_left execution failed");
+	check(result.type == TYPE_INT && result.v.num == 37,
+	      "ticks_left returned wrong value");
+	jit_program_free(ticks_left_p);
+
+	JITProgram *seconds_left_p = unary_program(0, HIR_OP_SECONDS_LEFT);
+	ticks = 10;
+	check(jit_program_execute(seconds_left_p, env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "seconds_left execution failed");
+	check(result.type == TYPE_INT && result.v.num == 5,
+	      "seconds_left returned wrong value");
+	jit_program_free(seconds_left_p);
 
 	JITProgram *min_p = binary_program(10, 20, HIR_OP_MIN);
 	ticks = 10;
@@ -2981,12 +3303,14 @@ main(void)
 	check_differential(str_const, 0, 10, 0, "string const differential");
 	jit_program_free(str_const);
 
-	/* String truth and comparison semantics require content inspection. */
+	/* String truth and comparison semantics. */
 	JITProgram *str_not = string_not_program("");
 	ticks = 10;
 	check(jit_program_execute(str_not, 0, &result, &ticks, &timed_out,
 				  &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "empty string not did not fallback");
+	      == JIT_RUN_RETURNED, "empty string not returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "empty string not evaluated to 1");
 	jit_program_free(str_not);
 
 	JITProgram *str_eq = string_compare_program("same", "SAME", HIR_OP_EQ);
@@ -3050,6 +3374,36 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == 1,
 	      "string less-than match");
 	jit_program_free(str_lt);
+
+	JITProgram *str_find = string_compare_program("h\xc3\xa9llo MOO", "moo",
+						     HIR_OP_INDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_find, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "index built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 7,
+	      "index built-in returned Unicode character position");
+	jit_program_free(str_find);
+
+	JITProgram *str_rfind = string_compare_program("MOO and moo", "moo",
+						      HIR_OP_RINDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_rfind, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "rindex built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 9,
+	      "rindex built-in returned last case-insensitive match");
+	jit_program_free(str_rfind);
+
+	JITProgram *str_missing = string_compare_program("LambdaMOO", "xyz",
+							HIR_OP_INDEX_BF);
+	ticks = 10;
+	check(jit_program_execute(str_missing, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "missing index built-in execution returned");
+	check(result.type == TYPE_INT && result.v.num == 0,
+	      "missing index built-in returned zero");
+	jit_program_free(str_missing);
     }
 
     /* Non-integer list indexing tests */
@@ -3114,6 +3468,172 @@ main(void)
 	      == JIT_RUN_FALLBACK, "list index elem type mismatch did not fallback");
 	jit_program_free(idx_str);
 	myfree(elements, M_LIST);
+    }
+
+    /* Dynamically tagged list elements survive SSA copies and deoptimization. */
+    {
+	JITProgram *tagged = list_index_tagged_deopt_program();
+	Var tagged_env[1];
+	Var tagged_stack[1];
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_STR;
+	tagged_env[0].v.list[1].v.str = str_dup("tagged element");
+	memset(tagged_stack, 0, sizeof(tagged_stack));
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt,
+				  tagged_stack) == JIT_RUN_FALLBACK,
+	      "tagged list index did not reach deopt boundary");
+	check(tagged_stack[0].type == TYPE_STR
+	      && !strcmp(tagged_stack[0].v.str, "tagged element"),
+	      "tagged list index reconstructed the wrong value");
+	free_var(tagged_stack[0]);
+	free_var(tagged_env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* A native return must use a tagged value's runtime type. */
+    {
+	JITProgram *tagged = list_index_tagged_return_program();
+	Var env[1];
+
+	env[0] = new_list(1);
+	env[0].v.list[1].type = TYPE_STR;
+	env[0].v.list[1].v.str = str_dup("tagged return");
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged return executed natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "tagged return"),
+	      "tagged return preserved its runtime type");
+	free_var(result);
+	free_var(env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* Tagged list bases and indexes are guarded before native indexing. */
+    {
+	JITProgram *tagged = list_index_tagged_base_program();
+	Var tagged_env[1];
+	Var tagged_stack[1];
+	Var inner = new_list(1);
+
+	inner.v.list[1].type = TYPE_STR;
+	inner.v.list[1].v.str = str_dup("nested tagged element");
+	tagged_env[0] = new_list(2);
+	tagged_env[0].v.list[1] = inner;
+	tagged_env[0].v.list[2].type = TYPE_INT;
+	tagged_env[0].v.list[2].v.num = 1;
+	memset(tagged_stack, 0, sizeof(tagged_stack));
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt,
+				  tagged_stack) == JIT_RUN_FALLBACK,
+	      "tagged base indexing did not reach deopt boundary");
+	check(tagged_stack[0].type == TYPE_STR
+	      && !strcmp(tagged_stack[0].v.str, "nested tagged element"),
+	      "tagged base indexing reconstructed the wrong value");
+	free_var(tagged_stack[0]);
+	tagged_env[0].v.list[2].type = TYPE_STR;
+	tagged_env[0].v.list[2].v.str = str_dup("not an index");
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer index did not fallback");
+	free_var(tagged_env[0].v.list[2]);
+	tagged_env[0].v.list[2].type = TYPE_INT;
+	tagged_env[0].v.list[2].v.num = 1;
+	free_var(tagged_env[0].v.list[1]);
+	tagged_env[0].v.list[1].type = TYPE_INT;
+	tagged_env[0].v.list[1].v.num = 7;
+	ticks = 10;
+	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-list base did not fallback");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* Equality and membership consume dynamically tagged values natively. */
+    {
+	JITProgram *tagged_eq = list_index_tagged_consumer_program(HIR_OP_EQ);
+	JITProgram *tagged_in = list_index_tagged_consumer_program(HIR_OP_IN);
+	Var tagged_env[2];
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_STR;
+	tagged_env[0].v.list[1].v.str = str_dup("tagged element");
+	tagged_env[1] = new_list(1);
+	tagged_env[1].v.list[1].type = TYPE_STR;
+	tagged_env[1].v.list[1].v.str = str_dup("tagged element");
+	ticks = 10;
+	check(jit_program_execute(tagged_eq, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED && result.type == TYPE_INT
+	      && result.v.num == 1,
+	      "tagged equality returned the wrong value");
+	ticks = 10;
+	check(jit_program_execute(tagged_in, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED && result.type == TYPE_INT
+	      && result.v.num == 1,
+	      "tagged membership returned the wrong value");
+	free_var(tagged_env[0]);
+	free_var(tagged_env[1]);
+	jit_program_free(tagged_eq);
+	jit_program_free(tagged_in);
+    }
+
+    /* Tagged strings retain their type through concatenation and index(). */
+    {
+	JITProgram *pipeline = tagged_string_pipeline_program();
+	Var env[1];
+
+	env[0] = new_list(2);
+	env[0].v.list[1].type = TYPE_STR;
+	env[0].v.list[1].v.str = str_dup("hello world");
+	env[0].v.list[2].type = TYPE_STR;
+	env[0].v.list[2].v.str = str_dup(" ");
+	ticks = 10;
+	check(jit_program_execute(pipeline, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged string pipeline executed natively");
+	check(result.type == TYPE_INT && result.v.num == 6,
+	      "tagged string pipeline returned the delimiter position");
+	free_var(env[0]);
+	jit_program_free(pipeline);
+    }
+
+    /* Sublist from runtime helper tests */
+    {
+	Var base = new_list(3);
+	base.v.list[1].type = TYPE_INT;
+	base.v.list[1].v.num = 10;
+	base.v.list[2].type = TYPE_INT;
+	base.v.list[2].v.num = 20;
+	base.v.list[3].type = TYPE_INT;
+	base.v.list[3].v.num = 30;
+
+	Var *sub2 = jit_rt_sublist_from(base.v.list, 2);
+	check(sub2 != 0 && sub2[0].v.num == 2 && sub2[1].v.num == 20 && sub2[2].v.num == 30,
+	      "jit_rt_sublist_from start 2 failed");
+	Var v_sub2;
+	v_sub2.type = TYPE_LIST;
+	v_sub2.v.list = sub2;
+	free_var(v_sub2);
+
+	Var *sub4 = jit_rt_sublist_from(base.v.list, 4);
+	check(sub4 != 0 && sub4[0].v.num == 0,
+	      "jit_rt_sublist_from start 4 failed");
+	Var v_sub4;
+	v_sub4.type = TYPE_LIST;
+	v_sub4.v.list = sub4;
+	free_var(v_sub4);
+
+	free_var(base);
     }
 
     /* Exception and finally stack marker deoptimization tests */
@@ -3423,6 +3943,76 @@ main(void)
 
 	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
+
+	/* 8. valid/parent tests */
+	check(jit_rt_valid(0) == 1, "jit_rt_valid object #0");
+	check(jit_rt_valid(-1) == 0, "jit_rt_valid object #-1");
+
+	int64_t parent_res = jit_rt_parent(1, &rt_err);
+	check(parent_res == 0 && rt_err == E_NONE, "jit_rt_parent object #1");
+	parent_res = jit_rt_parent(-1, &rt_err);
+	check(rt_err == E_INVARG, "jit_rt_parent invalid object");
+
+	/* 9. index/rindex tests */
+	check(jit_rt_index("hello world", "world") == 7, "jit_rt_index found");
+	check(jit_rt_index("hello world", "xyz") == 0, "jit_rt_index not found");
+	check(jit_rt_rindex("foo bar foo", "foo") == 9, "jit_rt_rindex found");
+
+	/* 10. seconds_left / time tests */
+	check(jit_rt_seconds_left() == 5, "jit_rt_seconds_left stub");
+	check(jit_rt_time() > 0, "jit_rt_time positive");
+    }
+
+    /* Deoptimization profiling tests */
+    {
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
+	      "deopt reason name none");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BUILTIN_CALL), "builtin_call") == 0,
+	      "deopt reason name builtin_call");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_VERB_CALL), "verb_call") == 0,
+	      "deopt reason name verb_call");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_PROPERTY_READ), "property_read") == 0,
+	      "deopt reason name property_read");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_PROPERTY_WRITE), "property_write") == 0,
+	      "deopt reason name property_write");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_RANGE_OP), "range_operation") == 0,
+	      "deopt reason name range_operation");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_TYPE_GUARD), "type_guard_failure") == 0,
+	      "deopt reason name type_guard_failure");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BRANCH_TYPE), "branch_type_mismatch") == 0,
+	      "deopt reason name branch_type_mismatch");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_CONTROL_FLOW), "control_flow") == 0,
+	      "deopt reason name control_flow");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_ARITHMETIC_TYPE), "arithmetic_type") == 0,
+	      "deopt reason name arithmetic_type");
+	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_UNSUPPORTED_OP), "unsupported_operation") == 0,
+	      "deopt reason name unsupported_operation");
+
+	jit_profile_reset();
+	jit_profile_record_entry();
+	jit_profile_record_entry();
+	jit_profile_record_completed();
+
+	JITDeoptState deopt_sample;
+	memset(&deopt_sample, 0, sizeof(deopt_sample));
+	deopt_sample.bytecode_pc = 42;
+	deopt_sample.source_lineno = 10;
+	deopt_sample.reason = JIT_DEOPT_BUILTIN_CALL;
+	jit_profile_record_deopt(0, "do_command", &deopt_sample);
+
+	deopt_sample.bytecode_pc = 18;
+	deopt_sample.source_lineno = 5;
+	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
+	jit_profile_record_deopt(1, "eval", &deopt_sample);
+
+	/* Trigger report generation */
+	jit_profile_report();
+
+	/* Trigger periodic check */
+	jit_profile_maybe_report(100);
+	jit_profile_maybe_report(2000);
+
+	jit_profile_reset();
     }
 
     return failures != 0;

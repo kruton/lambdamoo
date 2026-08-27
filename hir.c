@@ -22,6 +22,69 @@
 #include <stddef.h>
 #include <string.h>
 
+static int
+infer_string_add_operand(HIROp op, int other_known, var_type other_type,
+			 var_type *inferred_type)
+{
+    if (op != HIR_OP_ADD || !other_known || other_type != TYPE_STR)
+	return 0;
+
+    *inferred_type = TYPE_STR;
+    return 1;
+}
+
+static int
+unary_operand_defaults_to_list(HIROp op)
+{
+    return op == HIR_OP_CHECK_LIST_FOR_SPLICE;
+}
+
+static int
+is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
+			    int local_id, int first_user_local)
+{
+    return kind == HIR_TAC_LOAD_LOCAL && bytecode_pc == NO_BYTECODE_PC
+	&& local_id >= first_user_local;
+}
+
+static int
+builtin_entry_type(HIRTacKind kind, unsigned bytecode_pc, int local_id,
+		   int first_user_local, var_type *type)
+{
+    if (kind != HIR_TAC_LOAD_LOCAL || bytecode_pc != NO_BYTECODE_PC
+	|| local_id < 0 || local_id >= first_user_local)
+	return 0;
+
+    switch (local_id) {
+    case SLOT_NUM:
+    case SLOT_OBJ:
+    case SLOT_STR:
+    case SLOT_LIST:
+    case SLOT_ERR:
+    case SLOT_INT:
+    case SLOT_FLOAT:
+	*type = TYPE_INT;
+	return 1;
+    case SLOT_PLAYER:
+    case SLOT_DOBJ:
+    case SLOT_IOBJ:
+	*type = TYPE_OBJ;
+	return 1;
+    case SLOT_VERB:
+    case SLOT_ARGSTR:
+    case SLOT_DOBJSTR:
+    case SLOT_PREPSTR:
+    case SLOT_IOBJSTR:
+	*type = TYPE_STR;
+	return 1;
+    case SLOT_ARGS:
+	*type = TYPE_LIST;
+	return 1;
+    default:
+	return 0;
+    }
+}
+
 #ifdef HIR_TESTING
 static int
 is_string_builtin_length_anchor(Bytecodes *bc, unsigned pc, unsigned func,
@@ -1500,15 +1563,19 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	/* Empty stack! Insert implicit load at entry block. */
 	int t_init = ctx->next_temp++;
 	HIRSSAInstr *load = hir_alloc(ctx, sizeof(HIRSSAInstr));
-	load->kind = HIR_TAC_LOAD_LOCAL;
+	int internal_local = ctx->var_names
+	    && v >= (int) ctx->var_names->size;
+	load->kind = internal_local ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
 	load->bytecode_pc = NO_BYTECODE_PC;
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
 	load->label = 0;
-	load->local_id = v;
+	load->local_id = internal_local ? -1 : v;
 	load->op = HIR_OP_ADD;
+	load->literal.type = TYPE_INT;
+	load->literal.v.num = 0;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
 	load->num_local_values = 0;
@@ -3303,6 +3370,13 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_GT:
     case HIR_OP_GE:
     case HIR_OP_IN:
+    case HIR_OP_TICKS_LEFT:
+    case HIR_OP_SECONDS_LEFT:
+    case HIR_OP_TIME:
+    case HIR_OP_INDEX_BF:
+    case HIR_OP_RINDEX_BF:
+    case HIR_OP_VALID:
+    case HIR_OP_PARENT:
 	return 1;
     default:
 	return 0;
@@ -3392,6 +3466,41 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
     return 1;
 }
 
+static HIRSSAInstr *
+ssa_definition_for_value(HIRSSAProgram *ssa, int value)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value && ssa_defines_value(instr))
+		return instr;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static int
+ssa_first_list_element(HIRSSAProgram *ssa, int value)
+{
+    HIRSSAInstr *def;
+
+    while ((def = ssa_definition_for_value(ssa, value)) != 0) {
+	if (def->kind == HIR_TAC_UNARY
+	    && def->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return def->src1;
+	if (def->kind != HIR_TAC_BINARY
+	    || def->op != HIR_OP_LIST_ADD_TAIL)
+	    return 0;
+	value = def->src1;
+    }
+    return 0;
+}
+
 static int
 jit_extended_anchor_matches(Bytecodes *bc, unsigned pc, Extended_Opcode op)
 {
@@ -3419,9 +3528,12 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 		    && bc->vector[instr->bytecode_pc + 1] == instr->func)
 		|| op == OP_FOR_LIST
 		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER)
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
 					       EOP_LENGTH);
 	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
-	    || instr->op == HIR_OP_TYPEOF)
+	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_TICKS_LEFT
+	    || instr->op == HIR_OP_SECONDS_LEFT || instr->op == HIR_OP_TIME)
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
@@ -3450,17 +3562,29 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return op == OP_GET_PROP || op == OP_PUSH_GET_PROP;
 	case HIR_OP_MIN:
 	case HIR_OP_MAX:
+	case HIR_OP_INDEX_BF:
+	case HIR_OP_RINDEX_BF:
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
-	case HIR_OP_EQ: return op == OP_EQ;
+	case HIR_OP_EQ:
+	    return op == OP_EQ
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_NE: return op == OP_NE;
 	case HIR_OP_LT:
-	    return op == OP_LT || op == OP_FOR_RANGE || op == OP_FOR_LIST;
+	    return op == OP_LT || op == OP_FOR_RANGE || op == OP_FOR_LIST
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_LE:
-	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST;
+	    return op == OP_LE || op == OP_FOR_RANGE || op == OP_FOR_LIST
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_GT: return op == OP_GT;
-	case HIR_OP_GE: return op == OP_GE;
+	case HIR_OP_GE:
+	    return op == OP_GE
+		|| jit_extended_anchor_matches(bc, instr->bytecode_pc,
+					       EOP_SCATTER);
 	case HIR_OP_IN: return op == OP_IN;
 	case HIR_OP_BITOR:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_BITOR);
@@ -3538,6 +3662,8 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		    && bc->vector[instr->bytecode_pc] != OP_WHILE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_RANGE
 		    && bc->vector[instr->bytecode_pc] != OP_FOR_LIST
+		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
+						    EOP_SCATTER)
 		    && !jit_extended_anchor_matches(bc, instr->bytecode_pc,
 						    EOP_WHILE_ID)) {
 		    record_unsupported_fmt(ctx, "anchor: pc %u branch_false opcode mismatch (got opcode %u)",
@@ -3625,7 +3751,8 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 
 static int
 jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
-		  Bytecodes *bytecodes, var_type *value_types)
+		  Bytecodes *bytecodes, var_type *value_types,
+		  unsigned char *value_is_tagged)
 {
     JITDeoptMap *map;
     int i;
@@ -3652,12 +3779,52 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     memset(map, 0, sizeof(JITDeoptMap));
     map->bytecode_pc = instr->bytecode_pc;
     map->error_pc = instr->bytecode_pc;
+    map->source_lineno = instr->source_lineno;
     map->stack_depth = instr->num_stack_values;
     map->ticks_charged = instr->kind == HIR_TAC_UNARY
 	|| instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_BRANCH_FALSE
 	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
+
+    switch (instr->kind) {
+    case HIR_TAC_CALL:
+	map->reason = JIT_DEOPT_BUILTIN_CALL;
+	break;
+    case HIR_TAC_CALL_VERB:
+	map->reason = JIT_DEOPT_VERB_CALL;
+	break;
+    case HIR_TAC_PUT_PROP:
+	map->reason = JIT_DEOPT_PROPERTY_WRITE;
+	break;
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+	map->reason = JIT_DEOPT_RANGE_OP;
+	break;
+    case HIR_TAC_BRANCH_FALSE:
+	map->reason = JIT_DEOPT_BRANCH_TYPE;
+	break;
+    case HIR_TAC_BINARY:
+	if (instr->op == HIR_OP_GET_PROP)
+	    map->reason = JIT_DEOPT_PROPERTY_READ;
+	else
+	    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+	break;
+    case HIR_TAC_UNARY:
+	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST
+	    || instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+	    map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+	else
+	    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+	break;
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_STORE_LOCAL:
+	map->reason = JIT_DEOPT_TYPE_GUARD;
+	break;
+    default:
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+	break;
+    }
     if (map->num_locals) {
 	map->local_values = mymalloc(sizeof(int) * map->num_locals, M_PROGRAM);
 	map->local_types = mymalloc(sizeof(var_type) * map->num_locals, M_PROGRAM);
@@ -3666,7 +3833,8 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	for (i = 0; i < map->num_locals; i++)
 	    map->local_types[i] = (instr->local_values[i] > 0
 				   && instr->local_values[i] < program->num_values)
-		? value_types[instr->local_values[i]] : TYPE_INT;
+		? (value_is_tagged[instr->local_values[i]]
+		   ? TYPE_ANY : value_types[instr->local_values[i]]) : TYPE_INT;
     }
     if (map->stack_depth) {
 	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
@@ -3676,7 +3844,8 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	for (i = 0; i < (int) map->stack_depth; i++)
 	    map->stack_types[i] = (instr->stack_values[i] > 0
 				   && instr->stack_values[i] < program->num_values)
-		? value_types[instr->stack_values[i]] : TYPE_INT;
+		? (value_is_tagged[instr->stack_values[i]]
+		   ? TYPE_ANY : value_types[instr->stack_values[i]]) : TYPE_INT;
     }
     return program->num_deopt_maps++;
 }
@@ -3690,6 +3859,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     var_type *value_types;
     unsigned char *value_types_known;
     unsigned char *value_types_conflicted;
+    unsigned char *value_is_tagged;
     const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
@@ -3713,8 +3883,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->num_vars = ctx->var_names ? ctx->var_names->size : 0;
     program->num_deopt_maps = 1;
     program->deopt_maps = mymalloc(sizeof(JITDeoptMap), M_PROGRAM);
+    memset(&program->deopt_maps[0], 0, sizeof(JITDeoptMap));
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].error_pc = 0;
+    program->deopt_maps[0].source_lineno = 1;
+    program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
     program->deopt_maps[0].stack_depth = 0;
     program->deopt_maps[0].ticks_charged = 0;
     program->deopt_maps[0].num_locals = program->num_vars;
@@ -3738,19 +3911,37 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				 ? program->num_values : 1, M_PROGRAM);
     value_types_conflicted = mymalloc(program->num_values > 0
 				      ? program->num_values : 1, M_PROGRAM);
+    value_is_tagged = mymalloc(program->num_values > 0
+			      ? program->num_values : 1, M_PROGRAM);
     for (i = 0; i < program->num_values; i++)
 	value_types[i] = TYPE_INT;
     memset(value_types_known, 0, program->num_values > 0
 	   ? program->num_values : 1);
     memset(value_types_conflicted, 0, program->num_values > 0
 	   ? program->num_values : 1);
+    memset(value_is_tagged, 0, program->num_values > 0
+	   ? program->num_values : 1);
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
 	    if (si->value > 0 && si->value < program->num_values) {
+		var_type entry_type;
+
 		if (si->kind == HIR_TAC_CONST) {
 		    value_types[si->value] = si->literal.type;
+		    value_types_known[si->value] = 1;
+		} else if (builtin_entry_type(si->kind, si->bytecode_pc,
+					   si->local_id,
+					   first_user_slot(bytecode_program->version),
+					   &entry_type)) {
+		    value_types[si->value] = entry_type;
+		    value_types_known[si->value] = 1;
+		} else if (is_uninitialized_entry_load(si->kind,
+						       si->bytecode_pc,
+						       si->local_id,
+						       first_user_slot(bytecode_program->version))) {
+		    value_types[si->value] = TYPE_NONE;
 		    value_types_known[si->value] = 1;
 		} else if (si->kind == HIR_TAC_UNARY) {
 		    if (si->op == HIR_OP_MAKE_SINGLETON_LIST
@@ -3758,13 +3949,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->value] = TYPE_LIST;
 			value_types_known[si->value] = 1;
 		    } else if (si->op == HIR_OP_NOT || si->op == HIR_OP_TYPEOF
-			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH) {
+			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH
+			       || si->op == HIR_OP_ABS || si->op == HIR_OP_TICKS_LEFT
+			       || si->op == HIR_OP_SECONDS_LEFT || si->op == HIR_OP_TIME
+			       || si->op == HIR_OP_VALID) {
 			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    } else if (si->op == HIR_OP_PARENT) {
+			value_types[si->value] = TYPE_OBJ;
 			value_types_known[si->value] = 1;
 		    }
 		} else if (si->kind == HIR_TAC_BINARY) {
 		    if (si->op == HIR_OP_LIST_ADD_TAIL
-			|| si->op == HIR_OP_LIST_APPEND) {
+			|| si->op == HIR_OP_LIST_APPEND
+			|| si->op == HIR_OP_SUBLIST_FROM) {
 			value_types[si->value] = TYPE_LIST;
 			value_types_known[si->value] = 1;
 		    } else if (si->op == HIR_OP_EQ || si->op == HIR_OP_NE
@@ -3773,7 +3971,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			       || si->op == HIR_OP_IN || si->op == HIR_OP_BITOR
 			       || si->op == HIR_OP_BITXOR || si->op == HIR_OP_BITAND
 			       || si->op == HIR_OP_SHL || si->op == HIR_OP_SHR
-			       || si->op == HIR_OP_LSHR) {
+			       || si->op == HIR_OP_LSHR
+			       || si->op == HIR_OP_INDEX_BF
+			       || si->op == HIR_OP_RINDEX_BF) {
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
 		    }
@@ -3838,6 +4038,24 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    int src2_known = si->src2 > 0
 			&& si->src2 < program->num_values
 			&& value_types_known[si->src2];
+
+		    if (!src2_known
+			&& infer_string_add_operand(si->op, src1_known,
+					    src1_known
+					    ? value_types[si->src1] : TYPE_NONE,
+					    &value_types[si->src2])) {
+			    value_types_known[si->src2] = 1;
+			    src2_known = 1;
+			    types_changed = 1;
+		    } else if (!src1_known
+			       && infer_string_add_operand(si->op, src2_known,
+						   src2_known
+						   ? value_types[si->src2] : TYPE_NONE,
+						   &value_types[si->src1])) {
+			    value_types_known[si->src1] = 1;
+			    src1_known = 1;
+			    types_changed = 1;
+		    }
 
 		    if (src1_known || src2_known) {
 			var_type t1 = src1_known ? value_types[si->src1] : TYPE_INT;
@@ -3930,13 +4148,24 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	for (si = ssa_block->first; si; si = si->next) {
 	    int operand = 0;
 
-	    if ((si->kind == HIR_TAC_UNARY && si->op == HIR_OP_LENGTH)
-		|| (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX))
+	    if ((si->kind == HIR_TAC_UNARY
+		 && unary_operand_defaults_to_list(si->op))
+		|| (si->kind == HIR_TAC_BINARY
+		    && si->op == HIR_OP_SUBLIST_FROM))
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
 		if (!value_types_known[operand]) {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_SUBLIST_FROM) {
+		value_types[si->value] = TYPE_LIST;
+		value_types_known[si->value] = 1;
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_INT;
+		    value_types_known[si->src2] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
@@ -3952,6 +4181,28 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[property]) {
 		    value_types[property] = TYPE_STR;
 		    value_types_known[property] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_BINARY
+		&& (si->op == HIR_OP_INDEX_BF
+		    || si->op == HIR_OP_RINDEX_BF)) {
+		if (si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_STR;
+		    value_types_known[si->src1] = 1;
+		}
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_STR;
+		    value_types_known[si->src2] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_UNARY
+		&& (si->op == HIR_OP_VALID || si->op == HIR_OP_PARENT)) {
+		if (si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_OBJ;
+		    value_types_known[si->src1] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -3980,13 +4231,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[rhs] = 1;
 		}
 	    }
-	    if ((si->kind == HIR_TAC_RANGE_REF
-		 || si->kind == HIR_TAC_RANGE_SET)
-		&& si->src1 > 0 && si->src1 < program->num_values
-		&& !value_types_known[si->src1]) {
-		value_types[si->src1] = TYPE_LIST;
-		value_types_known[si->src1] = 1;
-	    }
+
 	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
 		int rhs = si->stack_values[si->num_stack_values - 1];
 
@@ -4017,10 +4262,77 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		}
 	    }
+	    if (si->kind == HIR_TAC_CALL) {
+		const char *func_name = name_func_by_num(si->func);
+		int first_arg = ssa_first_list_element(ssa, si->src1);
+
+		if (func_name
+		    && (!strcmp(func_name, "valid") || !strcmp(func_name, "notify"))
+		    && first_arg > 0 && first_arg < program->num_values
+		    && !value_types_known[first_arg]) {
+		    value_types[first_arg] = TYPE_OBJ;
+		    value_types_known[first_arg] = 1;
+		}
+	    }
 	    if (si == ssa_block->last)
 		break;
 	}
     }
+    /* Preserve runtime tags for values whose result type is selected at run
+       time.  Parallel-copy destinations need a tag as well, including joins
+       with a statically typed default value. */
+    for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	HIRSSAInstr *si;
+
+	for (si = ssa_block->first; si; si = si->next) {
+	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
+	    if (si == ssa_block->last)
+		break;
+	}
+    }
+    do {
+	types_changed = 0;
+	for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
+	    HIRSSAInstr *si;
+
+	    for (si = ssa_block->first; si; si = si->next) {
+		HIRParallelCopy *copy;
+		int tagged_operand = (si->src1 > 0
+				      && si->src1 < program->num_values
+				      && value_is_tagged[si->src1])
+		    || (si->src2 > 0 && si->src2 < program->num_values
+			&& value_is_tagged[si->src2]);
+
+		if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_ADD
+		    && tagged_operand && si->value > 0
+		    && si->value < program->num_values
+		    && !value_is_tagged[si->value]) {
+		    value_is_tagged[si->value] = 1;
+		    types_changed = 1;
+		}
+		if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP
+		    && si->value > 0 && si->value < program->num_values
+		    && !value_is_tagged[si->value]) {
+		    value_is_tagged[si->value] = 1;
+		    types_changed = 1;
+		}
+
+		for (copy = si->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& value_is_tagged[copy->src]
+			&& !value_is_tagged[copy->dst]) {
+			value_is_tagged[copy->dst] = 1;
+			types_changed = 1;
+		    }
+		if (si == ssa_block->last)
+		    break;
+	    }
+	}
+    } while (types_changed);
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
@@ -4040,6 +4352,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     if (value_type_diagnostic) {
 	myfree(value_types_conflicted, M_PROGRAM);
 	myfree(value_types_known, M_PROGRAM);
+	myfree(value_is_tagged, M_PROGRAM);
 	myfree(value_types, M_PROGRAM);
 	jit_program_free(program);
 	return jit_program_unsupported_with_diagnostic("unsupported-value-types",
@@ -4050,6 +4363,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	if (value_types_known[i] && value_types[i] == TYPE_FLOAT) {
 	    myfree(value_types_conflicted, M_PROGRAM);
 	    myfree(value_types_known, M_PROGRAM);
+	    myfree(value_is_tagged, M_PROGRAM);
 	    myfree(value_types, M_PROGRAM);
 	    jit_program_free(program);
 	    return jit_program_unsupported_with_diagnostic("unsupported-float-representation",
@@ -4082,10 +4396,18 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    JITInstruction *instr = mymalloc(sizeof(JITInstruction), M_PROGRAM);
 	    int uses_conflicted = (ssa_instr->src1 > 0
 				   && ssa_instr->src1 < program->num_values
-				   && value_types_conflicted[ssa_instr->src1])
+				   && value_types_conflicted[ssa_instr->src1]
+				   && !value_is_tagged[ssa_instr->src1])
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
-		    && value_types_conflicted[ssa_instr->src2]);
+		    && value_types_conflicted[ssa_instr->src2]
+		    && !value_is_tagged[ssa_instr->src2]);
+	    int uses_tagged = (ssa_instr->src1 > 0
+			       && ssa_instr->src1 < program->num_values
+			       && value_is_tagged[ssa_instr->src1])
+		|| (ssa_instr->src2 > 0
+		    && ssa_instr->src2 < program->num_values
+		    && value_is_tagged[ssa_instr->src2]);
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
@@ -4098,10 +4420,53 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->op = ssa_instr->op;
+	    if (((ssa_instr->src1 > 0
+		  && ssa_instr->src1 < program->num_values
+		  && value_types[ssa_instr->src1] == TYPE_NONE
+		  && !value_is_tagged[ssa_instr->src1])
+		 || (ssa_instr->src2 > 0
+		     && ssa_instr->src2 < program->num_values
+		     && value_types[ssa_instr->src2] == TYPE_NONE
+		     && !value_is_tagged[ssa_instr->src2]))
+		&& (ssa_instr->kind == HIR_TAC_UNARY
+		    || ssa_instr->kind == HIR_TAC_BINARY
+		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		    || ssa_instr->kind == HIR_TAC_RETURN))
+		instr->kind = HIR_TAC_DEOPT;
 	    if (uses_conflicted && (ssa_instr->kind == HIR_TAC_UNARY
 				    || ssa_instr->kind == HIR_TAC_BINARY
 				    || ssa_instr->kind == HIR_TAC_RETURN
 				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
+		instr->kind = HIR_TAC_DEOPT;
+	    if (uses_tagged
+		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		     || (ssa_instr->kind == HIR_TAC_UNARY
+			 && (ssa_instr->op == HIR_OP_NOT
+			     || ssa_instr->op == HIR_OP_LENGTH
+			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
+			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE))
+		     || (ssa_instr->kind == HIR_TAC_BINARY
+			 && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
+			     || ssa_instr->op == HIR_OP_IN
+			     || ssa_instr->op == HIR_OP_GET_PROP
+			     || ssa_instr->op == HIR_OP_SUBLIST_FROM
+			     || ssa_instr->op == HIR_OP_LIST_APPEND
+			     || ssa_instr->op == HIR_OP_LIST_ADD_TAIL
+			     || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
+			     || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
+			     || ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
+			     || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
+			     || ssa_instr->op == HIR_OP_MOD
+			     || ssa_instr->op == HIR_OP_INDEX_BF
+			     || ssa_instr->op == HIR_OP_RINDEX_BF
+			     || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_BITOR
+			     || ssa_instr->op == HIR_OP_BITXOR || ssa_instr->op == HIR_OP_SHL
+			     || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
+			     || ssa_instr->op == HIR_OP_INDEX)))
+		&& (ssa_instr->kind == HIR_TAC_UNARY
+		    || ssa_instr->kind == HIR_TAC_BINARY
+		    || ssa_instr->kind == HIR_TAC_RETURN
+		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
 		&& value_types_known[ssa_instr->src1]
@@ -4113,17 +4478,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 						   EOP_LENGTH)))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_UNARY
-		&& (ssa_instr->op == HIR_OP_NOT || ssa_instr->op == HIR_OP_COMPLEMENT
+		&& (ssa_instr->op == HIR_OP_COMPLEMENT
 		    || ssa_instr->op == HIR_OP_NEGATE || ssa_instr->op == HIR_OP_ABS)) {
 		int src1_known = ssa_instr->src1 > 0
 		    && ssa_instr->src1 < program->num_values
 		    && value_types_known[ssa_instr->src1];
 		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
 
-		if (ssa_instr->op == HIR_OP_NOT) {
-		    if (src1_known && t1 != TYPE_INT && t1 != TYPE_OBJ && t1 != TYPE_ERR)
-			instr->kind = HIR_TAC_DEOPT;
-		} else if (ssa_instr->op == HIR_OP_COMPLEMENT) {
+		if (ssa_instr->op == HIR_OP_COMPLEMENT) {
 		    if (src1_known && t1 != TYPE_INT)
 			instr->kind = HIR_TAC_DEOPT;
 		} else {
@@ -4152,14 +4514,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       == OP_FOR_RANGE
 		    && t1 == TYPE_OBJ && t2 == TYPE_INT;
 
-		if ((src1_known || src2_known)
+		if (!uses_tagged && (src1_known || src2_known)
 		    && !object_range_add
 		    && !(t1 == TYPE_INT && t2 == TYPE_INT)
 		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
-		    && !(ssa_instr->op == HIR_OP_ADD && t1 == TYPE_STR && t2 == TYPE_STR))
+		    && !(ssa_instr->op == HIR_OP_ADD
+			 && t1 == TYPE_STR && t2 == TYPE_STR))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
-	    if (ssa_instr->kind == HIR_TAC_BINARY
+	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 		    || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
 		    || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
@@ -4197,12 +4560,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
-						  &bytecode_program->main_vector,
-						  value_types);
+					  &bytecode_program->main_vector,
+					  value_types, value_is_tagged);
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
 		myfree(value_types_conflicted, M_PROGRAM);
 		myfree(value_types_known, M_PROGRAM);
+		myfree(value_is_tagged, M_PROGRAM);
 		myfree(value_types, M_PROGRAM);
 		jit_program_free(program);
 		return jit_program_unsupported_with_diagnostic("invalid-deopt-map",
@@ -4280,6 +4644,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_conflicted, M_PROGRAM);
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
+    program->value_is_tagged = value_is_tagged;
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */
@@ -4717,6 +5082,22 @@ op_name(HIROp op)
 	return "SCATTER";
     case HIR_OP_CHARGE_TICK:
 	return "CHARGE_TICK";
+    case HIR_OP_TICKS_LEFT:
+	return "TICKS_LEFT";
+    case HIR_OP_SECONDS_LEFT:
+	return "SECONDS_LEFT";
+    case HIR_OP_TIME:
+	return "TIME";
+    case HIR_OP_INDEX_BF:
+	return "INDEX";
+    case HIR_OP_RINDEX_BF:
+	return "RINDEX";
+    case HIR_OP_VALID:
+	return "VALID";
+    case HIR_OP_PARENT:
+	return "PARENT";
+    case HIR_OP_SUBLIST_FROM:
+	return "SUBLIST_FROM";
     }
 
     return "?";
@@ -5021,6 +5402,28 @@ hir_ssa_count_kind(HIRSSAProgram *ssa, HIRTacKind kind)
 	}
     }
 
+    return count;
+}
+
+int
+hir_ssa_out_of_range_load_count(HIRSSAProgram *ssa, int num_vars)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    if (!ssa)
+	return 0;
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL
+		&& (instr->local_id < 0 || instr->local_id >= num_vars))
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
     return count;
 }
 
@@ -6236,6 +6639,185 @@ append_scatter_deopt(HIRContext *ctx, HIRTacProgram *program,
 }
 
 static int
+append_scatter_constant(HIRContext *ctx, HIRTacProgram *program, Num value,
+			unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_CONST, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->literal.type = TYPE_INT;
+    instr->literal.v.num = value;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+append_scatter_unary(HIRContext *ctx, HIRTacProgram *program, HIROp op,
+		     int src, unsigned source_lineno, unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_UNARY, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->src1 = src;
+    instr->op = op;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+append_scatter_binary(HIRContext *ctx, HIRTacProgram *program, HIROp op,
+		      int lhs, int rhs, unsigned source_lineno,
+		      unsigned bytecode_pc)
+{
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_BINARY, source_lineno);
+
+    instr->bytecode_pc = bytecode_pc;
+    instr->dst = new_temp(ctx);
+    instr->src1 = lhs;
+    instr->src2 = rhs;
+    instr->op = op;
+    snapshot_lower_stack(ctx, instr);
+    append_tac(program, instr);
+    return instr->dst;
+}
+
+static int
+lower_scatter(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
+{
+    HIRScatter *item;
+    int saved_depth = ctx->lower_stack_depth;
+    int rhs = lower_expr(ctx, program, expr->u.scatter.rhs);
+    int scatter_depth = ctx->lower_stack_depth;
+    int required = 0;
+    int optional = 0;
+    int have_rest = 0;
+    int seen_optional = 0;
+    int seen_rest = 0;
+    int position = 0;
+    int invalid_label = new_label(ctx);
+    int done_label = new_label(ctx);
+    int length;
+    int limit;
+    int condition;
+
+    for (item = expr->u.scatter.items; item; item = item->next) {
+	if (item->kind == SCAT_REST) {
+	    if (seen_rest) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	    seen_rest = 1;
+	    have_rest = 1;
+	}
+	else if (item->kind == SCAT_REQUIRED) {
+	    if (seen_optional || seen_rest) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	    required++;
+	}
+	else if (item->kind == SCAT_OPTIONAL) {
+	    if (seen_rest) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	    seen_optional = 1;
+	    optional++;
+	    if (!item->expr) {
+		append_scatter_deopt(ctx, program, expr->source_lineno,
+				     expr->bytecode_pc);
+		ctx->lower_stack_depth = saved_depth;
+		push_lower_stack(ctx, rhs);
+		return rhs;
+	    }
+	}
+    }
+
+    append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+    length = append_scatter_unary(ctx, program, HIR_OP_LENGTH, rhs,
+				  expr->source_lineno, expr->bytecode_pc);
+    limit = append_scatter_constant(ctx, program, required,
+				    expr->source_lineno, expr->bytecode_pc);
+    condition = append_scatter_binary(ctx, program, HIR_OP_GE, length, limit,
+				      expr->source_lineno, expr->bytecode_pc);
+    append_unticked_branch_false(ctx, program, condition, invalid_label,
+				 expr->source_lineno, expr->bytecode_pc);
+
+    if (!have_rest) {
+	limit = append_scatter_constant(ctx, program, required + optional,
+					expr->source_lineno, expr->bytecode_pc);
+	condition = append_scatter_binary(ctx, program, HIR_OP_LE, length, limit,
+					  expr->source_lineno, expr->bytecode_pc);
+	append_unticked_branch_false(ctx, program, condition, invalid_label,
+				     expr->source_lineno, expr->bytecode_pc);
+    }
+
+    for (item = expr->u.scatter.items; item; item = item->next) {
+	int index;
+	int value;
+
+	position++;
+	index = append_scatter_constant(ctx, program, position,
+					 expr->source_lineno, expr->bytecode_pc);
+	if (item->kind == SCAT_OPTIONAL) {
+	    int default_label = new_label(ctx);
+	    int item_done_label = new_label(ctx);
+
+	    condition = append_scatter_binary(ctx, program, HIR_OP_GE,
+					 length, index, expr->source_lineno,
+					 expr->bytecode_pc);
+	    append_unticked_branch_false(ctx, program, condition, default_label,
+					 expr->source_lineno, expr->bytecode_pc);
+	    value = append_scatter_binary(ctx, program, HIR_OP_INDEX, rhs, index,
+					  expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	    append_jump(ctx, program, item_done_label, expr->source_lineno);
+	    append_label(ctx, program, default_label, expr->source_lineno);
+	    ctx->lower_stack_depth = scatter_depth;
+	    value = lower_expr(ctx, program, item->expr);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	    ctx->lower_stack_depth = scatter_depth;
+	    append_label(ctx, program, item_done_label, expr->source_lineno);
+	} else if (item->kind == SCAT_REST) {
+	    value = append_scatter_binary(ctx, program, HIR_OP_SUBLIST_FROM,
+					  rhs, index, expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	} else {
+	    value = append_scatter_binary(ctx, program, HIR_OP_INDEX, rhs, index,
+					  expr->source_lineno,
+					  expr->bytecode_pc);
+	    append_internal_store(ctx, program, item->local_id, value,
+				  expr->source_lineno);
+	}
+    }
+    append_jump(ctx, program, done_label, expr->source_lineno);
+    append_label(ctx, program, invalid_label, expr->source_lineno);
+    append_scatter_deopt(ctx, program, expr->source_lineno,
+			 expr->bytecode_pc);
+    append_label(ctx, program, done_label, expr->source_lineno);
+    ctx->lower_stack_depth = scatter_depth;
+    return rhs;
+}
+
+static int
 lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 {
     int base_depth = ctx->lower_stack_depth;
@@ -6250,9 +6832,6 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int try_val;
     int handler_val;
     int result_temp;
-
-    append_deopt_boundary(ctx, program, expr->source_lineno,
-			  expr->bytecode_pc);
 
     codes_val = lower_codes(ctx, program, expr->u.catch_expr.codes,
 			    expr->source_lineno, expr->bytecode_pc);
@@ -6559,16 +7138,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    return dst_temp;
 	}
     case HIR_EXPR_SCATTER:
-	{
-	    int saved_depth = ctx->lower_stack_depth;
-	    int rhs_temp = lower_expr(ctx, program, expr->u.scatter.rhs);
-
-	    append_scatter_deopt(ctx, program, expr->source_lineno,
-				 expr->bytecode_pc);
-	    ctx->lower_stack_depth = saved_depth;
-	    push_lower_stack(ctx, rhs_temp);
-	    return rhs_temp;
-	}
+	return lower_scatter(ctx, program, expr);
     case HIR_EXPR_LIST:
 	{
 	    HIRArg *item = expr->u.list.items;
@@ -6652,11 +7222,36 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    const char *func_name = name_func_by_num(expr->u.call.func);
 	    HIRArg *args = expr->u.call.args;
 
+	    if (func_name && (!strcmp(func_name, "ticks_left")
+			      || !strcmp(func_name, "seconds_left")
+			      || !strcmp(func_name, "time"))
+		&& !args) {
+		int dst_temp = new_temp(ctx);
+		HIRTacInstr *tac = new_tac(ctx, HIR_TAC_UNARY, expr->source_lineno);
+		append_tick(ctx, program, expr->source_lineno, expr->bytecode_pc);
+		tac->dst = dst_temp;
+		tac->src1 = 0;
+		if (!strcmp(func_name, "ticks_left"))
+		    tac->op = HIR_OP_TICKS_LEFT;
+		else if (!strcmp(func_name, "seconds_left"))
+		    tac->op = HIR_OP_SECONDS_LEFT;
+		else
+		    tac->op = HIR_OP_TIME;
+		tac->func = expr->u.call.func;
+		tac->bytecode_pc = expr->bytecode_pc;
+		snapshot_lower_stack(ctx, tac);
+		append_tac(program, tac);
+		push_lower_stack(ctx, dst_temp);
+		return dst_temp;
+	    }
+
 	    if (func_name && (!strcmp(func_name, "abs")
 			      || !strcmp(func_name, "toint")
 			      || !strcmp(func_name, "tonum")
 			      || !strcmp(func_name, "typeof")
-			      || !strcmp(func_name, "length"))
+			      || !strcmp(func_name, "length")
+			      || !strcmp(func_name, "valid")
+			      || !strcmp(func_name, "parent"))
 		&& args && !args->next && args->kind == ARG_NORMAL) {
 		int arg_temp = lower_expr(ctx, program, args->expr);
 		int dst_temp = new_temp(ctx);
@@ -6669,6 +7264,10 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		    tac->op = HIR_OP_TYPEOF;
 		else if (!strcmp(func_name, "length"))
 		    tac->op = HIR_OP_LENGTH;
+		else if (!strcmp(func_name, "valid"))
+		    tac->op = HIR_OP_VALID;
+		else if (!strcmp(func_name, "parent"))
+		    tac->op = HIR_OP_PARENT;
 		else
 		    tac->op = HIR_OP_TOINT;
 		tac->func = expr->u.call.func;
@@ -6678,7 +7277,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		ctx->lower_stack[ctx->lower_stack_depth - 1] = dst_temp;
 		return dst_temp;
 	    }
-	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max"))
+	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max")
+			      || !strcmp(func_name, "index") || !strcmp(func_name, "rindex"))
 		&& args && args->kind == ARG_NORMAL
 		&& args->next && args->next->kind == ARG_NORMAL
 		&& !args->next->next) {
@@ -6689,7 +7289,14 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		tac->dst = dst_temp;
 		tac->src1 = arg1_temp;
 		tac->src2 = arg2_temp;
-		tac->op = (!strcmp(func_name, "min")) ? HIR_OP_MIN : HIR_OP_MAX;
+		if (!strcmp(func_name, "min"))
+		    tac->op = HIR_OP_MIN;
+		else if (!strcmp(func_name, "max"))
+		    tac->op = HIR_OP_MAX;
+		else if (!strcmp(func_name, "index"))
+		    tac->op = HIR_OP_INDEX_BF;
+		else
+		    tac->op = HIR_OP_RINDEX_BF;
 		tac->func = expr->u.call.func;
 		tac->bytecode_pc = expr->bytecode_pc;
 		snapshot_lower_stack(ctx, tac);
@@ -7197,6 +7804,9 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	lower_stmt_list(ctx, program, stmt);
 	break;
     case HIR_STMT_EXPR:
+	if (stmt->u.expr && (stmt->u.expr->kind == HIR_EXPR_LITERAL
+			     || stmt->u.expr->kind == HIR_EXPR_LOCAL_LOAD))
+	    break;
 	(void) lower_expr(ctx, program, stmt->u.expr);
 	if (ctx->lower_stack_depth)
 	    ctx->lower_stack_depth--;
@@ -7271,6 +7881,35 @@ hir_test_string_builtin_length_anchor(Bytecodes *bc, unsigned pc,
 				      unsigned func, HIROp op)
 {
     return is_string_builtin_length_anchor(bc, pc, func, op);
+}
+
+int
+hir_test_infer_string_add_operand(HIROp op, int other_known,
+				  var_type other_type, var_type *inferred_type)
+{
+    return infer_string_add_operand(op, other_known, other_type, inferred_type);
+}
+
+int
+hir_test_unary_operand_defaults_to_list(HIROp op)
+{
+    return unary_operand_defaults_to_list(op);
+}
+
+int
+hir_test_is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
+				     int local_id, int first_user_local)
+{
+    return is_uninitialized_entry_load(kind, bytecode_pc, local_id,
+				       first_user_local);
+}
+
+int
+hir_test_builtin_entry_type(HIRTacKind kind, unsigned bytecode_pc,
+			    int local_id, int first_user_local, var_type *type)
+{
+    return builtin_entry_type(kind, bytecode_pc, local_id, first_user_local,
+			      type);
 }
 
 static HIRTacProgram *

@@ -363,6 +363,8 @@ test_short_circuit_tac(void)
     check_int("and synthetic loads",
 	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
     check_int("and phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("and internal locals are not environment loads",
+	      hir_ssa_out_of_range_load_count(ssa, names.size), 0);
     check_int("and verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 
@@ -379,6 +381,8 @@ test_short_circuit_tac(void)
     check_int("or synthetic loads",
 	      hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 1);
     check_int("or phi count", hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("or internal locals are not environment loads",
+	      hir_ssa_out_of_range_load_count(ssa, names.size), 0);
     check_int("or verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 }
@@ -1571,10 +1575,84 @@ test_optional_rest_scatter_deopt(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional rest scatter deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
-    check_int("optional rest scatter default not lowered",
-	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 0);
+    check_int("optional rest scatter default lowered",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc) > 0, 1);
+    check_int("optional rest scatter sublist op",
+	      hir_tac_count_binary_op(tac, HIR_OP_SUBLIST_FROM), 1);
     check_int("optional rest scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
     check_int("optional rest scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_optional_scatter_default_lowering(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Scatter required1, required2, optional1, optional2;
+    Expr default_value = int_expr(0, 10);
+    Expr second_default = int_expr(1, 10);
+    Expr scatter_lhs;
+    Expr rhs = id_expr(0, 10);
+    Expr assign;
+    Stmt ret;
+
+    memset(&required1, 0, sizeof(required1));
+    required1.kind = SCAT_REQUIRED;
+    required1.id = 1;
+    required1.next = &required2;
+    memset(&required2, 0, sizeof(required2));
+    required2.kind = SCAT_REQUIRED;
+    required2.id = 2;
+    required2.next = &optional1;
+    memset(&optional1, 0, sizeof(optional1));
+    optional1.kind = SCAT_OPTIONAL;
+    optional1.id = 3;
+    optional1.expr = &default_value;
+    optional1.next = &optional2;
+    memset(&optional2, 0, sizeof(optional2));
+    optional2.kind = SCAT_OPTIONAL;
+    optional2.id = 4;
+    optional2.expr = &second_default;
+
+    memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+    scatter_lhs.kind = EXPR_SCATTER;
+    scatter_lhs.lineno = 10;
+    scatter_lhs.e.scatter = &required1;
+    assign = binary_expr(EXPR_ASGN, &scatter_lhs, &rhs);
+    ret = return_stmt(&assign);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 5;
+    rhs.bytecode_pc = 1;
+    assign.bytecode_pc = 2;
+    default_value.bytecode_pc = 3;
+    second_default.bytecode_pc = 5;
+    ret.bytecode_pc = 4;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("optional scatter accepted", hir_context_error_count(ctx), 0);
+    check_int("optional scatter indexes all targets",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX), 4);
+    check_int("optional scatter lowers default",
+	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc), 1);
+    check_int("optional scatter lowers second default",
+	      hir_tac_count_bytecode_pc(tac, second_default.bytecode_pc), 1);
+    check_int("optional scatter charges one opcode tick",
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 1);
+    check_int("optional scatter has invalid-shape deopt",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+    check_int("optional scatter invalid deopt preserves rhs",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, assign.bytecode_pc), 1);
+    check_int("optional scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("optional scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    check_int("optional scatter out-of-ssa valid",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -1845,6 +1923,88 @@ test_pure_builtin_inlining_tac_ssa(void)
 
     check_int("min inline destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
+}
+
+static void
+test_string_search_builtin_inlining(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Arg_List a1, a2, a3;
+    Expr source, needle, case_matters, call;
+    Stmt ret;
+
+    memset(&source, 0, sizeof(source));
+    source.kind = EXPR_VAR;
+    source.lineno = 10;
+    source.e.var.type = TYPE_STR;
+    source.e.var.v.str = str_dup("LambdaMOO");
+    memset(&needle, 0, sizeof(needle));
+    needle.kind = EXPR_VAR;
+    needle.lineno = 10;
+    needle.e.var.type = TYPE_STR;
+    needle.e.var.v.str = str_dup("moo");
+    case_matters = int_expr(1, 10);
+
+    memset(&a2, 0, sizeof(a2));
+    a2.kind = ARG_NORMAL;
+    a2.expr = &needle;
+    memset(&a1, 0, sizeof(a1));
+    a1.kind = ARG_NORMAL;
+    a1.expr = &source;
+    a1.next = &a2;
+    memset(&call, 0, sizeof(call));
+    call.kind = EXPR_CALL;
+    call.lineno = 10;
+    call.e.call.func = 7;
+    call.e.call.args = &a1;
+    call.bytecode_pc = 5;
+    ret = return_stmt(&call);
+    ret.bytecode_pc = 7;
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("index inline binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX_BF), 1);
+    check_int("index inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    check_int("index inline verify errors", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+
+    call.e.call.func = 8;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("rindex inline binary count",
+	      hir_tac_count_binary_op(tac, HIR_OP_RINDEX_BF), 1);
+    check_int("rindex inline call count",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    hir_context_free(ctx);
+
+    memset(&a3, 0, sizeof(a3));
+    a3.kind = ARG_NORMAL;
+    a3.expr = &case_matters;
+    a2.next = &a3;
+    call.e.call.func = 7;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("three-argument index remains a call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    check_int("three-argument index is not inlined",
+	      hir_tac_count_binary_op(tac, HIR_OP_INDEX_BF), 0);
+    hir_context_free(ctx);
+
+    a2.next = 0;
+    call.e.call.func = 9;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("other two-argument built-in remains a call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    hir_context_free(ctx);
+
+    free_str(source.e.var.v.str);
+    free_str(needle.e.var.v.str);
 }
 
 static void
@@ -2693,7 +2853,7 @@ test_catch_expr_tac_ssa(void)
     check_int("catch expr tac returns",
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("catch expr deopt boundary",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     check_int("catch expr cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
     check_int("catch expr ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("catch expr verify errors", hir_context_error_count(ctx), 0);
@@ -2934,6 +3094,97 @@ test_unreachable_dead_code_and_folded_phi_ssa(void)
 }
 
 static void
+test_string_add_operand_inference(void)
+{
+    var_type inferred = TYPE_NONE;
+
+    check_int("string add infers unknown right operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 1, TYPE_STR,
+						&inferred), 1);
+    check_int("string add inferred type", inferred, TYPE_STR);
+
+    inferred = TYPE_NONE;
+    check_int("integer add does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 1, TYPE_INT,
+						&inferred), 0);
+    check_int("integer add leaves inferred type alone", inferred, TYPE_NONE);
+
+    check_int("non-add does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_SUB, 1, TYPE_STR,
+						&inferred), 0);
+    check_int("unknown peer does not infer string operand",
+	      hir_test_infer_string_add_operand(HIR_OP_ADD, 0, TYPE_STR,
+						&inferred), 0);
+}
+
+static void
+test_list_operand_inference(void)
+{
+    check_int("splice check infers list operand",
+	      hir_test_unary_operand_defaults_to_list(
+		  HIR_OP_CHECK_LIST_FOR_SPLICE), 1);
+    check_int("length does not default unknown operand to list",
+	      hir_test_unary_operand_defaults_to_list(HIR_OP_LENGTH), 0);
+    check_int("unrelated unary op does not infer list operand",
+	      hir_test_unary_operand_defaults_to_list(HIR_OP_NOT), 0);
+}
+
+static void
+test_uninitialized_entry_load_classification(void)
+{
+    int first_user = SLOT_FLOAT + 1;
+
+    check_int("user local entry load is uninitialized",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL,
+						   NO_BYTECODE_PC,
+						   first_user, first_user), 1);
+    check_int("built-in local entry load is initialized",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL,
+						   NO_BYTECODE_PC,
+						   SLOT_ARGS, first_user), 0);
+    check_int("anchored user local load is not an entry load",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_LOAD_LOCAL, 0,
+						   first_user, first_user), 0);
+    check_int("entry instruction must be a local load",
+	      hir_test_is_uninitialized_entry_load(HIR_TAC_CONST,
+						   NO_BYTECODE_PC,
+						   first_user, first_user), 0);
+}
+
+static void
+test_builtin_entry_types(void)
+{
+    int first_user = SLOT_FLOAT + 1;
+    var_type type = TYPE_ANY;
+
+    check_int("player entry load has object type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_PLAYER, first_user, &type), 1);
+    check_int("player entry load type", type, TYPE_OBJ);
+    check_int("args entry load has list type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_ARGS, first_user, &type), 1);
+    check_int("args entry load type", type, TYPE_LIST);
+    check_int("verb entry load has string type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_VERB, first_user, &type), 1);
+    check_int("verb entry load type", type, TYPE_STR);
+    check_int("NUM entry load has integer type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_NUM, first_user, &type), 1);
+    check_int("NUM entry load type", type, TYPE_INT);
+    check_int("user local has no built-in type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  first_user, first_user, &type), 0);
+    check_int("waif-capable this has no fixed type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, NO_BYTECODE_PC,
+					  SLOT_THIS, first_user, &type), 0);
+    check_int("anchored load has no entry type",
+	      hir_test_builtin_entry_type(HIR_TAC_LOAD_LOCAL, 0, SLOT_THIS,
+					  first_user, &type), 0);
+}
+
+static void
 test_length_expr_in_stores_and_negatives(void)
 {
     Names names;
@@ -3052,6 +3303,10 @@ int
 main(void)
 {
     test_string_builtin_length_anchor();
+    test_string_add_operand_inference();
+    test_list_operand_inference();
+    test_uninitialized_entry_load_classification();
+    test_builtin_entry_types();
     test_arithmetic_and_local_tac();
     test_control_flow_tac();
     test_short_circuit_tac();
@@ -3072,10 +3327,12 @@ main(void)
     test_list_index_in_arithmetic_tac_ssa();
     test_scatter_destructuring_tac_ssa();
     test_optional_rest_scatter_deopt();
+    test_optional_scatter_default_lowering();
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
+    test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
     test_for_list_loop_tac_ssa();

@@ -14,6 +14,7 @@ typedef struct JITDeoptMap JITDeoptMap;
 struct JITDeoptMap {
     unsigned bytecode_pc;
     unsigned error_pc;
+    unsigned source_lineno;
     unsigned stack_depth;
     int ticks_charged;
     int num_locals;
@@ -21,6 +22,7 @@ struct JITDeoptMap {
     var_type *local_types;
     int *stack_values;
     var_type *stack_types;
+    JITDeoptReason reason;
 };
 
 struct JITCopy {
@@ -74,6 +76,7 @@ struct JITProgram {
     size_t machine_code_len;
     Num *deopt_values;
     var_type *value_types;
+    unsigned char *value_is_tagged;
 };
 
 extern int jit_rt_is_true(int64_t, int);
@@ -82,8 +85,16 @@ extern int jit_rt_str_cmp(const char *, const char *, int);
 extern const char *jit_rt_str_concat(const char *, const char *, int32_t *);
 extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
+extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
+extern int64_t jit_rt_seconds_left(void);
+extern int64_t jit_rt_time(void);
+extern int64_t jit_rt_index(const char *, const char *);
+extern int64_t jit_rt_rindex(const char *, const char *);
+extern int64_t jit_rt_valid(int64_t);
+extern int64_t jit_rt_parent(int64_t, int32_t *);
 
 #endif /* !JIT_Internal_H */
