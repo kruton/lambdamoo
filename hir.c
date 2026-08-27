@@ -3787,10 +3787,12 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	|| instr->kind == HIR_TAC_BRANCH_FALSE
 	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
+    map->builtin_func = -1;
 
     switch (instr->kind) {
     case HIR_TAC_CALL:
 	map->reason = JIT_DEOPT_BUILTIN_CALL;
+	map->builtin_func = instr->func;
 	break;
     case HIR_TAC_CALL_VERB:
 	map->reason = JIT_DEOPT_VERB_CALL;
@@ -4116,6 +4118,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps = mymalloc(sizeof(JITDeoptMap), M_PROGRAM);
     memset(&program->deopt_maps[0], 0, sizeof(JITDeoptMap));
     program->deopt_maps[0].bytecode_pc = 0;
+    program->deopt_maps[0].builtin_func = -1;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].source_lineno = 1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;

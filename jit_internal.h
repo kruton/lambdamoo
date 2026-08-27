@@ -42,6 +42,7 @@ struct JITDeoptMap {
     int num_resume_values;
     JITResumeValue *resume_values;
     int native_resume_valid;
+    int builtin_func;
     JITDeoptReason reason;
 };
 

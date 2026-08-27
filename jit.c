@@ -9,6 +9,7 @@
 
 #include "db.h"
 #include "exceptions.h"
+#include "functions.h"
 #include "jit_internal.h"
 #include "list.h"
 #include "log.h"
@@ -3588,12 +3589,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     source_location->source_lineno = 0;
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
+	deopt->builtin_func = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
 	    deopt->source_lineno = program->deopt_maps[0].source_lineno;
 	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
 	    deopt->reason = program->deopt_maps[0].reason;
 	}
     }
@@ -3652,6 +3655,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->source_lineno = map->source_lineno;
 	    deopt->stack_depth = map->stack_depth;
 	    deopt->ticks_charged = map->ticks_charged;
+	    deopt->builtin_func = map->builtin_func;
 	    deopt->reason = map->reason;
 	}
     }
@@ -3721,6 +3725,7 @@ jit_program_dump_machine(JITProgram *program,
 typedef struct JITDeoptSite {
     Objid vloc;
     char *verbname;
+    int builtin_func;
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITDeoptReason reason;
@@ -3792,6 +3797,10 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
     JITDeoptReason reason = (deopt && deopt->reason < JIT_DEOPT_NUM_REASONS)
 	? deopt->reason : JIT_DEOPT_UNSUPPORTED_OP;
     Num log_mode;
+    int builtin_func = reason == JIT_DEOPT_BUILTIN_CALL && deopt
+	? deopt->builtin_func : -1;
+    const char *builtin_name = builtin_func >= 0
+	? name_func_by_num((unsigned) builtin_func) : 0;
     unsigned h;
     JITDeoptSite *site;
 
@@ -3800,18 +3809,22 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
 
     log_mode = server_int_option("jit_deopt_log_mode", 0);
     if (log_mode == 1) {
-	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s\n",
+	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s%s%s%s\n",
 	      vloc, verbname ? verbname : "?",
 	      deopt ? deopt->source_lineno : 0,
 	      deopt ? deopt->bytecode_pc : 0,
-	      jit_deopt_reason_name(reason));
+	      jit_deopt_reason_name(reason), builtin_name ? " [" : "",
+	      builtin_name ? builtin_name : "", builtin_name ? "]" : "");
     }
 
-    h = ((unsigned) vloc * 31 + (deopt ? deopt->bytecode_pc : 0) * 17 + (unsigned) reason) % JIT_DEOPT_HASH_SIZE;
+    h = ((unsigned) vloc * 31 + (deopt ? deopt->bytecode_pc : 0) * 17
+	 + (unsigned) reason + (unsigned) (builtin_func + 1) * 13)
+	% JIT_DEOPT_HASH_SIZE;
     for (site = deopt_sites_hash[h]; site; site = site->next) {
 	if (site->vloc == vloc
 	    && site->bytecode_pc == (deopt ? deopt->bytecode_pc : 0)
 	    && site->reason == reason
+	    && site->builtin_func == builtin_func
 	    && ((!site->verbname && !verbname)
 		|| (site->verbname && verbname && strcmp(site->verbname, verbname) == 0))) {
 	    site->count++;
@@ -3821,6 +3834,7 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
     site = mymalloc(sizeof(JITDeoptSite), M_PROGRAM);
     site->vloc = vloc;
     site->verbname = verbname ? str_dup(verbname) : 0;
+    site->builtin_func = builtin_func;
     site->bytecode_pc = deopt ? deopt->bytecode_pc : 0;
     site->source_lineno = deopt ? deopt->source_lineno : 0;
     site->reason = reason;
@@ -3876,10 +3890,14 @@ jit_profile_report(void)
 	oklog("JIT: Top Deoptimizing Call Sites:\n");
 	for (j = 0; j < 10 && top_sites[j]; j++) {
 	    JITDeoptSite *s = top_sites[j];
-	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s (count: %"PRIu64")\n",
+	    const char *builtin_name = s->builtin_func >= 0
+		? name_func_by_num((unsigned) s->builtin_func) : 0;
+	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s%s%s%s (count: %"PRIu64")\n",
 		  s->vloc, s->verbname ? s->verbname : "?",
 		  s->source_lineno, s->bytecode_pc,
 		  jit_deopt_reason_name(s->reason),
+		  builtin_name ? " [" : "", builtin_name ? builtin_name : "",
+		  builtin_name ? "]" : "",
 		  s->count);
 	}
     }

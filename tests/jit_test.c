@@ -424,6 +424,8 @@ call_boundary_program(void)
     map->bytecode_pc = map->error_pc = 25;
     map->stack_depth = 1;
     map->ticks_charged = 0;
+    map->builtin_func = 17;
+    map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->num_locals = 1;
     map->local_values = allocate(sizeof(int) * 1);
     map->local_values[0] = 1;
@@ -2122,11 +2124,13 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
+	deopt->builtin_func = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
 	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
 	}
     }
 
@@ -2461,6 +2465,7 @@ do_fallback:
 	    deopt->error_pc = map->error_pc;
 	    deopt->stack_depth = map->stack_depth;
 	    deopt->ticks_charged = map->ticks_charged;
+	    deopt->builtin_func = map->builtin_func;
 	}
     }
     myfree(values, M_PROGRAM);
@@ -2533,6 +2538,7 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 	check(native_deopt.error_pc == ref_deopt.error_pc, message);
 	check(native_deopt.stack_depth == ref_deopt.stack_depth, message);
 	check(native_deopt.ticks_charged == ref_deopt.ticks_charged, message);
+	check(native_deopt.builtin_func == ref_deopt.builtin_func, message);
 	for (i = 0; i < (int) native_deopt.stack_depth; i++) {
 	    check(native_deopt_stack[i].type == ref_deopt_stack[i].type, message);
 	    if (native_deopt_stack[i].type == TYPE_INT)
