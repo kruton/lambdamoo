@@ -1568,6 +1568,48 @@ list_index_tagged_deopt_program(void)
 }
 
 static JITProgram *
+list_index_tagged_return_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_is_tagged = allocate(4);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 list_index_tagged_base_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3448,6 +3490,25 @@ main(void)
 	      "tagged list index reconstructed the wrong value");
 	free_var(tagged_stack[0]);
 	free_var(tagged_env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* A native return must use a tagged value's runtime type. */
+    {
+	JITProgram *tagged = list_index_tagged_return_program();
+	Var env[1];
+
+	env[0] = new_list(1);
+	env[0].v.list[1].type = TYPE_STR;
+	env[0].v.list[1].v.str = str_dup("tagged return");
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged return executed natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "tagged return"),
+	      "tagged return preserved its runtime type");
+	free_var(result);
+	free_var(env[0]);
 	jit_program_free(tagged);
     }
 

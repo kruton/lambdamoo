@@ -2983,7 +2983,28 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  status, common_return);
 			break;
 		    }
-		    if (program->value_types
+		    if (program->value_is_tagged
+			&& program->value_is_tagged[instr->src1]) {
+			char name[32];
+			MIR_reg_t return_type;
+
+			sprintf(name, "return_type%d", copy_serial++);
+			return_type = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_mem_op(build->context,
+				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				offsetof(Var, v.num), result, 0, 1),
+			    MIR_new_reg_op(build->context, values[instr->src1])));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, return_type),
+			    MIR_new_mem_op(build->context, tag_t,
+				(program->num_values + instr->src1) * sizeof(Num),
+				deopt_values, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_mem_op(build->context, MIR_T_I32,
+				offsetof(Var, type), result, 0, 1),
+			    MIR_new_reg_op(build->context, return_type)));
+		    } else if (program->value_types
 			&& program->value_types[instr->src1] == TYPE_FLOAT) {
 #if FLOATS_ARE_BOXED
 			/* Box if needed */
@@ -3013,10 +3034,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 						      MIR_new_reg_op(build->context,
 								     values[instr->src1])));
 		    }
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 offsetof(Var, type), result, 0, 1),
-						  MIR_new_int_op(build->context, instr->literal_type)));
+		    if (!(program->value_is_tagged
+			  && program->value_is_tagged[instr->src1]))
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_mem_op(build->context, MIR_T_I32,
+				offsetof(Var, type), result, 0, 1),
+			    MIR_new_int_op(build->context, instr->literal_type)));
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_RETURN0:
