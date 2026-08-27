@@ -158,12 +158,16 @@ jit_rt_list_concat(Var *l1, Var *l2, int32_t *err_out)
 {
     Var v1, v2, res;
 
+    if (!l1 || !l2) {
+	*err_out = E_TYPE;
+	return 0;
+    }
     v1.type = TYPE_LIST;
     v1.v.list = l1;
     v2.type = TYPE_LIST;
     v2.v.list = l2;
 
-    res = listconcat(v1, v2);
+    res = listconcat(var_ref(v1), var_ref(v2));
     if (res.type == TYPE_ERR) {
 	*err_out = res.v.err;
 	return 0;
@@ -205,13 +209,14 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
     if (elem_type == TYPE_FLOAT)
 	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
     else if (elem_type == TYPE_STR)
-	elem.v.str = (const char *) (intptr_t) elem_raw;
-    else if (elem_type == TYPE_LIST)
+	elem.v.str = str_ref((const char *) (intptr_t) elem_raw);
+    else if (elem_type == TYPE_LIST) {
 	elem.v.list = (Var *) (intptr_t) elem_raw;
-    else
+	elem = var_ref(elem);
+    } else
 	elem.v.num = (Num) elem_raw;
 
-    res = listappend(l, elem);
+    res = listappend(var_ref(l), elem);
     return res.v.list;
 }
 
