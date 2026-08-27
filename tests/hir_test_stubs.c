@@ -138,6 +138,7 @@ name_func_by_num(unsigned id)
     case 6: return "length";
     case 7: return "index";
     case 8: return "rindex";
+    case 9: return "pass";
     default: return "unknown_func";
     }
 }

@@ -450,6 +450,69 @@ call_boundary_program(void)
 }
 
 static JITProgram *
+pass_call_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *call = instruction(HIR_TAC_CALL);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_is_tagged = allocate(3);
+    program->value_types[1] = TYPE_LIST;
+    program->value_is_tagged[2] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->resume_key.code_unit = 0;
+    map->resume_key.site = 2;
+    map->reason = JIT_DEOPT_BUILTIN_CALL;
+    map->builtin_func = 9;
+    map->native_resume_valid = 1;
+    map->num_resume_values = 1;
+    map->resume_values = allocate(sizeof(JITResumeValue));
+    map->resume_values[0].value = 2;
+    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->bytecode_pc = map->error_pc = 25;
+    map->stack_depth = 1;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int));
+    map->local_types = allocate(sizeof(var_type));
+    map->local_values[0] = 1;
+    map->local_types[0] = TYPE_LIST;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_LIST;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_args->value = 1;
+    load_args->local_id = 0;
+    load_args->literal_type = TYPE_LIST;
+    load_args->next = call;
+    call->value = 2;
+    call->src1 = 1;
+    call->deopt_map = 1;
+    call->resume_key = map->resume_key;
+    call->bytecode_pc = 25;
+    call->next = return_instr;
+    return_instr->src1 = 2;
+    return_instr->literal_type = TYPE_ANY;
+    block->first = load_args;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
 get_prop_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -2984,6 +3047,55 @@ main(void)
 	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
 	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
 	jit_program_free(call_prog);
+    }
+
+    /* pass() VM call and native continuation tests */
+    {
+	JITProgram *pass_prog = pass_call_program();
+	ResumeKey pass_key = { 0, 2 };
+	Var pass_env[1];
+	Var *pass_args = new_list(0).v.list;
+
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	ticks = 10;
+	check(jit_program_resume_map(pass_prog, pass_key) == 1,
+	      "pass continuation key did not resolve");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB, "pass did not request a VM call");
+	check(ticks == 10 && deopt.ticks_charged == 0,
+	      "pass reported the wrong charged tick count");
+	check(deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST,
+	      "pass did not materialize its argument list");
+	free_var(deopt_stack[0]);
+	deopt_stack[0].type = TYPE_STR;
+	deopt_stack[0].v.str = str_dup("passed");
+	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "pass continuation did not return");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "passed"),
+	      "pass continuation returned the wrong value");
+	free_var(result);
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	pass_prog = pass_call_program();
+	pass_prog->deopt_maps[1].native_resume_valid = 0;
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	check(jit_program_resume_map(pass_prog, pass_key) == -1,
+	      "unsafe pass continuation key resolved");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "pass without a native continuation did not request a VM call");
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
     }
 
     /* Property read deopt test */

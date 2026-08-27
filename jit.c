@@ -913,11 +913,15 @@ build_mir(JITProgram *program, MIRBuild *build)
 	JITInstruction *instr;
 
 	for (instr = block->first; instr; instr = instr->next) {
-	    if (instr->kind == HIR_TAC_CALL_VERB
-		&& jit_call_has_native_continuation(program, instr)
-		&& instr->deopt_map > 0
+	    if (instr->deopt_map > 0
 		&& instr->deopt_map < program->num_deopt_maps
-		&& program->deopt_maps[instr->deopt_map].stack_depth >= 3) {
+		&& (instr->kind == HIR_TAC_CALL_VERB
+		 || (instr->kind == HIR_TAC_CALL
+		     && jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])))
+		&& jit_call_has_native_continuation(program, instr)
+		&& program->deopt_maps[instr->deopt_map].stack_depth
+		   >= (unsigned) jit_call_stack_operands(
+		       &program->deopt_maps[instr->deopt_map])) {
 		resume_entries[instr->deopt_map] = MIR_new_label(build->context);
 		resume_continuations[instr->deopt_map] = MIR_new_label(build->context);
 	    }
@@ -941,7 +945,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 	if (!resume_entries[i])
 	    continue;
 	map = &program->deopt_maps[i];
-	outer_depth = map->stack_depth - 3;
+	outer_depth = map->stack_depth - jit_call_stack_operands(map);
 	append(build, resume_entries[i]);
 	for (j = 0; j < map->num_resume_values; j++) {
 	    JITResumeValue *resume = &map->resume_values[j];
@@ -3226,6 +3230,20 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_CALL:
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])) {
+			append_materialized_exit(build, program, instr->deopt_map,
+					 values,
+					 deopt_map_out, deopt_values, status,
+					 common_return, JIT_RUN_CALL_VERB);
+			if (resume_continuations[instr->deopt_map])
+			    append(build, resume_continuations[instr->deopt_map]);
+		    } else
+			append_deopt_exit(build, program, instr->deopt_map, values,
+					  deopt_map_out, deopt_values, status,
+					  common_return);
+		    break;
 		case HIR_TAC_PUT_PROP:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
@@ -3469,8 +3487,8 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
 
-	if (map->reason == JIT_DEOPT_VERB_CALL
-	    && map->stack_depth >= 3
+	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_is_pass(map))
+	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
 	    && map->resume_key.site == key.site) {
 	    JITBlock *block;
@@ -3479,7 +3497,9 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 		JITInstruction *instr;
 
 		for (instr = block->first; instr; instr = instr->next) {
-		    if (instr->kind == HIR_TAC_CALL_VERB
+		    if ((instr->kind == HIR_TAC_CALL_VERB
+			 || (instr->kind == HIR_TAC_CALL
+			     && jit_deopt_map_is_pass(map)))
 			&& instr->deopt_map == i
 			&& jit_call_has_native_continuation(program, instr))
 			return i;
@@ -3602,10 +3622,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
-    if (resume_map > 0 && resume_map < program->num_deopt_maps
-	&& program->deopt_maps[resume_map].reason == JIT_DEOPT_VERB_CALL
-	&& program->deopt_maps[resume_map].stack_depth >= 3)
-	resume_depth = program->deopt_maps[resume_map].stack_depth - 2;
+    if (resume_map > 0 && resume_map < program->num_deopt_maps) {
+	JITDeoptMap *map = &program->deopt_maps[resume_map];
+
+	if (map->reason == JIT_DEOPT_VERB_CALL && map->stack_depth >= 3)
+	    resume_depth = map->stack_depth - 2;
+	else if (jit_deopt_map_is_pass(map) && map->stack_depth >= 1)
+	    resume_depth = map->stack_depth;
+    }
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,

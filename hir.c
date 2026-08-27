@@ -3890,11 +3890,13 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
     map = &program->deopt_maps[instr->deopt_map];
     for (i = 0; i < map->num_locals; i++)
 	if (map->local_values[i] > 0
-	    && map->local_values[i] < program->num_values)
+	    && map->local_values[i] < program->num_values
+	    && !defs[map->local_values[i]])
 	    uses[map->local_values[i]] = 1;
     for (i = 0; i < (int) map->stack_depth; i++)
 	if (map->stack_values[i] > 0
-	    && map->stack_values[i] < program->num_values)
+	    && map->stack_values[i] < program->num_values
+	    && !defs[map->stack_values[i]])
 	    uses[map->stack_values[i]] = 1;
 }
 
@@ -3903,6 +3905,7 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		  JITInstruction *call, int value, JITResumeValue *resume)
 {
     JITBlock *block;
+    int call_operands = jit_call_stack_operands(map);
     int i;
 
     resume->value = value;
@@ -3916,7 +3919,7 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	    resume->index = i;
 	    return 1;
 	}
-    for (i = 0; i + 3 < (int) map->stack_depth; i++)
+    for (i = 0; i + call_operands < (int) map->stack_depth; i++)
 	if (map->stack_values[i] == value) {
 	    resume->source = JIT_RESUME_STACK;
 	    resume->index = i;
@@ -4042,15 +4045,20 @@ jit_build_resume_liveness(JITProgram *program)
 	    unsigned char *defs = mymalloc(program->num_values, M_PROGRAM);
 	    int value, live_count = 0;
 	    instr = instructions[index];
-	    if (instr->kind == HIR_TAC_CALL_VERB && instr->deopt_map > 0) {
+	    if (instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps
+		&& (instr->kind == HIR_TAC_CALL_VERB
+		 || (instr->kind == HIR_TAC_CALL
+		     && jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])))) {
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		int call_operands = jit_call_stack_operands(map);
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value])
 			live_count++;
 		map->resume_values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
 		map->num_resume_values = live_count;
-		map->native_resume_valid = map->stack_depth >= 3;
+		map->native_resume_valid = map->stack_depth >= (unsigned) call_operands;
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value]
