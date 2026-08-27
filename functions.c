@@ -57,6 +57,7 @@ struct bft_entry {
 
 static struct bft_entry bf_table[MAX_FUNC];
 static unsigned top_bf_table = 0;
+static unsigned protection_generation = 1;
 
 static unsigned
 register_common(const char *name, int minargs, int maxargs, bf_type func,
@@ -502,12 +503,31 @@ static void
 load_server_protect_function_flags(void)
 {
     unsigned i;
+    int changed = 0;
 
     for (i = 0; i < top_bf_table; i++) {
-	bf_table[i].protected
-	    = server_flag_option(bf_table[i].protect_str, 0);
+	int protected = server_flag_option(bf_table[i].protect_str, 0);
+
+	if (bf_table[i].protected != protected) {
+	    bf_table[i].protected = protected;
+	    changed = 1;
+	}
     }
+    if (changed)
+	protection_generation++;
     oklog("Loaded protect cache for %d builtin functions\n", i);
+}
+
+unsigned
+builtin_protection_generation(void)
+{
+    return protection_generation;
+}
+
+int
+builtin_function_is_protected(unsigned n)
+{
+    return n < top_bf_table && bf_table[n].protected;
 }
 
 Num _server_int_option_cache[SVO__CACHE_SIZE];

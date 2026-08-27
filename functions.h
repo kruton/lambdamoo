@@ -130,6 +130,8 @@ extern Byte *pc_for_bi_func_data(void);
  |  protection  |
  *--------------*/
 
+extern unsigned builtin_protection_generation(void);
+extern int builtin_function_is_protected(unsigned);
 extern void load_server_options(void);
 
 #endif		/* !Functions_H */
