@@ -1702,6 +1702,75 @@ list_index_tagged_consumer_program(HIROp op)
 }
 
 static JITProgram *
+tagged_string_pipeline_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_one = instruction(HIR_TAC_CONST);
+    JITInstruction *load_subject = instruction(HIR_TAC_BINARY);
+    JITInstruction *const_two = instruction(HIR_TAC_CONST);
+    JITInstruction *load_delim = instruction(HIR_TAC_BINARY);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *index = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 8;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 8);
+    program->value_is_tagged = allocate(8);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[4] = TYPE_INT;
+    program->value_types[7] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_is_tagged[5] = 1;
+    program->value_is_tagged[6] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_one;
+    const_one->value = 2;
+    const_one->literal = 1;
+    const_one->literal_type = TYPE_INT;
+    const_one->next = load_subject;
+    load_subject->value = 3;
+    load_subject->src1 = 1;
+    load_subject->src2 = 2;
+    load_subject->op = HIR_OP_INDEX;
+    load_subject->next = const_two;
+    const_two->value = 4;
+    const_two->literal = 2;
+    const_two->literal_type = TYPE_INT;
+    const_two->next = load_delim;
+    load_delim->value = 5;
+    load_delim->src1 = 1;
+    load_delim->src2 = 4;
+    load_delim->op = HIR_OP_INDEX;
+    load_delim->next = concat;
+    concat->value = 6;
+    concat->src1 = 3;
+    concat->src2 = 5;
+    concat->op = HIR_OP_ADD;
+    concat->next = index;
+    index->value = 7;
+    index->src1 = 6;
+    index->src2 = 5;
+    index->op = HIR_OP_INDEX_BF;
+    index->next = ret;
+    ret->src1 = 7;
+    ret->literal_type = TYPE_INT;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 verb_call_boundary_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3192,12 +3261,14 @@ main(void)
 	check_differential(str_const, 0, 10, 0, "string const differential");
 	jit_program_free(str_const);
 
-	/* String truth and comparison semantics require content inspection. */
+	/* String truth and comparison semantics. */
 	JITProgram *str_not = string_not_program("");
 	ticks = 10;
 	check(jit_program_execute(str_not, 0, &result, &ticks, &timed_out,
 				  &error, 0, 0, 0)
-	      == JIT_RUN_FALLBACK, "empty string not did not fallback");
+	      == JIT_RUN_RETURNED, "empty string not returned");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "empty string not evaluated to 1");
 	jit_program_free(str_not);
 
 	JITProgram *str_eq = string_compare_program("same", "SAME", HIR_OP_EQ);
@@ -3453,6 +3524,26 @@ main(void)
 	free_var(tagged_env[1]);
 	jit_program_free(tagged_eq);
 	jit_program_free(tagged_in);
+    }
+
+    /* Tagged strings retain their type through concatenation and index(). */
+    {
+	JITProgram *pipeline = tagged_string_pipeline_program();
+	Var env[1];
+
+	env[0] = new_list(2);
+	env[0].v.list[1].type = TYPE_STR;
+	env[0].v.list[1].v.str = str_dup("hello world");
+	env[0].v.list[2].type = TYPE_STR;
+	env[0].v.list[2].v.str = str_dup(" ");
+	ticks = 10;
+	check(jit_program_execute(pipeline, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged string pipeline executed natively");
+	check(result.type == TYPE_INT && result.v.num == 6,
+	      "tagged string pipeline returned the delimiter position");
+	free_var(env[0]);
+	jit_program_free(pipeline);
     }
 
     /* Sublist from runtime helper tests */

@@ -3123,8 +3123,8 @@ test_list_operand_inference(void)
     check_int("splice check infers list operand",
 	      hir_test_unary_operand_defaults_to_list(
 		  HIR_OP_CHECK_LIST_FOR_SPLICE), 1);
-    check_int("length defaults unknown operand to list",
-	      hir_test_unary_operand_defaults_to_list(HIR_OP_LENGTH), 1);
+    check_int("length does not default unknown operand to list",
+	      hir_test_unary_operand_defaults_to_list(HIR_OP_LENGTH), 0);
     check_int("unrelated unary op does not infer list operand",
 	      hir_test_unary_operand_defaults_to_list(HIR_OP_NOT), 0);
 }

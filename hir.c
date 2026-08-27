@@ -36,7 +36,7 @@ infer_string_add_operand(HIROp op, int other_known, var_type other_type,
 static int
 unary_operand_defaults_to_list(HIROp op)
 {
-    return op == HIR_OP_LENGTH || op == HIR_OP_CHECK_LIST_FOR_SPLICE;
+    return op == HIR_OP_CHECK_LIST_FOR_SPLICE;
 }
 
 static int
@@ -4151,7 +4151,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if ((si->kind == HIR_TAC_UNARY
 		 && unary_operand_defaults_to_list(si->op))
 		|| (si->kind == HIR_TAC_BINARY
-		    && (si->op == HIR_OP_INDEX || si->op == HIR_OP_SUBLIST_FROM)))
+		    && si->op == HIR_OP_SUBLIST_FROM))
 		operand = si->src1;
 	    if (operand > 0 && operand < program->num_values) {
 		if (!value_types_known[operand]) {
@@ -4231,13 +4231,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[rhs] = 1;
 		}
 	    }
-	    if ((si->kind == HIR_TAC_RANGE_REF
-		 || si->kind == HIR_TAC_RANGE_SET)
-		&& si->src1 > 0 && si->src1 < program->num_values
-		&& !value_types_known[si->src1]) {
-		value_types[si->src1] = TYPE_LIST;
-		value_types_known[si->src1] = 1;
-	    }
+
 	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
 		int rhs = si->stack_values[si->num_stack_values - 1];
 
@@ -4284,9 +4278,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
-    /* Preserve the runtime tag for list elements whose type cannot be inferred.
-       Parallel-copy destinations need a tag as well, including joins with a
-       statically typed default value. */
+    /* Preserve runtime tags for values whose result type is selected at run
+       time.  Parallel-copy destinations need a tag as well, including joins
+       with a statically typed default value. */
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 
@@ -4306,6 +4300,25 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 	    for (si = ssa_block->first; si; si = si->next) {
 		HIRParallelCopy *copy;
+		int tagged_operand = (si->src1 > 0
+				      && si->src1 < program->num_values
+				      && value_is_tagged[si->src1])
+		    || (si->src2 > 0 && si->src2 < program->num_values
+			&& value_is_tagged[si->src2]);
+
+		if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_ADD
+		    && tagged_operand && si->value > 0
+		    && si->value < program->num_values
+		    && !value_is_tagged[si->value]) {
+		    value_is_tagged[si->value] = 1;
+		    types_changed = 1;
+		}
+		if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP
+		    && si->value > 0 && si->value < program->num_values
+		    && !value_is_tagged[si->value]) {
+		    value_is_tagged[si->value] = 1;
+		    types_changed = 1;
+		}
 
 		for (copy = si->copies; copy; copy = copy->next)
 		    if (copy->src > 0 && copy->src < program->num_values
@@ -4426,17 +4439,34 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (uses_tagged
-		&& !(ssa_instr->kind == HIR_TAC_BINARY
-		     && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
-			 || ssa_instr->op == HIR_OP_IN
-			 || ssa_instr->op == HIR_OP_GET_PROP
-			 || ssa_instr->op == HIR_OP_SUBLIST_FROM
-			 || (ssa_instr->op == HIR_OP_INDEX
-			     && ssa_instr->src1 > 0
-			     && value_is_tagged[ssa_instr->src1]
-			     && ssa_instr->src2 > 0
-			     && (value_is_tagged[ssa_instr->src2]
-				 || value_types[ssa_instr->src2] == TYPE_INT))))
+		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		     || (ssa_instr->kind == HIR_TAC_UNARY
+			 && (ssa_instr->op == HIR_OP_NOT
+			     || ssa_instr->op == HIR_OP_NEGATE
+			     || ssa_instr->op == HIR_OP_ABS
+			     || ssa_instr->op == HIR_OP_COMPLEMENT
+			     || ssa_instr->op == HIR_OP_TOINT
+			     || ssa_instr->op == HIR_OP_LENGTH
+			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
+			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE))
+		     || (ssa_instr->kind == HIR_TAC_BINARY
+			 && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
+			     || ssa_instr->op == HIR_OP_IN
+			     || ssa_instr->op == HIR_OP_GET_PROP
+			     || ssa_instr->op == HIR_OP_SUBLIST_FROM
+			     || ssa_instr->op == HIR_OP_LIST_APPEND
+			     || ssa_instr->op == HIR_OP_LIST_ADD_TAIL
+			     || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
+			     || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
+			     || ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
+			     || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
+			     || ssa_instr->op == HIR_OP_MOD
+			     || ssa_instr->op == HIR_OP_INDEX_BF
+			     || ssa_instr->op == HIR_OP_RINDEX_BF
+			     || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_BITOR
+			     || ssa_instr->op == HIR_OP_BITXOR || ssa_instr->op == HIR_OP_SHL
+			     || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
+			     || ssa_instr->op == HIR_OP_INDEX)))
 		&& (ssa_instr->kind == HIR_TAC_UNARY
 		    || ssa_instr->kind == HIR_TAC_BINARY
 		    || ssa_instr->kind == HIR_TAC_RETURN
@@ -4452,17 +4482,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 						   EOP_LENGTH)))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_UNARY
-		&& (ssa_instr->op == HIR_OP_NOT || ssa_instr->op == HIR_OP_COMPLEMENT
+		&& (ssa_instr->op == HIR_OP_COMPLEMENT
 		    || ssa_instr->op == HIR_OP_NEGATE || ssa_instr->op == HIR_OP_ABS)) {
 		int src1_known = ssa_instr->src1 > 0
 		    && ssa_instr->src1 < program->num_values
 		    && value_types_known[ssa_instr->src1];
 		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
 
-		if (ssa_instr->op == HIR_OP_NOT) {
-		    if (src1_known && t1 != TYPE_INT && t1 != TYPE_OBJ && t1 != TYPE_ERR)
-			instr->kind = HIR_TAC_DEOPT;
-		} else if (ssa_instr->op == HIR_OP_COMPLEMENT) {
+		if (ssa_instr->op == HIR_OP_COMPLEMENT) {
 		    if (src1_known && t1 != TYPE_INT)
 			instr->kind = HIR_TAC_DEOPT;
 		} else {
@@ -4491,11 +4518,12 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       == OP_FOR_RANGE
 		    && t1 == TYPE_OBJ && t2 == TYPE_INT;
 
-		if ((src1_known || src2_known)
+		if (!uses_tagged && (src1_known || src2_known)
 		    && !object_range_add
 		    && !(t1 == TYPE_INT && t2 == TYPE_INT)
 		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
-		    && !(ssa_instr->op == HIR_OP_ADD && t1 == TYPE_STR && t2 == TYPE_STR))
+		    && !(ssa_instr->op == HIR_OP_ADD
+			 && t1 == TYPE_STR && t2 == TYPE_STR))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
 	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_BINARY
