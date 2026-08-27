@@ -3052,7 +3052,7 @@ main(void)
     env[0].type = TYPE_INT;
     env[0].v.num = 0;
 
-    /* Call boundary deopt test */
+    /* Generic built-in VM call boundary test */
     {
 	JITProgram *call_prog = call_boundary_program();
 	deopt_stack[0].type = TYPE_INT;
@@ -3060,7 +3060,7 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(call_prog, env, &result, &ticks, &timed_out,
 				  &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_FALLBACK, "call boundary did not return fallback");
+	      == JIT_RUN_CALL_VERB, "call boundary did not request a VM call");
 	check(deopt.bytecode_pc == 25, "call boundary wrong bytecode_pc");
 	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
 	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");

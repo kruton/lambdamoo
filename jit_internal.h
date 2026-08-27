@@ -67,14 +67,14 @@ jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
 static inline int
 jit_deopt_map_can_bridge_builtin(JITDeoptMap *map)
 {
-    return jit_deopt_map_is_builtin(map, "pass")
+    return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
 	|| jit_deopt_map_is_specialized_builtin(map);
 }
 
 static inline int
 jit_deopt_map_bridges_builtin(JITDeoptMap *map)
 {
-    return jit_deopt_map_is_builtin(map, "pass")
+    return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
 	|| (jit_deopt_map_is_specialized_builtin(map)
 	    && builtin_function_is_protected((unsigned) map->builtin_func));
 }
