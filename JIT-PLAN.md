@@ -61,7 +61,7 @@ The current branch has already established the first compiler backbone:
 * critical-edge splitting and SSA destruction;
 * explicit tick operations retained through native lowering;
 * an optional `--enable-jit` extension using vendored MIR 1.0.0 at O0;
-* lazy, per-program native generation for a guarded integer-only tier;
+* lazy, per-program native generation for a guarded multi-type tier;
 * native entry and return through the existing activation unwinder;
 * JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
 * read-only MIR output through `disassemble(..., "mir")`;
@@ -89,29 +89,19 @@ HIR should model:
 * unsupported or bailout-first expressions/statements;
 * source line information on every lowered operation.
 
-The initial supported subset is intentionally conservative:
+The current native subset is substantially wider than the original integer
+tier. It includes structured control flow, integer and unboxed-float arithmetic,
+strings and lists, scatter assignment (including optional/default/rest items),
+range and list loops, catch/finally markers, property reads and writes, selected
+continuation-free built-ins, and dynamically tagged values with guarded native
+consumers. Unsupported operations remain visible in IR so verifiers, dumps,
+and future lowering passes can reason about bailout boundaries.
 
-* integer addition, subtraction, multiplication, and comparisons;
-* local loads and stores;
-* simple `if`/`else`;
-* simple `while`;
-* returns when no active `finally`/`except` state complicates unwinding.
-
-The v1 unsupported or bailout-first set should include:
-
-* verb calls;
-* built-in calls;
-* property access and mutation;
-* fork creation;
-* try/except/finally;
-* scatter assignment;
-* list/string construction and mutation;
-* WAIF-specific paths;
-* any operation that can suspend, push an activation, or depend on complex
-  interpreter stack markers.
-
-Unsupported operations should remain visible in IR so verifiers, dumps, and
-future lowering passes can reason about bailout boundaries.
+JIT eligibility is no longer the limiting metric: every verb in the current
+Opal.db census can produce native code. The active frontend goal is now to
+increase the percentage of entered activations that run to completion without
+deoptimizing. New lowering work should therefore be selected from runtime
+deoptimization frequency, not merely from syntactic database prevalence.
 
 ## 5. Phase 2: TAC
 
@@ -225,9 +215,9 @@ ResumePoint/ResumeID.
 
 ### 9.1 Tick Accounting
 
-LambdaMOO tick accounting is per ticked operation. The first native tier should
-preserve this exactly by charging the same logical work as the interpreter would
-have charged for the compiled region.
+LambdaMOO tick accounting is per ticked operation. The current native tier
+preserves this exactly by charging the same logical work as the interpreter
+would have charged for the compiled region.
 
 Later tiers may batch tick checks, but only when bailout can reconstruct an
 activation at a valid resume point and preserve abort behavior for tick and
@@ -238,12 +228,13 @@ seconds exhaustion.
 Built-ins can return, raise, call another verb, suspend, or abort. Verb calls
 can push new activations and affect permissions, traceback, and suspension.
 
-For v1:
-
-* deopt before built-in and verb calls;
-* let the existing interpreter perform the call;
-* keep `bi_func_pc`, `bi_func_id`, and `bi_func_data` as interpreter-owned
-  continuation state.
+The current tier deoptimizes before general built-in and verb calls, but directly
+lowers a reviewed set of continuation-free built-ins and runtime operations.
+These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
+`index()`, `rindex()`, `ticks_left()`, `seconds_left()`, `time()`, `valid()`, and
+`parent()`. General calls continue in the interpreter, which owns
+`bi_func_pc`, `bi_func_id`, `bi_func_data`, activation creation, suspension, and
+traceback behavior.
 
 Built-in inlining must be opt-in and metadata-driven. A built-in may be inlined
 only if its registered contract declares it continuation-free:
@@ -262,12 +253,12 @@ The current interpreter implements exception and finally behavior through
 runtime stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) and `unwind_stack()`.
 This is not equivalent to native exception tables alone.
 
-For v1:
-
-* bail out before try/except/finally regions;
-* preserve stack-marker semantics in the interpreter;
-* avoid drawing synthetic exceptional edges from every instruction until HIR
-  explicitly models stack markers and unwind behavior.
+HIR and deoptimization maps now model catch and finally stack markers well
+enough to enter these regions and reconstruct interpreter unwind state. Native
+operations may execute inside them, but an operation whose error edge cannot be
+proven equivalent still deoptimizes before the interpreter-visible boundary.
+Avoid synthetic exceptional edges from every instruction until HIR models the
+corresponding native handler transfer explicitly.
 
 Native landing pads may be added later as an optimization, but they must still
 materialize the same activation and stack-marker state expected by
@@ -401,273 +392,173 @@ architecture for the current AST-first plan.
 * **`TYPE_ANY` fallback:** If type propagation cannot prove a specialized type,
   emit a guard or stay in the interpreter.
 
-## 14. Near-Term Roadmap
+## 14. Current Status and Native-Completion Roadmap
 
-Completed in the first native-code milestone:
+### 14.1 Current implementation
 
-* short-circuit `&&` and `||` lowering without eager right-operand evaluation;
-* definition-dominates-use SSA verification with focused negative tests; and
-* differential native/reference recipe tests for branching, phi copies,
-  guards, and resource-limit aborts;
-* sparse integer type and constant propagation; and
-* safe constant folding, constant-branch simplification, and unreachable-block
-  pruning;
-* explicit wrapping integer arithmetic and error semantics shared by the
-  interpreter and compiler; and
-* checked native integer division and modulo, including division by zero and
-  the minimum-integer divided by negative-one case; and
-* checked native integer exponentiation and shifts, plus bitwise integer
-  operators; and
-* validated bytecode resume anchors carried from AST code generation through
-  HIR, SSA, optimization, and native recipes; and
-* canonical entry deoptimization maps; and
-* deep deoptimization maps that reconstruct updated integer locals, nested
-  operand stacks, bytecode and error PCs, and exact tick accounting from SSA
-  values on post-entry guard failure;
-* cold native abort and error exits that restore exact bytecode/error PCs and
-  carry source lines without adding location stores to tick hot paths;
-* guarded integer locals whose values enter through the runtime environment; and
-* checked native list and argument-list indexing with bounds checking and
-  either element-type guards or a runtime type tag for values whose type cannot
-  be inferred statically, including tagged list bases and indexes; and
-* native equality, inequality, and list-membership operations over dynamically
-  tagged operands with exact type-guard fallback; and
-* list destructuring (scatter assignment) and list construction/splicing lowered
-  to TAC/SSA with bytecode anchors and native destructuring execution, including
-  trailing optional items with lazily evaluated defaults; rest scatter and
-  optionals without explicit defaults retain exact interpreter fallback;
-* deopt-before-call boundaries for built-in functions with seamless runtime state
-  handoff at `OP_BI_FUNC_CALL`; and
-* direct native inlining for pure continuation-free built-ins (`abs()`, `min()`,
-  `max()`, `toint()`, `typeof()`, `length()`, and two-argument `index()` and
-  `rindex()`) eliminating deopt boundaries for pure operations; and
-* direct native lowering for property reads (`obj.prop`) and property assignments
-  (`obj.prop = rhs`) with exact deopt maps and type-safe interpreter stack restoration;
-* range-based `for` loop lowering (`for i in [start..end]`) with exact opcode
-  tick accounting and interpreter stack reconstruction; and
-* integer list iteration lowering (`for x in (list)`) with guarded list access,
-  bytecode anchors, and interpreter fallback for non-integer elements; and
-* conditional expressions (`EXPR_COND` `c ? t | f`) with bytecode anchors,
-  nested evaluation, and clean SSA phi join; and
-* `break` and `continue`, including labeled exits from nested `while`, range,
-  and list loops without losing bytecode resume anchors; and
-* range expressions (`base[from..to]`) for list and string slicing, plus range
-  assignments (`base[from..to] = rhs`), lowered through exact deoptimization and
-  interpreter stack reconstruction boundaries; and
-* deopt-before-call boundaries for verb calls (`obj:verb(args...)`), preserving
-  argument stacks, permissions, traceback state, and activation-push semantics; and
-* guarded SSA values for object (`TYPE_OBJ`) scalars, including object range
-  loops, literal representations, comparisons, and exact deoptimization/return
-  semantics; and
-* native representation for double-precision, unboxed floating-point
-  (`TYPE_FLOAT`) values, including local loads, arithmetic, numeric error exits,
-  comparisons, branches, returns, and deoptimization; other configured float
-  representations currently make affected verbs ineligible; and
-* ownership-aware string values (`TYPE_STR`) and non-integer list elements
-  (`TYPE_OBJ`, `TYPE_FLOAT`, `TYPE_STR`, `TYPE_LIST`) so indexing, iteration,
-  locals, returns, and deoptimization preserve reference counts; and
-* exception and `finally` stack markers (`TYPE_CATCH`, `TYPE_FINALLY`) modeled
-  before lowering catch expressions, `try-except`, and `try-finally` statements,
-  with relocated handler PCs and pre-entry deoptimization boundaries preserving
-  exact interpreter stack-unwind and `finally` semantics; and
-* fork and suspension deoptimization boundaries (`HIR_TAC_DEOPT`) modeling time
-  expressions, argument stacks, and exact bytecode resume anchors, ensuring
-  native execution materializes every continuation field required by serialized
-  activations; and
-* length expression (`$`, `EXPR_LENGTH`) lowering in indexed (`expr[$]`) and range
-  (`expr[from..$]`) contexts, maintaining context-sensitive base value tracking
-  and native length extraction; and
-* expanded differential validation harness comparing native and reference execution
-  across values, errors, source locations, ticks, full deoptimization state (including
-  bytecode PCs and runtime operand stacks), reference ownership, nested control flow,
-  forced fallbacks across all supported boundaries, and repeated-execution smoke
-  coverage; and
-* actionable JIT rejection diagnostics exposed through `verb_info(..., 1)`, plus
-  `tests/census.sh` for aggregating top-level reasons and detailed diagnostics
-  across Opal.db without modifying the source database; and
-* SSA construction fixes for unreachable dead code, unreachable phi inputs, and
-  folded-phi ordering, eliminating the `invalid-ir` category from Opal.db without
-  adding synthetic tick charges to structural SSA blocks; and
-* ownership-correct empty and persistent list constants, with JIT-program
-  references retained across repeated native execution and released at program
-  teardown; and
-* argument-list operation anchors taken from individual argument bytecode PCs,
-  reducing bytecode-anchor rejections without weakening anchor validation; and
-* membership (`HIR_OP_IN`) accepted at an exact deoptimization boundary, with
-  its operands, tick refund, and bytecode resume state restored for interpreter
-  evaluation; and
-* direct indexed local assignments accepted at `OP_PUT_TEMP` deoptimization
-  boundaries with their base, index, and right-hand-side stack values preserved;
-  and
-* nested local- and property-rooted indexed assignments, with `OP_PUSH_REF` and
-  `OP_PUSH_GET_PROP` anchors preserving every intermediate value required by
-  interpreter write-back; and
-* all scatter assignments resumed at an exact `EOP_SCATTER` interpreter
-  boundary, preserving the RHS list while leaving arity checks, defaults, rest
-  construction, ownership, and errors to the existing VM implementation; and
-* arithmetic on known complex values resumed at its exact interpreter boundary,
-  preserving native integer and float arithmetic while allowing string and list
-  operations to remain under the VM's ownership and error semantics; and
-* direct string indexing resumed at `OP_REF`, `$` string length resumed at
-  `EOP_LENGTH`, and `length(string)` lowered natively with configured byte- or
-  Unicode-character semantics and exact built-in identity validation; and
-* value-type conflicts across control-flow joins (parallel copies), comparisons,
-  property operations, index stores, and mixed arithmetic deoptimized at exact
-  VM boundaries, eliminating all value-type rejections; and
-* length expressions (`$`, `EXPR_LENGTH`) supported in all indexed assignments,
-  range stores, and chained lvalue contexts, achieving full database coverage; and
-* shared ownership-audited runtime helpers implemented for complex-value semantics
-  (`jit_rt_is_true`, `jit_rt_equality`, `jit_rt_str_cmp`, `jit_rt_str_concat`,
-  `jit_rt_str_ref`, `jit_rt_list_concat`, `jit_rt_list_append`, `jit_rt_list_in`,
-  `jit_rt_get_prop`), with MIR call integration lowering string concatenation,
-  string comparisons, list equality, string indexing, list membership, and
-  truth-value branching natively; and
-* direct native lowering for `ticks_left()`, `seconds_left()`, and `time()`,
-  including exact built-in anchors and tick accounting; and
-* direct native lowering for continuation-free object built-ins (`valid()` and
-  `parent()`), including consumer-driven `TYPE_OBJ` inference and exact `E_INVARG`
-  error exits; and
-* entry-state modeling for uninitialized `TYPE_NONE` locals, with compiler-only
-  locals kept out of the runtime environment and semantic reads deoptimized
-  before the VM must raise `E_VARNF`; and
-* runtime deoptimization census support in `tests/deopt-census.sh`, with entry
-  guard failures reported separately from unsupported operations.
+The branch now has a complete AST-to-native pipeline with verified TAC, CFG,
+dominators, SSA construction and destruction, bytecode resume anchors, exact
+tick accounting, source locations, deoptimization maps, MIR generation, and
+lazy machine-code compilation. JIT state is observable through
+`verb_info()`, `jit_compile()`, and `disassemble()`; the test tooling includes
+eligibility and runtime-deoptimization censuses.
 
-The Opal.db baseline measured after this milestone contains 6,319 verbs. Of
-these, all 6,319 (100.00%) are JIT-eligible and compiled; zero verbs report
-`unsupported-program`, `invalid-bytecode-anchor`, `unsupported-value-types`, or
-`invalid-ir`. These top-level reasons are mutually exclusive but the detailed
-census confirms zero remaining blockers:
+All 6,319 verbs in the current Opal.db eligibility census compile successfully.
+There are no remaining top-level `unsupported-program`,
+`unsupported-value-types`, `invalid-bytecode-anchor`, or `invalid-ir`
+rejections. Eligibility must remain at 100%, but it is now a regression metric,
+not the roadmap driver.
 
-* zero `unsupported-program` rejections, down from 8;
-* zero `unsupported-value-types` rejections, down from 161;
-* zero `invalid-bytecode-anchor` failures, down from 65 after clearing
-  inherited bytecode anchors on constant-folded branch jumps;
-* zero `ssa-support: list constant` rejections, down from 2,852;
-* zero `HIR_OP_IN` (`ssa-support: unsupported operation 15`) rejections, down
-  from 1,004;
-* zero unsupported non-local assignments, down from 412 after preserving local
-  and property-rooted indexed write-back chains;
-* zero optional/rest scatter rejections, down from 137;
-* zero parallel-copy type conflicts across control flow joins, down from 106;
-* zero arithmetic type conflicts, down from 872 after deoptimizing known complex
-  arithmetic at its exact VM boundary; and
-* zero unsupported length expressions outside indexed contexts (`$`).
+The current native execution surface includes:
 
-Counts describe the first reported failure in each verb. Fixing one category may
-expose a later rejection, so the census must be rerun after every milestone.
+* integer and unboxed-double arithmetic, comparisons, branches, loops, and
+  object-range iteration with interpreter-compatible errors and overflow;
+* strings, lists, constants, indexing, slicing, construction, splicing,
+  membership, comparison, concatenation, and dynamically tagged consumers;
+* local, indexed, range, and selected property reads/writes with
+  ownership-aware runtime helpers;
+* required, optional/default, and rest scatter assignment;
+* conditional expressions, `break`, `continue`, catch/finally markers, and
+  canonical deoptimization boundaries for forks and suspension;
+* native truth testing and exact return/deoptimization materialization for
+  integer, object, float, string, list, error, `TYPE_NONE`, and dynamically
+  tagged values;
+* selected continuation-free built-ins, including resource-query, string,
+  numeric, and object predicates; and
+* safe deopt-before-call handling for general built-ins and verb calls.
 
-Compile eligibility is no longer the useful coverage bottleneck. The current
-runtime sample enters 252 JIT-compiled activations and completes 105 (41.67%)
-in native code; 144 (57.14%) deoptimize. The emergency workload suspends before
-finishing the requested object range, so these figures are a repeatable sample,
-not a database-wide execution census. Its current reason distribution is:
+Recent tagged-value work allows runtime-typed scalar and complex values to flow
+through concatenation, indexing, list construction, comparisons, branches,
+properties, and returns. Runtime tags are propagated through SSA copies and
+dynamic-result operations. Native consumers either dispatch on the tag or
+deoptimize before touching a representation they do not support.
 
-* 19 `arithmetic_type` deopts (13.19%);
-* 15 entry or local `type_guard_failure` deopts (10.42%), down from 227 after
-  separating compiler-only locals from VM locals and preserving `TYPE_NONE`
-  for user-local entry values before consumer-driven inference;
-* 52 `unsupported_operation` deopts (36.11%), down from 190;
-* 41 `property_read` deopts (28.47%);
-* 9 `range_operation` deopts (6.25%);
-* 6 `builtin_call` deopts (4.17%); and
-* 2 `verb_call` deopts (1.39%).
+### 14.2 Measurement
 
-The former top deoptimization site `#61:valid` (18 deopts) has been completely
-eliminated with native inlining of `valid()` and `parent()`, allowing `#61:valid`
-to run 100% natively without fallback.
-
-The line-1 string expression in `#59:verbname_match` is correctly omitted from
-HIR. Its old line 1/PC 0 report was an entry guard failure, not execution of the
-side-effect-free expression. Backward string inference carries its indexed
-argument accesses through line 2, and native two-argument `index()`/`rindex()`
-lowering now allows the sampled calls to complete without deoptimization.
-
-`#811:controls` previously inferred its scatter targets `who` and `what` as
-objects and incorrectly applied those types to their uninitialized entry SSA
-values. It now preserves their entry type as `TYPE_NONE` and reaches the exact
-scatter boundary at line 8/PC 22 before deoptimizing.
-
-Trailing optional scatter defaults now have native list-shape control flow and
-lazy default evaluation. Indexed elements whose type cannot be inferred carry
-their runtime tag through SSA copies and deoptimization maps. Consequently, the
-hot `#52:has_callable_verb` case now passes its scatter anchor and exits at its
-later unsupported operation on line 6/PC 30 with `verbname` reconstructed as a
-string. Multiple trailing optionals with explicit defaults are also lowered.
-Tagged membership moves the sampled `#66:get` calls past line 6/PC 26 to their
-later property-read boundary on line 8/PC 37. The eight `#55:assoc` exits remain
-at a caught `t[indx]` operation: the sampled value fails its dynamic list/index
-guard, so preserving the surrounding catch semantics still requires interpreter
-fallback.
-
-The former `#57:misc_option` line 1/PC 0 failure was an invalid specialization
-of built-in local `args` as an integer, not execution of its line-1 string
-comment. A list-splice check now propagates `TYPE_LIST` to its operand, so the
-sampled calls pass their entry guard and reach the real `$misc_options` property
-read on line 2/PC 7.
-
-Catch expressions, singleton list creation (`HIR_OP_MAKE_SINGLETON_LIST`), list
-appending (`HIR_OP_LIST_ADD_TAIL`), and property reads (`HIR_OP_GET_PROP`) with
-dynamically tagged object support are now lowered natively. With permissions
-validated via the verb activation's programmer object, `#811:controls` runs
-100% natively without deoptimization. Across objects #0..#25 in `Opal.db`, total
-deoptimizations decreased from 144 to 72, property-read deopts dropped from 61
-to 0, and completed verb execution rose from 15.45% to 29.09%.
-
-Rest scatter destructuring (`@rest`, e.g. `{line, @xargs} = args`) is now
-lowered directly via `HIR_OP_SUBLIST_FROM` and `jit_rt_sublist_from()`. This
-eliminates scatter bailouts across variadic argument parsers, including
-`#6:notify` and `#53:verb_or_property` in `codepoint.db`.
-
-Reproduce the census from the repository root with a JIT-enabled build using:
+Run the compile-eligibility census with:
 
 ```sh
 ./tests/census.sh Opal.db ./moo
 ```
 
-The optional arguments select another database and server binary. The script
-uses numeric verb descriptors to avoid ambiguity from aliases or overlapping
-verb names and removes its temporary output database on exit. The server may
-require permission to create its listening socket even though the census uses
-emergency mode and makes no network connections.
-
-Reproduce the runtime deoptimization sample with:
+Run the native-completion census with:
 
 ```sh
 ./tests/deopt-census.sh Opal.db ./moo 0 25
 ```
 
-The final two arguments select the inclusive object-number range. The script
-prints the profile written through `server_log()` and warns when a called verb
-suspends the emergency task before the range is complete.
+The last two arguments select the inclusive object range. The emergency
+workload may suspend before exhausting that range, so compare runs made with the
+same database, object range, and server configuration. Record both entered and
+completed activation counts: a lower raw deopt count can otherwise hide reduced
+coverage.
 
-The next reviewable compiler milestones, in priority order, are:
+A recent codepoint.db sample over objects #0 through #50 entered 1,418 compiled
+activations, completed 236 natively, and deoptimized 1,131. Its distribution was:
 
-1. Classify the 84 unsupported-operation sites by operation and call-site
-   frequency. Lower the highest-frequency continuation-free operation first,
-   retaining exact bytecode anchors and deopt state for everything else.
-2. Split and reduce the remaining 38 type-guard failures. Report the guarded
-   local slot plus expected and actual type, then distinguish true argument
-   specialization failures from inert entry-state values. Do not weaken guards
-   for values that can be semantically read before assignment.
-3. Classify the remaining 20 `arithmetic_type` exits. Do not inline the caught
-   `#55:assoc` index failure until native catch-region control flow can preserve
-   its `E_RANGE`/`E_TYPE` handler semantics.
-4. Define declarative built-in effect metadata (pure, may raise, may allocate,
-   may call, may suspend, ownership behavior) and make JIT eligibility consume
-   it. Only then expand fast paths for high-frequency, continuation-free
-   built-ins; all other built-ins remain deopt-before-call boundaries.
-5. Make code-unit identity explicit in native entry and deoptimization maps,
-   then compile fork vectors independently. A fork statement should remain an
-   interpreter boundary, but its separately compiled body should be eligible
-   for native entry without confusing main-vector bytecode PCs, resume anchors,
-   or serialized activations.
-6. Add profile-guided, semantics-preserving optimization only after the wider
-   differential suite is green: redundant guards and local traffic first,
-   followed by block-level tick batching where exact timeout and source-location
-   behavior can be proven. Measure each optimization against interpreter, JIT
-   O0, and optimized JIT runs.
-7. Finish with database-scale validation and performance work: multi-verb and
-   suspended-task workloads, checkpoint/reload tests, fuzzed interpreter/JIT
-   comparison, compile-time and code-size accounting, and benchmarks that
-   identify the next coverage or optimization bottleneck.
+* 363 unsupported operations (32.10%);
+* 345 verb calls (30.50%);
+* 206 built-in calls (18.21%);
+* 162 type guards (14.32%);
+* 38 range operations (3.36%);
+* 15 arithmetic guards (1.33%); and
+* one property write and one branch-type mismatch.
+
+These figures are workload-specific. They show that expanding complete native
+execution now depends primarily on operation/call coverage and guard quality,
+not on compiling more verb bodies.
+
+### 14.3 Priorities for programs that remain entirely native
+
+1. **Classify unsupported operations by HIR operation and call site.**
+   Extend `tests/deopt-census.sh` output so the 363 generic
+   `unsupported_operation` exits are attributable to an exact HIR operation,
+   bytecode opcode, and source site. Start with the high-frequency event-handler
+   and controls paths. Do not implement an operation until its resume stack,
+   error behavior, tick charge, and ownership contract are known.
+
+2. **Keep native callers native across ordinary verb calls.**
+   Verb calls are the largest well-defined boundary. Add a native-to-runtime
+   call bridge that can push a normal activation and dispatch a JIT-compiled
+   callee, while retaining an interpreter continuation for suspension,
+   traceback, recursion, permissions, and a callee that deoptimizes. Begin with
+   non-tail calls that return normally; add tail calls only after activation
+   replacement is modeled. This is likely the single largest improvement to
+   whole-program native completion.
+
+3. **Replace the built-in name allowlist with effect metadata.**
+   Record argument prototypes and effects such as pure, allocation, possible
+   errors, permission checks, calls, suspension, abort, continuation state, and
+   ownership transfer. Use the metadata both for type inference and for deciding
+   whether a built-in can run through a native call bridge. Prioritize the
+   highest-frequency continuation-free built-ins from the census. Never inline a
+   built-in that can return `BI_CALL`, `BI_SUSPEND`, or `BI_ABORT` without a
+   modeled continuation.
+
+4. **Make every lowered boundary independently resumable.**
+   A deopt map attached to a synthesized operation must reconstruct the operand
+   stack expected by its bytecode PC, not merely the operation's logical SSA
+   operands. Add verifier checks and negative tests for built-in argument-list
+   construction, scatter, property/index write-back, range operations, caught
+   errors, and other multi-bytecode lowerings. This prevents a guard miss from
+   resuming with a well-typed but structurally invalid interpreter stack.
+
+5. **Reduce type guards using consumer constraints and tagged dispatch.**
+   Report local/value identity and expected/actual tags for the remaining guard
+   failures. Seed only invariant runtime slots, preserve `TYPE_NONE` for
+   uninitialized user locals, and infer types backward from exact built-in and
+   operation contracts. When multiple types are legitimate, carry the runtime
+   tag and add a guarded consumer instead of guessing a static type. Never
+   weaken a guard merely to improve census numbers.
+
+6. **Finish dynamic complex-value propagation and ownership accounting.**
+   Audit every instruction that can produce a runtime-selected type—property
+   reads, list indexing, joins, calls, and overloaded arithmetic—and ensure its
+   tag reaches locals, copies, returns, and deopt maps. Add explicit
+   borrowed/owned/immortal states so native temporaries are released on normal,
+   error, and deopt exits. Include repeated-execution leak tests for strings,
+   lists, properties, and call results.
+
+7. **Lower the hottest remaining range and caught-error paths.**
+   The current sample reaches range operations after earlier string/list work.
+   Add native list and string range extraction/assignment only where bounds,
+   Unicode indexing, allocation quotas, source locations, and catch transfer are
+   exact. A caught error should enter its native handler only after stack-marker
+   and tick equivalence are tested; otherwise deopt before the operation.
+
+8. **Compile fork vectors and support native re-entry.**
+   Make code-unit identity explicit in entry and deopt maps, compile fork vectors
+   independently, and retain bytecode fallback for serialized tasks. A fork
+   statement may remain a scheduling boundary while its body becomes eligible
+   for native entry. Add checkpoint/reload and suspended-task tests before
+   enabling native resume.
+
+9. **Optimize only after coverage boundaries are trustworthy.**
+   First remove redundant guards and repeated local/tag loads. Then consider
+   block-level tick batching, call-site specialization, and MIR optimization
+   levels. Every optimization must preserve exact timeout, source-location,
+   error, and deoptimization behavior and be measured against interpreter and
+   JIT O0 baselines.
+
+10. **Expand differential and database-scale validation continuously.**
+    Add generated programs covering every runtime tag at every tagged consumer,
+    forced guard failures at synthesized bytecode anchors, nested catches,
+    recursion, permissions, repeated complex-value execution, checkpoint/reload,
+    and suspension. Track native completion percentage, reason distribution,
+    compile time, code size, and execution time for stable workloads.
+
+### 14.4 Definition of a completed coverage milestone
+
+A new operation or call path is complete only when:
+
+* its successful path matches the interpreter's value, ownership, ticks, and
+  source location;
+* every type, bounds, quota, permission, arithmetic, and timeout failure either
+  matches the interpreter natively or deoptimizes before side effects;
+* every deopt target reconstructs the exact bytecode stack and locals expected
+  at that PC;
+* catch/finally and suspension behavior remain canonical;
+* focused native/reference tests include negative runtime-tag cases;
+* the eligibility census has no regression; and
+* a stable runtime census demonstrates movement to a later substantive boundary
+  or an increased native-completion rate.
