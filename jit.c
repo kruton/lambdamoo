@@ -3518,6 +3518,7 @@ typedef struct JITDeoptSite {
 static JITDeoptSite *deopt_sites_hash[JIT_DEOPT_HASH_SIZE];
 static uint64_t total_jit_entries = 0;
 static uint64_t total_jit_completed = 0;
+static uint64_t total_vm_calls = 0;
 static uint64_t total_deopts = 0;
 static uint64_t deopt_reason_counts[JIT_DEOPT_NUM_REASONS];
 static time_t last_deopt_report_time = 0;
@@ -3562,6 +3563,12 @@ void
 jit_profile_record_completed(void)
 {
     total_jit_completed++;
+}
+
+void
+jit_profile_record_vm_call(void)
+{
+    total_vm_calls++;
 }
 
 void
@@ -3618,10 +3625,12 @@ jit_profile_report(void)
 	return;
 
     oklog("JIT: ===== Deoptimization Profile Report =====\n");
-    oklog("JIT: Total entries: %"PRIu64" | Completed: %"PRIu64" (%.2f%%) | Deopts: %"PRIu64" (%.2f%%)\n",
+    oklog("JIT: Total entries: %"PRIu64" | Completed: %"PRIu64" (%.2f%%) | VM calls: %"PRIu64" (%.2f%%) | Deopts: %"PRIu64" (%.2f%%)\n",
 	  total_jit_entries,
 	  total_jit_completed,
 	  total_jit_entries > 0 ? (100.0 * (double) total_jit_completed / (double) total_jit_entries) : 0.0,
+	  total_vm_calls,
+	  total_jit_entries > 0 ? (100.0 * (double) total_vm_calls / (double) total_jit_entries) : 0.0,
 	  total_deopts,
 	  total_jit_entries > 0 ? (100.0 * (double) total_deopts / (double) total_jit_entries) : 0.0);
 
@@ -3704,6 +3713,7 @@ jit_profile_reset(void)
     }
     total_jit_entries = 0;
     total_jit_completed = 0;
+    total_vm_calls = 0;
     total_deopts = 0;
     memset(deopt_reason_counts, 0, sizeof(deopt_reason_counts));
     last_deopt_report_time = 0;

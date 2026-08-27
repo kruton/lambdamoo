@@ -954,6 +954,8 @@ do {								\
 		if (jit_result == JIT_RUN_FALLBACK)
 		    jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
 					     &deopt);
+		else
+		    jit_profile_record_vm_call();
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;

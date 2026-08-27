@@ -3996,6 +3996,7 @@ main(void)
 	jit_profile_record_entry();
 	jit_profile_record_entry();
 	jit_profile_record_completed();
+	jit_profile_record_vm_call();
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));

@@ -56,6 +56,7 @@ typedef struct {
 extern const char *jit_deopt_reason_name(JITDeoptReason);
 extern void jit_profile_record_entry(void);
 extern void jit_profile_record_completed(void);
+extern void jit_profile_record_vm_call(void);
 extern void jit_profile_record_deopt(Objid, const char *, const JITDeoptState *);
 extern void jit_profile_maybe_report(int);
 extern void jit_profile_report(void);
