@@ -108,7 +108,7 @@ jit_rt_str_cmp(const char *s1, const char *s2, int case_matters)
 const char *
 jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
 {
-    int l1, l2, total;
+    size_t l1, l2, total;
     char *res;
 
     if (!s1)
@@ -119,7 +119,7 @@ jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
     l2 = memo_strlen(s2);
     total = l1 + l2;
 
-    if (server_int_option_cached(SVO_MAX_STRING_CONCAT) < total) {
+    if ((size_t) server_int_option_cached(SVO_MAX_STRING_CONCAT) < total) {
 	*err_out = E_QUOTA;
 	return 0;
     }
@@ -134,7 +134,7 @@ jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
 const char *
 jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
 {
-    int len;
+    size_t len;
     char *res;
 
     if (!str) {
@@ -142,7 +142,7 @@ jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
 	return 0;
     }
     len = memo_strlen(str);
-    if (idx < 1 || idx > len) {
+    if (idx < 1 || (size_t) idx > len) {
 	*err_out = E_RANGE;
 	return 0;
     }
