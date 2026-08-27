@@ -496,17 +496,17 @@ comparison with the earlier codepoint.db workload.
 2. **Expand native caller continuation liveness.**
    The first bridge stage now materializes the canonical `OP_CALL_VERB` stack,
    pushes a normal activation, and dispatches an eligible callee through JIT
-   without reporting a caller deoptimization. Direct-return calls now have a
-   native `RESUME_PHASE_AFTER_CALL` entry that restores locals and the dynamically
-   typed callee result. Generalize this by computing the SSA values live across
-   each call and assigning every such value a continuation source: runtime local,
-   VM operand-stack slot, constant, or explicitly spilled native temporary. The
-   verifier must reject a continuation with an unmapped live value; falling back
-   to the interpreter is safer than reconstructing an undefined register. Retain
-   the interpreter continuation for suspension, traceback, recursion,
-   permissions, and any unverified call site. Add tail-call activation replacement
-   only after the general normal-return path is modeled. This remains the largest
-   likely improvement to whole-program native completion.
+   without reporting a caller deoptimization. General normal-return calls now
+   have a native continuation that restores every SSA value live across the call
+   from a runtime local, VM operand-stack slot, constant, or the dynamically
+   typed call result. The liveness calculation treats later deoptimization-map
+   locals and stack entries as implicit uses; otherwise a value needed only to
+   reconstruct interpreter state can be incorrectly discarded. Calls with an
+   unmapped live value retain their interpreter continuation. Add explicit native
+   temporary spills where the census shows that restriction matters, and retain
+   interpreter continuation for suspension, traceback, recursion, permissions,
+   and other unverified paths. Tail-call activation replacement should wait until
+   those normal and exceptional paths are modeled.
 
 3. **Replace the built-in name allowlist with effect metadata.**
    Record argument prototypes and effects such as pure, allocation, possible
@@ -558,9 +558,13 @@ comparison with the earlier codepoint.db workload.
 9. **Optimize only after coverage boundaries are trustworthy.**
    First remove redundant guards and repeated local/tag loads. Then consider
    block-level tick batching, call-site specialization, and MIR optimization
-   levels. Every optimization must preserve exact timeout, source-location,
-   error, and deoptimization behavior and be measured against interpreter and
-   JIT O0 baselines.
+   levels. Deopt-aware liveness is intentionally broader than machine-operand
+   liveness: values named by a later interpreter-state map are genuinely live
+   even if no later native instruction reads them. Reduce that pressure by
+   coalescing equivalent deopt states and omitting maps from instructions that
+   cannot exit, not by dropping their implicit uses. Every optimization must
+   preserve exact timeout, source-location, error, and deoptimization behavior
+   and be measured against interpreter and JIT O0 baselines.
 
 10. **Expand differential and database-scale validation continuously.**
     Add generated programs covering every runtime tag at every tagged consumer,
