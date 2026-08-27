@@ -235,7 +235,10 @@ These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
 `parent()`. Verb calls use a distinct VM-call exit that materializes the exact
 `OP_CALL_VERB` stack and transfers to the canonical activation-push path without
 counting the transfer as a deoptimization. The callee can therefore enter JIT,
-but the caller currently resumes in the interpreter after the callee returns.
+and a caller that immediately returns the callee result resumes at a native
+`RESUME_PHASE_AFTER_CALL` entry after the callee returns. Other caller shapes
+currently resume in the interpreter because their compiler temporaries are not
+yet represented in the continuation map.
 The interpreter continues to own `bi_func_pc`, `bi_func_id`, `bi_func_data`,
 activation creation, suspension, and traceback behavior.
 
@@ -490,16 +493,20 @@ comparison with the earlier codepoint.db workload.
    and controls paths. Do not implement an operation until its resume stack,
    error behavior, tick charge, and ownership contract are known.
 
-2. **Resume native callers after ordinary verb calls.**
+2. **Expand native caller continuation liveness.**
    The first bridge stage now materializes the canonical `OP_CALL_VERB` stack,
    pushes a normal activation, and dispatches an eligible callee through JIT
-   without reporting a caller deoptimization. Add a native continuation entry
-   for the caller's `RESUME_PHASE_AFTER_CALL` key so a normal callee return can
-   restore the result and live values and continue in native code. Retain the
-   interpreter continuation for suspension, traceback, recursion, permissions,
-   and a callee that deoptimizes. Add tail calls only after activation
-   replacement is modeled. This remains the largest likely improvement to
-   whole-program native completion.
+   without reporting a caller deoptimization. Direct-return calls now have a
+   native `RESUME_PHASE_AFTER_CALL` entry that restores locals and the dynamically
+   typed callee result. Generalize this by computing the SSA values live across
+   each call and assigning every such value a continuation source: runtime local,
+   VM operand-stack slot, constant, or explicitly spilled native temporary. The
+   verifier must reject a continuation with an unmapped live value; falling back
+   to the interpreter is safer than reconstructing an undefined register. Retain
+   the interpreter continuation for suspension, traceback, recursion,
+   permissions, and any unverified call site. Add tail-call activation replacement
+   only after the general normal-return path is modeled. This remains the largest
+   likely improvement to whole-program native completion.
 
 3. **Replace the built-in name allowlist with effect metadata.**
    Record argument prototypes and effects such as pure, allocation, possible
