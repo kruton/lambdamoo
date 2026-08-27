@@ -1611,12 +1611,64 @@ build_mir(JITProgram *program, MIRBuild *build)
 			break;
 		    }
 		    if (instr->op == HIR_OP_SUBLIST_FROM) {
+			int tagged_list = program->value_is_tagged
+			    && program->value_is_tagged[instr->src1];
+			int tagged_start = program->value_is_tagged
+			    && program->value_is_tagged[instr->src2];
+			MIR_label_t deopt = 0;
+			MIR_label_t done = 0;
+
+			if (tagged_list || tagged_start) {
+			    char name[32];
+
+			    deopt = MIR_new_label(build->context);
+			    done = MIR_new_label(build->context);
+			    if (tagged_list) {
+				MIR_reg_t type;
+
+				sprintf(name, "sublist_type%d", copy_serial++);
+				type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->src1) * sizeof(Num),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, type),
+				    MIR_new_int_op(build->context, TYPE_LIST)));
+			    }
+			    if (tagged_start) {
+				MIR_reg_t type;
+
+				sprintf(name, "sublist_start_type%d", copy_serial++);
+				type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->src2) * sizeof(Num),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, type),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    }
+			}
 			append(build, MIR_new_call_insn(build->context, 5,
 			    MIR_new_ref_op(build->context, build->proto_sublist_from),
 			    MIR_new_ref_op(build->context, build->import_sublist_from),
 			    MIR_new_reg_op(build->context, values[instr->value]),
 			    MIR_new_reg_op(build->context, values[instr->src1]),
 			    MIR_new_reg_op(build->context, values[instr->src2])));
+			if (tagged_list || tagged_start) {
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, deopt);
+			    append_deopt_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return);
+			    append(build, done);
+			}
 			break;
 		    }
 		    if (instr->op == HIR_OP_LIST_APPEND) {

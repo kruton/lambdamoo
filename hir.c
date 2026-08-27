@@ -4442,10 +4442,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
-			     || ssa_instr->op == HIR_OP_NEGATE
-			     || ssa_instr->op == HIR_OP_ABS
-			     || ssa_instr->op == HIR_OP_COMPLEMENT
-			     || ssa_instr->op == HIR_OP_TOINT
 			     || ssa_instr->op == HIR_OP_LENGTH
 			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
 			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE))
