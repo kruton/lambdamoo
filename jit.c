@@ -917,7 +917,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		&& instr->deopt_map < program->num_deopt_maps
 		&& (instr->kind == HIR_TAC_CALL_VERB
 		 || (instr->kind == HIR_TAC_CALL
-		     && jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])))
+		     && jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])))
 		&& jit_call_has_native_continuation(program, instr)
 		&& program->deopt_maps[instr->deopt_map].stack_depth
 		   >= (unsigned) jit_call_stack_operands(
@@ -3232,7 +3232,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 		case HIR_TAC_CALL:
 		    if (instr->deopt_map > 0
 			&& instr->deopt_map < program->num_deopt_maps
-			&& jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])) {
+			&& jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])) {
 			append_materialized_exit(build, program, instr->deopt_map,
 					 values,
 					 deopt_map_out, deopt_values, status,
@@ -3487,7 +3487,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
 
-	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_is_pass(map))
+	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_bridges_builtin(map))
 	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
 	    && map->resume_key.site == key.site) {
@@ -3499,7 +3499,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 		for (instr = block->first; instr; instr = instr->next) {
 		    if ((instr->kind == HIR_TAC_CALL_VERB
 			 || (instr->kind == HIR_TAC_CALL
-			     && jit_deopt_map_is_pass(map)))
+			     && jit_deopt_map_bridges_builtin(map)))
 			&& instr->deopt_map == i
 			&& jit_call_has_native_continuation(program, instr))
 			return i;
@@ -3627,7 +3627,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 
 	if (map->reason == JIT_DEOPT_VERB_CALL && map->stack_depth >= 3)
 	    resume_depth = map->stack_depth - 2;
-	else if (jit_deopt_map_is_pass(map) && map->stack_depth >= 1)
+	else if (jit_deopt_map_bridges_builtin(map) && map->stack_depth >= 1)
 	    resume_depth = map->stack_depth;
     }
     function = (NativeFunction) program->native_function;

@@ -50,16 +50,22 @@ struct JITDeoptMap {
 };
 
 static inline int
-jit_deopt_map_is_pass(JITDeoptMap *map)
+jit_deopt_map_is_builtin(JITDeoptMap *map, const char *name)
 {
     return map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0
-	&& !strcmp(name_func_by_num((unsigned) map->builtin_func), "pass");
+	&& !strcmp(name_func_by_num((unsigned) map->builtin_func), name);
+}
+
+static inline int
+jit_deopt_map_bridges_builtin(JITDeoptMap *map)
+{
+    return jit_deopt_map_is_builtin(map, "pass");
 }
 
 static inline int
 jit_call_stack_operands(JITDeoptMap *map)
 {
-    return jit_deopt_map_is_pass(map) ? 1 : 3;
+    return map->reason == JIT_DEOPT_BUILTIN_CALL ? 1 : 3;
 }
 
 struct JITCopy {

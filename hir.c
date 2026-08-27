@@ -4049,7 +4049,7 @@ jit_build_resume_liveness(JITProgram *program)
 		&& instr->deopt_map < program->num_deopt_maps
 		&& (instr->kind == HIR_TAC_CALL_VERB
 		 || (instr->kind == HIR_TAC_CALL
-		     && jit_deopt_map_is_pass(&program->deopt_maps[instr->deopt_map])))) {
+		     && jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])))) {
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
 		int call_operands = jit_call_stack_operands(map);
 		for (value = 1; value < program->num_values; value++)
