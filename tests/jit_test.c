@@ -13,7 +13,7 @@
 #include <limits.h>
 
 #define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
-    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2)
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1)
 
 static int failures;
 
@@ -754,17 +754,28 @@ call_verb_program(void)
     JITInstruction *load_args = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
     JITDeoptMap *map;
 
     program->num_values = 5;
     program->num_vars = 3;
     program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_is_tagged = allocate(5);
+    program->value_types[1] = TYPE_OBJ;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_LIST;
+    program->value_is_tagged[4] = 1;
     add_entry_deopt_map(program);
     program->deopt_maps = myrealloc(program->deopt_maps,
 				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
     map = &program->deopt_maps[1];
     memset(map, 0, sizeof(JITDeoptMap));
     program->num_deopt_maps = 2;
+    map->resume_key.code_unit = 0;
+    map->resume_key.site = 1;
+    map->resume_key.phase = RESUME_PHASE_AFTER_CALL;
+    map->reason = JIT_DEOPT_VERB_CALL;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
@@ -806,8 +817,12 @@ call_verb_program(void)
     call_verb->src1 = 1;
     call_verb->src2 = 2;
     call_verb->deopt_map = 1;
+    call_verb->resume_key = map->resume_key;
+    call_verb->next = return_instr;
+    return_instr->src1 = 4;
+    return_instr->literal_type = TYPE_ANY;
     block->first = load_obj;
-    block->last = call_verb;
+    block->last = return_instr;
     return program;
 }
 
@@ -1826,10 +1841,6 @@ verb_call_boundary_program(void)
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
     map = &program->deopt_maps[1];
-    map->resume_key.code_unit = 0;
-    map->resume_key.site = 7;
-    map->resume_key.phase = RESUME_PHASE_AFTER_CALL;
-    map->reason = JIT_DEOPT_VERB_CALL;
     map->bytecode_pc = 55;
     map->error_pc = 55;
     program->blocks = program->last_block = block;
@@ -2986,6 +2997,27 @@ main(void)
     /* Verb call deopt boundary tests */
     {
 	JITProgram *call_prog = call_verb_program();
+	ResumeKey call_key = { 0, 1, RESUME_PHASE_AFTER_CALL };
+	ResumeKey wrong_key = { 0, 2, RESUME_PHASE_AFTER_CALL };
+	check(jit_program_resume_map(call_prog, call_key) == 1,
+	      "verb call resume key did not resolve");
+	check(jit_program_resume_map(call_prog, wrong_key) == -1,
+	      "unknown verb call resume key resolved");
+	{
+	    JITProgram *non_tail = call_verb_program();
+	    JITInstruction *call = non_tail->blocks->first;
+	    JITInstruction *extra = instruction(HIR_TAC_CONST);
+
+	    while (call->kind != HIR_TAC_CALL_VERB)
+		call = call->next;
+	    extra->value = 1;
+	    extra->literal_type = TYPE_OBJ;
+	    extra->next = call->next;
+	    call->next = extra;
+	    check(jit_program_resume_map(non_tail, call_key) == -1,
+		  "non-tail verb call exposed an unsafe continuation");
+	    jit_program_free(non_tail);
+	}
 	deep_env[0].type = TYPE_OBJ;
 	deep_env[0].v.obj = 0;
 	deep_env[1].type = TYPE_STR;
@@ -3012,6 +3044,16 @@ main(void)
 	      "call_verb wrong argument stack value");
 	free_var(deopt_stack[1]);
 	free_var(deopt_stack[2]);
+	deopt_stack[0].type = TYPE_STR;
+	deopt_stack[0].v.str = str_dup("returned");
+	check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "call_verb continuation did not return");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "returned"),
+	      "call_verb continuation returned the wrong value");
+	free_var(result);
+	free_var(deopt_stack[0]);
 	free_var(deep_env[1]);
 	free_var(deep_env[2]);
 	jit_program_free(call_prog);
@@ -3727,12 +3769,6 @@ main(void)
     /* Boundary deoptimization differential tests */
     {
 	JITProgram *vcall_p = verb_call_boundary_program();
-	ResumeKey call_key = { 0, 7, RESUME_PHASE_AFTER_CALL };
-	ResumeKey wrong_key = { 0, 8, RESUME_PHASE_AFTER_CALL };
-	check(jit_program_resume_map(vcall_p, call_key) == 1,
-	      "verb call resume key did not resolve");
-	check(jit_program_resume_map(vcall_p, wrong_key) == -1,
-	      "unknown verb call resume key resolved");
 	check_differential(vcall_p, 0, 10, 0, "verb call boundary differential");
 	jit_program_free(vcall_p);
 

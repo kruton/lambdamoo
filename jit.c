@@ -343,8 +343,25 @@ jit_rt_parent(int64_t oid, int32_t *err_out)
     return (int64_t) db_object_parent(obj);
 }
 
+int64_t
+jit_rt_var_raw(const Var *value)
+{
+    if (value->type == TYPE_FLOAT)
+	return double_to_raw(fl_unbox(value->v.fnum));
+    if (value->type == TYPE_STR)
+	return (int64_t) (intptr_t) value->v.str;
+    if (value->type == TYPE_LIST)
+	return (int64_t) (intptr_t) value->v.list;
+    if (value->type == TYPE_OBJ)
+	return value->v.obj;
+    if (value->type == TYPE_ERR)
+	return value->v.err;
+    return value->v.num;
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
-				   JITSourceLocation *, int *, Num *, Objid);
+				   JITSourceLocation *, int *, Num *, Objid,
+				   int, Var *);
 
 typedef struct {
     MIR_context_t context;
@@ -384,6 +401,8 @@ typedef struct {
     MIR_item_t import_valid;
     MIR_item_t proto_parent;
     MIR_item_t import_parent;
+    MIR_item_t proto_var_raw;
+    MIR_item_t import_var_raw;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -662,15 +681,72 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
 			     JIT_RUN_FALLBACK);
 }
 
+static void
+append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
+		    int value, MIR_reg_t stack, int stack_index,
+		    MIR_reg_t deopt_values, int *serial)
+{
+    MIR_reg_t raw, address;
+    char name[32];
+
+    if (value <= 0 || value >= program->num_values)
+	return;
+    sprintf(name, "resume_raw%d", (*serial)++);
+    raw = new_reg(build, name);
+    sprintf(name, "resume_addr%d", (*serial)++);
+    address = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_ADD,
+			      MIR_new_reg_op(build->context, address),
+			      MIR_new_reg_op(build->context, stack),
+			      MIR_new_int_op(build->context,
+					     stack_index * sizeof(Var))));
+    append(build, MIR_new_call_insn(build->context, 4,
+	MIR_new_ref_op(build->context, build->proto_var_raw),
+	MIR_new_ref_op(build->context, build->import_var_raw),
+	MIR_new_reg_op(build->context, raw),
+	MIR_new_reg_op(build->context, address)));
+    if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+	append(build, MIR_new_insn(build->context, MIR_DMOV,
+				  MIR_new_reg_op(build->context, values[value]),
+				  MIR_new_reg_op(build->context, raw)));
+    else
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+				  MIR_new_reg_op(build->context, values[value]),
+				  MIR_new_reg_op(build->context, raw)));
+    if (program->value_is_tagged && program->value_is_tagged[value])
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context,
+		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		    (program->num_values + value) * sizeof(Num),
+		    deopt_values, 0, 1),
+	    MIR_new_mem_op(build->context, MIR_T_I32,
+		    stack_index * sizeof(Var) + offsetof(Var, type),
+		    stack, 0, 1)));
+}
+
+static int
+jit_call_has_native_continuation(JITBlock *block, JITInstruction *call)
+{
+    /* Deopt maps preserve VM-visible state, not every compiler temporary live
+       across a call.  A direct return needs only the dynamically typed call
+       result; wider continuation points require an explicit native liveness
+       map before they are safe to expose. */
+    return call->next && call->next == block->last
+	&& call->next->kind == HIR_TAC_RETURN
+	&& call->next->src1 == call->value;
+}
+
 static int
 build_mir(JITProgram *program, MIRBuild *build)
 {
     MIR_type_t result_type = MIR_T_I64;
     MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
-    MIR_reg_t source_location, deopt_values, progr;
+    MIR_reg_t source_location, deopt_values, progr, resume_map, resume_stack;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
+    MIR_label_t *resume_entries, *resume_continuations;
+    JITInstruction **resume_instructions;
     MIR_label_t fallback;
     MIR_label_t tick_abort = 0, seconds_abort = 0;
     MIR_label_t common_return;
@@ -708,6 +784,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_rindex", (void *) jit_rt_rindex);
     MIR_load_external(build->context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(build->context, "jit_rt_parent", (void *) jit_rt_parent);
+    MIR_load_external(build->context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
 
     build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
 					 MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -778,13 +855,18 @@ build_mir(JITProgram *program, MIRBuild *build)
 					MIR_T_I64, "oid", MIR_T_P, "err");
     build->import_parent = MIR_new_import(build->context, "jit_rt_parent");
 
+    build->proto_var_raw = MIR_new_proto(build->context, "proto_var_raw", 1,
+					 &res_i64, 1, MIR_T_P, "value");
+    build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
+
     build->function = MIR_new_func(build->context, "jit_verb", 1,
-				   &result_type, 9,
+				   &result_type, 11,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
 				   MIR_T_P, "error_out", MIR_T_P, "source_location",
 				   MIR_T_P, "deopt_map_out", MIR_T_P, "deopt_values",
-				   MIR_T_I64, "progr");
+				   MIR_T_I64, "progr", MIR_T_I32, "resume_map",
+				   MIR_T_P, "resume_stack");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
@@ -797,6 +879,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     deopt_values = MIR_reg(build->context, "deopt_values",
 			   build->function->u.func);
     progr = MIR_reg(build->context, "progr", build->function->u.func);
+    resume_map = MIR_reg(build->context, "resume_map", build->function->u.func);
+    resume_stack = MIR_reg(build->context, "resume_stack", build->function->u.func);
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -821,6 +905,68 @@ build_mir(JITProgram *program, MIRBuild *build)
     memset(labels, 0, sizeof(MIR_label_t) * (max_block_id + 1));
     for (block = program->blocks; block; block = block->next)
 	labels[block->id] = MIR_new_label(build->context);
+
+    resume_entries = mymalloc(sizeof(MIR_label_t) * program->num_deopt_maps,
+			      M_PROGRAM);
+    resume_continuations = mymalloc(sizeof(MIR_label_t)
+				    * program->num_deopt_maps, M_PROGRAM);
+    resume_instructions = mymalloc(sizeof(JITInstruction *)
+				   * program->num_deopt_maps, M_PROGRAM);
+    memset(resume_entries, 0,
+	   sizeof(MIR_label_t) * program->num_deopt_maps);
+    memset(resume_continuations, 0,
+	   sizeof(MIR_label_t) * program->num_deopt_maps);
+    memset(resume_instructions, 0,
+	   sizeof(JITInstruction *) * program->num_deopt_maps);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CALL_VERB
+		&& jit_call_has_native_continuation(block, instr)
+		&& instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps
+		&& program->deopt_maps[instr->deopt_map].stack_depth >= 3) {
+		resume_entries[instr->deopt_map] = MIR_new_label(build->context);
+		resume_continuations[instr->deopt_map] = MIR_new_label(build->context);
+		resume_instructions[instr->deopt_map] = instr;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (i = 1; i < program->num_deopt_maps; i++)
+	if (resume_entries[i])
+	    append(build, MIR_new_insn(build->context, MIR_BEQ,
+		MIR_new_label_op(build->context, resume_entries[i]),
+		MIR_new_reg_op(build->context, resume_map),
+		MIR_new_int_op(build->context, i)));
+    append(build, MIR_new_insn(build->context, MIR_JMP,
+			      MIR_new_label_op(build->context,
+					       labels[program->blocks->id])));
+    for (i = 1; i < program->num_deopt_maps; i++) {
+	JITDeoptMap *map;
+	JITInstruction *call;
+	int j, outer_depth;
+
+	if (!resume_entries[i])
+	    continue;
+	map = &program->deopt_maps[i];
+	call = resume_instructions[i];
+	outer_depth = map->stack_depth - 3;
+	append(build, resume_entries[i]);
+	for (j = 0; j < map->num_locals; j++)
+	    append_resume_value(build, program, values, map->local_values[j],
+				env, j, deopt_values, &copy_serial);
+	for (j = 0; j < outer_depth; j++)
+	    append_resume_value(build, program, values, map->stack_values[j],
+				resume_stack, j, deopt_values, &copy_serial);
+	append_resume_value(build, program, values, call->value, resume_stack,
+			    outer_depth, deopt_values, &copy_serial);
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+				  MIR_new_label_op(build->context,
+						   resume_continuations[i])));
+    }
 
     for (block = program->blocks; block; block = block->next) {
 	    JITInstruction *instr;
@@ -3079,6 +3225,10 @@ build_mir(JITProgram *program, MIRBuild *build)
 					     values, deopt_map_out,
 					     deopt_values, status,
 					     common_return, JIT_RUN_CALL_VERB);
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& resume_continuations[instr->deopt_map])
+			append(build, resume_continuations[instr->deopt_map]);
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
@@ -3111,6 +3261,9 @@ build_mir(JITProgram *program, MIRBuild *build)
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
+    myfree(resume_instructions, M_PROGRAM);
+    myfree(resume_continuations, M_PROGRAM);
+    myfree(resume_entries, M_PROGRAM);
     myfree(labels, M_PROGRAM);
     myfree(values, M_PROGRAM);
     return 1;
@@ -3303,10 +3456,25 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	JITDeoptMap *map = &program->deopt_maps[i];
 
 	if (map->reason == JIT_DEOPT_VERB_CALL
+	    && map->stack_depth >= 3
 	    && map->resume_key.code_unit == key.code_unit
 	    && map->resume_key.site == key.site
-	    && map->resume_key.phase == key.phase)
-	    return i;
+	    && map->resume_key.phase == key.phase) {
+	    JITBlock *block;
+
+	    for (block = program->blocks; block; block = block->next) {
+		JITInstruction *instr;
+
+		for (instr = block->first; instr; instr = instr->next) {
+		    if (instr->kind == HIR_TAC_CALL_VERB
+			&& instr->deopt_map == i
+			&& jit_call_has_native_continuation(block, instr))
+			return i;
+		    if (instr == block->last)
+			break;
+		}
+	    }
+	}
     }
     return -1;
 }
@@ -3393,11 +3561,12 @@ JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
 		    int *ticks, int *timed_out, enum error *error,
 		    JITSourceLocation *source_location, JITDeoptState *deopt,
-		    Var *deopt_stack, Objid progr)
+		    Var *deopt_stack, Objid progr, int resume_map)
 {
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
+    int resume_depth = 0;
     JITSourceLocation ignored_location;
 
     if (!source_location)
@@ -3418,13 +3587,19 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
+    if (resume_map > 0 && resume_map < program->num_deopt_maps
+	&& program->deopt_maps[resume_map].reason == JIT_DEOPT_VERB_CALL
+	&& program->deopt_maps[resume_map].stack_depth >= 3)
+	resume_depth = program->deopt_maps[resume_map].stack_depth - 2;
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
-			     program->deopt_values, progr);
+			     program->deopt_values, progr, resume_map,
+			     deopt_stack);
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB) {
 	JITDeoptMap *map;
+	Var *new_stack = 0;
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
@@ -3442,14 +3617,22 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		free_var(env[i]);
 		env[i] = value;
 	    }
-	for (i = 0; deopt_stack && i < (int) map->stack_depth; i++) {
+	if (deopt_stack && map->stack_depth)
+	    new_stack = mymalloc(sizeof(Var) * map->stack_depth, M_PROGRAM);
+	for (i = 0; new_stack && i < (int) map->stack_depth; i++) {
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
 	    if (type == TYPE_ANY)
 		type = (var_type) program->deopt_values[program->num_values
 		    + map->stack_values[i]];
 
-	    deopt_stack[i] = materialize_deopt_value(type,
+	    new_stack[i] = materialize_deopt_value(type,
 		program->deopt_values[map->stack_values[i]]);
+	}
+	if (new_stack) {
+	    for (i = 0; i < resume_depth; i++)
+		free_var(deopt_stack[i]);
+	    memcpy(deopt_stack, new_stack, sizeof(Var) * map->stack_depth);
+	    myfree(new_stack, M_PROGRAM);
 	}
 	if (deopt) {
 	    deopt->bytecode_pc = map->bytecode_pc;

@@ -4286,6 +4286,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *si;
 
 	for (si = ssa_block->first; si; si = si->next) {
+	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_CALL_VERB)
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])

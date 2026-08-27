@@ -98,5 +98,6 @@ extern int64_t jit_rt_index(const char *, const char *);
 extern int64_t jit_rt_rindex(const char *, const char *);
 extern int64_t jit_rt_valid(int64_t);
 extern int64_t jit_rt_parent(int64_t, int32_t *);
+extern int64_t jit_rt_var_raw(const Var *);
 
 #endif /* !JIT_Internal_H */
