@@ -16,6 +16,7 @@ typedef enum {
 
 typedef enum {
     JIT_RUN_FALLBACK,
+    JIT_RUN_CALL_VERB,
     JIT_RUN_RETURNED,
     JIT_RUN_ERROR,
     JIT_RUN_ABORT_TICKS,

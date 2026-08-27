@@ -598,10 +598,10 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 }
 
 static void
-append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
-		  MIR_reg_t *values, MIR_reg_t deopt_map_out,
-		  MIR_reg_t deopt_values, MIR_reg_t status,
-		  MIR_label_t common_return)
+append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
+			 MIR_reg_t *values, MIR_reg_t deopt_map_out,
+			 MIR_reg_t deopt_values, MIR_reg_t status,
+			 MIR_label_t common_return, JITRunResult result)
 {
     JITDeoptMap *map = &program->deopt_maps[map_id];
     int i;
@@ -648,7 +648,18 @@ append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, map_id)));
-    return_status(build, status, common_return, JIT_RUN_FALLBACK);
+    return_status(build, status, common_return, result);
+}
+
+static void
+append_deopt_exit(MIRBuild *build, JITProgram *program, int map_id,
+		  MIR_reg_t *values, MIR_reg_t deopt_map_out,
+		  MIR_reg_t deopt_values, MIR_reg_t status,
+		  MIR_label_t common_return)
+{
+    append_materialized_exit(build, program, map_id, values, deopt_map_out,
+			     deopt_values, status, common_return,
+			     JIT_RUN_FALLBACK);
 }
 
 static int
@@ -3056,13 +3067,18 @@ build_mir(JITProgram *program, MIRBuild *build)
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_CALL:
-		case HIR_TAC_CALL_VERB:
 		case HIR_TAC_PUT_PROP:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);
+		    break;
+		case HIR_TAC_CALL_VERB:
+		    append_materialized_exit(build, program, instr->deopt_map,
+					     values, deopt_map_out,
+					     deopt_values, status,
+					     common_return, JIT_RUN_CALL_VERB);
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
@@ -3387,7 +3403,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
 			     program->deopt_values, progr);
-    if (native_result == JIT_RUN_FALLBACK) {
+    if (native_result == JIT_RUN_FALLBACK
+	|| native_result == JIT_RUN_CALL_VERB) {
 	JITDeoptMap *map;
 	int i;
 

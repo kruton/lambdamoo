@@ -949,9 +949,11 @@ do {								\
 		error_bv = bc.vector + source_location.error_pc;
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
-	    } else if (jit_result == JIT_RUN_FALLBACK) {
-		jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
-					 &deopt);
+	    } else if (jit_result == JIT_RUN_FALLBACK
+		       || jit_result == JIT_RUN_CALL_VERB) {
+		if (jit_result == JIT_RUN_FALLBACK)
+		    jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
+					     &deopt);
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;

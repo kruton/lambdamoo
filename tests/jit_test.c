@@ -2093,6 +2093,7 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
     JITBlock *block = program->blocks;
     JITSourceLocation ignored_loc;
     int deopt_map_index = -1;
+    JITRunResult fallback_result = JIT_RUN_FALLBACK;
 
     if (!source_location)
 	source_location = &ignored_loc;
@@ -2135,11 +2136,14 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		break;
 	    case HIR_TAC_DEOPT:
 	    case HIR_TAC_CALL:
-	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		deopt_map_index = instr->deopt_map;
+		goto do_fallback;
+	    case HIR_TAC_CALL_VERB:
+		deopt_map_index = instr->deopt_map;
+		fallback_result = JIT_RUN_CALL_VERB;
 		goto do_fallback;
 	    case HIR_TAC_CONST:
 		if (instr->literal_type == TYPE_FLOAT)
@@ -2441,7 +2445,7 @@ do_fallback:
 	}
     }
     myfree(values, M_PROGRAM);
-    return JIT_RUN_FALLBACK;
+    return fallback_result;
 }
 
 static void
@@ -2989,7 +2993,7 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(call_prog, deep_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_FALLBACK, "call_verb did not return fallback");
+	      == JIT_RUN_CALL_VERB, "call_verb did not request a VM call");
 	check(ticks == 9 && deopt.ticks_charged == 1,
 	      "call_verb reported the wrong charged tick count");
 	check(deopt.bytecode_pc == 30, "call_verb wrong bytecode_pc");
