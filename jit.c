@@ -3293,6 +3293,25 @@ jit_program_deopt_map_count(JITProgram *program)
 }
 
 int
+jit_program_resume_map(JITProgram *program, ResumeKey key)
+{
+    int i;
+
+    if (!program || key.site == 0 || key.phase != RESUME_PHASE_AFTER_CALL)
+	return -1;
+    for (i = 1; i < program->num_deopt_maps; i++) {
+	JITDeoptMap *map = &program->deopt_maps[i];
+
+	if (map->reason == JIT_DEOPT_VERB_CALL
+	    && map->resume_key.code_unit == key.code_unit
+	    && map->resume_key.site == key.site
+	    && map->resume_key.phase == key.phase)
+	    return i;
+    }
+    return -1;
+}
+
+int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;

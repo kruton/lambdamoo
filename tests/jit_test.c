@@ -1826,6 +1826,10 @@ verb_call_boundary_program(void)
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
     map = &program->deopt_maps[1];
+    map->resume_key.code_unit = 0;
+    map->resume_key.site = 7;
+    map->resume_key.phase = RESUME_PHASE_AFTER_CALL;
+    map->reason = JIT_DEOPT_VERB_CALL;
     map->bytecode_pc = 55;
     map->error_pc = 55;
     program->blocks = program->last_block = block;
@@ -3723,6 +3727,12 @@ main(void)
     /* Boundary deoptimization differential tests */
     {
 	JITProgram *vcall_p = verb_call_boundary_program();
+	ResumeKey call_key = { 0, 7, RESUME_PHASE_AFTER_CALL };
+	ResumeKey wrong_key = { 0, 8, RESUME_PHASE_AFTER_CALL };
+	check(jit_program_resume_map(vcall_p, call_key) == 1,
+	      "verb call resume key did not resolve");
+	check(jit_program_resume_map(vcall_p, wrong_key) == -1,
+	      "unknown verb call resume key resolved");
 	check_differential(vcall_p, 0, 10, 0, "verb call boundary differential");
 	jit_program_free(vcall_p);
 

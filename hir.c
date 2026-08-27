@@ -3777,6 +3777,7 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 				    * (program->num_deopt_maps + 1), M_PROGRAM);
     map = &program->deopt_maps[program->num_deopt_maps];
     memset(map, 0, sizeof(JITDeoptMap));
+    map->resume_key = instr->resume_key;
     map->bytecode_pc = instr->bytecode_pc;
     map->error_pc = instr->bytecode_pc;
     map->source_lineno = instr->source_lineno;
@@ -4411,6 +4412,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
+	    instr->resume_key = ssa_instr->resume_key;
 	    instr->source_lineno = ssa_instr->source_lineno;
 	    instr->bytecode_pc = ssa_instr->bytecode_pc;
 	    if (ssa_instr->bytecode_pc != NO_BYTECODE_PC)

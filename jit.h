@@ -3,6 +3,7 @@
 
 #include "config.h"
 
+#include "program.h"
 #include "structures.h"
 
 typedef struct JITProgram JITProgram;
@@ -74,6 +75,7 @@ extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
+extern int jit_program_resume_map(JITProgram *, ResumeKey);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 					enum error *, JITSourceLocation *,

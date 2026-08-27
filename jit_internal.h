@@ -12,6 +12,7 @@ typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 
 struct JITDeoptMap {
+    ResumeKey resume_key;
     unsigned bytecode_pc;
     unsigned error_pc;
     unsigned source_lineno;
@@ -33,6 +34,7 @@ struct JITCopy {
 
 struct JITInstruction {
     HIRTacKind kind;
+    ResumeKey resume_key;
     unsigned source_lineno;
     unsigned bytecode_pc;
     int value;
