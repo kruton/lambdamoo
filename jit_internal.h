@@ -10,6 +10,22 @@ typedef struct JITCopy JITCopy;
 typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
+typedef struct JITResumeValue JITResumeValue;
+
+typedef enum {
+    JIT_RESUME_LOCAL,
+    JIT_RESUME_STACK,
+    JIT_RESUME_RESULT,
+    JIT_RESUME_CONSTANT
+} JITResumeSource;
+
+struct JITResumeValue {
+    int value;
+    JITResumeSource source;
+    int index;
+    Num literal;
+    var_type literal_type;
+};
 
 struct JITDeoptMap {
     ResumeKey resume_key;
@@ -23,6 +39,9 @@ struct JITDeoptMap {
     var_type *local_types;
     int *stack_values;
     var_type *stack_types;
+    int num_resume_values;
+    JITResumeValue *resume_values;
+    int native_resume_valid;
     JITDeoptReason reason;
 };
 

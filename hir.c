@@ -3851,6 +3851,236 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     return program->num_deopt_maps++;
 }
 
+static int
+jit_instr_defines_value(JITInstruction *instr)
+{
+    return instr->kind == HIR_TAC_CONST || instr->kind == HIR_TAC_LOAD_LOCAL
+	|| instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
+	|| instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB
+	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_RANGE_REF
+	|| instr->kind == HIR_TAC_RANGE_SET || instr->kind == HIR_TAC_UNSUPPORTED;
+}
+
+static void
+jit_instr_liveness(JITProgram *program, JITInstruction *instr,
+		   unsigned char *uses, unsigned char *defs)
+{
+    JITCopy *copy;
+    JITDeoptMap *map;
+    int i;
+
+    if (jit_instr_defines_value(instr) && instr->value > 0
+	&& instr->value < program->num_values)
+	defs[instr->value] = 1;
+    if (instr->kind == HIR_TAC_PARALLEL_COPY)
+	for (copy = instr->copies; copy; copy = copy->next) {
+	    if (copy->src > 0 && copy->src < program->num_values)
+		uses[copy->src] = 1;
+	    if (copy->dst > 0 && copy->dst < program->num_values)
+		defs[copy->dst] = 1;
+	}
+    if (instr->src1 > 0 && instr->src1 < program->num_values)
+	uses[instr->src1] = 1;
+    if (instr->src2 > 0 && instr->src2 < program->num_values)
+	uses[instr->src2] = 1;
+    if (instr->deopt_map <= 0 || instr->deopt_map >= program->num_deopt_maps)
+	return;
+    map = &program->deopt_maps[instr->deopt_map];
+    for (i = 0; i < map->num_locals; i++)
+	if (map->local_values[i] > 0
+	    && map->local_values[i] < program->num_values)
+	    uses[map->local_values[i]] = 1;
+    for (i = 0; i < (int) map->stack_depth; i++)
+	if (map->stack_values[i] > 0
+	    && map->stack_values[i] < program->num_values)
+	    uses[map->stack_values[i]] = 1;
+}
+
+static int
+jit_resume_source(JITProgram *program, JITDeoptMap *map,
+		  JITInstruction *call, int value, JITResumeValue *resume)
+{
+    JITBlock *block;
+    int i;
+
+    resume->value = value;
+    if (value == call->value) {
+	resume->source = JIT_RESUME_RESULT;
+	return 1;
+    }
+    for (i = 0; i < map->num_locals; i++)
+	if (map->local_values[i] == value) {
+	    resume->source = JIT_RESUME_LOCAL;
+	    resume->index = i;
+	    return 1;
+	}
+    for (i = 0; i + 3 < (int) map->stack_depth; i++)
+	if (map->stack_values[i] == value) {
+	    resume->source = JIT_RESUME_STACK;
+	    resume->index = i;
+	    return 1;
+	}
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CONST && instr->value == value) {
+		resume->source = JIT_RESUME_CONSTANT;
+		resume->literal = instr->literal;
+		resume->literal_type = instr->literal_type;
+		return 1;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static void
+jit_build_resume_liveness(JITProgram *program)
+{
+    JITBlock *block;
+    unsigned char **live_in, **live_out, **block_use, **block_def;
+    int max_block = 0, changed, i;
+
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    live_in = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    live_out = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_use = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_def = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    memset(live_in, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(live_out, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_use, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_def, 0, sizeof(unsigned char *) * (max_block + 1));
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	unsigned char *seen_defs;
+
+	live_in[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	live_out[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_use[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_def[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	seen_defs = mymalloc(program->num_values, M_PROGRAM);
+	memset(live_in[block->id], 0, program->num_values);
+	memset(live_out[block->id], 0, program->num_values);
+	memset(block_use[block->id], 0, program->num_values);
+	memset(block_def[block->id], 0, program->num_values);
+	memset(seen_defs, 0, program->num_values);
+	for (instr = block->first; instr; instr = instr->next) {
+	    unsigned char *uses = mymalloc(program->num_values, M_PROGRAM);
+	    unsigned char *defs = mymalloc(program->num_values, M_PROGRAM);
+	    int value;
+	    memset(uses, 0, program->num_values);
+	    memset(defs, 0, program->num_values);
+	    jit_instr_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++) {
+		if (uses[value] && !seen_defs[value])
+		    block_use[block->id][value] = 1;
+		if (defs[value]) {
+		    seen_defs[value] = 1;
+		    block_def[block->id][value] = 1;
+		}
+	    }
+	    myfree(defs, M_PROGRAM);
+	    myfree(uses, M_PROGRAM);
+	    if (instr == block->last)
+		break;
+	}
+	myfree(seen_defs, M_PROGRAM);
+    }
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    int value, successor;
+	    for (value = 1; value < program->num_values; value++) {
+		int out = 0;
+		for (successor = 0; successor < block->num_successors; successor++)
+		    if (live_in[block->successors[successor]]
+			&& live_in[block->successors[successor]][value])
+			out = 1;
+		if (live_out[block->id][value] != out) {
+		    live_out[block->id][value] = out;
+		    changed = 1;
+		}
+		out = block_use[block->id][value]
+		    || (out && !block_def[block->id][value]);
+		if (live_in[block->id][value] != out) {
+		    live_in[block->id][value] = out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction **instructions;
+	JITInstruction *instr;
+	unsigned char *live;
+	int count = 0, index;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    count++;
+	    if (instr == block->last)
+		break;
+	}
+	instructions = mymalloc(sizeof(JITInstruction *) * count, M_PROGRAM);
+	count = 0;
+	for (instr = block->first; instr; instr = instr->next) {
+	    instructions[count++] = instr;
+	    if (instr == block->last)
+		break;
+	}
+	live = mymalloc(program->num_values, M_PROGRAM);
+	memcpy(live, live_out[block->id], program->num_values);
+	for (index = count - 1; index >= 0; index--) {
+	    unsigned char *uses = mymalloc(program->num_values, M_PROGRAM);
+	    unsigned char *defs = mymalloc(program->num_values, M_PROGRAM);
+	    int value, live_count = 0;
+	    instr = instructions[index];
+	    if (instr->kind == HIR_TAC_CALL_VERB && instr->deopt_map > 0) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		for (value = 1; value < program->num_values; value++)
+		    if (live[value])
+			live_count++;
+		map->resume_values = live_count
+		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
+		map->num_resume_values = live_count;
+		map->native_resume_valid = map->stack_depth >= 3;
+		live_count = 0;
+		for (value = 1; value < program->num_values; value++)
+		    if (live[value]
+			&& !jit_resume_source(program, map, instr, value,
+					      &map->resume_values[live_count++]))
+			map->native_resume_valid = 0;
+	    }
+	    memset(uses = mymalloc(program->num_values, M_PROGRAM), 0,
+		   program->num_values);
+	    memset(defs = mymalloc(program->num_values, M_PROGRAM), 0,
+		   program->num_values);
+	    jit_instr_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++)
+		live[value] = uses[value] || (live[value] && !defs[value]);
+	    myfree(defs, M_PROGRAM);
+	    myfree(uses, M_PROGRAM);
+	}
+	myfree(live, M_PROGRAM);
+	myfree(instructions, M_PROGRAM);
+    }
+    for (i = 0; i <= max_block; i++) {
+	if (live_in[i]) myfree(live_in[i], M_PROGRAM);
+	if (live_out[i]) myfree(live_out[i], M_PROGRAM);
+	if (block_use[i]) myfree(block_use[i], M_PROGRAM);
+	if (block_def[i]) myfree(block_def[i], M_PROGRAM);
+    }
+    myfree(block_def, M_PROGRAM);
+    myfree(block_use, M_PROGRAM);
+    myfree(live_out, M_PROGRAM);
+    myfree(live_in, M_PROGRAM);
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -4651,6 +4881,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_build_resume_liveness(program);
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */

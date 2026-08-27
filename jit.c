@@ -3311,6 +3311,8 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_types)
 		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
+		if (program->deopt_maps[i].resume_values)
+		    myfree(program->deopt_maps[i].resume_values, M_PROGRAM);
 	    }
 	    myfree(program->deopt_maps, M_PROGRAM);
 	}
