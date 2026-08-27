@@ -775,6 +775,11 @@ call_verb_program(void)
     map->resume_key.code_unit = 0;
     map->resume_key.site = 1;
     map->reason = JIT_DEOPT_VERB_CALL;
+    map->native_resume_valid = 1;
+    map->num_resume_values = 1;
+    map->resume_values = allocate(sizeof(JITResumeValue));
+    map->resume_values[0].value = 4;
+    map->resume_values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
@@ -3013,6 +3018,7 @@ main(void)
 	    extra->literal_type = TYPE_OBJ;
 	    extra->next = call->next;
 	    call->next = extra;
+	    non_tail->deopt_maps[1].native_resume_valid = 0;
 	    check(jit_program_resume_map(non_tail, call_key) == -1,
 		  "non-tail verb call exposed an unsafe continuation");
 	    jit_program_free(non_tail);

@@ -725,15 +725,10 @@ append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
 }
 
 static int
-jit_call_has_native_continuation(JITBlock *block, JITInstruction *call)
+jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 {
-    /* Deopt maps preserve VM-visible state, not every compiler temporary live
-       across a call.  A direct return needs only the dynamically typed call
-       result; wider continuation points require an explicit native liveness
-       map before they are safe to expose. */
-    return call->next && call->next == block->last
-	&& call->next->kind == HIR_TAC_RETURN
-	&& call->next->src1 == call->value;
+    return call->deopt_map > 0 && call->deopt_map < program->num_deopt_maps
+	&& program->deopt_maps[call->deopt_map].native_resume_valid;
 }
 
 static int
@@ -746,7 +741,6 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_reg_t *values;
     MIR_label_t *labels;
     MIR_label_t *resume_entries, *resume_continuations;
-    JITInstruction **resume_instructions;
     MIR_label_t fallback;
     MIR_label_t tick_abort = 0, seconds_abort = 0;
     MIR_label_t common_return;
@@ -910,26 +904,21 @@ build_mir(JITProgram *program, MIRBuild *build)
 			      M_PROGRAM);
     resume_continuations = mymalloc(sizeof(MIR_label_t)
 				    * program->num_deopt_maps, M_PROGRAM);
-    resume_instructions = mymalloc(sizeof(JITInstruction *)
-				   * program->num_deopt_maps, M_PROGRAM);
     memset(resume_entries, 0,
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
     memset(resume_continuations, 0,
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
-    memset(resume_instructions, 0,
-	   sizeof(JITInstruction *) * program->num_deopt_maps);
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
 	for (instr = block->first; instr; instr = instr->next) {
 	    if (instr->kind == HIR_TAC_CALL_VERB
-		&& jit_call_has_native_continuation(block, instr)
+		&& jit_call_has_native_continuation(program, instr)
 		&& instr->deopt_map > 0
 		&& instr->deopt_map < program->num_deopt_maps
 		&& program->deopt_maps[instr->deopt_map].stack_depth >= 3) {
 		resume_entries[instr->deopt_map] = MIR_new_label(build->context);
 		resume_continuations[instr->deopt_map] = MIR_new_label(build->context);
-		resume_instructions[instr->deopt_map] = instr;
 	    }
 	    if (instr == block->last)
 		break;
@@ -946,23 +935,46 @@ build_mir(JITProgram *program, MIRBuild *build)
 					       labels[program->blocks->id])));
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map;
-	JITInstruction *call;
 	int j, outer_depth;
 
 	if (!resume_entries[i])
 	    continue;
 	map = &program->deopt_maps[i];
-	call = resume_instructions[i];
 	outer_depth = map->stack_depth - 3;
 	append(build, resume_entries[i]);
-	for (j = 0; j < map->num_locals; j++)
-	    append_resume_value(build, program, values, map->local_values[j],
-				env, j, deopt_values, &copy_serial);
-	for (j = 0; j < outer_depth; j++)
-	    append_resume_value(build, program, values, map->stack_values[j],
-				resume_stack, j, deopt_values, &copy_serial);
-	append_resume_value(build, program, values, call->value, resume_stack,
-			    outer_depth, deopt_values, &copy_serial);
+	for (j = 0; j < map->num_resume_values; j++) {
+	    JITResumeValue *resume = &map->resume_values[j];
+
+	    if (resume->source == JIT_RESUME_LOCAL)
+		append_resume_value(build, program, values, resume->value, env,
+				    resume->index, deopt_values, &copy_serial);
+	    else if (resume->source == JIT_RESUME_STACK)
+		append_resume_value(build, program, values, resume->value,
+				    resume_stack, resume->index, deopt_values,
+				    &copy_serial);
+	    else if (resume->source == JIT_RESUME_RESULT)
+		append_resume_value(build, program, values, resume->value,
+				    resume_stack, outer_depth, deopt_values,
+				    &copy_serial);
+	    else if (resume->source == JIT_RESUME_CONSTANT) {
+		if (program->value_types[resume->value] == TYPE_FLOAT) {
+		    double d = raw_to_double(resume->literal);
+		    append(build, MIR_new_insn(build->context, MIR_DMOV,
+			MIR_new_reg_op(build->context, values[resume->value]),
+			MIR_new_double_op(build->context, d)));
+		} else
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_reg_op(build->context, values[resume->value]),
+			MIR_new_int_op(build->context, resume->literal)));
+		if (program->value_is_tagged[resume->value])
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_mem_op(build->context,
+			    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+			    (program->num_values + resume->value) * sizeof(Num),
+			    deopt_values, 0, 1),
+			MIR_new_int_op(build->context, resume->literal_type)));
+	    }
+	}
 	append(build, MIR_new_insn(build->context, MIR_JMP,
 				  MIR_new_label_op(build->context,
 						   resume_continuations[i])));
@@ -3261,7 +3273,6 @@ build_mir(JITProgram *program, MIRBuild *build)
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
-    myfree(resume_instructions, M_PROGRAM);
     myfree(resume_continuations, M_PROGRAM);
     myfree(resume_entries, M_PROGRAM);
     myfree(labels, M_PROGRAM);
@@ -3469,7 +3480,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 		for (instr = block->first; instr; instr = instr->next) {
 		    if (instr->kind == HIR_TAC_CALL_VERB
 			&& instr->deopt_map == i
-			&& jit_call_has_native_continuation(block, instr))
+			&& jit_call_has_native_continuation(program, instr))
 			return i;
 		    if (instr == block->last)
 			break;
