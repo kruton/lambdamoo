@@ -453,7 +453,7 @@ call_boundary_program(void)
 }
 
 static JITProgram *
-pass_call_program(void)
+builtin_call_program(unsigned func)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -478,7 +478,7 @@ pass_call_program(void)
     map->resume_key.code_unit = 0;
     map->resume_key.site = 2;
     map->reason = JIT_DEOPT_BUILTIN_CALL;
-    map->builtin_func = 9;
+    map->builtin_func = func;
     map->native_resume_valid = 1;
     map->num_resume_values = 1;
     map->resume_values = allocate(sizeof(JITResumeValue));
@@ -3069,7 +3069,7 @@ main(void)
 
     /* pass() VM call and native continuation tests */
     {
-	JITProgram *pass_prog = pass_call_program();
+	JITProgram *pass_prog = builtin_call_program(9);
 	ResumeKey pass_key = { 0, 2 };
 	Var pass_env[1];
 	Var *pass_args = new_list(0).v.list;
@@ -3100,7 +3100,7 @@ main(void)
 	free_var(pass_env[0]);
 	jit_program_free(pass_prog);
 
-	pass_prog = pass_call_program();
+	pass_prog = builtin_call_program(9);
 	pass_prog->deopt_maps[1].native_resume_valid = 0;
 	pass_args = new_list(0).v.list;
 	pass_env[0].type = TYPE_LIST;
@@ -3111,6 +3111,30 @@ main(void)
 				  &timed_out, &error, 0, &deopt, deopt_stack)
 	      == JIT_RUN_CALL_VERB,
 	      "pass without a native continuation did not request a VM call");
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	/* The same continuation machinery applies to ordinary built-ins. */
+	pass_prog = builtin_call_program(17);
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	check(jit_program_resume_map(pass_prog, pass_key) == 1,
+	      "generic built-in continuation key did not resolve");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "generic built-in did not request a VM call");
+	free_var(deopt_stack[0]);
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 41;
+	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "generic built-in continuation did not return");
+	check(result.type == TYPE_INT && result.v.num == 41,
+	      "generic built-in continuation returned the wrong value");
 	free_var(deopt_stack[0]);
 	free_var(pass_env[0]);
 	jit_program_free(pass_prog);

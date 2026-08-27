@@ -3,8 +3,6 @@
 
 #include "config.h"
 
-#include "my-string.h"
-
 #include "functions.h"
 #include "hir.h"
 #include "jit.h"
@@ -49,13 +47,6 @@ struct JITDeoptMap {
     int builtin_args;
     JITDeoptReason reason;
 };
-
-static inline int
-jit_deopt_map_is_builtin(JITDeoptMap *map, const char *name)
-{
-    return map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0
-	&& !strcmp(name_func_by_num((unsigned) map->builtin_func), name);
-}
 
 static inline int
 jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
