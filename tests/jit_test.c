@@ -774,7 +774,6 @@ call_verb_program(void)
     program->num_deopt_maps = 2;
     map->resume_key.code_unit = 0;
     map->resume_key.site = 1;
-    map->resume_key.phase = RESUME_PHASE_AFTER_CALL;
     map->reason = JIT_DEOPT_VERB_CALL;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
@@ -2997,8 +2996,8 @@ main(void)
     /* Verb call deopt boundary tests */
     {
 	JITProgram *call_prog = call_verb_program();
-	ResumeKey call_key = { 0, 1, RESUME_PHASE_AFTER_CALL };
-	ResumeKey wrong_key = { 0, 2, RESUME_PHASE_AFTER_CALL };
+	ResumeKey call_key = { 0, 1 };
+	ResumeKey wrong_key = { 0, 2 };
 	check(jit_program_resume_map(call_prog, call_key) == 1,
 	      "verb call resume key did not resolve");
 	check(jit_program_resume_map(call_prog, wrong_key) == -1,

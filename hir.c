@@ -6086,7 +6086,6 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.call.resume_key.site = ast->e.call.resume_site;
-	expr->u.call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.call.func = ast->e.call.func;
 	expr->u.call.args = lift_arg_list(ctx, ast->e.call.args);
 	return expr;
@@ -6096,7 +6095,6 @@ lift_expr(HIRContext *ctx, Expr *ast)
 	expr->bytecode_pc = ast->bytecode_pc;
 	expr->u.verb_call.resume_key.code_unit = ctx->current_code_unit;
 	expr->u.verb_call.resume_key.site = ast->e.verb.resume_site;
-	expr->u.verb_call.resume_key.phase = RESUME_PHASE_AFTER_CALL;
 	expr->u.verb_call.obj = lift_expr(ctx, ast->e.verb.obj);
 	expr->u.verb_call.verb = lift_expr(ctx, ast->e.verb.verb);
 	expr->u.verb_call.args = lift_arg_list(ctx, ast->e.verb.args);

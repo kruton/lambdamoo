@@ -3450,7 +3450,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 {
     int i;
 
-    if (!program || key.site == 0 || key.phase != RESUME_PHASE_AFTER_CALL)
+    if (!program || key.site == 0)
 	return -1;
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
@@ -3458,8 +3458,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	if (map->reason == JIT_DEOPT_VERB_CALL
 	    && map->stack_depth >= 3
 	    && map->resume_key.code_unit == key.code_unit
-	    && map->resume_key.site == key.site
-	    && map->resume_key.phase == key.phase) {
+	    && map->resume_key.site == key.site) {
 	    JITBlock *block;
 
 	    for (block = program->blocks; block; block = block->next) {
