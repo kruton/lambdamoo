@@ -4459,14 +4459,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
 		&& si->num_stack_values >= 3) {
-		int base = si->stack_values[si->num_stack_values - 3];
 		int index = si->stack_values[si->num_stack_values - 2];
 
-		if (base > 0 && base < program->num_values
-		    && !value_types_known[base]) {
-		    value_types[base] = TYPE_LIST;
-		    value_types_known[base] = 1;
-		}
 		if (index > 0 && index < program->num_values
 		    && !value_types_known[index]) {
 		    value_types[index] = TYPE_INT;
@@ -4484,13 +4478,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 
-	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
-		int rhs = si->stack_values[si->num_stack_values - 1];
+	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values >= 4) {
+		int from = si->stack_values[si->num_stack_values - 3];
+		int to = si->stack_values[si->num_stack_values - 2];
 
-		if (rhs > 0 && rhs < program->num_values
-		    && !value_types_known[rhs]) {
-		    value_types[rhs] = TYPE_LIST;
-		    value_types_known[rhs] = 1;
+		if (from > 0 && from < program->num_values
+		    && !value_types_known[from]) {
+		    value_types[from] = TYPE_INT;
+		    value_types_known[from] = 1;
+		}
+		if (to > 0 && to < program->num_values
+		    && !value_types_known[to]) {
+		    value_types[to] = TYPE_INT;
+		    value_types_known[to] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_CALL_VERB) {

@@ -4058,6 +4058,83 @@ main(void)
 	jit_program_free(in_p);
     }
 
+    {
+	/* Regression test: empty JIT program compilation and fallback */
+	JITProgram *empty_prog = new_jit_program();
+	check(jit_program_compile(empty_prog) == 1, "empty JIT program compile succeeds");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	JITRunResult res = jit_program_execute(empty_prog, 0, &result,
+					       &ticks, &timed_out, &error,
+					       0, 0, 0);
+	check(res == JIT_RUN_FALLBACK, "empty JIT program execute falls back");
+	jit_program_free(empty_prog);
+    }
+
+    {
+	/* Regression test: deoptimization of indexed string operation must not corrupt local type to TYPE_LIST */
+	JITProgram *deopt_prog = new_jit_program();
+	JITBlock *block = allocate(sizeof(JITBlock));
+	JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+	JITInstruction *deopt_inst = instruction(HIR_TAC_DEOPT);
+	JITDeoptMap *map;
+	Var env[1];
+	Var stack[4];
+	JITDeoptState deopt_state;
+
+	deopt_prog->num_values = 2;
+	deopt_prog->num_vars = 1;
+	deopt_prog->num_blocks = 1;
+	deopt_prog->value_types = allocate(sizeof(var_type) * 2);
+	deopt_prog->value_types[1] = TYPE_STR;
+	add_entry_deopt_map(deopt_prog);
+	deopt_prog->deopt_maps = myrealloc(deopt_prog->deopt_maps,
+					   sizeof(JITDeoptMap) * 2, M_PROGRAM);
+	map = &deopt_prog->deopt_maps[1];
+	memset(map, 0, sizeof(JITDeoptMap));
+	deopt_prog->num_deopt_maps = 2;
+	map->bytecode_pc = map->error_pc = 20;
+	map->stack_depth = 0;
+	map->ticks_charged = 1;
+	map->num_locals = 1;
+	map->local_values = allocate(sizeof(int) * 1);
+	map->local_values[0] = 1;
+	map->local_types = allocate(sizeof(var_type) * 1);
+	map->local_types[0] = TYPE_STR;
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+
+	deopt_prog->blocks = deopt_prog->last_block = block;
+	block->id = 1;
+	load->value = 1;
+	load->local_id = 0;
+	load->literal_type = TYPE_STR;
+	load->deopt_map = 0;
+	deopt_inst->kind = HIR_TAC_DEOPT;
+	deopt_inst->deopt_map = 1;
+
+	load->next = deopt_inst;
+	block->first = load;
+	block->last = deopt_inst;
+
+	env[0].type = TYPE_STR;
+	env[0].v.str = str_dup("root class");
+
+	check(jit_program_compile(deopt_prog) == 1, "indexed string deopt program compile");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	memset(&deopt_state, 0, sizeof(deopt_state));
+	JITRunResult res = jit_program_execute(deopt_prog, env, &result,
+					       &ticks, &timed_out, &error,
+					       0, &deopt_state, stack);
+	check(res == JIT_RUN_FALLBACK, "indexed string deopt returns fallback");
+	check(env[0].type == TYPE_STR, "deoptimized string local retains TYPE_STR");
+	check(strcmp(env[0].v.str, "root class") == 0, "deoptimized string local retains value");
+	free_var(env[0]);
+	jit_program_free(deopt_prog);
+    }
+
     jit_program_free(program);
     jit_program_free(guard);
     jit_program_free(scatter);

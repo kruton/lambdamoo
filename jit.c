@@ -935,9 +935,13 @@ build_mir(JITProgram *program, MIRBuild *build)
 		MIR_new_label_op(build->context, resume_entries[i]),
 		MIR_new_reg_op(build->context, resume_map),
 		MIR_new_int_op(build->context, i)));
-    append(build, MIR_new_insn(build->context, MIR_JMP,
-			      MIR_new_label_op(build->context,
-					       labels[program->blocks->id])));
+    if (program->blocks)
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+				  MIR_new_label_op(build->context,
+						   labels[program->blocks->id])));
+    else
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+				  MIR_new_label_op(build->context, fallback)));
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map;
 	int j, outer_depth;
