@@ -431,8 +431,8 @@ The current native execution surface includes:
   tagged values;
 * selected continuation-free built-ins, including resource-query, string,
   numeric, and object predicates; and
-* safe deopt-before-call handling for general built-ins and a dedicated VM-call
-  bridge for verb calls.
+* VM-call bridges with SSA-liveness continuations for general built-ins and
+  verb calls, including protected built-in overrides.
 
 Recent tagged-value work allows runtime-typed scalar and complex values to flow
 through concatenation, indexing, list construction, comparisons, branches,
@@ -484,6 +484,14 @@ guards, and two range operations. The task suspended before exhausting the
 range, so this confirms removal of the verb-call reason but is not a performance
 comparison with the earlier codepoint.db workload.
 
+After enabling the VM bridge for every fixed-ID built-in call, the same Opal.db
+object range recorded 720,008 VM crossings without a `builtin_call`
+deoptimization. The crossing count includes both built-in and verb boundaries.
+The remaining 320,008 exits comprised 239,996 unsupported
+operations, 79,999 type guards, and 13 range operations. This is a coverage
+result rather than a speed comparison: bridged built-ins still execute in the
+VM, but their callers can resume native execution.
+
 ### 14.3 Priorities for programs that remain entirely native
 
 1. **Classify unsupported operations by HIR operation and call site.**
@@ -493,7 +501,7 @@ comparison with the earlier codepoint.db workload.
    and controls paths. Do not implement an operation until its resume stack,
    error behavior, tick charge, and ownership contract are known.
 
-2. **Expand native caller continuation liveness.**
+2. **Validate native continuations across stateful VM calls.**
    The first bridge stage now materializes the canonical `OP_CALL_VERB` stack,
    pushes a normal activation, and dispatches an eligible callee through JIT
    without reporting a caller deoptimization. General normal-return calls now
@@ -502,20 +510,23 @@ comparison with the earlier codepoint.db workload.
    typed call result. The liveness calculation treats later deoptimization-map
    locals and stack entries as implicit uses; otherwise a value needed only to
    reconstruct interpreter state can be incorrectly discarded. Calls with an
-   unmapped live value retain their interpreter continuation. Add explicit native
-   temporary spills where the census shows that restriction matters, and retain
-   interpreter continuation for suspension, traceback, recursion, permissions,
-   and other unverified paths. Tail-call activation replacement should wait until
-   those normal and exceptional paths are modeled.
+   unmapped live value retain their interpreter continuation. General fixed-ID
+   built-ins now use the same boundary and no longer report `builtin_call`
+   deoptimizations. Add explicit coverage for `BI_RAISE`, `BI_CALL`,
+   `BI_SUSPEND`, and `BI_ABORT`, especially persistence and resumption of a task
+   suspended inside a built-in. Add native temporary spills where the census
+   shows an unmapped-live-value restriction matters. Tail-call activation
+   replacement should wait until normal and exceptional paths are modeled.
 
-3. **Replace the built-in name allowlist with effect metadata.**
+3. **Use effect metadata to select direct native built-in lowering.**
    Record argument prototypes and effects such as pure, allocation, possible
    errors, permission checks, calls, suspension, abort, continuation state, and
-   ownership transfer. Use the metadata both for type inference and for deciding
-   whether a built-in can run through a native call bridge. Prioritize the
-   highest-frequency continuation-free built-ins from the census. Never inline a
-   built-in that can return `BI_CALL`, `BI_SUSPEND`, or `BI_ABORT` without a
-   modeled continuation.
+   ownership transfer. The VM bridge is the safe default for fixed-ID calls; use
+   metadata both for type inference and for deciding whether a built-in can
+   bypass that bridge and execute directly in native code. Prioritize frequent,
+   cheap, continuation-free built-ins where the VM crossing is measurable.
+   Never directly lower a built-in that can return `BI_CALL`, `BI_SUSPEND`, or
+   `BI_ABORT` without modeling that outcome.
 
 4. **Make every lowered boundary independently resumable.**
    A deopt map attached to a synthesized operation must reconstruct the operand
