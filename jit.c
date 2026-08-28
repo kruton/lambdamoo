@@ -3910,7 +3910,6 @@ static void
 jit_program_release_native(JITProgram *program)
 {
     if (program->mir_context) {
-	MIR_gen_finish((MIR_context_t) program->mir_context);
 	MIR_finish((MIR_context_t) program->mir_context);
 	program->mir_context = 0;
     }
@@ -4242,6 +4241,7 @@ jit_program_compile(JITProgram *program)
     }
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
+    MIR_gen_finish(build.context);
     program->mir_context = build.context;
     program->mir_allocator = build.allocator;
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
