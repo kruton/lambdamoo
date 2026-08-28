@@ -1648,6 +1648,81 @@ nested_try_except_finally_deopt_program(void)
 }
 
 static JITProgram *
+range_ref_test_program(var_type base_type)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_base = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_from = instruction(HIR_TAC_CONST);
+    JITInstruction *const_to = instruction(HIR_TAC_CONST);
+    JITInstruction *range_op = instruction(HIR_TAC_RANGE_REF);
+    JITInstruction *ret_op = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[0] = TYPE_NONE;
+    program->value_types[1] = base_type;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = base_type;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 10;
+    map->error_pc = 10;
+    map->stack_depth = 3;
+    map->ticks_charged = 1;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int));
+    map->local_types = allocate(sizeof(var_type));
+    map->local_values[0] = 1;
+    map->local_types[0] = base_type;
+    map->stack_values = allocate(sizeof(int) * 3);
+    map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_types[0] = base_type;
+    map->stack_types[1] = TYPE_INT;
+    map->stack_types[2] = TYPE_INT;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_base->value = 1;
+    load_base->local_id = 0;
+    load_base->next = const_from;
+
+    const_from->value = 2;
+    const_from->literal = 2;
+    const_from->literal_type = TYPE_INT;
+    const_from->next = const_to;
+
+    const_to->value = 3;
+    const_to->literal = 4;
+    const_to->literal_type = TYPE_INT;
+    const_to->next = range_op;
+
+    range_op->value = 4;
+    range_op->src1 = 1;
+    range_op->src2 = 2;
+    range_op->deopt_map = 1;
+    range_op->bytecode_pc = 10;
+    range_op->next = ret_op;
+
+    ret_op->src1 = 4;
+    ret_op->literal_type = base_type;
+
+    block->first = load_base;
+    block->last = ret_op;
+    return program;
+}
+
+static JITProgram *
 list_index_typed_program(var_type elem_type)
 {
     JITProgram *program = new_jit_program();
@@ -4047,6 +4122,43 @@ main(void)
 	      "fork boundary time value on stack wrong");
 	free_var(deopt_stack[0]);
 	jit_program_free(fork_deopt);
+
+	/* Native string and list range reference tests */
+	{
+	    Var str_input;
+	    str_input.type = TYPE_STR;
+	    str_input.v.str = str_dup("abcdef");
+	    JITProgram *str_range_p = range_ref_test_program(TYPE_STR);
+	    ticks = 10;
+	    check(jit_program_execute(str_range_p, &str_input, &result, &ticks,
+				      &timed_out, &error, 0, &deopt_state, 0)
+		  == JIT_RUN_RETURNED, "string range ref did not return");
+	    check(result.type == TYPE_STR && !strcmp(result.v.str, "bcd"),
+		  "string range ref returned wrong substring");
+	    free_var(result);
+	    free_var(str_input);
+	    jit_program_free(str_range_p);
+
+	    Var list_input = new_list(5);
+	    list_input.v.list[1] = (Var){ .type = TYPE_INT, .v.num = 10 };
+	    list_input.v.list[2] = (Var){ .type = TYPE_INT, .v.num = 20 };
+	    list_input.v.list[3] = (Var){ .type = TYPE_INT, .v.num = 30 };
+	    list_input.v.list[4] = (Var){ .type = TYPE_INT, .v.num = 40 };
+	    list_input.v.list[5] = (Var){ .type = TYPE_INT, .v.num = 50 };
+	    JITProgram *list_range_p = range_ref_test_program(TYPE_LIST);
+	    ticks = 10;
+	    check(jit_program_execute(list_range_p, &list_input, &result, &ticks,
+				      &timed_out, &error, 0, &deopt_state, 0)
+		  == JIT_RUN_RETURNED, "list range ref did not return");
+	    check(result.type == TYPE_LIST && result.v.list[0].v.num == 3
+		  && result.v.list[1].v.num == 20
+		  && result.v.list[2].v.num == 30
+		  && result.v.list[3].v.num == 40,
+		  "list range ref returned wrong sublist");
+	    free_var(result);
+	    free_var(list_input);
+	    jit_program_free(list_range_p);
+	}
     }
 
     /* Nested control flow (loop + conditional) differential test */

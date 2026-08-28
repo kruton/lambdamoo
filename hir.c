@@ -4389,6 +4389,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			types_changed = 1;
 		    }
 		}
+		if (si->kind == HIR_TAC_RANGE_REF
+		    && si->value > 0 && si->value < program->num_values
+		    && si->src1 > 0 && si->src1 < program->num_values
+		    && value_types_known[si->src1]) {
+		    var_type base_t = value_types[si->src1];
+		    if (base_t == TYPE_STR || base_t == TYPE_LIST) {
+			if (!value_types_known[si->value]) {
+			    value_types[si->value] = base_t;
+			    value_types_known[si->value] = 1;
+			    types_changed = 1;
+			}
+		    }
+		}
 		if (si == ssa_block->last)
 		    break;
 	    }
@@ -4418,6 +4431,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_INT;
 		    value_types_known[si->src2] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_RANGE_REF) {
+		int from = si->src2;
+		if (from > 0 && from < program->num_values
+		    && !value_types_known[from]) {
+		    value_types[from] = TYPE_INT;
+		    value_types_known[from] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
@@ -4559,7 +4580,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *si;
 
 	for (si = ssa_block->first; si; si = si->next) {
-	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_CALL_VERB)
+	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_CALL_VERB
+		 || si->kind == HIR_TAC_RANGE_REF)
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
@@ -4728,6 +4750,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		     || ssa_instr->kind == HIR_TAC_RETURN
 		     || ssa_instr->kind == HIR_TAC_CALL_VERB
 		     || ssa_instr->kind == HIR_TAC_CALL
+		     || ssa_instr->kind == HIR_TAC_RANGE_REF
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
 			     || ssa_instr->op == HIR_OP_LENGTH

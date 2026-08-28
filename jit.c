@@ -15,6 +15,7 @@
 #include "log.h"
 #include "server.h"
 #include "storage.h"
+#include "utf.h"
 #include "utils.h"
 
 #include "mir.h"
@@ -152,6 +153,56 @@ jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
     res[1] = '\0';
     *err_out = E_NONE;
     return res;
+}
+
+static inline int
+jit_rangeref_fails(Num length, Num from, Num after)
+{
+    return !(from >= after || (1 <= from && after <= length + 1));
+}
+
+const char *
+jit_rt_str_range_ref(const char *str, int64_t from, int64_t to, int32_t *err_out)
+{
+    Var base, res;
+    Num bfromafter[2];
+
+    if (!str) {
+	*err_out = E_TYPE;
+	return 0;
+    }
+    bfromafter[0] = from;
+    bfromafter[1] = to + 1;
+    utf_byte_range(str, bfromafter);
+    if (jit_rangeref_fails(memo_strlen(str), bfromafter[0], bfromafter[1])) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    base.type = TYPE_STR;
+    base.v.str = str;
+    res = substr(var_ref(base), bfromafter[0], bfromafter[1]);
+    *err_out = E_NONE;
+    return res.v.str;
+}
+
+Var *
+jit_rt_list_range_ref(Var *list, int64_t from, int64_t to, int32_t *err_out)
+{
+    Var base, res;
+
+    if (!list) {
+	*err_out = E_TYPE;
+	return 0;
+    }
+    if (jit_rangeref_fails(list[0].v.num, from, to + 1)) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    base.type = TYPE_LIST;
+    base.v.list = list;
+    res = sublist(var_ref(base), from, to + 1);
+    *err_out = E_NONE;
+    return res.v.list;
 }
 
 Var *
@@ -378,6 +429,10 @@ typedef struct {
     MIR_item_t import_str_concat;
     MIR_item_t proto_str_ref;
     MIR_item_t import_str_ref;
+    MIR_item_t proto_str_range_ref;
+    MIR_item_t import_str_range_ref;
+    MIR_item_t proto_list_range_ref;
+    MIR_item_t import_list_range_ref;
     MIR_item_t proto_list_concat;
     MIR_item_t import_list_concat;
     MIR_item_t proto_singleton_list;
@@ -784,6 +839,8 @@ build_mir(JITProgram *program, MIRBuild *build)
     MIR_load_external(build->context, "jit_rt_str_cmp", (void *) jit_rt_str_cmp);
     MIR_load_external(build->context, "jit_rt_str_concat", (void *) jit_rt_str_concat);
     MIR_load_external(build->context, "jit_rt_str_ref", (void *) jit_rt_str_ref);
+    MIR_load_external(build->context, "jit_rt_str_range_ref", (void *) jit_rt_str_range_ref);
+    MIR_load_external(build->context, "jit_rt_list_range_ref", (void *) jit_rt_list_range_ref);
     MIR_load_external(build->context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(build->context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(build->context, "jit_rt_list_append", (void *) jit_rt_list_append);
@@ -819,6 +876,14 @@ build_mir(JITProgram *program, MIRBuild *build)
     build->proto_str_ref = MIR_new_proto(build->context, "proto_str_ref", 1, &res_p, 3,
 					 MIR_T_P, "s", MIR_T_I64, "idx", MIR_T_P, "err");
     build->import_str_ref = MIR_new_import(build->context, "jit_rt_str_ref");
+
+    build->proto_str_range_ref = MIR_new_proto(build->context, "proto_str_range_ref", 1, &res_p, 4,
+					       MIR_T_P, "s", MIR_T_I64, "from", MIR_T_I64, "to", MIR_T_P, "err");
+    build->import_str_range_ref = MIR_new_import(build->context, "jit_rt_str_range_ref");
+
+    build->proto_list_range_ref = MIR_new_proto(build->context, "proto_list_range_ref", 1, &res_p, 4,
+						MIR_T_P, "l", MIR_T_I64, "from", MIR_T_I64, "to", MIR_T_P, "err");
+    build->import_list_range_ref = MIR_new_import(build->context, "jit_rt_list_range_ref");
 
     build->proto_list_concat = MIR_new_proto(build->context, "proto_list_concat", 1, &res_p, 3,
 					     MIR_T_P, "l1", MIR_T_P, "l2", MIR_T_P, "err");
@@ -3353,8 +3418,198 @@ build_mir(JITProgram *program, MIRBuild *build)
 					  common_return);
 		    break;
 		case HIR_TAC_PUT_PROP:
-		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
+		    append_deopt_exit(build, program, instr->deopt_map, values,
+				      deopt_map_out, deopt_values, status,
+				      common_return);
+		    break;
+		case HIR_TAC_RANGE_REF:
+		    if (instr->deopt_map >= 0
+			&& instr->deopt_map < program->num_deopt_maps) {
+			JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+			int base_val = instr->src1;
+			int from_val = instr->src2;
+			int to_val = (map->stack_depth >= 1)
+			    ? map->stack_values[map->stack_depth - 1] : 0;
+			var_type base_type = program->value_types
+			    ? program->value_types[base_val] : TYPE_ANY;
+			int tagged_base = program->value_is_tagged
+			    && program->value_is_tagged[base_val];
+			int tagged_from = program->value_is_tagged
+			    && program->value_is_tagged[from_val];
+			int tagged_to = (to_val > 0 && program->value_is_tagged)
+			    && program->value_is_tagged[to_val];
+
+			if (to_val > 0 && (base_type == TYPE_STR || base_type == TYPE_LIST || tagged_base)) {
+			    char name[32];
+			    MIR_label_t deopt = 0;
+			    MIR_label_t range_err = new_status_exit(build, &status_exits,
+								    &last_status_exit,
+								    JIT_RUN_ERROR,
+								    E_RANGE,
+								    instr->bytecode_pc,
+								    instr->source_lineno);
+			    sprintf(name, "range_err%d", copy_serial++);
+			    MIR_reg_t err_reg = new_reg(build, name);
+
+			    if (tagged_base || tagged_from || tagged_to) {
+				deopt = MIR_new_label(build->context);
+				if (tagged_from) {
+				    MIR_reg_t ft;
+				    sprintf(name, "range_ft%d", copy_serial++);
+				    ft = new_reg(build, name);
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_reg_op(build->context, ft),
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + from_val) * sizeof(Num),
+					    deopt_values, 0, 1)));
+				    append(build, MIR_new_insn(build->context, MIR_BNE,
+					MIR_new_label_op(build->context, deopt),
+					MIR_new_reg_op(build->context, ft),
+					MIR_new_int_op(build->context, TYPE_INT)));
+				}
+				if (tagged_to) {
+				    MIR_reg_t tt;
+				    sprintf(name, "range_tt%d", copy_serial++);
+				    tt = new_reg(build, name);
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_reg_op(build->context, tt),
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + to_val) * sizeof(Num),
+					    deopt_values, 0, 1)));
+				    append(build, MIR_new_insn(build->context, MIR_BNE,
+					MIR_new_label_op(build->context, deopt),
+					MIR_new_reg_op(build->context, tt),
+					MIR_new_int_op(build->context, TYPE_INT)));
+				}
+			    }
+
+			    if (base_type == TYPE_STR) {
+				append(build, MIR_new_call_insn(build->context, 7,
+				    MIR_new_ref_op(build->context, build->proto_str_range_ref),
+				    MIR_new_ref_op(build->context, build->import_str_range_ref),
+				    MIR_new_reg_op(build->context, values[instr->value]),
+				    MIR_new_reg_op(build->context, values[base_val]),
+				    MIR_new_reg_op(build->context, values[from_val]),
+				    MIR_new_reg_op(build->context, values[to_val]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, range_err),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+				if (program->value_is_tagged && program->value_is_tagged[instr->value])
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + instr->value) * sizeof(Num),
+					    deopt_values, 0, 1),
+					MIR_new_int_op(build->context, TYPE_STR)));
+			    } else if (base_type == TYPE_LIST) {
+				append(build, MIR_new_call_insn(build->context, 7,
+				    MIR_new_ref_op(build->context, build->proto_list_range_ref),
+				    MIR_new_ref_op(build->context, build->import_list_range_ref),
+				    MIR_new_reg_op(build->context, values[instr->value]),
+				    MIR_new_reg_op(build->context, values[base_val]),
+				    MIR_new_reg_op(build->context, values[from_val]),
+				    MIR_new_reg_op(build->context, values[to_val]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, range_err),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+				if (program->value_is_tagged && program->value_is_tagged[instr->value])
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + instr->value) * sizeof(Num),
+					    deopt_values, 0, 1),
+					MIR_new_int_op(build->context, TYPE_LIST)));
+			    } else {
+				MIR_reg_t bt;
+				MIR_label_t is_list = MIR_new_label(build->context);
+				MIR_label_t done = MIR_new_label(build->context);
+				sprintf(name, "range_bt%d", copy_serial++);
+				bt = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, bt),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + base_val) * sizeof(Num),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BEQ,
+				    MIR_new_label_op(build->context, is_list),
+				    MIR_new_reg_op(build->context, bt),
+				    MIR_new_int_op(build->context, TYPE_LIST)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, bt),
+				    MIR_new_int_op(build->context, TYPE_STR)));
+
+				append(build, MIR_new_call_insn(build->context, 7,
+				    MIR_new_ref_op(build->context, build->proto_str_range_ref),
+				    MIR_new_ref_op(build->context, build->import_str_range_ref),
+				    MIR_new_reg_op(build->context, values[instr->value]),
+				    MIR_new_reg_op(build->context, values[base_val]),
+				    MIR_new_reg_op(build->context, values[from_val]),
+				    MIR_new_reg_op(build->context, values[to_val]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, range_err),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+				if (program->value_is_tagged && program->value_is_tagged[instr->value])
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + instr->value) * sizeof(Num),
+					    deopt_values, 0, 1),
+					MIR_new_int_op(build->context, TYPE_STR)));
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, done)));
+
+				append(build, is_list);
+				append(build, MIR_new_call_insn(build->context, 7,
+				    MIR_new_ref_op(build->context, build->proto_list_range_ref),
+				    MIR_new_ref_op(build->context, build->import_list_range_ref),
+				    MIR_new_reg_op(build->context, values[instr->value]),
+				    MIR_new_reg_op(build->context, values[base_val]),
+				    MIR_new_reg_op(build->context, values[from_val]),
+				    MIR_new_reg_op(build->context, values[to_val]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, range_err),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+				if (program->value_is_tagged && program->value_is_tagged[instr->value])
+				    append(build, MIR_new_insn(build->context, MIR_MOV,
+					MIR_new_mem_op(build->context, tag_t,
+					    (program->num_values + instr->value) * sizeof(Num),
+					    deopt_values, 0, 1),
+					MIR_new_int_op(build->context, TYPE_LIST)));
+				append(build, done);
+			    }
+
+			    if (deopt) {
+				MIR_label_t loaded = MIR_new_label(build->context);
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, loaded)));
+				append(build, deopt);
+				append_deopt_exit(build, program, instr->deopt_map,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				append(build, loaded);
+			    }
+			    break;
+			}
+		    }
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);

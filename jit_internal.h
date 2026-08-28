@@ -140,6 +140,8 @@ extern int jit_rt_equality(int64_t, int, int64_t, int, int);
 extern int jit_rt_str_cmp(const char *, const char *, int);
 extern const char *jit_rt_str_concat(const char *, const char *, int32_t *);
 extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
+extern const char *jit_rt_str_range_ref(const char *, int64_t, int64_t, int32_t *);
+extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
