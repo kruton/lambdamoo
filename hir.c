@@ -3550,7 +3550,8 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 					       EOP_LENGTH);
 	if (instr->op == HIR_OP_ABS || instr->op == HIR_OP_TOINT
 	    || instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_TICKS_LEFT
-	    || instr->op == HIR_OP_SECONDS_LEFT || instr->op == HIR_OP_TIME)
+	    || instr->op == HIR_OP_SECONDS_LEFT || instr->op == HIR_OP_TIME
+	    || instr->op == HIR_OP_VALID || instr->op == HIR_OP_PARENT)
 	    return instr->bytecode_pc + 1 < bc->size
 		&& bc->vector[instr->bytecode_pc] == OP_BI_FUNC_CALL
 		&& bc->vector[instr->bytecode_pc + 1] == instr->func;
