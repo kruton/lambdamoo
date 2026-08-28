@@ -2009,6 +2009,83 @@ list_index_tagged_consumer_program(HIROp op)
 }
 
 static JITProgram *
+tagged_unary_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *unary = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_is_tagged = allocate(3);
+    program->value_is_tagged[1] = 1;
+    program->value_types[2] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load->value = 1;
+    load->local_id = 0;
+    load->literal_type = TYPE_ANY;
+    load->next = unary;
+    unary->value = 2;
+    unary->src1 = 1;
+    unary->op = op;
+    unary->next = ret;
+    ret->src1 = 2;
+    ret->literal_type = TYPE_INT;
+    block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_binary_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_lhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_rhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *binary = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_is_tagged = allocate(4);
+    program->value_is_tagged[1] = 1;
+    program->value_is_tagged[2] = 1;
+    program->value_is_tagged[3] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_lhs->value = 1;
+    load_lhs->local_id = 0;
+    load_lhs->literal_type = TYPE_ANY;
+    load_lhs->next = load_rhs;
+    load_rhs->value = 2;
+    load_rhs->local_id = 1;
+    load_rhs->literal_type = TYPE_ANY;
+    load_rhs->next = binary;
+    binary->value = 3;
+    binary->src1 = 1;
+    binary->src2 = 2;
+    binary->op = op;
+    binary->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = TYPE_INT;
+    block->first = load_lhs;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 tagged_string_pipeline_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3987,6 +4064,50 @@ main(void)
 	free_var(tagged_env[1]);
 	jit_program_free(tagged_eq);
 	jit_program_free(tagged_in);
+    }
+
+    /* Type inspection reads a dynamic value's runtime tag without deoptimizing. */
+    {
+	JITProgram *tagged_typeof = tagged_unary_program(HIR_OP_TYPEOF);
+	Var tagged_env[1];
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("dynamic type");
+	ticks = 10;
+	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged typeof executed natively");
+	check(result.type == TYPE_INT && result.v.num == TYPE_STR,
+	      "tagged typeof returned the runtime type");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged_typeof);
+    }
+
+    /* Tagged exponentiation accepts integers and guards other runtime types. */
+    {
+	JITProgram *tagged_exp = tagged_binary_program(HIR_OP_EXP);
+	Var tagged_env[2];
+
+	tagged_env[0].type = TYPE_INT;
+	tagged_env[0].v.num = 3;
+	tagged_env[1].type = TYPE_INT;
+	tagged_env[1].v.num = 4;
+	ticks = 10;
+	check(jit_program_execute(tagged_exp, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged exponentiation executed natively");
+	check(result.type == TYPE_INT && result.v.num == 81,
+	      "tagged exponentiation returned the wrong value");
+
+	tagged_env[1].type = TYPE_STR;
+	tagged_env[1].v.str = str_dup("not an exponent");
+	ticks = 10;
+	check(jit_program_execute(tagged_exp, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer exponent did not deoptimize");
+	free_var(tagged_env[1]);
+	jit_program_free(tagged_exp);
     }
 
     /* Tagged strings retain their type through concatenation and index(). */

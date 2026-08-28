@@ -4753,6 +4753,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		     || ssa_instr->kind == HIR_TAC_RANGE_REF
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
+			     || ssa_instr->op == HIR_OP_TYPEOF
 			     || ssa_instr->op == HIR_OP_LENGTH
 			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
 			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE))
@@ -4767,7 +4768,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			     || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
 			     || ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
 			     || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
-			     || ssa_instr->op == HIR_OP_MOD
+			     || ssa_instr->op == HIR_OP_MOD || ssa_instr->op == HIR_OP_EXP
 			     || ssa_instr->op == HIR_OP_INDEX_BF
 			     || ssa_instr->op == HIR_OP_RINDEX_BF
 			     || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_BITOR
