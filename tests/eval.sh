@@ -28,4 +28,4 @@ cleanup() {
 }
 trap cleanup EXIT
 
-printf ';%s\nquit\n' "$*" | "$MOO_BIN" -e "$DB_FILE" "$TMP_OUT"
+printf ';%s\nquit\n' "$*" | "$MOO_BIN" -e "$DB_FILE" "$TMP_OUT" 2>&1
