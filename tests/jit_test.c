@@ -3011,7 +3011,7 @@ main(void)
 	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
 	      && stats.machine_code_bytes == program->machine_code_len
 	      && stats.native_allocated_bytes >= stats.machine_code_bytes
-	      && stats.mir_bytes > 0,
+	      && stats.mir_bytes == 0,
 	      "JIT memory statistics are wrong");
 	check(stats.accounted_bytes == stats.metadata_bytes + stats.runtime_bytes
 	      + stats.native_allocated_bytes + stats.mir_bytes,

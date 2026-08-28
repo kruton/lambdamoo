@@ -573,9 +573,55 @@ jit_mir_allocator_free(JITMIRAllocator *allocator)
     myfree(allocator, M_PROGRAM);
 }
 
+static MIR_context_t shared_mir_context = 0;
+static JITMIRAllocator *shared_mir_allocator = 0;
+static uint64_t next_module_serial = 0;
+
+static void
+jit_load_externals(MIR_context_t context)
+{
+    MIR_load_external(context, "jit_rt_is_true", (void *) jit_rt_is_true);
+    MIR_load_external(context, "jit_rt_equality", (void *) jit_rt_equality);
+    MIR_load_external(context, "jit_rt_str_cmp", (void *) jit_rt_str_cmp);
+    MIR_load_external(context, "jit_rt_str_concat", (void *) jit_rt_str_concat);
+    MIR_load_external(context, "jit_rt_str_ref", (void *) jit_rt_str_ref);
+    MIR_load_external(context, "jit_rt_str_range_ref", (void *) jit_rt_str_range_ref);
+    MIR_load_external(context, "jit_rt_list_range_ref", (void *) jit_rt_list_range_ref);
+    MIR_load_external(context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
+    MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
+    MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
+    MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
+    MIR_load_external(context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
+    MIR_load_external(context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
+    MIR_load_external(context, "jit_rt_time", (void *) jit_rt_time);
+    MIR_load_external(context, "jit_rt_index", (void *) jit_rt_index);
+    MIR_load_external(context, "jit_rt_rindex", (void *) jit_rt_rindex);
+    MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
+    MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
+    MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
+}
+
+static int
+jit_ensure_shared_context(void)
+{
+    if (shared_mir_context)
+	return 1;
+    shared_mir_allocator = jit_mir_allocator_new();
+    if (!shared_mir_allocator)
+	return 0;
+    shared_mir_context = MIR_init2(&shared_mir_allocator->interface, 0);
+    if (!shared_mir_context) {
+	jit_mir_allocator_free(shared_mir_allocator);
+	shared_mir_allocator = 0;
+	return 0;
+    }
+    jit_load_externals(shared_mir_context);
+    return 1;
+}
+
 typedef struct {
     MIR_context_t context;
-    JITMIRAllocator *allocator;
     MIR_module_t module;
     MIR_item_t function;
     MIR_item_t proto_is_true;
@@ -982,7 +1028,7 @@ jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 }
 
 static int
-build_mir(JITProgram *program, MIRBuild *build)
+build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 {
     MIR_type_t result_type = MIR_T_I64;
     MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
@@ -997,45 +1043,21 @@ build_mir(JITProgram *program, MIRBuild *build)
     JITStatusExit *status_exits = 0;
     JITStatusExit *last_status_exit = 0;
     JITBlock *block;
+    char module_name[64];
+    char func_name[64];
     int max_block_id = 0;
     int copy_serial = 0;
     int source_marker_serial = 0;
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
-    build->allocator = jit_mir_allocator_new();
-    build->context = MIR_init2(&build->allocator->interface, 0);
-    if (!build->context) {
-	jit_mir_allocator_free(build->allocator);
-	build->allocator = 0;
-	return 0;
-    }
-    build->module = MIR_new_module(build->context, "lambda_moo_jit");
+    build->context = context;
+    snprintf(module_name, sizeof(module_name), "moo_mod_%" PRIu64, ++next_module_serial);
+    build->module = MIR_new_module(build->context, module_name);
     MIR_type_t res_i64 = MIR_T_I64;
     MIR_type_t res_p = MIR_T_P;
     MIR_type_t res_i32 = MIR_T_I32;
     MIR_type_t tag_t = sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32;
-
-    MIR_load_external(build->context, "jit_rt_is_true", (void *) jit_rt_is_true);
-    MIR_load_external(build->context, "jit_rt_equality", (void *) jit_rt_equality);
-    MIR_load_external(build->context, "jit_rt_str_cmp", (void *) jit_rt_str_cmp);
-    MIR_load_external(build->context, "jit_rt_str_concat", (void *) jit_rt_str_concat);
-    MIR_load_external(build->context, "jit_rt_str_ref", (void *) jit_rt_str_ref);
-    MIR_load_external(build->context, "jit_rt_str_range_ref", (void *) jit_rt_str_range_ref);
-    MIR_load_external(build->context, "jit_rt_list_range_ref", (void *) jit_rt_list_range_ref);
-    MIR_load_external(build->context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
-    MIR_load_external(build->context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
-    MIR_load_external(build->context, "jit_rt_list_append", (void *) jit_rt_list_append);
-    MIR_load_external(build->context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
-    MIR_load_external(build->context, "jit_rt_list_in", (void *) jit_rt_list_in);
-    MIR_load_external(build->context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
-    MIR_load_external(build->context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
-    MIR_load_external(build->context, "jit_rt_time", (void *) jit_rt_time);
-    MIR_load_external(build->context, "jit_rt_index", (void *) jit_rt_index);
-    MIR_load_external(build->context, "jit_rt_rindex", (void *) jit_rt_rindex);
-    MIR_load_external(build->context, "jit_rt_valid", (void *) jit_rt_valid);
-    MIR_load_external(build->context, "jit_rt_parent", (void *) jit_rt_parent);
-    MIR_load_external(build->context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
 
     build->proto_is_true = MIR_new_proto(build->context, "proto_is_true", 1, &res_i32, 2,
 					 MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -1118,7 +1140,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
 
-    build->function = MIR_new_func(build->context, "jit_verb", 1,
+    snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64, next_module_serial);
+    build->function = MIR_new_func(build->context, func_name, 1,
 				   &result_type, 11,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
@@ -3909,14 +3932,6 @@ jit_program_unsupported(const char *reason)
 static void
 jit_program_release_native(JITProgram *program)
 {
-    if (program->mir_context) {
-	MIR_finish((MIR_context_t) program->mir_context);
-	program->mir_context = 0;
-    }
-    if (program->mir_allocator) {
-	jit_mir_allocator_free(program->mir_allocator);
-	program->mir_allocator = 0;
-    }
     if (program->deopt_values) {
 	myfree(program->deopt_values, M_PROGRAM);
 	program->deopt_values = 0;
@@ -3924,6 +3939,8 @@ jit_program_release_native(JITProgram *program)
     program->native_function = 0;
     program->machine_code = 0;
     program->machine_code_len = 0;
+    program->mir_context = 0;
+    program->mir_allocator = 0;
 }
 
 void
@@ -4073,10 +4090,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->runtime_bytes = program->deopt_values
 	? sizeof(Num) * program->num_values * 2 : 0;
     stats->machine_code_bytes = program->machine_code_len;
-    stats->native_allocated_bytes = program->mir_context
-	? _MIR_code_allocated_size((MIR_context_t) program->mir_context) : 0;
-    stats->mir_bytes = program->mir_allocator
-	? ((JITMIRAllocator *) program->mir_allocator)->live_bytes : 0;
+    stats->native_allocated_bytes = program->machine_code_len;
+    stats->mir_bytes = 0;
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
 	+ stats->native_allocated_bytes + stats->mir_bytes;
 }
@@ -4203,7 +4218,7 @@ jit_program_compile(JITProgram *program)
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
-    if (!build_mir(program, &build)) {
+    if (!jit_ensure_shared_context() || !build_mir(program, &build, shared_mir_context)) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
@@ -4217,19 +4232,17 @@ jit_program_compile(JITProgram *program)
 	program->diagnostic = str_dup("mir build module failed");
 	return 0;
     }
-    MIR_load_module(build.context, build.module);
-    MIR_gen_init(build.context);
-    MIR_gen_set_optimize_level(build.context, 0);
-    MIR_link(build.context, MIR_set_gen_interface, 0);
-    program->native_function = MIR_gen(build.context, build.function);
+    MIR_load_module(shared_mir_context, build.module);
+    MIR_gen_init(shared_mir_context);
+    MIR_gen_set_optimize_level(shared_mir_context, 0);
+    MIR_link(shared_mir_context, MIR_set_gen_interface, 0);
+    program->native_function = MIR_gen(shared_mir_context, build.function);
     if (!program->native_function) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
 	    program->compile_failures++;
-	MIR_gen_finish(build.context);
-	MIR_finish(build.context);
-	jit_mir_allocator_free(build.allocator);
+	MIR_gen_finish(shared_mir_context);
 	program->state = JIT_STATE_FAILED;
 	if (program->reason)
 	    free_str(program->reason);
@@ -4241,9 +4254,9 @@ jit_program_compile(JITProgram *program)
     }
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
-    MIR_gen_finish(build.context);
-    program->mir_context = build.context;
-    program->mir_allocator = build.allocator;
+    MIR_gen_finish(shared_mir_context);
+    program->mir_context = 0;
+    program->mir_allocator = 0;
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
     memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
@@ -4500,19 +4513,35 @@ int
 jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *),
 		     void *data)
 {
+    JITMIRAllocator *allocator;
+    MIR_context_t context;
     MIRBuild build;
     FILE *file;
     char line[1024];
 
-    if (!program || !program->eligible || !build_mir(program, &build))
+    if (!program || !program->eligible)
 	return 0;
-    file = tmpfile();
-    if (!file) {
-	MIR_finish(build.context);
-	jit_mir_allocator_free(build.allocator);
+    allocator = jit_mir_allocator_new();
+    if (!allocator)
+	return 0;
+    context = MIR_init2(&allocator->interface, 0);
+    if (!context) {
+	jit_mir_allocator_free(allocator);
 	return 0;
     }
-    MIR_output_module(build.context, file, build.module);
+    jit_load_externals(context);
+    if (!build_mir(program, &build, context)) {
+	MIR_finish(context);
+	jit_mir_allocator_free(allocator);
+	return 0;
+    }
+    file = tmpfile();
+    if (!file) {
+	MIR_finish(context);
+	jit_mir_allocator_free(allocator);
+	return 0;
+    }
+    MIR_output_module(context, file, build.module);
     rewind(file);
     while (fgets(line, sizeof(line), file)) {
 	size_t length = strlen(line);
@@ -4521,8 +4550,8 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
 	add_line(line, data);
     }
     fclose(file);
-    MIR_finish(build.context);
-    jit_mir_allocator_free(build.allocator);
+    MIR_finish(context);
+    jit_mir_allocator_free(allocator);
     return 1;
 }
 
