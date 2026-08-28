@@ -1822,6 +1822,45 @@ test_builtin_call_tac_ssa(void)
 }
 
 static void
+test_zero_argument_builtin_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr call_expr;
+    Stmt ret;
+
+    memset(&call_expr, 0, sizeof(call_expr));
+    call_expr.kind = EXPR_CALL;
+    call_expr.lineno = 10;
+    call_expr.bytecode_pc = 1;
+    call_expr.e.call.func = 10; /* time */
+    call_expr.e.call.args = 0;
+
+    ret = return_stmt(&call_expr);
+    ret.bytecode_pc = 3;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("zero-argument builtin unary count",
+	      hir_tac_count_unary_op(tac, HIR_OP_TIME), 1);
+    check_int("zero-argument builtin verify errors",
+	      hir_context_error_count(ctx), 0);
+    check_int("zero-argument builtin destroy ssa",
+	      hir_destroy_ssa(ctx, ssa), 1);
+    check_int("zero-argument builtin out-of-ssa valid",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_pure_builtin_inlining_tac_ssa(void)
 {
     Names names;
@@ -3331,6 +3370,7 @@ main(void)
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
+    test_zero_argument_builtin_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
     test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();

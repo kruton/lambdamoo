@@ -540,6 +540,13 @@ verify_temp_use(HIRContext *ctx, int temp, unsigned char *defined,
 	record_unsupported_fmt(ctx, "tac: temp %d used before definition", temp);
 }
 
+static int
+unary_op_has_operand(HIROp op)
+{
+    return op != HIR_OP_TICKS_LEFT && op != HIR_OP_SECONDS_LEFT
+	&& op != HIR_OP_TIME;
+}
+
 static void
 verify_temp_def(HIRContext *ctx, int temp, unsigned char *defined,
 		int max_temp)
@@ -626,7 +633,8 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_UNARY:
-	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    if (unary_op_has_operand(instr->op))
+		verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_BINARY:
@@ -2153,13 +2161,18 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 	for (instr = block->first; instr; instr = instr->next) {
 	    switch (instr->kind) {
 	    case HIR_TAC_STORE_LOCAL:
-	    case HIR_TAC_UNARY:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_BRANCH_FALSE:
 	    case HIR_TAC_RETURN:
 		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
 					   order, 0, max_value,
 					   def_block, def_order);
+		break;
+	    case HIR_TAC_UNARY:
+		if (unary_op_has_operand(instr->op))
+		    verify_ssa_dominating_use(ctx, dom, instr->src1,
+					       block->id, order, 0, max_value,
+					       def_block, def_order);
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
@@ -2243,7 +2256,8 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_UNARY:
-		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		if (unary_op_has_operand(instr->op))
+		    verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3282,9 +3296,12 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_STORE_LOCAL:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
-	    case HIR_TAC_UNARY:
 	    case HIR_TAC_CALL:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		break;
+	    case HIR_TAC_UNARY:
+		if (unary_op_has_operand(instr->op))
+		    verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		break;
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_PUT_PROP:
