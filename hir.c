@@ -4528,15 +4528,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
-		int object = si->src1;
 		int property = si->src2;
 
-		if (object > 0 && object < program->num_values
-		    && !value_types_known[object]) {
-		    value_types[object] = TYPE_OBJ;
-		    value_types_known[object] = 1;
-		    types_changed = 1;
-		}
 		if (property > 0 && property < program->num_values
 		    && !value_types_known[property]) {
 		    value_types[property] = TYPE_STR;
@@ -4610,12 +4603,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 	    if (si->kind == HIR_TAC_CALL_VERB) {
-		if (si->src1 > 0 && si->src1 < program->num_values
-		    && !value_types_known[si->src1]) {
-		    value_types[si->src1] = TYPE_OBJ;
-		    value_types_known[si->src1] = 1;
-		    types_changed = 1;
-		}
 		if (si->src2 > 0 && si->src2 < program->num_values
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_STR;
