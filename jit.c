@@ -405,6 +405,10 @@ jit_rt_var_raw(const Var *value)
 	return (int64_t) (intptr_t) value->v.str;
     if (value->type == TYPE_LIST)
 	return (int64_t) (intptr_t) value->v.list;
+#ifdef WAIF_CORE
+    if (value->type == TYPE_WAIF)
+	return (int64_t) (intptr_t) value->v.waif;
+#endif
     if (value->type == TYPE_OBJ)
 	return value->v.obj;
     if (value->type == TYPE_ERR)
@@ -4453,6 +4457,12 @@ materialize_deopt_value(var_type type, Num raw)
 	if (!raw)
 	    return (Var){ .type = TYPE_NONE, .v = { .num = 0 } };
 	value.v.list = (Var *) (intptr_t) raw;
+#ifdef WAIF_CORE
+    } else if (type == TYPE_WAIF) {
+	if (!raw)
+	    return (Var){ .type = TYPE_NONE, .v = { .num = 0 } };
+	value.v.waif = (Waif *) (intptr_t) raw;
+#endif
     } else if (type == TYPE_OBJ)
 	value.v.obj = raw;
     else if (type == TYPE_ERR)

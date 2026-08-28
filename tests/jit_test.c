@@ -4281,6 +4281,19 @@ main(void)
 	free_var(base);
     }
 
+#ifdef WAIF_CORE
+    /* Complex extension values retain the full pointer through resumes. */
+    {
+	Var waif;
+	uintptr_t pointer = UINTPTR_MAX - 0x1234;
+
+	waif.type = TYPE_WAIF;
+	waif.v.waif = (Waif *) pointer;
+	check((uintptr_t) jit_rt_var_raw(&waif) == pointer,
+	      "jit_rt_var_raw truncated waif pointer");
+    }
+#endif
+
     /* Exception and finally stack marker deoptimization tests */
     {
 	JITProgram *boundary = exception_boundary_deopt_program();
