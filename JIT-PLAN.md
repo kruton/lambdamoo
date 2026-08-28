@@ -237,9 +237,12 @@ These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
 `OP_CALL_VERB` stack and transfers to the canonical activation-push path without
 counting the transfer as a deoptimization. The callee can therefore enter JIT,
 and a caller that immediately returns the callee result resumes at a native
-`RESUME_PHASE_AFTER_CALL` entry after the callee returns. Other caller shapes
-currently resume in the interpreter because their compiler temporaries are not
-yet represented in the continuation map.
+`RESUME_PHASE_AFTER_CALL` entry after the callee returns. General caller shapes
+can also resume through an SSA-liveness continuation when every live value is
+materializable. Native continuation is conservatively disabled when the
+caller's outer operand-stack prefix contains a `TYPE_CATCH` or `TYPE_FINALLY`
+marker; those calls resume in the interpreter because the current continuation
+map does not preserve the complete control-stack prefix.
 The interpreter continues to own `bi_func_pc`, `bi_func_id`, `bi_func_data`,
 activation creation, suspension, and traceback behavior.
 
@@ -270,6 +273,12 @@ corresponding native handler transfer explicitly.
 Native landing pads may be added later as an optimization, but they must still
 materialize the same activation and stack-marker state expected by
 `unwind_stack()`.
+
+The same requirement applies to native return continuations after VM calls.
+Before enabling them across protected regions, continuation maps must preserve
+and reconstruct the complete caller stack prefix, including catch/finally
+markers and any enclosing loop state, rather than only call operands and live
+SSA values.
 
 ## 10. Phase 7: Resume, Deoptimization, and Persistence
 
@@ -527,7 +536,13 @@ VM, but their callers can resume native execution.
    reconstruct interpreter state can be incorrectly discarded. Calls with an
    unmapped live value retain their interpreter continuation. General fixed-ID
    built-ins now use the same boundary and no longer report `builtin_call`
-   deoptimizations. Add explicit coverage for `BI_RAISE`, `BI_CALL`,
+   deoptimizations. Calls with an outer `TYPE_CATCH` or `TYPE_FINALLY` stack
+   marker currently retain their interpreter continuation. To lift that
+   restriction, extend continuation maps to retain the entire canonical caller
+   stack prefix, including handler markers and enclosing range/list-loop state,
+   and verify its exact depth, ordering, ownership, and unwind behavior on
+   return. Add nested catch/finally and loop-around-call regressions before
+   enabling that path. Also add explicit coverage for `BI_RAISE`, `BI_CALL`,
    `BI_SUSPEND`, and `BI_ABORT`, especially persistence and resumption of a task
    suspended inside a built-in. Add native temporary spills where the census
    shows an unmapped-live-value restriction matters. Tail-call activation
