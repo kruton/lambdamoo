@@ -966,7 +966,11 @@ do {								\
 		return OUTCOME_ABORTED;
 	    } else if (jit_result == JIT_RUN_ERROR) {
 		bv = bc.vector + source_location.bytecode_pc;
-		error_bv = bc.vector + source_location.error_pc;
+		if (deopt.materialized) {
+		    error_bv = bc.vector + deopt.error_pc;
+		    rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
+		} else
+		    error_bv = bc.vector + source_location.error_pc;
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK

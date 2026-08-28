@@ -46,6 +46,7 @@ typedef struct {
     unsigned error_pc;
     unsigned source_lineno;
     unsigned stack_depth;
+    int materialized;
     int ticks_charged;
     int builtin_func;
     int operation;

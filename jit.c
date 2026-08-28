@@ -787,6 +787,7 @@ struct JITStatusExit {
     MIR_label_t label;
     JITRunResult status;
     enum error error;
+    int deopt_map;
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITStatusExit *next;
@@ -932,14 +933,15 @@ return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
 
 static MIR_label_t
 new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
-		JITRunResult status, enum error error, unsigned bytecode_pc,
-		unsigned source_lineno)
+		JITRunResult status, enum error error, int deopt_map,
+		unsigned bytecode_pc, unsigned source_lineno)
 {
     JITStatusExit *exit = mymalloc(sizeof(JITStatusExit), M_PROGRAM);
 
     exit->label = MIR_new_label(build->context);
     exit->status = status;
     exit->error = error;
+    exit->deopt_map = deopt_map;
     exit->bytecode_pc = bytecode_pc;
     exit->source_lineno = source_lineno;
     exit->next = 0;
@@ -962,7 +964,8 @@ append_float_result_check(MIRBuild *build, JITInstruction *instr,
     MIR_reg_t exponent;
     MIR_reg_t exponent_mask;
     MIR_label_t float_error = new_status_exit(build, status_exits,
-	last_status_exit, JIT_RUN_ERROR, E_FLOAT, instr->bytecode_pc,
+	last_status_exit, JIT_RUN_ERROR, E_FLOAT, instr->deopt_map,
+	instr->bytecode_pc,
 	instr->source_lineno);
 
     sprintf(name, "float_bits%d", *copy_serial);
@@ -993,8 +996,15 @@ append_float_result_check(MIRBuild *build, JITInstruction *instr,
 }
 
 static void
+append_materialized_exit(MIRBuild *, JITProgram *, int, MIR_reg_t *,
+			 MIR_reg_t, MIR_reg_t, MIR_reg_t, MIR_label_t,
+			 JITRunResult);
+
+static void
 append_status_exits(MIRBuild *build, JITStatusExit *exit,
-		    MIR_reg_t source_location, MIR_reg_t error_out,
+		    JITProgram *program, MIR_reg_t *values,
+		    MIR_reg_t source_location, MIR_reg_t deopt_map_out,
+		    MIR_reg_t deopt_values, MIR_reg_t error_out,
 		    MIR_reg_t status, MIR_label_t common_return)
 {
     while (exit) {
@@ -1021,7 +1031,13 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 		MIR_new_mem_op(build->context, MIR_T_I32,
 			       0, error_out, 0, 1),
 		MIR_new_int_op(build->context, exit->error)));
-	return_status(build, status, common_return, exit->status);
+	if (exit->status == JIT_RUN_ERROR && exit->deopt_map > 0
+	    && exit->deopt_map < program->num_deopt_maps)
+	    append_materialized_exit(build, program, exit->deopt_map, values,
+		deopt_map_out, deopt_values, status, common_return,
+		JIT_RUN_ERROR);
+	else
+	    return_status(build, status, common_return, exit->status);
 	myfree(exit, M_PROGRAM);
 	exit = next;
     }
@@ -1402,10 +1418,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    if (instr->op != HIR_OP_CHARGE_TICK) {
 			tick_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
-			    instr->bytecode_pc, instr->source_lineno);
+			    -1, instr->bytecode_pc, instr->source_lineno);
 			seconds_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
-			    instr->bytecode_pc, instr->source_lineno);
+			    -1, instr->bytecode_pc, instr->source_lineno);
 		    }
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 						  MIR_new_reg_op(build->context,
@@ -1731,7 +1747,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    sprintf(name, "parent_err%d", copy_serial++);
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t invalid_arg = new_status_exit(build, &status_exits,
-				&last_status_exit, JIT_RUN_ERROR, E_INVARG, instr->bytecode_pc,
+				&last_status_exit, JIT_RUN_ERROR, E_INVARG,
+				instr->deopt_map, instr->bytecode_pc,
 				instr->source_lineno);
 			    append(build, MIR_new_call_insn(build->context, 5,
 				MIR_new_ref_op(build->context, build->proto_parent),
@@ -2233,7 +2250,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    sprintf(name, "out_type_ptr%d", copy_serial++);
 			    MIR_reg_t out_type_ptr = new_reg(build, name);
 			    MIR_label_t prop_err = new_status_exit(build, &status_exits,
-				&last_status_exit, JIT_RUN_ERROR, E_NONE, instr->bytecode_pc,
+				&last_status_exit, JIT_RUN_ERROR, E_NONE,
+				instr->deopt_map, instr->bytecode_pc,
 				instr->source_lineno);
 
 			    if (obj_tagged) {
@@ -2699,7 +2717,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    sprintf(name, "str_err%d", copy_serial++);
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t quota_error = new_status_exit(build, &status_exits,
-				&last_status_exit, JIT_RUN_ERROR, E_QUOTA, instr->bytecode_pc,
+				&last_status_exit, JIT_RUN_ERROR, E_QUOTA,
+				instr->deopt_map, instr->bytecode_pc,
 				instr->source_lineno);
 			    append(build, MIR_new_call_insn(build->context, 6,
 				MIR_new_ref_op(build->context, build->proto_str_concat),
@@ -2738,7 +2757,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    sprintf(name, "str_err%d", copy_serial++);
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t quota_error = new_status_exit(build, &status_exits,
-				&last_status_exit, JIT_RUN_ERROR, E_QUOTA, instr->bytecode_pc,
+				&last_status_exit, JIT_RUN_ERROR, E_QUOTA,
+				instr->deopt_map, instr->bytecode_pc,
 				instr->source_lineno);
 
 			    if (tagged_s1) {
@@ -2888,7 +2908,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 							       MIR_T_D, name);
 			    MIR_label_t division_by_zero = new_status_exit(build,
 				&status_exits, &last_status_exit, JIT_RUN_ERROR,
-				E_DIV, instr->bytecode_pc, instr->source_lineno);
+				E_DIV, instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 			    append(build, MIR_new_insn(build->context, MIR_DMOV,
 						      MIR_new_reg_op(build->context, zero),
 						      MIR_new_mem_op(build->context, MIR_T_D,
@@ -2990,16 +3011,19 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    || instr->op == HIR_OP_EXP)
 			    arithmetic_error = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_DIV,
-				instr->bytecode_pc, instr->source_lineno);
+				instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 			if (instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
 			    || instr->op == HIR_OP_LSHR)
 			    invalid_argument = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_INVARG,
-				instr->bytecode_pc, instr->source_lineno);
+				instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 			if (instr->op == HIR_OP_INDEX)
 			    range_error = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
-				instr->bytecode_pc, instr->source_lineno);
+				instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 		    if (instr->op == HIR_OP_INDEX) {
 			if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_STR) {
@@ -3032,7 +3056,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t range_err = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
-				instr->bytecode_pc, instr->source_lineno);
+				instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 			    append(build, MIR_new_call_insn(build->context, 6,
 				MIR_new_ref_op(build->context, build->proto_str_ref),
 				MIR_new_ref_op(build->context, build->import_str_ref),
@@ -3132,7 +3157,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_reg_t err_reg = new_reg(build, name_err);
 			    MIR_label_t str_range_err = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_RANGE,
-				instr->bytecode_pc, instr->source_lineno);
+				instr->deopt_map, instr->bytecode_pc,
+				instr->source_lineno);
 			    append(build, MIR_new_call_insn(build->context, 6,
 				MIR_new_ref_op(build->context, build->proto_str_ref),
 				MIR_new_ref_op(build->context, build->import_str_ref),
@@ -3820,6 +3846,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 								    &last_status_exit,
 								    JIT_RUN_ERROR,
 								    E_RANGE,
+								    instr->deopt_map,
 								    instr->bytecode_pc,
 								    instr->source_lineno);
 			    sprintf(name, "range_err%d", copy_serial++);
@@ -4022,7 +4049,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, 0)));
     return_status(build, status, common_return, JIT_RUN_FALLBACK);
-    append_status_exits(build, status_exits, source_location, error_out, status,
+    append_status_exits(build, status_exits, program, values, source_location,
+			deopt_map_out, deopt_values, error_out, status,
 			common_return);
     append(build, common_return);
     append(build, MIR_new_ret_insn(build->context, 1,
@@ -4533,7 +4561,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 			     program->deopt_values, progr, resume_map,
 			     deopt_stack);
     if (native_result == JIT_RUN_FALLBACK
-	|| native_result == JIT_RUN_CALL_VERB) {
+	|| native_result == JIT_RUN_CALL_VERB
+	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
 	JITDeoptMap *map;
 	Var *new_stack = 0;
 	unsigned materialized_depth;
@@ -4587,6 +4616,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->error_pc = map->error_pc;
 	    deopt->source_lineno = map->source_lineno;
 	    deopt->stack_depth = materialized_depth;
+	    deopt->materialized = 1;
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
 	    deopt->operation = map->operation;

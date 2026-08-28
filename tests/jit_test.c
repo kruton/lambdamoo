@@ -1402,7 +1402,7 @@ string_length_program(const char *s)
 }
 
 static JITProgram *
-catch_stack_marker_deopt_program(void)
+catch_stack_marker_program(int native_error)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -1412,16 +1412,21 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 4;
+    program->num_values = native_error ? 7 : 4;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_INT;
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_CATCH;
+    if (native_error) {
+	program->value_types[4] = TYPE_INT;
+	program->value_types[5] = TYPE_INT;
+	program->value_types[6] = TYPE_INT;
+    }
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 25;
@@ -1454,13 +1459,36 @@ catch_stack_marker_deopt_program(void)
     const_catch->value = 3;
     const_catch->literal = 1;
     const_catch->literal_type = TYPE_CATCH;
-    const_catch->next = deopt_op;
+    if (native_error) {
+	JITInstruction *const_lhs = instruction(HIR_TAC_CONST);
+	JITInstruction *const_rhs = instruction(HIR_TAC_CONST);
 
-    deopt_op->deopt_map = 1;
-    deopt_op->bytecode_pc = 25;
+	const_catch->next = const_lhs;
+	const_lhs->value = 4;
+	const_lhs->literal = 1;
+	const_lhs->literal_type = TYPE_INT;
+	const_lhs->next = const_rhs;
+	const_rhs->value = 5;
+	const_rhs->literal = 0;
+	const_rhs->literal_type = TYPE_INT;
+	const_rhs->next = deopt_op;
+	deopt_op->kind = HIR_TAC_BINARY;
+	deopt_op->value = 6;
+	deopt_op->src1 = 4;
+	deopt_op->src2 = 5;
+	deopt_op->op = HIR_OP_DIV;
+	deopt_op->deopt_map = 1;
+	deopt_op->bytecode_pc = 25;
+	deopt_op->source_lineno = 9;
+	block->last = deopt_op;
+    } else {
+	const_catch->next = deopt_op;
+	deopt_op->deopt_map = 1;
+	deopt_op->bytecode_pc = 25;
+	block->last = deopt_op;
+    }
 
     block->first = const_codes;
-    block->last = deopt_op;
     return program;
 }
 
@@ -4269,7 +4297,7 @@ main(void)
 	      "exception boundary charged a tick");
 	jit_program_free(boundary);
 
-	JITProgram *catch_deopt = catch_stack_marker_deopt_program();
+	JITProgram *catch_deopt = catch_stack_marker_program(0);
 	JITDeoptState deopt_state;
 	Var deopt_stack[10];
 	memset(deopt_stack, 0, sizeof(deopt_stack));
@@ -4288,6 +4316,29 @@ main(void)
 	free_var(deopt_stack[1]);
 	free_var(deopt_stack[2]);
 	jit_program_free(catch_deopt);
+
+	JITProgram *catch_error = catch_stack_marker_program(1);
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	error = E_NONE;
+	check(jit_program_execute(catch_error, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_ERROR && error == E_DIV,
+	      "native error with catch marker failed");
+	check(deopt_state.stack_depth == 3,
+	      "native error catch marker depth wrong");
+	check(deopt_state.materialized,
+	      "native error did not report materialized state");
+	check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 0,
+	      "native error catch codes wrong");
+	check(deopt_stack[1].type == TYPE_INT && deopt_stack[1].v.num == 77,
+	      "native error catch handler pc wrong");
+	check(deopt_stack[2].type == TYPE_CATCH && deopt_stack[2].v.num == 1,
+	      "native error catch marker wrong");
+	free_var(deopt_stack[0]);
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	jit_program_free(catch_error);
 
 	JITProgram *fin_deopt = finally_stack_marker_deopt_program();
 	memset(deopt_stack, 0, sizeof(deopt_stack));
