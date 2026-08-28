@@ -1904,6 +1904,65 @@ list_index_tagged_return_program(void)
 }
 
 static JITProgram *
+tagged_parent_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_list = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_idx = instruction(HIR_TAC_CONST);
+    JITInstruction *index_instr = instruction(HIR_TAC_BINARY);
+    JITInstruction *parent_instr = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_is_tagged = allocate(5);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_is_tagged[3] = 1;
+    program->value_types[4] = TYPE_OBJ;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 31;
+    map->source_lineno = 5;
+    map->operation = HIR_OP_PARENT;
+    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_list->value = 1;
+    load_list->local_id = 0;
+    load_list->literal_type = TYPE_LIST;
+    load_list->next = const_idx;
+    const_idx->value = 2;
+    const_idx->literal = 1;
+    const_idx->literal_type = TYPE_INT;
+    const_idx->next = index_instr;
+    index_instr->value = 3;
+    index_instr->src1 = 1;
+    index_instr->src2 = 2;
+    index_instr->op = HIR_OP_INDEX;
+    index_instr->next = parent_instr;
+    parent_instr->value = 4;
+    parent_instr->src1 = 3;
+    parent_instr->op = HIR_OP_PARENT;
+    parent_instr->deopt_map = 1;
+    parent_instr->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_OBJ;
+    block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 list_index_tagged_base_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -4093,6 +4152,34 @@ main(void)
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "tagged return"),
 	      "tagged return preserved its runtime type");
 	free_var(result);
+	free_var(env[0]);
+	jit_program_free(tagged);
+    }
+
+    /* A tagged object operand can execute parent() natively. */
+    {
+	JITProgram *tagged = tagged_parent_program();
+	Var env[1];
+
+	env[0] = new_list(1);
+	env[0].v.list[1].type = TYPE_OBJ;
+	env[0].v.list[1].v.obj = 1;
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged parent object did not execute natively");
+	check(result.type == TYPE_OBJ && result.v.obj == 0,
+	      "tagged parent returned the wrong object");
+	free_var(result);
+
+	env[0].v.list[1].type = TYPE_INT;
+	env[0].v.list[1].v.num = 1;
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, 0) == JIT_RUN_FALLBACK,
+	      "tagged parent non-object did not fallback");
+	check(deopt.bytecode_pc == 31 && deopt.operation == HIR_OP_PARENT,
+	      "tagged parent fallback used the wrong deopt map");
 	free_var(env[0]);
 	jit_program_free(tagged);
     }
