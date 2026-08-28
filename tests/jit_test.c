@@ -4870,6 +4870,14 @@ main(void)
 	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
 
+	ok = jit_rt_put_prop(0, "name", 2, 456, TYPE_INT, &rt_err);
+	check(ok == 1 && rt_err == E_NONE, "jit_rt_put_prop valid property write");
+	ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
+	check(ok == 1 && prop_type == TYPE_INT && prop_raw == 456,
+	      "jit_rt_put_prop stored property value");
+	ok = jit_rt_put_prop(-1, "name", 2, 456, TYPE_INT, &rt_err);
+	check(ok == 0 && rt_err == E_INVIND, "jit_rt_put_prop invalid object");
+
 	/* 8. valid/parent tests */
 	check(jit_rt_valid(0) == 1, "jit_rt_valid object #0");
 	check(jit_rt_valid(-1) == 0, "jit_rt_valid object #-1");

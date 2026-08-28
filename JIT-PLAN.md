@@ -516,6 +516,16 @@ operations, 79,999 type guards, and 13 range operations. This is a coverage
 result rather than a speed comparison: bridged built-ins still execute in the
 VM, but their callers can resume native execution.
 
+Property writes now lower `HIR_TAC_PUT_PROP` directly for object receivers and
+string property names, including dynamically tagged receivers and right-hand
+side values. The runtime helper preserves ordinary and built-in property
+permission checks, stores a referenced copy while retaining the assignment
+result, and reports interpreter-compatible errors. A wizard-flag transition
+still deoptimizes before mutation so the interpreter retains its canonical
+traceback and audit logging behavior. Property read and write support is
+therefore no longer a pending native-operation milestone; the remaining work is
+the broader ownership-map and synthesized-anchor validation described below.
+
 ### 14.3 Priorities for programs that remain entirely native
 
 1. **Classify unsupported operations by HIR operation and call site.**

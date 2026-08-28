@@ -15,6 +15,7 @@
 
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
+static Var test_property = { .type = TYPE_INT, .v.num = 123 };
 
 void hir_test_set_length_protected(int);
 
@@ -409,6 +410,20 @@ is_wizard(Objid oid)
     return oid == 2 || oid == 3;
 }
 
+int
+is_user(Objid oid)
+{
+    (void) oid;
+    return 0;
+}
+
+Objid
+db_object_owner(Objid oid)
+{
+    (void) oid;
+    return 2;
+}
+
 db_prop_handle
 db_find_property(Objid oid, const char *name, Var *value)
 {
@@ -418,11 +433,18 @@ db_find_property(Objid oid, const char *name, Var *value)
     if (oid >= 0 && name && *name) {
 	h.ptr = (void *) 0x1;
 	if (value) {
-	    value->type = TYPE_INT;
-	    value->v.num = 123;
+	    *value = test_property;
 	}
     }
     return h;
+}
+
+void
+db_set_property_value(db_prop_handle h, Var value)
+{
+    (void) h;
+    free_var(test_property);
+    test_property = value;
 }
 
 int

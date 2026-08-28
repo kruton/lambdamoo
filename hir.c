@@ -4555,6 +4555,17 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    types_changed = 1;
 		}
 	    }
+	    if (si->kind == HIR_TAC_PUT_PROP) {
+		int rhs = si->num_stack_values >= 1
+		    ? si->stack_values[si->num_stack_values - 1] : 0;
+
+		if (rhs > 0 && rhs < program->num_values
+		    && value_types_known[rhs] && !value_types_known[si->value]) {
+		    value_types[si->value] = value_types[rhs];
+		    value_types_known[si->value] = 1;
+		    types_changed = 1;
+		}
+	    }
 	    if (si->kind == HIR_TAC_BINARY
 		&& (si->op == HIR_OP_INDEX_BF
 		    || si->op == HIR_OP_RINDEX_BF)) {
@@ -4692,6 +4703,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
+	    if (si->kind == HIR_TAC_PUT_PROP) {
+		int rhs = si->num_stack_values >= 1
+		    ? si->stack_values[si->num_stack_values - 1] : 0;
+
+		if (rhs > 0 && rhs < program->num_values && value_is_tagged[rhs]) {
+		    value_is_tagged[si->value] = 1;
+		    value_types[si->value] = TYPE_ANY;
+		    value_types_known[si->value] = 0;
+		}
+	    }
 	    if (si->kind == HIR_TAC_BINARY
 		&& (si->op == HIR_OP_INDEX || si->op == HIR_OP_GET_PROP)
 		&& si->value > 0 && si->value < program->num_values
