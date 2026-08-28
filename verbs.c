@@ -279,10 +279,36 @@ jit_metadata_pair(const char *name, Var value)
 }
 
 static Var
+jit_metadata_num_pair(const char *name, uint64_t number)
+{
+    Var value;
+
+    value.type = TYPE_INT;
+    value.v.num = number > NUM_MAX ? NUM_MAX : (Num) number;
+    return jit_metadata_pair(name, value);
+}
+
+static Var
+jit_deopt_metadata(const JITProgramStats *stats)
+{
+    Var reasons = new_list(JIT_DEOPT_NUM_REASONS - 1);
+    int reason;
+
+    for (reason = 1; reason < JIT_DEOPT_NUM_REASONS; reason++)
+	reasons.v.list[reason] = jit_metadata_num_pair(
+	    jit_deopt_reason_name((JITDeoptReason) reason),
+	    stats->deopts_by_reason[reason]);
+    return reasons;
+}
+
+static Var
 jit_metadata(JITProgram *program)
 {
-    Var metadata = new_list(9);
+    JITProgramStats stats;
+    Var metadata = new_list(26);
     Var value;
+
+    jit_program_stats(program, &stats);
 
     value.type = TYPE_STR;
     value.v.str = str_dup(jit_program_state_name(program));
@@ -310,6 +336,39 @@ jit_metadata(JITProgram *program)
     value.type = TYPE_STR;
     value.v.str = str_dup(jit_program_diagnostic(program));
     metadata.v.list[9] = jit_metadata_pair("diagnostic", value);
+    metadata.v.list[10] = jit_metadata_num_pair("entries", stats.entries);
+    metadata.v.list[11] = jit_metadata_num_pair("completions",
+					       stats.completions);
+    metadata.v.list[12] = jit_metadata_num_pair("vm_calls", stats.vm_calls);
+    metadata.v.list[13] = jit_metadata_num_pair("deopts", stats.deopts);
+    metadata.v.list[14] = jit_metadata_pair("deopts_by_reason",
+					    jit_deopt_metadata(&stats));
+    metadata.v.list[15] = jit_metadata_num_pair("last_used_generation",
+					       stats.last_used_generation);
+    metadata.v.list[16] = jit_metadata_num_pair("last_used_time",
+					       stats.last_used_time < 0
+					       ? 0 : stats.last_used_time);
+    metadata.v.list[17] = jit_metadata_num_pair("compile_attempts",
+					       stats.compile_attempts);
+    metadata.v.list[18] = jit_metadata_num_pair("compile_successes",
+					       stats.compile_successes);
+    metadata.v.list[19] = jit_metadata_num_pair("compile_failures",
+					       stats.compile_failures);
+    metadata.v.list[20] = jit_metadata_num_pair("compile_time_us",
+					       stats.compile_time_us);
+    metadata.v.list[21] = jit_metadata_num_pair("metadata_bytes",
+					       stats.metadata_bytes);
+    metadata.v.list[22] = jit_metadata_num_pair("runtime_bytes",
+					       stats.runtime_bytes);
+    metadata.v.list[23] = jit_metadata_num_pair("machine_code_bytes",
+					       stats.machine_code_bytes);
+    metadata.v.list[24] = jit_metadata_num_pair("native_allocated_bytes",
+					       stats.native_allocated_bytes);
+    value.type = TYPE_INT;
+    value.v.num = stats.mir_bytes;
+    metadata.v.list[25] = jit_metadata_pair("mir_bytes", value);
+    metadata.v.list[26] = jit_metadata_num_pair("accounted_bytes",
+					       stats.accounted_bytes);
     return metadata;
 }
 #endif

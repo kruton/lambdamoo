@@ -409,6 +409,18 @@ lazy machine-code compilation. JIT state is observable through
 `verb_info()`, `jit_compile()`, and `disassemble()`; the test tooling includes
 eligibility and runtime-deoptimization censuses.
 
+Passing a true third argument to `verb_info()` includes per-program JIT usage
+and memory statistics. These include native entries and completions, VM-call
+crossings, deoptimizations by reason, last-use time and generation, compilation
+attempts/results/time, persistent metadata bytes, runtime materialization
+storage, and generated machine-code bytes. `accounted_bytes` is included by
+`program_bytes()` and uses the executable pages reported by
+`native_allocated_bytes`, rather than only the used instruction length in
+`machine_code_bytes`. MIR 1.0.0 does not expose its internal retained heap
+allocation size, so `mir_bytes` is `-1` rather than an unreliable estimate;
+allocator-level MIR accounting remains prerequisite work for a strict
+process-memory cache.
+
 All 6,319 verbs in the current Opal.db eligibility census compile successfully.
 There are no remaining top-level `unsupported-program`,
 `unsupported-value-types`, `invalid-bytecode-anchor`, or `invalid-ir`
