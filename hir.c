@@ -5611,6 +5611,46 @@ hir_ssa_stack_depth_at_bytecode_pc(HIRSSAProgram *program,
 }
 
 int
+hir_ssa_stack_value_at_bytecode_pc(HIRSSAProgram *program,
+				   unsigned bytecode_pc, int stack_slot)
+{
+    HIRSSABlock *block;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->bytecode_pc == bytecode_pc
+		&& stack_slot >= 0 && stack_slot < instr->num_stack_values)
+		return instr->stack_values[stack_slot];
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return -1;
+}
+
+int
+hir_ssa_binary_value_at_bytecode_pc(HIRSSAProgram *program,
+				    unsigned bytecode_pc, HIROp op)
+{
+    HIRSSABlock *block;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_BINARY && instr->op == op
+		&& instr->bytecode_pc == bytecode_pc)
+		return instr->value;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return -1;
+}
+
+int
 hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *program,
 				   unsigned bytecode_pc, int local_id)
 {
@@ -7970,6 +8010,7 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_tac(program, instr);
     append_internal_store(ctx, program, index_local, next_index,
 			  stmt->source_lineno);
+    ctx->lower_stack[ctx->lower_stack_depth - 1] = next_index;
 
     lower_stmt_list(ctx, program, stmt->u.for_list.body);
     append_jump(ctx, program, top_label, stmt->source_lineno);

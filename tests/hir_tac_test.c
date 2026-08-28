@@ -2168,6 +2168,8 @@ test_for_list_loop_tac_ssa(void)
     Expr result = id_expr(1, 13);
     Stmt ret = return_stmt(&result);
 
+    add.bytecode_pc = 42;
+    loop.bytecode_pc = 41;
     loop.next = &ret;
     memset(&names, 0, sizeof(names));
     names.size = 32;
@@ -2186,6 +2188,9 @@ test_for_list_loop_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
     check_int("for list ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("for list body stack uses incremented index",
+	      hir_ssa_stack_value_at_bytecode_pc(ssa, 42, 1),
+	      hir_ssa_binary_value_at_bytecode_pc(ssa, 41, HIR_OP_ADD));
 
     check_int("for list destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
