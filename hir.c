@@ -4781,15 +4781,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    || ssa_instr->kind == HIR_TAC_CALL_VERB
 		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
-	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
-		&& value_types_known[ssa_instr->src1]
-		&& value_types[ssa_instr->src1] == TYPE_STR
-		&& (ssa_instr->kind == HIR_TAC_UNARY
-		    && ssa_instr->op == HIR_OP_LENGTH
-		    && jit_extended_anchor_matches(&bytecode_program->main_vector,
-						   ssa_instr->bytecode_pc,
-						   EOP_LENGTH)))
-		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_UNARY
 		&& (ssa_instr->op == HIR_OP_COMPLEMENT
 		    || ssa_instr->op == HIR_OP_NEGATE || ssa_instr->op == HIR_OP_ABS)) {
