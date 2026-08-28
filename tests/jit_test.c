@@ -3525,6 +3525,25 @@ main(void)
 	      "call_verb continuation returned the wrong value");
 	free_var(result);
 	free_var(deopt_stack[0]);
+	{
+	    JITProgram *fallthrough = call_verb_program();
+	    JITInstruction *call = fallthrough->blocks->first;
+	    JITInstruction *terminal = instruction(HIR_TAC_LABEL);
+
+	    while (call->kind != HIR_TAC_CALL_VERB)
+		call = call->next;
+	    call->next = terminal;
+	    fallthrough->blocks->last = terminal;
+	    deopt_stack[0].type = TYPE_INT;
+	    deopt_stack[0].v.num = 17;
+	    check((jit_program_execute)(fallthrough, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+		  "fallthrough continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 0,
+		  "fallthrough continuation did not return zero");
+	    jit_program_free(fallthrough);
+	}
 	free_var(deep_env[1]);
 	free_var(deep_env[2]);
 	jit_program_free(call_prog);

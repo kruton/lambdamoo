@@ -935,6 +935,22 @@ return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
 			      MIR_new_label_op(build->context, common_return)));
 }
 
+static void
+append_return_zero(MIRBuild *build, MIR_reg_t result, MIR_reg_t status,
+		   MIR_label_t common_return)
+{
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context,
+		       sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		       offsetof(Var, v.num), result, 0, 1),
+	MIR_new_int_op(build->context, 0)));
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context, MIR_T_I32,
+		       offsetof(Var, type), result, 0, 1),
+	MIR_new_int_op(build->context, TYPE_INT)));
+    return_status(build, status, common_return, JIT_RUN_RETURNED);
+}
+
 static MIR_label_t
 new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
 		JITRunResult status, enum error error, int deopt_map,
@@ -3793,17 +3809,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    return_status(build, status, common_return, JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_RETURN0:
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_mem_op(build->context,
-								 sizeof(Num) == 8
-								 ? MIR_T_I64 : MIR_T_I32,
-								 offsetof(Var, v.num), result, 0, 1),
-						  MIR_new_int_op(build->context, 0)));
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 offsetof(Var, type), result, 0, 1),
-						  MIR_new_int_op(build->context, TYPE_INT)));
-		    return_status(build, status, common_return, JIT_RUN_RETURNED);
+		    append_return_zero(build, result, status, common_return);
 		    break;
 		case HIR_TAC_CALL:
 		    if (instr->deopt_map > 0
@@ -4045,6 +4051,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		append(build, MIR_new_insn(build->context, MIR_JMP,
 					    MIR_new_label_op(build->context,
 							     labels[block->successors[0]])));
+	    else if (block->num_successors == 0
+		     && (!block->last
+			 || (block->last->kind != HIR_TAC_RETURN
+			     && block->last->kind != HIR_TAC_RETURN0)))
+		append_return_zero(build, result, status, common_return);
     }
 
     append(build, fallback);
