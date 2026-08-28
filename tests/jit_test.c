@@ -3397,6 +3397,27 @@ main(void)
 	jit_program_free(pass_prog);
     }
 
+    /* Specialized built-in fallback reconstructs the bytecode argument list. */
+    {
+	JITProgram *builtin_deopt = string_length_program("hello");
+	JITInstruction *length_instr = builtin_deopt->blocks->first->next;
+
+	length_instr->kind = HIR_TAC_DEOPT;
+	ticks = 10;
+	check(jit_program_execute(builtin_deopt, env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK,
+	      "specialized built-in fallback did not deopt");
+	check(deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST,
+	      "specialized built-in fallback did not pack its arguments");
+	check(deopt_stack[0].v.list[0].v.num == 1
+	      && deopt_stack[0].v.list[1].type == TYPE_STR
+	      && !strcmp(deopt_stack[0].v.list[1].v.str, "hello"),
+	      "specialized built-in fallback packed the wrong argument");
+	free_var(deopt_stack[0]);
+	jit_program_free(builtin_deopt);
+    }
+
     /* Property read deopt test */
     {
 	JITProgram *get_prog = get_prop_program();

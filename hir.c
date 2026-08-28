@@ -4978,6 +4978,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    instr->literal = ssa_instr->literal.v.err;
 		else if (ssa_instr->literal.type == TYPE_INT)
 		    instr->literal = ssa_instr->literal.v.num;
+		else if (ssa_instr->literal.type == TYPE_CATCH
+			 || ssa_instr->literal.type == TYPE_FINALLY)
+		    instr->literal = ssa_instr->literal.v.num;
 		else if (ssa_instr->literal.type == TYPE_FLOAT) {
 		    FlNum f = fl_unbox(ssa_instr->literal.v.fnum);
 		    memcpy(&instr->literal, &f, sizeof(Num));

@@ -1445,6 +1445,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		case HIR_TAC_DEOPT:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 			deopt_map_out, deopt_values, status, common_return);
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& resume_continuations[instr->deopt_map])
+			append(build, resume_continuations[instr->deopt_map]);
 		    break;
 		case HIR_TAC_CONST:
 		    if (program->value_types
@@ -4552,8 +4556,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		free_var(env[i]);
 		env[i] = value;
 	    }
-	if (deopt_stack && (map->stack_depth || (native_result == JIT_RUN_CALL_VERB
-					       && map->builtin_args == 0)))
+	if (deopt_stack && (map->stack_depth
+			    || (jit_deopt_map_is_specialized_builtin(map)
+				&& map->builtin_args == 0)))
 	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
 	for (i = 0; new_stack && i < (int) map->stack_depth; i++) {
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
@@ -4564,8 +4569,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    new_stack[i] = materialize_deopt_value(type,
 		program->deopt_values[map->stack_values[i]]);
 	}
-	if (new_stack && native_result == JIT_RUN_CALL_VERB
-	    && jit_deopt_map_is_specialized_builtin(map)) {
+	if (new_stack && jit_deopt_map_is_specialized_builtin(map)) {
 	    int outer_depth = map->stack_depth - map->builtin_args;
 	    Var args = new_list(map->builtin_args);
 
