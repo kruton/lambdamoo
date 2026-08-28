@@ -102,7 +102,12 @@ void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase) {
       u[0].d = *(double *) ((char *) va->reg_save_area + va->fp_offset);
       u[1].i = *(uint64_t *) ((char *) va->reg_save_area + va->gp_offset);
     }
-    va->fp_offset += 8;
+    /* An SSE eightbyte occupies a 16-byte slot in the register save area
+       (each XMM is stored in 16 bytes), so fp_offset must advance by 16 --
+       matching the SSE-only path (case 2) and va_arg_builtin.  Advancing by
+       only 8 made the next mixed-class struct's SSE field read an
+       overlapping/stale slot.  The INTEGER eightbyte is 8 bytes. */
+    va->fp_offset += 16;
     va->gp_offset += 8;
     if (res != NULL) memcpy (res, &u, s);
     return;
@@ -429,7 +434,7 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   push_insns (code, prolog, sizeof (prolog));
   for (size_t i = 0; i < nargs; i++) {
     MIR_type_t type = arg_descs[i].type;
@@ -466,8 +471,7 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
         gen_mov (code, (i + nres) * sizeof (long double), 12, TRUE);   /* r12 = block addr */
         gen_mov2 (code, 0, iregs[n_iregs], TRUE);                      /* arg_reg = mem[r12] */
         if (qwords == 2) gen_mov2 (code, 8, iregs[n_iregs + 1], TRUE); /* arg_reg = mem[r12 + 8] */
-        n_iregs += qwords;
-        n_xregs += qwords;
+        n_iregs += qwords; /* an all-INTEGER block consumes no SSE registers */
         continue;
       } else if (type == MIR_T_BLK + 2 && n_xregs + qwords <= max_xregs) {
         assert (qwords <= 2);
@@ -481,7 +485,6 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
         gen_mov (code, (i + nres) * sizeof (long double), 12, TRUE); /* r12 = block addr */
         gen_mov2 (code, 0, iregs[n_iregs], TRUE);                    /* arg_reg = mem[r12] */
         n_iregs++;
-        n_xregs++;
         gen_movxmm2 (code, 8, n_xregs, TRUE); /* xmm = mem[r12 + 8] */
         n_xregs++;
         continue;
@@ -492,7 +495,6 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
         n_xregs++;
         gen_mov2 (code, 8, iregs[n_iregs], TRUE); /* arg_reg = mem[r12 + 8] */
         n_iregs++;
-        n_xregs++;
         continue;
       }
       gen_blk_mov (code, sp_offset, (i + nres) * sizeof (long double), qwords);
@@ -641,7 +643,7 @@ void *_MIR_get_interp_shim (MIR_context_t ctx, MIR_item_t func_item, void *handl
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
 #ifndef _WIN32
   push_insns (code, push_rbx, sizeof (push_rbx));
 #endif
@@ -726,7 +728,7 @@ void *_MIR_get_wrapper (MIR_context_t ctx, MIR_item_t called_func, void *hook_ad
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   addr = push_insns (code, start_pat, sizeof (start_pat));
   memcpy (addr + call_func_offset, &called_func, sizeof (void *));
   memcpy (addr + ctx_offset, &ctx, sizeof (void *));
@@ -816,7 +818,7 @@ void *_MIR_get_wrapper_end (MIR_context_t ctx) {
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   push_insns (code, wrap_end, sizeof (wrap_end));
   res = _MIR_publish_code (ctx, VARR_ADDR (uint8_t, code), VARR_LENGTH (uint8_t, code));
   VARR_DESTROY (uint8_t, code);
@@ -959,7 +961,7 @@ void *_MIR_get_bb_wrapper (MIR_context_t ctx, void *data, void *hook_address) {
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   push_insns (code, save_pat2, sizeof (save_pat2));
   addr = push_insns (code, call_pat, sizeof (call_pat));
   memcpy (addr + data_offset, &data, sizeof (void *));

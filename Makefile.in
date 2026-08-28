@@ -105,6 +105,9 @@ DISTFILES = $(ALL_SRCS) Makefile.in config.h.in options.h.in \
 	restart restart.sh Minimal.db README.Minimal
 
 MIR_VENDOR_FILES = vendor/mir/LICENSE vendor/mir/README.lambdamoo \
+	vendor/mir/CUSTOM-ALLOCATORS.md vendor/mir/mir-alloc.h \
+	vendor/mir/mir-alloc-default.c vendor/mir/mir-code-alloc.h \
+	vendor/mir/mir-code-alloc-default.c \
 	vendor/mir/mir.c vendor/mir/mir.h vendor/mir/mir-gen.c \
 	vendor/mir/mir-gen.h vendor/mir/mir-aarch64.c \
 	vendor/mir/mir-aarch64.h vendor/mir/mir-gen-aarch64.c \
@@ -166,7 +169,8 @@ test-hir-tac: tests/hir_tac_test
 tests/jit_test.o: tests/jit_test.c jit.h jit_internal.h
 	$(COMPILE.c) -o $@ tests/jit_test.c
 
-tests/jit_test_jit.o: jit.c jit.h jit_internal.h
+tests/jit_test_jit.o: jit.c jit.h jit_internal.h \
+	$(abs_srcdir)/vendor/mir/mir.h $(abs_srcdir)/vendor/mir/mir-gen.h
 	$(COMPILE.c) -I$(abs_srcdir)/vendor/mir -o $@ jit.c
 
 tests/jit_test: $(JIT_TEST_OBJS)

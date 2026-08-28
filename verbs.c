@@ -320,7 +320,7 @@ jit_metadata(JITProgram *program)
     value.v.str = str_dup("mir");
     metadata.v.list[3] = jit_metadata_pair("backend", value);
     value.type = TYPE_STR;
-    value.v.str = str_dup("1.0.0");
+    value.v.str = str_dup("a8ab7c31cd5f9b23b77d84c60b3d83e62d9d304c");
     metadata.v.list[4] = jit_metadata_pair("backend_version", value);
     value.type = TYPE_STR;
     value.v.str = str_dup("integer-v1");

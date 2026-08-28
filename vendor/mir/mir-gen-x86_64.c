@@ -859,24 +859,14 @@ static void target_machinize (gen_ctx_t gen_ctx) {
       MIR_op_t va_op = insn->ops[0];
       MIR_reg_t va_reg;
 #ifndef _WIN32
-      int gp_offset = 0, fp_offset = 48, mem_offset = 0;
-      MIR_var_t var;
+      /* Use the arg passing state left by the prologue walk above: it is the
+         only way to agree with the actual layout (register classes of block
+         args, 8-byte rounding of memory-passed blocks, reg exhaustion). */
+      int gp_offset = (int) (int_arg_num > 6 ? 48 : int_arg_num * 8);
+      int fp_offset = (int) (48 + (fp_arg_num > 8 ? 128 : fp_arg_num * 16));
+      int64_t mem_offset = (int64_t) (mem_size - spill_space_size);
 
       assert (func->vararg_p && va_op.mode == MIR_OP_VAR);
-      for (uint32_t narg = 0; narg < func->nargs; narg++) {
-        var = VARR_GET (MIR_var_t, func->vars, narg);
-        if (var.type == MIR_T_F || var.type == MIR_T_D) {
-          fp_offset += 16;
-          if (gp_offset >= 176) mem_offset += 8;
-        } else if (var.type == MIR_T_LD) {
-          mem_offset += 16;
-        } else if (MIR_blk_type_p (var.type)) {
-          mem_offset += var.size;
-        } else { /* including RBLK */
-          gp_offset += 8;
-          if (gp_offset >= 48) mem_offset += 8;
-        }
-      }
       va_reg = va_op.u.var;
       /* Insns can be not simplified as soon as they match a machine insn.  */
       /* mem32[va_reg] = gp_offset; mem32[va_reg] = fp_offset */
@@ -1434,28 +1424,34 @@ struct pattern {
   /* fld m1;fld m2;op;fstp m0: */ \
   {ICODE, "mld mld mld", "DB /5 m1; DB /5 m2; " OP_CODE "; DB /7 m0", 0},
 
-#define SHOP0(ICODE, SUFF, PREF, CL_OP_CODE, I8_OP_CODE)                       \
-  {ICODE##SUFF, "r 0 h1", #PREF " " CL_OP_CODE " R0", 0},       /* sh r0,cl */ \
-    {ICODE##SUFF, "m3 0 h1", #PREF " " CL_OP_CODE " m0", 0},    /* sh m0,cl */ \
-    {ICODE##SUFF, "r 0 i0", #PREF " " I8_OP_CODE " R0 i2", 0},  /* sh r0,i2 */ \
-    {ICODE##SUFF, "m3 0 i0", #PREF " " I8_OP_CODE " m0 i2", 0}, /* sh m0,i2 */
+#define SHOP(ICODE, CL_OP_CODE, I8_OP_CODE)                      \
+  {ICODE, "r 0 h1", "X " CL_OP_CODE " R0"},       /* sh r0,cl */ \
+    {ICODE, "m3 0 h1", "X " CL_OP_CODE " m0"},    /* sh m0,cl */ \
+    {ICODE, "r 0 i0", "X " I8_OP_CODE " R0 i2"},  /* sh r0,i2 */ \
+    {ICODE, "m3 0 i0", "X " I8_OP_CODE " m0 i2"}, /* sh m0,i2 */
 
-#define SHOP(ICODE, CL_OP_CODE, I8_OP_CODE)  \
-  SHOP0 (ICODE, , X, CL_OP_CODE, I8_OP_CODE) \
-  SHOP0 (ICODE, S, Y, CL_OP_CODE, I8_OP_CODE)
+#define SHOPS(ICODE, CL_OP_CODE, I8_OP_CODE)                     \
+  {ICODE, "r 0 h1", "Y " CL_OP_CODE " R0"},       /* sh r0,cl */ \
+    {ICODE, "m2 0 h1", "Y " CL_OP_CODE " m0"},    /* sh m0,cl */ \
+    {ICODE, "r 0 i0", "Y " I8_OP_CODE " R0 i2"},  /* sh r0,i2 */ \
+    {ICODE, "m2 0 i0", "Y " I8_OP_CODE " m0 i2"}, /* sh m0,i2 */
 
 /* cmp ...; setx r0: */
-#define CMP0(ICODE, SUFF, PREF, SETX)                                                    \
-  {ICODE##SUFF, "r r r", #PREF " 3B r1 R2; Y " SETX " S0", 0},        /* cmp r1,r2;...*/ \
-    {ICODE##SUFF, "r r m3", #PREF " 3B r1 m2; Y " SETX " S0", 0},     /* cmp r1,m2;...*/ \
-    {ICODE##SUFF, "r r i0", #PREF " 83 /7 R1 i2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
-    {ICODE##SUFF, "r r i2", #PREF " 81 /7 R1 I2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
-    {ICODE##SUFF, "r m3 i0", #PREF " 83 /7 m1 i2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/ \
-    {ICODE##SUFF, "r m3 i2", #PREF " 81 /7 m1 I2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/
+#define CMP(ICODE, SETX)                                                      \
+  {ICODE, "r r r", "X 3B r1 R2; Y " SETX " S0", 0},        /* cmp r1,r2;...*/ \
+    {ICODE, "r r m3", "X 3B r1 m2; Y " SETX " S0", 0},     /* cmp r1,m2;...*/ \
+    {ICODE, "r r i0", "X 83 /7 R1 i2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
+    {ICODE, "r r i2", "X 81 /7 R1 I2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
+    {ICODE, "r m3 i0", "X 83 /7 m1 i2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/ \
+    {ICODE, "r m3 i2", "X 81 /7 m1 I2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/
 
-#define CMP(ICODE, SET_OPCODE)  \
-  CMP0 (ICODE, , X, SET_OPCODE) \
-  CMP0 (ICODE, S, Y, SET_OPCODE)
+#define CMPS(ICODE, SETX)                                                     \
+  {ICODE, "r r r", "Y 3B r1 R2; Y " SETX " S0", 0},        /* cmp r1,r2;...*/ \
+    {ICODE, "r r m2", "Y 3B r1 m2; Y " SETX " S0", 0},     /* cmp r1,m2;...*/ \
+    {ICODE, "r r i0", "Y 83 /7 R1 i2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
+    {ICODE, "r r i2", "Y 81 /7 R1 I2; Y " SETX " S0", 0},  /* cmp r1,i2;...*/ \
+    {ICODE, "r m2 i0", "Y 83 /7 m1 i2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/ \
+    {ICODE, "r m2 i2", "Y 81 /7 m1 I2; Y " SETX " S0", 0}, /* cmp m1,i2;...*/
 
 #define FEQ(ICODE, V, SET_OPCODE)                                                            \
   /*xor %eax,%eax;ucomiss r1,{r,m2};mov V,%edx;set[n]p r0;cmovne %rdx,%rax; mov %rax,r0:  */ \
@@ -1524,29 +1520,35 @@ struct pattern {
   BR1 (ICODE, , Y, LONG_JMP_OPCODE)  \
   BR1 (ICODE, S, Y, LONG_JMP_OPCODE)
 
-#define BCMPS0(ICODE, SUFF, PREF, SHORT_JMP_OPCODE)                                               \
-  {ICODE##SUFF, "l r r", #PREF " 3B r1 R2;" SHORT_JMP_OPCODE " l0", 0},    /*cmp r0,r1;jxx rel8*/ \
-    {ICODE##SUFF, "l r m3", #PREF " 3B r1 m2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp r0,m1;...*/      \
-    {ICODE##SUFF, "l r i0", #PREF " 83 /7 R1 i2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/  \
-    {ICODE##SUFF, "l r i2", #PREF " 81 /7 R1 I2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/  \
-    {ICODE##SUFF, "l m3 i0", #PREF " 83 /7 m1 i2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/  \
-    {ICODE##SUFF, "l m3 i2", #PREF " 81 /7 m1 I2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/
+#define BCMPS(ICODE, SHORT_JMP_OPCODE)                                                     \
+  {ICODE, "l r r", "X 3B r1 R2;" SHORT_JMP_OPCODE " l0", 0},        /*cmp r0,r1;jxx rel8*/ \
+    {ICODE, "l r m3", "X 3B r1 m2;" SHORT_JMP_OPCODE " l0", 0},     /*cmp r0,m1;...*/      \
+    {ICODE, "l r i0", "X 83 /7 R1 i2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/      \
+    {ICODE, "l r i2", "X 81 /7 R1 I2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/      \
+    {ICODE, "l m3 i0", "X 83 /7 m1 i2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/      \
+    {ICODE, "l m3 i2", "X 81 /7 m1 I2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/
+#define SBCMPS(ICODE, SHORT_JMP_OPCODE)                                                    \
+  {ICODE, "l r r", "Y 3B r1 R2;" SHORT_JMP_OPCODE " l0", 0},        /*cmp r0,r1;jxx rel8*/ \
+    {ICODE, "l r m2", "Y 3B r1 m2;" SHORT_JMP_OPCODE " l0", 0},     /*cmp r0,m1;...*/      \
+    {ICODE, "l r i0", "Y 83 /7 R1 i2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/      \
+    {ICODE, "l r i2", "Y 81 /7 R1 I2;" SHORT_JMP_OPCODE " l0", 0},  /*cmp r0,i1;...*/      \
+    {ICODE, "l m2 i0", "Y 83 /7 m1 i2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/      \
+    {ICODE, "l m2 i2", "Y 81 /7 m1 I2;" SHORT_JMP_OPCODE " l0", 0}, /*cmp m0,i1;...*/
 
-#define BCMPS(ICODE, SHORT_JMP_OPCODE)  \
-  BCMPS0 (ICODE, , X, SHORT_JMP_OPCODE) \
-  BCMPS0 (ICODE, S, Y, SHORT_JMP_OPCODE)
-
-#define BCMP0(ICODE, SUFF, PREF, LONG_JMP_OPCODE)                                                 \
-  {ICODE##SUFF, "L r r", #PREF " 3B r1 R2;" LONG_JMP_OPCODE " L0", 0},    /*cmp r0,r1;jxx rel32*/ \
-    {ICODE##SUFF, "L r m3", #PREF " 3B r1 m2;" LONG_JMP_OPCODE " L0", 0}, /*cmp r0,m1;...*/       \
-    {ICODE##SUFF, "L r i0", #PREF " 83 /7 R1 i2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/   \
-    {ICODE##SUFF, "L r i2", #PREF " 81 /7 R1 I2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/   \
-    {ICODE##SUFF, "L m3 i0", #PREF " 83 /7 m1 i2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/   \
-    {ICODE##SUFF, "L m3 i2", #PREF " 81 /7 m1 I2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/
-
-#define BCMP(ICODE, LONG_JMP_OPCODE)  \
-  BCMP0 (ICODE, , X, LONG_JMP_OPCODE) \
-  BCMP0 (ICODE, S, Y, LONG_JMP_OPCODE)
+#define BCMP(ICODE, LONG_JMP_OPCODE)                                                       \
+  {ICODE, "L r r", "X 3B r1 R2;" LONG_JMP_OPCODE " L0", 0},        /*cmp r0,r1;jxx rel32*/ \
+    {ICODE, "L r m3", "X 3B r1 m2;" LONG_JMP_OPCODE " L0", 0},     /*cmp r0,m1;...*/       \
+    {ICODE, "L r i0", "X 83 /7 R1 i2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/       \
+    {ICODE, "L r i2", "X 81 /7 R1 I2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/       \
+    {ICODE, "L m3 i0", "X 83 /7 m1 i2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/       \
+    {ICODE, "L m3 i2", "X 81 /7 m1 I2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/
+#define SBCMP(ICODE, LONG_JMP_OPCODE)                                                      \
+  {ICODE, "L r r", "Y 3B r1 R2;" LONG_JMP_OPCODE " L0", 0},        /*cmp r0,r1;jxx rel32*/ \
+    {ICODE, "L r m2", "Y 3B r1 m2;" LONG_JMP_OPCODE " L0", 0},     /*cmp r0,m1;...*/       \
+    {ICODE, "L r i0", "Y 83 /7 R1 i2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/       \
+    {ICODE, "L r i2", "Y 81 /7 R1 I2;" LONG_JMP_OPCODE " L0", 0},  /*cmp r0,i1;...*/       \
+    {ICODE, "L m2 i0", "Y 83 /7 m1 i2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/       \
+    {ICODE, "L m2 i2", "Y 81 /7 m1 I2;" LONG_JMP_OPCODE " L0", 0}, /*cmp m0,i1;...*/
 
 #define FBCMPS(ICODE, SHORT_JMP_OPCODE) \
   {ICODE, "l r r", "Y 0F 2E r1 R2;" SHORT_JMP_OPCODE " l0", 0}, /* ucomiss r0,r1;jxx rel8*/
@@ -1623,9 +1625,9 @@ static struct pattern patterns[] = {
   {MIR_UEXT32, "r m2", "Y 8B r0 m1", 0},    /* mov r0,m1 */
 
   {MIR_I2F, "r r", "F3 X 0F 2A r0 R1", 0},                  /* cvtsi2ss r0,r1 */
-  {MIR_I2F, "r mf", "F3 X 0F 2A r0 m1", 0},                 /* cvtsi2ss r0,m1 */
+  {MIR_I2F, "r m3", "F3 X 0F 2A r0 m1", 0},                 /* cvtsi2ss r0,m1 */
   {MIR_I2D, "r r", "F2 X 0F 2A r0 R1", 0},                  /* cvtsi2sd r0,r1 */
-  {MIR_I2D, "r md", "F2 X 0F 2A r0 m1", 0},                 /* cvtsi2sd r0,m1 */
+  {MIR_I2D, "r m3", "F2 X 0F 2A r0 m1", 0},                 /* cvtsi2sd r0,m1 */
   {MIR_I2LD, "mld r", "X 89 r1 mt; DF /5 mt; DB /7 m0", 0}, /*mov -16(sp),r1;fild -16(sp);fstp m0 */
 
   {MIR_F2I, "r r", "F3 X 0F 2C r0 R1", 0},  /* cvttss2si r0,r1 */
@@ -1733,10 +1735,18 @@ static struct pattern patterns[] = {
   SHOP (MIR_LSH, "D3 /4", "C1 /4") SHOP (MIR_RSH, "D3 /7", "C1 /7") /* arithm shifts */
   SHOP (MIR_URSH, "D3 /5", "C1 /5")                                 /* logical shifts */
 
+  SHOPS (MIR_LSHS, "D3 /4", "C1 /4") SHOPS (MIR_RSHS, "D3 /7", "C1 /7") /* arithm shifts */
+  SHOPS (MIR_URSHS, "D3 /5", "C1 /5")                                   /* logical shifts */
+
   CMP (MIR_EQ, "0F 94") CMP (MIR_NE, "0F 95") CMP (MIR_LT, "0F 9C")   /* 1.int cmps */
   CMP (MIR_ULT, "0F 92") CMP (MIR_LE, "0F 9E") CMP (MIR_ULE, "0F 96") /* 2.int cmps */
   CMP (MIR_GT, "0F 9F") CMP (MIR_UGT, "0F 97") CMP (MIR_GE, "0F 9D")  /* 3.int cmps */
   CMP (MIR_UGE, "0F 93")                                              /* 4.int cmps */
+
+  CMPS (MIR_EQS, "0F 94") CMPS (MIR_NES, "0F 95") CMPS (MIR_LTS, "0F 9C")   /* 1.short cmps */
+  CMPS (MIR_ULTS, "0F 92") CMPS (MIR_LES, "0F 9E") CMPS (MIR_ULES, "0F 96") /* 2.short cmps */
+  CMPS (MIR_GTS, "0F 9F") CMPS (MIR_UGTS, "0F 97") CMPS (MIR_GES, "0F 9D")  /* 3.short cmps */
+  CMPS (MIR_UGES, "0F 93")                                                  /* 4.short cmps */
 
   FEQ (MIR_FEQ, "V0", "0F 9B") DEQ (MIR_DEQ, "V0", "0F 9B")   /* 1. fp cmps */
   LDEQ (MIR_LDEQ, "V0", "0F 9B") FEQ (MIR_FNE, "V1", "0F 9A") /* 2. fp cmps */
@@ -1776,11 +1786,23 @@ static struct pattern patterns[] = {
   BCMPS (MIR_BGT, "7F") BCMPS (MIR_UBGT, "77") /* 4. int compare and branch */
   BCMPS (MIR_BGE, "7D") BCMPS (MIR_UBGE, "73") /* 5. int compare and branch */
 
+  SBCMPS (MIR_BEQS, "74") SBCMPS (MIR_BNES, "75")  /* 1. short compare and branch */
+  SBCMPS (MIR_BLTS, "7C") SBCMPS (MIR_UBLTS, "72") /* 2. short compare and branch */
+  SBCMPS (MIR_BLES, "7E") SBCMPS (MIR_UBLES, "76") /* 3. short compare and branch */
+  SBCMPS (MIR_BGTS, "7F") SBCMPS (MIR_UBGTS, "77") /* 4. short compare and branch */
+  SBCMPS (MIR_BGES, "7D") SBCMPS (MIR_UBGES, "73") /* 5. short compare and branch */
+
   BCMP (MIR_BEQ, "0F 84") BCMP (MIR_BNE, "0F 85")  /* 1. int compare and branch */
   BCMP (MIR_BLT, "0F 8C") BCMP (MIR_UBLT, "0F 82") /* 2. int compare and branch */
   BCMP (MIR_BLE, "0F 8E") BCMP (MIR_UBLE, "0F 86") /* 3. int compare and branch */
   BCMP (MIR_BGT, "0F 8F") BCMP (MIR_UBGT, "0F 87") /* 4. int compare and branch */
   BCMP (MIR_BGE, "0F 8D") BCMP (MIR_UBGE, "0F 83") /* 5. int compare and branch */
+
+  SBCMP (MIR_BEQS, "0F 84") SBCMP (MIR_BNES, "0F 85")  /* 1. short compare and branch */
+  SBCMP (MIR_BLTS, "0F 8C") SBCMP (MIR_UBLTS, "0F 82") /* 2. short compare and branch */
+  SBCMP (MIR_BLES, "0F 8E") SBCMP (MIR_UBLES, "0F 86") /* 3. short compare and branch */
+  SBCMP (MIR_BGTS, "0F 8F") SBCMP (MIR_UBGTS, "0F 87") /* 4. short compare and branch */
+  SBCMP (MIR_BGES, "0F 8D") SBCMP (MIR_UBGES, "0F 83") /* 5. short compare and branch */
 
 #if 0 /* it is switched off because we change the following insn in machinize pass: */
   FBCMP (MIR_FBLT, "0F 82") DBCMP (MIR_DBLT, "0F 82")   /* 1. fp cmp and branch */
@@ -1875,12 +1897,13 @@ static int pattern_index_cmp (const void *a1, const void *a2) {
 static int get_max_insn_size (gen_ctx_t gen_ctx, const char *replacement);
 
 static void patterns_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   int i, ind, n = sizeof (patterns) / sizeof (struct pattern);
   MIR_insn_code_t prev_code, code;
   insn_pattern_info_t *info_addr;
   insn_pattern_info_t pinfo = {0, 0};
 
-  VARR_CREATE (int, pattern_indexes, 0);
+  VARR_CREATE (int, pattern_indexes, alloc, 0);
   for (i = 0; i < n; i++) {
     patterns[i].max_insn_size = get_max_insn_size (gen_ctx, patterns[i].replacement);
 #if 0
@@ -1890,7 +1913,7 @@ static void patterns_init (gen_ctx_t gen_ctx) {
     VARR_PUSH (int, pattern_indexes, i);
   }
   qsort (VARR_ADDR (int, pattern_indexes), n, sizeof (int), pattern_index_cmp);
-  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, 0);
+  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, alloc, 0);
   for (i = 0; i < MIR_INSN_BOUND; i++) VARR_PUSH (insn_pattern_info_t, insn_pattern_info, pinfo);
   info_addr = VARR_ADDR (insn_pattern_info_t, insn_pattern_info);
   for (prev_code = MIR_INSN_BOUND, i = 0; i < n; i++) {
@@ -3133,17 +3156,18 @@ static void target_redirect_bb_origin_branch (gen_ctx_t gen_ctx, target_bb_versi
 }
 
 static void target_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   MIR_context_t ctx = gen_ctx->ctx;
 
   gen_ctx->target_ctx = gen_malloc (gen_ctx, sizeof (struct target_ctx));
-  VARR_CREATE (uint8_t, result_code, 0);
-  VARR_CREATE (int, insn_pattern_indexes, 0);
-  VARR_CREATE (uint64_t, const_pool, 0);
-  VARR_CREATE (const_ref_t, const_refs, 0);
-  VARR_CREATE (label_ref_t, label_refs, 0);
-  VARR_CREATE (uint64_t, abs_address_locs, 0);
-  VARR_CREATE (MIR_code_reloc_t, relocs, 0);
-  VARR_CREATE (call_ref_t, gen_ctx->target_ctx->call_refs, 0);
+  VARR_CREATE (uint8_t, result_code, alloc, 0);
+  VARR_CREATE (int, insn_pattern_indexes, alloc, 0);
+  VARR_CREATE (uint64_t, const_pool, alloc, 0);
+  VARR_CREATE (const_ref_t, const_refs, alloc, 0);
+  VARR_CREATE (label_ref_t, label_refs, alloc, 0);
+  VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
+  VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
+  VARR_CREATE (call_ref_t, gen_ctx->target_ctx->call_refs, alloc, 0);
   MIR_type_t res = MIR_T_D;
   MIR_var_t args[] = {{MIR_T_D, "src", 0}};
   _MIR_register_unspec_insn (gen_ctx->ctx, MOVDQA_CODE, "movdqa", 1, &res, 1, FALSE, args);
@@ -3153,6 +3177,7 @@ static void target_init (gen_ctx_t gen_ctx) {
 }
 
 static void target_finish (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   patterns_finish (gen_ctx);
   _MIR_free_insn (gen_ctx->ctx, temp_jump);
   VARR_DESTROY (uint8_t, result_code);
@@ -3163,6 +3188,6 @@ static void target_finish (gen_ctx_t gen_ctx) {
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
   VARR_DESTROY (call_ref_t, gen_ctx->target_ctx->call_refs);
-  free (gen_ctx->target_ctx);
+  MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }

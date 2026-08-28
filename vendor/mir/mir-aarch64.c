@@ -91,7 +91,7 @@ void *va_arg_builtin (void *p, uint64_t t) {
     va->__gr_offs += 8;
   } else {
     if (type == MIR_T_LD && __SIZEOF_LONG_DOUBLE__ == 16)
-      va->__stack = (void *) (((uint64_t) va->__stack + 15) % 16);
+      va->__stack = (void *) (((uint64_t) va->__stack + 15) / 16 * 16);
     a = va->__stack;
     va->__stack
       = (char *) va->__stack + (type == MIR_T_LD && __SIZEOF_LONG_DOUBLE__ == 16 ? 16 : 8);
@@ -207,8 +207,10 @@ void *_MIR_get_thunk (MIR_context_t ctx) {
   return _MIR_publish_code (ctx, (uint8_t *) pat, sizeof (pat));
 }
 
-void _MIR_redirect_thunk (MIR_context_t ctx, void *thunk, void *to) {
-  static const uint32_t branch_pat1 = 0xd61f0120; /* br x9 */
+/* The far form clobbers x<temp_reg>: callers must pick a register that holds
+   nothing live at the redirect site.  */
+static void redirect_thunk_by_reg (MIR_context_t ctx, void *thunk, void *to,
+                                   unsigned temp_reg) {
   static const uint32_t branch_pat2 = 0x14000000; /* b x */
   int64_t offset = (uint32_t *) to - (uint32_t *) thunk;
   uint32_t code[4];
@@ -218,11 +220,15 @@ void _MIR_redirect_thunk (MIR_context_t ctx, void *thunk, void *to) {
     code[0] = branch_pat2 | ((uint32_t) offset & BR_OFFSET_MASK);
     _MIR_change_code (ctx, thunk, (uint8_t *) &code[0], sizeof (code[0]));
   } else {
-    code[0] = 0x58000049; /* ldr x9,8 (pc-relative) */
-    code[1] = branch_pat1;
+    code[0] = 0x58000040 | temp_reg;        /* ldr x<temp_reg>,8 (pc-relative) */
+    code[1] = 0xd61f0000 | (temp_reg << 5); /* br x<temp_reg> */
     *(void **) &code[2] = to;
     _MIR_change_code (ctx, thunk, (uint8_t *) code, sizeof (code));
   }
+}
+
+void _MIR_redirect_thunk (MIR_context_t ctx, void *thunk, void *to) {
+  redirect_thunk_by_reg (ctx, thunk, to, 9);
 }
 
 void *_MIR_get_thunk_addr (MIR_context_t ctx MIR_UNUSED, void *thunk) {
@@ -334,7 +340,7 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   mir_assert (__SIZEOF_LONG_DOUBLE__ == 8 || __SIZEOF_LONG_DOUBLE__ == 16);
   for (size_t i = 0; i < nargs; i++) { /* calculate offset for blk params */
 #if defined(__APPLE__)                 /* all varargs are passed on stack */
@@ -414,7 +420,8 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
       if (n_vregs < 8) {
         pat |= offset_imm | n_vregs++;
       } else {
-        if (type == MIR_T_LD && __SIZEOF_LONG_DOUBLE__ == 16) sp_offset = (sp_offset + 15) % 16;
+        if (type == MIR_T_LD && __SIZEOF_LONG_DOUBLE__ == 16)
+          sp_offset = (sp_offset + 15) / 16 * 16;
         pat |= offset_imm | temp_reg;
         push_insns (code, &pat, sizeof (pat));
         pat = type == MIR_T_F                                  ? sts_pat
@@ -516,7 +523,7 @@ void *_MIR_get_interp_shim (MIR_context_t ctx, MIR_item_t func_item, void *handl
   VARR (uint8_t) * code;
   void *res;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
 #if defined(__APPLE__)
   int stack_arg_sp_offset, sp_offset, scale;
   uint32_t qwords, sp = 31;
@@ -683,7 +690,7 @@ void *_MIR_get_wrapper (MIR_context_t ctx, MIR_item_t called_func, void *hook_ad
   size_t len = 5 * 4; /* initial len */
   VARR (uint8_t) * code;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   for (;;) { /* dealing with moving code to another page as the immediate call is pc relative */
     curr_addr = base_addr = _MIR_get_new_code_addr (ctx, len);
     if (curr_addr == NULL) break;
@@ -736,7 +743,7 @@ void *_MIR_get_wrapper_end (MIR_context_t ctx) {
   VARR (uint8_t) * code;
   size_t len;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   push_insns (code, wrap_end, sizeof (wrap_end));
   len = VARR_LENGTH (uint8_t, code);
   res_code = _MIR_publish_code (ctx, VARR_ADDR (uint8_t, code), len);
@@ -752,11 +759,16 @@ void *_MIR_get_bb_thunk (MIR_context_t ctx, void *bb_version, void *handler) {
   size_t offset;
   VARR (uint8_t) * code;
 
-  VARR_CREATE (uint8_t, code, 64);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 64);
   offset = gen_mov_addr (code, 9, bb_version); /* x9 = bb_version */
   push_insns (code, pat, sizeof (pat));
   res = _MIR_publish_code (ctx, VARR_ADDR (uint8_t, code), VARR_LENGTH (uint8_t, code));
-  _MIR_redirect_thunk (ctx, (uint8_t *) res + offset, handler);
+  /* x9 carries bb_version to the handler, so the branch to the handler must
+     not use _MIR_redirect_thunk's x9-based far form: when the thunk ends up
+     farther than a direct branch can reach (+-128MB) from the handler, the
+     handler would receive its own address instead of bb_version.  Use x10,
+     the other fixed temp not used in machinized code.  */
+  redirect_thunk_by_reg (ctx, (uint8_t *) res + offset, handler, 10);
 #if 0
   if (getenv ("MIR_code_dump") != NULL)
     _MIR_dump_code ("bb thunk:", res, VARR_LENGTH (uint8_t, code));
@@ -818,7 +830,7 @@ void *_MIR_get_bb_wrapper (MIR_context_t ctx, void *data, void *hook_address) {
   void *res;
   VARR (uint8_t) * code;
 
-  VARR_CREATE (uint8_t, code, 128);
+  VARR_CREATE (uint8_t, code, ctx->alloc, 128);
   push_insns (code, &save_fplr, sizeof (save_fplr));
   push_insns (code, save_insns, sizeof (save_insns));
   push_insns (code, save_insns2, sizeof (save_insns2));

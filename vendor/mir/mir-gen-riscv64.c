@@ -256,7 +256,7 @@ static void gen_blk_mov (gen_ctx_t gen_ctx, MIR_insn_t anchor, size_t to_disp,
   if (save_regs > 1)
     gen_mov (gen_ctx, anchor, MIR_MOV, _MIR_new_var_op (ctx, A1_HARD_REG), treg_op2);
   if (save_regs > 2)
-    gen_mov (gen_ctx, anchor, MIR_MOV, _MIR_new_var_op (ctx, R2_HARD_REG), treg_op3);
+    gen_mov (gen_ctx, anchor, MIR_MOV, _MIR_new_var_op (ctx, A2_HARD_REG), treg_op3);
 }
 
 #define FMVXW_CODE 0
@@ -388,16 +388,22 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
         }
         continue;
       }
-      /* Put on stack and pass the address: */
-      gen_blk_mov (gen_ctx, call_insn, blk_offset, SP_HARD_REG, arg_op.u.mem.base, qwords,
-                   int_arg_num);
+      /* Put on stack and pass the address.  The copy and the address
+         computation must stay BEFORE all the argument hard reg loads: for
+         qwords > 16 the copy is a call to mir.blk_mov, which would clobber
+         argument values already loaded into caller-saved regs (fa0-fa7,
+         a0-a7) if emitted next to the call insn.  Advance
+         curr_prev_call_insn to the ADD itself so several block args keep
+         this prologue region contiguous.  */
+      MIR_reg_t blk_base_reg = arg_op.u.mem.base;
       arg_op = _MIR_new_var_op (ctx, gen_new_temp_reg (gen_ctx, MIR_T_I64, func));
       gen_assert (curr_prev_call_insn
                   != NULL); /* call_insn should not be 1st after simplification */
       new_insn = MIR_new_insn (gen_ctx->ctx, MIR_ADD, arg_op, _MIR_new_var_op (ctx, SP_HARD_REG),
                                MIR_new_int_op (ctx, blk_offset));
       gen_add_insn_after (gen_ctx, curr_prev_call_insn, new_insn);
-      curr_prev_call_insn = DLIST_NEXT (MIR_insn_t, new_insn);
+      gen_blk_mov (gen_ctx, new_insn, blk_offset, SP_HARD_REG, blk_base_reg, qwords, 0);
+      curr_prev_call_insn = new_insn;
       blk_offset += qwords * 8;
     }
     if ((arg_reg
@@ -1806,15 +1812,16 @@ static int pattern_index_cmp (const void *a1, const void *a2) {
 }
 
 static void patterns_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   int i, ind, n = sizeof (patterns) / sizeof (struct pattern);
   MIR_insn_code_t prev_code, code;
   insn_pattern_info_t *info_addr;
   insn_pattern_info_t pinfo = {0, 0};
 
-  VARR_CREATE (int, pattern_indexes, 0);
+  VARR_CREATE (int, pattern_indexes, alloc, 0);
   for (i = 0; i < n; i++) VARR_PUSH (int, pattern_indexes, i);
   qsort (VARR_ADDR (int, pattern_indexes), n, sizeof (int), pattern_index_cmp);
-  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, 0);
+  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, alloc, 0);
   for (i = 0; i < MIR_INSN_BOUND; i++) VARR_PUSH (insn_pattern_info_t, insn_pattern_info, pinfo);
   info_addr = VARR_ADDR (insn_pattern_info_t, insn_pattern_info);
   for (prev_code = MIR_INSN_BOUND, i = 0; i < n; i++) {
@@ -2967,14 +2974,15 @@ static void target_redirect_bb_origin_branch (gen_ctx_t gen_ctx, target_bb_versi
 }
 
 static void target_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   MIR_context_t ctx = gen_ctx->ctx;
   check_hard_reg_alloc_order ();
   gen_ctx->target_ctx = gen_malloc (gen_ctx, sizeof (struct target_ctx));
-  VARR_CREATE (uint8_t, result_code, 0);
-  VARR_CREATE (label_ref_t, label_refs, 0);
-  VARR_CREATE (const_ref_t, const_refs, 0);
-  VARR_CREATE (uint64_t, abs_address_locs, 0);
-  VARR_CREATE (MIR_code_reloc_t, relocs, 0);
+  VARR_CREATE (uint8_t, result_code, alloc, 0);
+  VARR_CREATE (label_ref_t, label_refs, alloc, 0);
+  VARR_CREATE (const_ref_t, const_refs, alloc, 0);
+  VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
+  VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
   MIR_type_t res = MIR_T_I64;
   MIR_var_t args1[] = {{MIR_T_F, "src", 0}};
   MIR_var_t args2[] = {{MIR_T_D, "src", 0}};
@@ -2986,6 +2994,7 @@ static void target_init (gen_ctx_t gen_ctx) {
 }
 
 static void target_finish (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   patterns_finish (gen_ctx);
   _MIR_free_insn (gen_ctx->ctx, temp_jump);
   VARR_DESTROY (uint8_t, result_code);
@@ -2993,6 +3002,6 @@ static void target_finish (gen_ctx_t gen_ctx) {
   VARR_DESTROY (const_ref_t, const_refs);
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
-  free (gen_ctx->target_ctx);
+  MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }

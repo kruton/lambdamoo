@@ -205,6 +205,7 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
   MIR_op_t arg_op, temp_op, arg_reg_op, ret_reg_op, mem_op;
   MIR_insn_code_t new_insn_code, ext_code;
   MIR_insn_t new_insn, ext_insn;
+  MIR_insn_t prev_call_insn = DLIST_PREV (MIR_insn_t, call_insn);
 
   if (call_insn->code == MIR_INLINE) call_insn->code = MIR_CALL;
   if (proto->args == NULL) {
@@ -290,9 +291,19 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
                  _MIR_new_var_mem_op (ctx, MIR_T_I64, disp, arg_op.u.mem.base, MIR_NON_VAR, 1));
         setup_call_hard_reg_args (gen_ctx, call_insn, R3_HARD_REG + n_iregs);
       }
-      if (qwords > 0)
-        gen_blk_mov (gen_ctx, call_insn, mem_size + PPC64_STACK_HEADER_SIZE, SP_HARD_REG, disp,
-                     arg_op.u.mem.base, qwords, n_iregs);
+      if (qwords > 0) {
+        /* The copy of the block tail must happen BEFORE all the argument
+           hard reg loads: for qwords > 16 it is a call to mir.blk_mov, which
+           would clobber argument values already loaded into caller-saved
+           regs (f1-f13, r3-r10) if emitted next to the call insn.  Anchoring
+           at the insn following prev_call_insn puts it ahead of every arg
+           load emitted so far (SP is fixed here: the param area is part of
+           the frame).  */
+        gen_assert (prev_call_insn != NULL); /* call_insn should not be 1st */
+        gen_blk_mov (gen_ctx, DLIST_NEXT (MIR_insn_t, prev_call_insn),
+                     mem_size + PPC64_STACK_HEADER_SIZE, SP_HARD_REG, disp, arg_op.u.mem.base,
+                     qwords, 0);
+      }
       mem_size += qwords * 8;
       n_iregs += qwords;
       continue;
@@ -1478,15 +1489,16 @@ static int pattern_index_cmp (const void *a1, const void *a2) {
 }
 
 static void patterns_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   int i, ind, n = sizeof (patterns) / sizeof (struct pattern);
   MIR_insn_code_t prev_code, code;
   insn_pattern_info_t *info_addr;
   insn_pattern_info_t pinfo = {0, 0};
 
-  VARR_CREATE (int, pattern_indexes, 0);
+  VARR_CREATE (int, pattern_indexes, alloc, 0);
   for (i = 0; i < n; i++) VARR_PUSH (int, pattern_indexes, i);
   qsort (VARR_ADDR (int, pattern_indexes), n, sizeof (int), pattern_index_cmp);
-  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, 0);
+  VARR_CREATE (insn_pattern_info_t, insn_pattern_info, alloc, 0);
   for (i = 0; i < MIR_INSN_BOUND; i++) VARR_PUSH (insn_pattern_info_t, insn_pattern_info, pinfo);
   info_addr = VARR_ADDR (insn_pattern_info_t, insn_pattern_info);
   for (prev_code = MIR_INSN_BOUND, i = 0; i < n; i++) {
@@ -2621,25 +2633,27 @@ static void target_redirect_bb_origin_branch (gen_ctx_t gen_ctx, target_bb_versi
 }
 
 static void target_init (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   MIR_context_t ctx = gen_ctx->ctx;
 
   gen_ctx->target_ctx = gen_malloc (gen_ctx, sizeof (struct target_ctx));
-  VARR_CREATE (uint8_t, result_code, 0);
-  VARR_CREATE (label_ref_t, label_refs, 0);
-  VARR_CREATE (uint64_t, abs_address_locs, 0);
-  VARR_CREATE (MIR_code_reloc_t, relocs, 0);
+  VARR_CREATE (uint8_t, result_code, alloc, 0);
+  VARR_CREATE (label_ref_t, label_refs, alloc, 0);
+  VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
+  VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
   patterns_init (gen_ctx);
   temp_jump = MIR_new_insn (ctx, MIR_JMP, MIR_new_label_op (ctx, NULL));
   temp_jump_replacement = find_insn_pattern_replacement (gen_ctx, temp_jump, FALSE);
 }
 
 static void target_finish (gen_ctx_t gen_ctx) {
+  MIR_alloc_t alloc = gen_alloc (gen_ctx);
   patterns_finish (gen_ctx);
   _MIR_free_insn (gen_ctx->ctx, temp_jump);
   VARR_DESTROY (uint8_t, result_code);
   VARR_DESTROY (label_ref_t, label_refs);
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
-  free (gen_ctx->target_ctx);
+  MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }

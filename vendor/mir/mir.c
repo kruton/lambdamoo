@@ -3,6 +3,7 @@
 */
 
 #include "mir.h"
+#include "mir-code-alloc.h"
 
 DEF_VARR (MIR_insn_t);
 DEF_VARR (MIR_reg_t);
@@ -31,6 +32,8 @@ struct MIR_context {
   struct gen_ctx *gen_ctx;     /* should be the 1st member */
   struct c2mir_ctx *c2mir_ctx; /* should be the 2nd member */
   MIR_error_func_t error_func;
+  MIR_alloc_t alloc;
+  MIR_code_alloc_t code_alloc;
   int func_redef_permission_p;        /* when true loaded func can be redfined lately */
   VARR (size_t) * insn_nops;          /* constant after initialization */
   VARR (MIR_proto_t) * unspec_protos; /* protos of unspec insns (set only during initialization) */
@@ -92,7 +95,7 @@ static void util_error (MIR_context_t ctx, const char *message);
 #include <limits.h>
 
 static void interp_init (MIR_context_t ctx);
-static void finish_func_interpretation (MIR_item_t func_item);
+static void finish_func_interpretation (MIR_item_t func_item, MIR_alloc_t alloc);
 static void interp_finish (MIR_context_t ctx);
 
 static void MIR_NO_RETURN default_error (enum MIR_error_type error_type MIR_UNUSED,
@@ -310,7 +313,7 @@ static const struct insn_desc insn_descs[] = {
   {MIR_UBO, "ubo", {MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_BNO, "bno", {MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_UBNO, "ubno", {MIR_OP_LABEL, MIR_OP_BOUND}},
-  {MIR_LADDR, "laddr", {MIR_OP_INT, MIR_OP_LABEL, MIR_OP_BOUND}},
+  {MIR_LADDR, "laddr", {MIR_OP_INT | OUT_FLAG, MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_JMPI, "jmpi", {MIR_OP_INT, MIR_OP_BOUND}},
   {MIR_CALL, "call", {MIR_OP_BOUND}},
   {MIR_INLINE, "inline", {MIR_OP_BOUND}},
@@ -340,11 +343,10 @@ static const struct insn_desc insn_descs[] = {
 static void check_and_prepare_insn_descs (MIR_context_t ctx) {
   size_t i, j;
 
-  VARR_CREATE (size_t, insn_nops, 0);
+  VARR_CREATE (size_t, insn_nops, ctx->alloc, 0);
   for (i = 0; i < MIR_INSN_BOUND; i++) {
     mir_assert (insn_descs[i].code == i);
-    for (j = 0; insn_descs[i].op_modes[j] != MIR_OP_BOUND; j++)
-      ;
+    for (j = 0; insn_descs[i].op_modes[j] != MIR_OP_BOUND; j++);
     VARR_PUSH (size_t, insn_nops, j);
   }
 }
@@ -388,12 +390,12 @@ static int str_eq (string_t str1, string_t str2, void *arg MIR_UNUSED) {
   return str1.str.len == str2.str.len && memcmp (str1.str.s, str2.str.s, str1.str.len) == 0;
 }
 
-static void string_init (VARR (string_t) * *strs, HTAB (string_t) * *str_tab) {
+static void string_init (MIR_alloc_t alloc, VARR (string_t) * *strs, HTAB (string_t) * *str_tab) {
   string_t string = {0, {0, NULL}};
 
-  VARR_CREATE (string_t, *strs, 0);
+  VARR_CREATE (string_t, *strs, alloc, 0);
   VARR_PUSH (string_t, *strs, string); /* don't use 0th string */
-  HTAB_CREATE (string_t, *str_tab, 1000, str_hash, str_eq, NULL);
+  HTAB_CREATE (string_t, *str_tab, alloc, 1000, str_hash, str_eq, NULL);
 }
 
 static int string_find (VARR (string_t) * *strs MIR_UNUSED, HTAB (string_t) * *str_tab,
@@ -410,7 +412,7 @@ static string_t string_store (MIR_context_t ctx, VARR (string_t) * *strs,
   string_t el, string;
 
   if (string_find (strs, str_tab, str, &el)) return el;
-  if ((heap_str = malloc (str.len)) == NULL)
+  if ((heap_str = MIR_malloc (ctx->alloc, str.len)) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for strings");
   memcpy (heap_str, str.s, str.len);
   string.str.s = heap_str;
@@ -426,14 +428,14 @@ static struct string get_ctx_string (MIR_context_t ctx, MIR_str_t str) {
 }
 
 static const char *get_ctx_str (MIR_context_t ctx, const char *string) {
-  return get_ctx_string (ctx, (MIR_str_t){strlen (string) + 1, string}).str.s;
+  return get_ctx_string (ctx, (MIR_str_t) {strlen (string) + 1, string}).str.s;
 }
 
-static void string_finish (VARR (string_t) * *strs, HTAB (string_t) * *str_tab) {
+static void string_finish (MIR_alloc_t alloc, VARR (string_t) * *strs, HTAB (string_t) * *str_tab) {
   size_t i;
 
   for (i = 1; i < VARR_LENGTH (string_t, *strs); i++)
-    free ((char *) VARR_ADDR (string_t, *strs)[i].str.s);
+    MIR_free (alloc, (char *) VARR_ADDR (string_t, *strs)[i].str.s);
   VARR_DESTROY (string_t, *strs);
   HTAB_DESTROY (string_t, *str_tab);
 }
@@ -450,7 +452,7 @@ struct alias_ctx {
 
 MIR_alias_t MIR_alias (MIR_context_t ctx, const char *name) {
   return (MIR_alias_t) string_store (ctx, &aliases, &alias_tab,
-                                     (MIR_str_t){strlen (name) + 1, name})
+                                     (MIR_str_t) {strlen (name) + 1, name})
     .num;
 }
 
@@ -528,13 +530,15 @@ static void func_regs_init (MIR_context_t ctx, MIR_func_t func) {
   func_regs_t func_regs;
   reg_desc_t rd = {MIR_T_I64, 0, NULL, NULL};
 
-  if ((func_regs = func->internal = malloc (sizeof (struct func_regs))) == NULL)
+  if ((func_regs = func->internal = MIR_malloc (ctx->alloc, sizeof (struct func_regs))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for func regs info");
-  VARR_CREATE (reg_desc_t, func_regs->reg_descs, 50);
+  VARR_CREATE (reg_desc_t, func_regs->reg_descs, ctx->alloc, 50);
   VARR_PUSH (reg_desc_t, func_regs->reg_descs, rd); /* for 0 reg */
-  HTAB_CREATE (size_t, func_regs->name2rdn_tab, 100, name2rdn_hash, name2rdn_eq, func_regs);
-  HTAB_CREATE (size_t, func_regs->hrn2rdn_tab, 10, hrn2rdn_hash, hrn2rdn_eq, func_regs);
-  HTAB_CREATE (size_t, func_regs->reg2rdn_tab, 100, reg2rdn_hash, reg2rdn_eq, func_regs);
+  HTAB_CREATE (size_t, func_regs->name2rdn_tab, ctx->alloc, 100, name2rdn_hash, name2rdn_eq,
+               func_regs);
+  HTAB_CREATE (size_t, func_regs->hrn2rdn_tab, ctx->alloc, 10, hrn2rdn_hash, hrn2rdn_eq, func_regs);
+  HTAB_CREATE (size_t, func_regs->reg2rdn_tab, ctx->alloc, 100, reg2rdn_hash, reg2rdn_eq,
+               func_regs);
 }
 
 static int target_locs_num (MIR_reg_t loc, MIR_type_t type);
@@ -590,7 +594,7 @@ static MIR_reg_t create_func_reg (MIR_context_t ctx, MIR_func_t func, const char
       return rd_ref->reg;
     }
     func_module = func->func_item->module;
-    if (func_module->data == NULL) func_module->data = bitmap_create2 (128);
+    if (func_module->data == NULL) func_module->data = bitmap_create2 (ctx->alloc, 128);
     bitmap_set_bit_p (func_module->data, hr); /* hard regs used for globals */
   }
   *name_ptr = rd.name;
@@ -612,7 +616,7 @@ static void func_regs_finish (MIR_context_t ctx MIR_UNUSED, MIR_func_t func) {
   HTAB_DESTROY (size_t, func_regs->name2rdn_tab);
   HTAB_DESTROY (size_t, func_regs->hrn2rdn_tab);
   HTAB_DESTROY (size_t, func_regs->reg2rdn_tab);
-  free (func->internal);
+  MIR_free (ctx->alloc, func->internal);
   func->internal = NULL;
 }
 
@@ -666,6 +670,8 @@ MIR_error_func_t MIR_get_error_func (MIR_context_t ctx) { return error_func; }  
 void MIR_set_error_func (MIR_context_t ctx, MIR_error_func_t func) {  // ?? atomic access
   error_func = func;
 }
+
+MIR_alloc_t MIR_get_alloc (MIR_context_t ctx) { return ctx->alloc; }
 
 int MIR_get_func_redef_permission_p (MIR_context_t ctx) { return func_redef_permission_p; }
 
@@ -721,11 +727,17 @@ double _MIR_get_api_version (void) { return MIR_API_VERSION; }
 static void hard_reg_name_init (MIR_context_t ctx);
 static void hard_reg_name_finish (MIR_context_t ctx);
 
-MIR_context_t _MIR_init (void) {
+#include "mir-alloc-default.c"
+#include "mir-code-alloc-default.c"
+
+MIR_context_t _MIR_init (MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) {
   MIR_context_t ctx;
 
+  if (alloc == NULL) alloc = &default_alloc;
+  if (code_alloc == NULL) code_alloc = &default_code_alloc;
+
   mir_assert (MIR_OP_BOUND < OUT_FLAG);
-  if ((ctx = malloc (sizeof (struct MIR_context))) == NULL)
+  if ((ctx = MIR_malloc (alloc, sizeof (struct MIR_context))) == NULL)
     default_error (MIR_alloc_error, "Not enough memory for ctx");
   ctx->string_ctx = NULL;
   ctx->alias_ctx = NULL;
@@ -739,33 +751,35 @@ MIR_context_t _MIR_init (void) {
 #ifndef NDEBUG
   for (MIR_insn_code_t c = 0; c < MIR_INVALID_INSN; c++) mir_assert (c == insn_descs[c].code);
 #endif
+  ctx->alloc = alloc;
+  ctx->code_alloc = code_alloc;
   error_func = default_error;
   func_redef_permission_p = FALSE;
   curr_module = NULL;
   curr_func = NULL;
   curr_label_num = 0;
-  if ((ctx->string_ctx = malloc (sizeof (struct string_ctx))) == NULL
-      || (ctx->alias_ctx = malloc (sizeof (struct string_ctx))) == NULL)
+  if ((ctx->string_ctx = MIR_malloc (alloc, sizeof (struct string_ctx))) == NULL
+      || (ctx->alias_ctx = MIR_malloc (alloc, sizeof (struct string_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
-  string_init (&strings, &string_tab);
-  string_init (&aliases, &alias_tab);
-  VARR_CREATE (MIR_proto_t, unspec_protos, 0);
+  string_init (alloc, &strings, &string_tab);
+  string_init (alloc, &aliases, &alias_tab);
+  VARR_CREATE (MIR_proto_t, unspec_protos, alloc, 0);
   check_and_prepare_insn_descs (ctx);
   DLIST_INIT (MIR_module_t, all_modules);
   simplify_init (ctx);
-  VARR_CREATE (char, temp_string, 64);
-  VARR_CREATE (uint8_t, temp_data, 512);
-  VARR_CREATE (uint8_t, used_label_p, 512);
+  VARR_CREATE (char, temp_string, alloc, 64);
+  VARR_CREATE (uint8_t, temp_data, alloc, 512);
+  VARR_CREATE (uint8_t, used_label_p, alloc, 512);
 #if !MIR_NO_IO
   io_init (ctx);
 #endif
 #if !MIR_NO_SCAN
   scan_init (ctx);
 #endif
-  VARR_CREATE (MIR_module_t, modules_to_link, 0);
-  VARR_CREATE (MIR_op_t, temp_ops, 0);
+  VARR_CREATE (MIR_module_t, modules_to_link, alloc, 0);
+  VARR_CREATE (MIR_op_t, temp_ops, alloc, 0);
   init_module (ctx, &environment_module, ".environment");
-  HTAB_CREATE (MIR_item_t, module_item_tab, 512, item_hash, item_eq, NULL);
+  HTAB_CREATE (MIR_item_t, module_item_tab, ctx->alloc, 512, item_hash, item_eq, NULL);
   setjmp_addr = NULL;
   code_init (ctx);
   wrapper_end_addr = _MIR_get_wrapper_end (ctx); /* should be after code_init */
@@ -780,7 +794,7 @@ static void remove_insn (MIR_context_t ctx, MIR_item_t func_item, MIR_insn_t ins
   if (func_item->item_type != MIR_func_item)
     MIR_get_error_func (ctx) (MIR_wrong_param_value_error, "MIR_remove_insn: wrong func item");
   DLIST_REMOVE (MIR_insn_t, *insns, insn);
-  free (insn);
+  MIR_free (ctx->alloc, insn);
 }
 
 void MIR_remove_insn (MIR_context_t ctx, MIR_item_t func_item, MIR_insn_t insn) {
@@ -805,39 +819,39 @@ static void remove_item (MIR_context_t ctx, MIR_item_t item) {
     VARR_DESTROY (MIR_var_t, item->u.func->vars);
     if (item->u.func->global_vars != NULL) VARR_DESTROY (MIR_var_t, item->u.func->global_vars);
     func_regs_finish (ctx, item->u.func);
-    free (item->u.func);
+    MIR_free (ctx->alloc, item->u.func);
     break;
   case MIR_proto_item:
     VARR_DESTROY (MIR_var_t, item->u.proto->args);
-    free (item->u.proto);
+    MIR_free (ctx->alloc, item->u.proto);
     break;
   case MIR_import_item:
   case MIR_export_item:
   case MIR_forward_item: break;
   case MIR_data_item:
-    if (item->addr != NULL && item->section_head_p) free (item->addr);
-    free (item->u.data);
+    if (item->addr != NULL && item->section_head_p) MIR_free (ctx->alloc, item->addr);
+    MIR_free (ctx->alloc, item->u.data);
     break;
   case MIR_ref_data_item:
-    if (item->addr != NULL && item->section_head_p) free (item->addr);
-    free (item->u.ref_data);
+    if (item->addr != NULL && item->section_head_p) MIR_free (ctx->alloc, item->addr);
+    MIR_free (ctx->alloc, item->u.ref_data);
     break;
   case MIR_lref_data_item:
-    if (item->addr != NULL && item->section_head_p) free (item->addr);
-    free (item->u.lref_data);
+    if (item->addr != NULL && item->section_head_p) MIR_free (ctx->alloc, item->addr);
+    MIR_free (ctx->alloc, item->u.lref_data);
     break;
   case MIR_expr_data_item:
-    if (item->addr != NULL && item->section_head_p) free (item->addr);
-    free (item->u.expr_data);
+    if (item->addr != NULL && item->section_head_p) MIR_free (ctx->alloc, item->addr);
+    MIR_free (ctx->alloc, item->u.expr_data);
     break;
   case MIR_bss_item:
-    if (item->addr != NULL && item->section_head_p) free (item->addr);
-    free (item->u.bss);
+    if (item->addr != NULL && item->section_head_p) MIR_free (ctx->alloc, item->addr);
+    MIR_free (ctx->alloc, item->u.bss);
     break;
   default: mir_assert (FALSE);
   }
-  if (item->data != NULL) free (item->data);
-  free (item);
+  if (item->data != NULL) MIR_free (ctx->alloc, item->data);
+  MIR_free (ctx->alloc, item);
 }
 
 static void remove_module (MIR_context_t ctx, MIR_module_t module, int free_module_p) {
@@ -848,7 +862,7 @@ static void remove_module (MIR_context_t ctx, MIR_module_t module, int free_modu
     remove_item (ctx, item);
   }
   if (module->data != NULL) bitmap_destroy (module->data);
-  if (free_module_p) free (module);
+  if (free_module_p) MIR_free (ctx->alloc, module);
 }
 
 static void remove_all_modules (MIR_context_t ctx) {
@@ -879,11 +893,11 @@ void MIR_finish (MIR_context_t ctx) {
   while (VARR_LENGTH (MIR_proto_t, unspec_protos) != 0) {
     MIR_proto_t proto = VARR_POP (MIR_proto_t, unspec_protos);
     VARR_DESTROY (MIR_var_t, proto->args);
-    free (proto);
+    MIR_free (ctx->alloc, proto);
   }
   VARR_DESTROY (MIR_proto_t, unspec_protos);
-  string_finish (&strings, &string_tab);
-  string_finish (&aliases, &alias_tab);
+  string_finish (ctx->alloc, &strings, &string_tab);
+  string_finish (ctx->alloc, &aliases, &alias_tab);
   simplify_finish (ctx);
   VARR_DESTROY (size_t, insn_nops);
   code_finish (ctx);
@@ -894,9 +908,9 @@ void MIR_finish (MIR_context_t ctx) {
   if (curr_module != NULL)
     MIR_get_error_func (ctx) (MIR_finish_error, "finish when module %s is not finished",
                               curr_module->name);
-  free (ctx->string_ctx);
-  free (ctx->alias_ctx);
-  free (ctx);
+  MIR_free (ctx->alloc, ctx->string_ctx);
+  MIR_free (ctx->alloc, ctx->alias_ctx);
+  MIR_free (ctx->alloc, ctx);
   ctx = NULL;
 }
 
@@ -905,7 +919,7 @@ MIR_module_t MIR_new_module (MIR_context_t ctx, const char *name) {
     MIR_get_error_func (ctx) (MIR_nested_module_error,
                               "Creating module when previous module %s is not finished",
                               curr_module->name);
-  if ((curr_module = malloc (sizeof (struct MIR_module))) == NULL)
+  if ((curr_module = MIR_malloc (ctx->alloc, sizeof (struct MIR_module))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for module %s creation", name);
   init_module (ctx, curr_module, name);
   DLIST_APPEND (MIR_module_t, all_modules, curr_module);
@@ -1052,7 +1066,7 @@ static MIR_item_t create_item (MIR_context_t ctx, MIR_item_type_t item_type,
 
   if (curr_module == NULL)
     MIR_get_error_func (ctx) (MIR_no_module_error, "%s outside module", item_name);
-  if ((item = malloc (sizeof (struct MIR_item))) == NULL)
+  if ((item = MIR_malloc (ctx->alloc, sizeof (struct MIR_item))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of item %s",
                               item_name);
   item->data = NULL;
@@ -1081,7 +1095,7 @@ static MIR_item_t new_export_import_forward (MIR_context_t ctx, const char *name
     item->u.forward_id = uniq_name;
   if (create_only_p) return item;
   if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   return item;
@@ -1102,9 +1116,9 @@ MIR_item_t MIR_new_forward (MIR_context_t ctx, const char *name) {
 MIR_item_t MIR_new_bss (MIR_context_t ctx, const char *name, size_t len) {
   MIR_item_t tab_item, item = create_item (ctx, MIR_bss_item, "bss");
 
-  item->u.bss = malloc (sizeof (struct MIR_bss));
+  item->u.bss = MIR_malloc (ctx->alloc, sizeof (struct MIR_bss));
   if (item->u.bss == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of bss %s", name);
   }
   if (name != NULL) name = get_ctx_str (ctx, name);
@@ -1113,7 +1127,7 @@ MIR_item_t MIR_new_bss (MIR_context_t ctx, const char *name, size_t len) {
   if (name == NULL) {
     DLIST_APPEND (MIR_item_t, curr_module->items, item);
   } else if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   return item;
@@ -1153,13 +1167,13 @@ MIR_item_t MIR_new_data (MIR_context_t ctx, const char *name, MIR_type_t el_type
   size_t el_len;
 
   if (wrong_type_p (el_type)) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_wrong_type_error, "wrong type in data %s", name);
   }
   el_len = _MIR_type_size (ctx, el_type);
-  item->u.data = data = malloc (sizeof (struct MIR_data) + el_len * nel);
+  item->u.data = data = MIR_malloc (ctx->alloc, sizeof (struct MIR_data) + el_len * nel);
   if (data == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of data %s",
                               name == NULL ? "" : name);
   }
@@ -1168,7 +1182,7 @@ MIR_item_t MIR_new_data (MIR_context_t ctx, const char *name, MIR_type_t el_type
   if (name == NULL) {
     DLIST_APPEND (MIR_item_t, curr_module->items, item);
   } else if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   data->el_type = canon_type (el_type);
@@ -1186,9 +1200,9 @@ MIR_item_t MIR_new_ref_data (MIR_context_t ctx, const char *name, MIR_item_t ref
   MIR_item_t tab_item, item = create_item (ctx, MIR_ref_data_item, "ref data");
   MIR_ref_data_t ref_data;
 
-  item->u.ref_data = ref_data = malloc (sizeof (struct MIR_ref_data));
+  item->u.ref_data = ref_data = MIR_malloc (ctx->alloc, sizeof (struct MIR_ref_data));
   if (ref_data == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of ref data %s",
                               name == NULL ? "" : name);
   }
@@ -1199,7 +1213,7 @@ MIR_item_t MIR_new_ref_data (MIR_context_t ctx, const char *name, MIR_item_t ref
   if (name == NULL) {
     DLIST_APPEND (MIR_item_t, curr_module->items, item);
   } else if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   return item;
@@ -1211,13 +1225,13 @@ MIR_item_t MIR_new_lref_data (MIR_context_t ctx, const char *name, MIR_label_t l
   MIR_lref_data_t lref_data;
 
   if (label == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "null label for lref data %s",
                               name == NULL ? "" : name);
   }
-  item->u.lref_data = lref_data = malloc (sizeof (struct MIR_lref_data));
+  item->u.lref_data = lref_data = MIR_malloc (ctx->alloc, sizeof (struct MIR_lref_data));
   if (lref_data == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of lref data %s",
                               name == NULL ? "" : name);
   }
@@ -1231,7 +1245,7 @@ MIR_item_t MIR_new_lref_data (MIR_context_t ctx, const char *name, MIR_label_t l
   if (name == NULL) {
     DLIST_APPEND (MIR_item_t, curr_module->items, item);
   } else if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   return item;
@@ -1241,9 +1255,9 @@ MIR_item_t MIR_new_expr_data (MIR_context_t ctx, const char *name, MIR_item_t ex
   MIR_item_t tab_item, item = create_item (ctx, MIR_expr_data_item, "expr data");
   MIR_expr_data_t expr_data;
 
-  item->u.expr_data = expr_data = malloc (sizeof (struct MIR_expr_data));
+  item->u.expr_data = expr_data = MIR_malloc (ctx->alloc, sizeof (struct MIR_expr_data));
   if (expr_data == NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of expr data %s",
                               name == NULL ? "" : name);
   }
@@ -1260,7 +1274,7 @@ MIR_item_t MIR_new_expr_data (MIR_context_t ctx, const char *name, MIR_item_t ex
   if (name == NULL) {
     DLIST_APPEND (MIR_item_t, curr_module->items, item);
   } else if ((tab_item = add_item (ctx, item)) != item) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     item = tab_item;
   }
   return item;
@@ -1269,7 +1283,8 @@ MIR_item_t MIR_new_expr_data (MIR_context_t ctx, const char *name, MIR_item_t ex
 static MIR_proto_t create_proto (MIR_context_t ctx, const char *name, size_t nres,
                                  MIR_type_t *res_types, size_t nargs, int vararg_p,
                                  MIR_var_t *args) {
-  MIR_proto_t proto = malloc (sizeof (struct MIR_proto) + nres * sizeof (MIR_type_t));
+  MIR_proto_t proto
+    = MIR_malloc (ctx->alloc, sizeof (struct MIR_proto) + nres * sizeof (MIR_type_t));
   MIR_var_t arg;
 
   if (proto == NULL)
@@ -1279,7 +1294,7 @@ static MIR_proto_t create_proto (MIR_context_t ctx, const char *name, size_t nre
   if (nres != 0) memcpy (proto->res_types, res_types, nres * sizeof (MIR_type_t));
   proto->nres = (uint32_t) nres;
   proto->vararg_p = vararg_p != 0;
-  VARR_CREATE (MIR_var_t, proto->args, nargs);
+  VARR_CREATE (MIR_var_t, proto->args, ctx->alloc, nargs);
   for (size_t i = 0; i < nargs; i++) {
     arg = args[i];
     arg.name = get_ctx_str (ctx, arg.name);
@@ -1371,9 +1386,9 @@ static MIR_item_t new_func_arr (MIR_context_t ctx, const char *name, size_t nres
       MIR_get_error_func (ctx) (MIR_wrong_type_error, "wrong result type in func %s", name);
   func_item = create_item (ctx, MIR_func_item, "function");
   curr_func = func_item->u.func = func
-    = malloc (sizeof (struct MIR_func) + nres * sizeof (MIR_type_t));
+    = MIR_malloc (ctx->alloc, sizeof (struct MIR_func) + nres * sizeof (MIR_type_t));
   if (func == NULL) {
-    free (func_item);
+    MIR_free (ctx->alloc, func_item);
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of func %s", name);
   }
   func->name = get_ctx_str (ctx, name);
@@ -1385,7 +1400,7 @@ static MIR_item_t new_func_arr (MIR_context_t ctx, const char *name, size_t nres
   mir_assert (tab_item == func_item);
   DLIST_INIT (MIR_insn_t, func->insns);
   DLIST_INIT (MIR_insn_t, func->original_insns);
-  VARR_CREATE (MIR_var_t, func->vars, nargs + 8);
+  VARR_CREATE (MIR_var_t, func->vars, ctx->alloc, nargs + 8);
   func->global_vars = NULL;
   func->nargs = (uint32_t) nargs;
   func->last_temp_num = 0;
@@ -1474,7 +1489,7 @@ static MIR_reg_t new_func_reg (MIR_context_t ctx, MIR_func_t func, MIR_type_t ty
   if (hard_reg_name == NULL) {
     VARR_PUSH (MIR_var_t, func->vars, var);
   } else {
-    if (func->global_vars == NULL) VARR_CREATE (MIR_var_t, func->global_vars, 8);
+    if (func->global_vars == NULL) VARR_CREATE (MIR_var_t, func->global_vars, ctx->alloc, 8);
     VARR_PUSH (MIR_var_t, func->global_vars, var);
   }
   return res;
@@ -1757,7 +1772,7 @@ static int setup_global (MIR_context_t ctx, const char *name, void *addr, MIR_it
   item = new_export_import_forward (ctx, name, MIR_import_item, "import", TRUE);
   if ((tab_item = item_tab_find (ctx, MIR_item_name (ctx, item), &environment_module)) != item
       && tab_item != NULL) {
-    free (item);
+    MIR_free (ctx->alloc, item);
     redef_p = TRUE;
   } else {
     HTAB_DO (MIR_item_t, module_item_tab, item, HTAB_INSERT, tab_item);
@@ -1810,7 +1825,7 @@ static MIR_item_t load_bss_data_section (MIR_context_t ctx, MIR_item_t item, int
         break;
     if (section_size % 8 != 0)
       section_size += 8 - section_size % 8; /* we might use 64-bit copying of data */
-    if ((item->addr = malloc (section_size)) == NULL) {
+    if ((item->addr = MIR_malloc (ctx->alloc, section_size)) == NULL) {
       name = MIR_item_name (ctx, item);
       MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory to allocate data/bss %s",
                                 name == NULL ? "" : name);
@@ -2041,7 +2056,7 @@ void MIR_link (MIR_context_t ctx, void (*set_interface) (MIR_context_t ctx, MIR_
       for (item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
            item = DLIST_NEXT (MIR_item_t, item))
         if (item->item_type == MIR_func_item) {
-          finish_func_interpretation (item); /* in case if it was used for expr data */
+          finish_func_interpretation (item, ctx->alloc); /* in case if it was used for expr data */
           set_interface (ctx, item);
         }
     }
@@ -2144,7 +2159,7 @@ static MIR_insn_t create_insn (MIR_context_t ctx, size_t nops, MIR_insn_code_t c
   MIR_insn_t insn;
 
   if (nops == 0) nops = 1;
-  insn = malloc (sizeof (struct MIR_insn) + sizeof (MIR_op_t) * (nops - 1));
+  insn = MIR_malloc (ctx->alloc, sizeof (struct MIR_insn) + sizeof (MIR_op_t) * (nops - 1));
   if (insn == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for insn creation");
 #if defined(_WIN32) || __SIZEOF_LONG_DOUBLE__ == 8
@@ -2347,7 +2362,7 @@ MIR_insn_t MIR_copy_insn (MIR_context_t ctx, MIR_insn_t insn) {
   size_t size;
   mir_assert (insn != NULL);
   size = sizeof (struct MIR_insn) + sizeof (MIR_op_t) * (insn->nops == 0 ? 0 : insn->nops - 1);
-  MIR_insn_t new_insn = malloc (size);
+  MIR_insn_t new_insn = MIR_malloc (ctx->alloc, size);
 
   if (new_insn == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory to copy insn %s",
@@ -2366,7 +2381,7 @@ static MIR_insn_t create_label (MIR_context_t ctx, int64_t label_num) {
 
 MIR_insn_t MIR_new_label (MIR_context_t ctx) { return create_label (ctx, ++curr_label_num); }
 
-void _MIR_free_insn (MIR_context_t ctx MIR_UNUSED, MIR_insn_t insn) { free (insn); }
+void _MIR_free_insn (MIR_context_t ctx MIR_UNUSED, MIR_insn_t insn) { MIR_free (ctx->alloc, insn); }
 
 static MIR_reg_t new_temp_reg (MIR_context_t ctx, MIR_type_t type, MIR_func_t func) {
   char reg_name[30];
@@ -2736,8 +2751,8 @@ void _MIR_duplicate_func_insns (MIR_context_t ctx, MIR_item_t func_item) {
   func->original_vars_num = VARR_LENGTH (MIR_var_t, func->vars);
   func->original_insns = func->insns;
   DLIST_INIT (MIR_insn_t, func->insns);
-  VARR_CREATE (MIR_insn_t, labels, 0);
-  VARR_CREATE (MIR_insn_t, branch_insns, 0);
+  VARR_CREATE (MIR_insn_t, labels, ctx->alloc, 0);
+  VARR_CREATE (MIR_insn_t, branch_insns, ctx->alloc, 0);
   for (insn = DLIST_HEAD (MIR_insn_t, func->original_insns); insn != NULL;
        insn = DLIST_NEXT (MIR_insn_t, insn)) { /* copy insns and collect label info */
     new_insn = MIR_copy_insn (ctx, insn);
@@ -3058,7 +3073,7 @@ void _MIR_output_data_item_els (MIR_context_t ctx, FILE *f, MIR_item_t item, int
   }
   if (data->el_type == MIR_T_U8 && data->nel != 0 && data->u.els[data->nel - 1] == '\0') {
     fprintf (f, c_p ? "/* " : " # "); /* print possible string as a comment */
-    MIR_output_str (ctx, f, (MIR_str_t){data->nel, (char *) data->u.els});
+    MIR_output_str (ctx, f, (MIR_str_t) {data->nel, (char *) data->u.els});
     if (c_p) fprintf (f, " */");
   }
 }
@@ -3222,15 +3237,15 @@ static int val_eq (val_t v1, val_t v2, void *arg) {
 }
 
 static void simplify_init (MIR_context_t ctx) {
-  if ((ctx->simplify_ctx = malloc (sizeof (struct simplify_ctx))) == NULL)
+  if ((ctx->simplify_ctx = MIR_malloc (ctx->alloc, sizeof (struct simplify_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
-  HTAB_CREATE (val_t, val_tab, 512, val_hash, val_eq, ctx);
-  VARR_CREATE (MIR_insn_t, temp_insns, 0);
-  VARR_CREATE (MIR_insn_t, cold_insns, 0);
-  VARR_CREATE (MIR_insn_t, labels, 0);
-  VARR_CREATE (MIR_reg_t, inline_reg_map, 256);
-  VARR_CREATE (MIR_insn_t, anchors, 32);
-  VARR_CREATE (size_t, alloca_sizes, 32);
+  HTAB_CREATE (val_t, val_tab, ctx->alloc, 512, val_hash, val_eq, ctx);
+  VARR_CREATE (MIR_insn_t, temp_insns, ctx->alloc, 0);
+  VARR_CREATE (MIR_insn_t, cold_insns, ctx->alloc, 0);
+  VARR_CREATE (MIR_insn_t, labels, ctx->alloc, 0);
+  VARR_CREATE (MIR_reg_t, inline_reg_map, ctx->alloc, 256);
+  VARR_CREATE (MIR_insn_t, anchors, ctx->alloc, 32);
+  VARR_CREATE (size_t, alloca_sizes, ctx->alloc, 32);
   inlined_calls = inline_insns_before = inline_insns_after = 0;
 }
 
@@ -3248,7 +3263,7 @@ static void simplify_finish (MIR_context_t ctx) {
   VARR_DESTROY (MIR_insn_t, temp_insns);
   VARR_DESTROY (MIR_insn_t, cold_insns);
   HTAB_DESTROY (val_t, val_tab);
-  free (ctx->simplify_ctx);
+  MIR_free (ctx->alloc, ctx->simplify_ctx);
   ctx->simplify_ctx = NULL;
 }
 
@@ -4143,7 +4158,7 @@ static void process_inlines (MIR_context_t ctx, MIR_item_t func_item) {
                                    MIR_new_reg_op (ctx, ret_reg));
           MIR_insert_insn_before (ctx, func_item, anchor, new_insn);
         }
-        free (ret_insn);
+        MIR_free (ctx->alloc, ret_insn);
       }
     }
     redirect_duplicated_labels (ctx, labels, temp_insns);
@@ -4311,68 +4326,10 @@ MIR_item_t _MIR_builtin_func (MIR_context_t ctx, MIR_module_t module, const char
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(__riscv)
-#define PROT_WRITE_EXEC (PROT_WRITE | PROT_READ | PROT_EXEC)
-#else
-#define PROT_WRITE_EXEC (PROT_WRITE | PROT_EXEC)
-#endif
-#define PROT_READ_EXEC (PROT_READ | PROT_EXEC)
-
-#if defined(__APPLE__) && defined(__aarch64__)
-#include <libkern/OSCacheControl.h>
-#include <pthread.h>
-#endif
-
-static int mem_protect (void *addr, size_t len, int prot) {
-#if !defined(__APPLE__) || !defined(__aarch64__)
-  return mprotect (addr, len, prot);
-#else
-  if ((prot & PROT_WRITE) && pthread_jit_write_protect_supported_np ())
-    pthread_jit_write_protect_np (FALSE);
-  if (prot & PROT_READ) {
-    if (pthread_jit_write_protect_supported_np ()) pthread_jit_write_protect_np (TRUE);
-    sys_icache_invalidate (addr, len);
-  } else if (0) {
-    if (mprotect (addr, len, prot) != 0) {
-      perror ("mem_protect");
-      fprintf (stderr, "good bye!\n");
-      exit (1);
-    }
-  }
-  return 0;
-#endif
-}
-
-#define mem_unmap munmap
-
-static void *mem_map (size_t len) {
-#if defined(__APPLE__) && defined(__aarch64__)
-  return mmap (NULL, len, PROT_EXEC | PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT,
-               -1, 0);
-#else
-  return mmap (NULL, len, PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-}
-
 static size_t mem_page_size () { return sysconf (_SC_PAGE_SIZE); }
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-
-#define PROT_WRITE_EXEC PAGE_EXECUTE_READWRITE
-#define PROT_READ_EXEC PAGE_EXECUTE_READ
-#define MAP_FAILED NULL
-
-static int mem_protect (void *addr, size_t len, int prot) {
-  DWORD old_prot = 0;
-  return VirtualProtect (addr, len, prot, &old_prot) ? 0 : -1;
-}
-
-static int mem_unmap (void *addr, size_t len) {
-  return VirtualFree (addr, len, MEM_RELEASE) ? 0 : -1;
-}
-
-static void *mem_map (size_t len) { return VirtualAlloc (NULL, len, MEM_COMMIT, PAGE_EXECUTE); }
 
 static size_t mem_page_size () {
   SYSTEM_INFO sysInfo;
@@ -4392,10 +4349,33 @@ DEF_VARR (code_holder_t);
 struct machine_code_ctx {
   VARR (code_holder_t) * code_holders;
   size_t page_size;
+  uint8_t *code_reserve_start, *code_reserve_free, *code_reserve_bound;
 };
 
 #define code_holders ctx->machine_code_ctx->code_holders
 #define page_size ctx->machine_code_ctx->page_size
+#define code_reserve_start ctx->machine_code_ctx->code_reserve_start
+#define code_reserve_free ctx->machine_code_ctx->code_reserve_free
+#define code_reserve_bound ctx->machine_code_ctx->code_reserve_bound
+
+/* Generated code, thunks, and wrappers reference each other with direct
+   branches whose reach is limited on some targets (e.g. +-128MB on aarch64).
+   Carving all code holders out of one contiguous address-space reservation
+   keeps every piece of generated code within direct branch range of every
+   other one.  The reservation is address space only: untouched pages cost no
+   memory.  Without it, code mappings can end up scattered across the address
+   space -- the libc allocator's own mmaps land between them -- which breaks
+   the bb thunk -> bb wrapper and generated-code -> bb thunk branches of
+   lazy basic-block generation (seen with musl libc's allocator on aarch64).
+   If the reservation is exhausted or unavailable, fall back to individual
+   mappings as before.  */
+#ifndef MIR_CODE_RESERVE_SIZE
+#if UINTPTR_MAX == 0xffffffffffffffffu && !defined(_WIN32)
+#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)
+#else
+#define MIR_CODE_RESERVE_SIZE 0 /* scarce address space (or Windows commit charge) */
+#endif
+#endif
 
 static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   uint8_t *mem;
@@ -4409,8 +4389,13 @@ static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   }
   npages = (size + page_size) / page_size;
   len = page_size * npages;
-  mem = (uint8_t *) mem_map (len);
-  if (mem == MAP_FAILED) return NULL;
+  if (code_reserve_start != NULL && (size_t) (code_reserve_bound - code_reserve_free) >= len) {
+    mem = code_reserve_free;
+    code_reserve_free += len;
+  } else {
+    mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, len);
+    if (mem == MAP_FAILED) return NULL;
+  }
   ch.start = mem;
   ch.free = mem;
   ch.bound = mem + len;
@@ -4426,16 +4411,16 @@ void _MIR_flush_code_cache (void *start, void *bound) {
 }
 
 #if !defined(MIR_BOOTSTRAP) || !defined(__APPLE__) || !defined(__aarch64__)
-void _MIR_set_code (size_t prot_start, size_t prot_len, uint8_t *base, size_t nloc,
-                    const MIR_code_reloc_t *relocs, size_t reloc_size) {
-  mem_protect ((uint8_t *) prot_start, prot_len, PROT_WRITE_EXEC);
+void _MIR_set_code (MIR_code_alloc_t code_alloc, size_t prot_start, size_t prot_len, uint8_t *base,
+                    size_t nloc, const MIR_code_reloc_t *relocs, size_t reloc_size) {
+  MIR_mem_protect (code_alloc, (uint8_t *) prot_start, prot_len, PROT_WRITE_EXEC);
   if (reloc_size == 0) {
     for (size_t i = 0; i < nloc; i++)
       memcpy (base + relocs[i].offset, &relocs[i].value, sizeof (void *));
   } else {
     for (size_t i = 0; i < nloc; i++) memcpy (base + relocs[i].offset, relocs[i].value, reloc_size);
   }
-  mem_protect ((uint8_t *) prot_start, prot_len, PROT_READ_EXEC);
+  MIR_mem_protect (code_alloc, (uint8_t *) prot_start, prot_len, PROT_READ_EXEC);
 }
 #endif
 
@@ -4448,7 +4433,8 @@ static uint8_t *add_code (MIR_context_t ctx MIR_UNUSED, code_holder_t *ch_ptr, c
   MIR_code_reloc_t reloc;
   reloc.offset = 0;
   reloc.value = code;
-  _MIR_set_code ((size_t) ch_ptr->start, ch_ptr->bound - ch_ptr->start, mem, 1, &reloc, code_len);
+  _MIR_set_code (ctx->code_alloc, (size_t) ch_ptr->start, ch_ptr->bound - ch_ptr->start, mem, 1,
+                 &reloc, code_len);
   _MIR_flush_code_cache (mem, ch_ptr->free);
   return mem;
 }
@@ -4482,7 +4468,7 @@ void _MIR_change_code (MIR_context_t ctx, uint8_t *addr, const uint8_t *code,
   len = (size_t) addr + code_len - start;
   reloc.offset = 0;
   reloc.value = code;
-  _MIR_set_code (start, len, addr, 1, &reloc, code_len);
+  _MIR_set_code (ctx->code_alloc, start, len, addr, 1, &reloc, code_len);
   _MIR_flush_code_cache (addr, addr + code_len);
 }
 
@@ -4495,7 +4481,7 @@ void _MIR_update_code_arr (MIR_context_t ctx, uint8_t *base, size_t nloc,
     if (max_offset < relocs[i].offset) max_offset = relocs[i].offset;
   start = (size_t) base / page_size * page_size;
   len = (size_t) base + max_offset + sizeof (void *) - start;
-  _MIR_set_code (start, len, base, nloc, relocs, 0);
+  _MIR_set_code (ctx->code_alloc, start, len, base, nloc, relocs, 0);
   _MIR_flush_code_cache (base, base + max_offset + sizeof (void *));
 }
 
@@ -4520,19 +4506,32 @@ uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size) {
 }
 
 static void code_init (MIR_context_t ctx) {
-  if ((ctx->machine_code_ctx = malloc (sizeof (struct machine_code_ctx))) == NULL)
+  if ((ctx->machine_code_ctx = MIR_malloc (ctx->alloc, sizeof (struct machine_code_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
   page_size = mem_page_size ();
-  VARR_CREATE (code_holder_t, code_holders, 128);
+  VARR_CREATE (code_holder_t, code_holders, ctx->alloc, 128);
+  code_reserve_start = code_reserve_free = code_reserve_bound = NULL;
+  if (MIR_CODE_RESERVE_SIZE != 0) {
+    uint8_t *mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, MIR_CODE_RESERVE_SIZE);
+    if (mem != MAP_FAILED) {
+      code_reserve_start = code_reserve_free = mem;
+      code_reserve_bound = mem + MIR_CODE_RESERVE_SIZE;
+    }
+  }
 }
 
 static void code_finish (MIR_context_t ctx) {
   while (VARR_LENGTH (code_holder_t, code_holders) != 0) {
     code_holder_t ch = VARR_POP (code_holder_t, code_holders);
-    mem_unmap (ch.start, ch.bound - ch.start);
+    if (code_reserve_start != NULL && ch.start >= code_reserve_start
+        && ch.start < code_reserve_bound)
+      continue; /* carved from the reservation, unmapped below as a whole */
+    MIR_mem_unmap (ctx->code_alloc, ch.start, ch.bound - ch.start);
   }
+  if (code_reserve_start != NULL)
+    MIR_mem_unmap (ctx->code_alloc, code_reserve_start, code_reserve_bound - code_reserve_start);
   VARR_DESTROY (code_holder_t, code_holders);
-  free (ctx->machine_code_ctx);
+  MIR_free (ctx->alloc, ctx->machine_code_ctx);
   ctx->machine_code_ctx = NULL;
 }
 
@@ -4728,7 +4727,19 @@ static size_t put_ldouble (MIR_context_t ctx, writer_func_t writer, long double 
   size_t len;
 
   if (writer == NULL) return 0;
+  /* Zero the whole union first: an 80-bit long double occupies only 10 of the
+     16 bytes, so u.ld = ld leaves the 6 padding bytes uninitialized — writing
+     them makes binary MIR non-deterministic (the decoder reads back only the
+     valid bits, so content matches but raw bytes vary, breaking the bootstrap
+     self-consistency test). */
+  u.u[0] = u.u[1] = 0;
   u.ld = ld;
+#if defined(__i386__) || defined(__x86_64__)
+  /* x86 80-bit extended long double occupies only 10 of the 16 bytes; the
+     assignment may still copy the source's 6 padding bytes (e.g. via a 16-byte
+     SSE move), so mask to the meaningful 80 bits (bytes 0-9) for determinism. */
+  u.u[1] &= 0xffffULL;
+#endif
   len = put_uint (ctx, writer, u.u[0], sizeof (uint64_t));
   return put_uint (ctx, writer, u.u[1], sizeof (uint64_t)) + len;
 }
@@ -4814,11 +4825,11 @@ static size_t write_str (MIR_context_t ctx, writer_func_t writer, MIR_str_t str)
   return write_str_tag (ctx, writer, str, TAG_STR1);
 }
 static size_t write_name (MIR_context_t ctx, writer_func_t writer, const char *name) {
-  return write_str_tag (ctx, writer, (MIR_str_t){strlen (name) + 1, name}, TAG_NAME1);
+  return write_str_tag (ctx, writer, (MIR_str_t) {strlen (name) + 1, name}, TAG_NAME1);
 }
 
 static size_t write_reg (MIR_context_t ctx, writer_func_t writer, const char *reg_name) {
-  size_t len = write_str_tag (ctx, writer, (MIR_str_t){strlen (reg_name) + 1, reg_name}, TAG_REG1);
+  size_t len = write_str_tag (ctx, writer, (MIR_str_t) {strlen (reg_name) + 1, reg_name}, TAG_REG1);
 
   output_regs_len += len;
   return len;
@@ -5121,12 +5132,12 @@ void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_con
 
   io_writer = writer;
 #ifndef MIR_NO_BIN_COMPRESSION
-  if ((io_reduce_data = reduce_encode_start (reduce_writer, ctx)) == NULL)
+  if ((io_reduce_data = reduce_encode_start (ctx->alloc, reduce_writer, ctx)) == NULL)
     MIR_get_error_func (ctx) (MIR_binary_io_error, "can not alloc data for MIR binary compression");
 #endif
   output_insns_len = output_labs_len = 0;
   output_regs_len = output_mem_len = output_int_len = output_float_len = 0;
-  string_init (&output_strings, &output_string_tab);
+  string_init (ctx->alloc, &output_strings, &output_string_tab);
   write_modules (ctx, NULL, module); /* store strings */
   len = write_uint (ctx, reduce_writer, CURR_BIN_VERSION);
   str_len = write_uint (ctx, reduce_writer, VARR_LENGTH (string_t, output_strings) - 1);
@@ -5149,9 +5160,9 @@ void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_con
            output_regs_len, output_mem_len, output_int_len, output_float_len);
 #endif
   put_byte (ctx, reduce_writer, TAG_EOFILE);
-  string_finish (&output_strings, &output_string_tab);
+  string_finish (ctx->alloc, &output_strings, &output_string_tab);
 #ifndef MIR_NO_BIN_COMPRESSION
-  if (!reduce_encode_finish (io_reduce_data))
+  if (!reduce_encode_finish (ctx->alloc, io_reduce_data))
     MIR_get_error_func (ctx) (MIR_binary_io_error, "error in writing MIR binary");
 #endif
 }
@@ -5529,7 +5540,7 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
 
   io_reader = reader;
 #ifndef MIR_NO_BIN_COMPRESSION
-  if ((io_reduce_data = reduce_decode_start (reduce_reader, ctx)) == NULL)
+  if ((io_reduce_data = reduce_decode_start (ctx->alloc, reduce_reader, ctx)) == NULL)
     MIR_get_error_func (ctx) (MIR_binary_io_error,
                               "can not alloc data for MIR binary decompression");
 #endif
@@ -5837,7 +5848,7 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
   if (reader (ctx) != EOF)
     MIR_get_error_func (ctx) (MIR_binary_io_error, "garbage at the end of file");
 #ifndef MIR_NO_BIN_COMPRESSION
-  reduce_decode_finish (io_reduce_data);
+  reduce_decode_finish (ctx->alloc, io_reduce_data);
 #endif
 }
 
@@ -5850,14 +5861,14 @@ void MIR_read (MIR_context_t ctx, FILE *f) {
 
 static void io_init (MIR_context_t ctx) {
   mir_assert (TAG_LAST < 127); /* see bin_tag_t */
-  if ((ctx->io_ctx = malloc (sizeof (struct io_ctx))) == NULL)
+  if ((ctx->io_ctx = MIR_malloc (ctx->alloc, sizeof (struct io_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
-  VARR_CREATE (MIR_var_t, proto_vars, 0);
-  VARR_CREATE (MIR_type_t, proto_types, 0);
-  VARR_CREATE (MIR_op_t, read_insn_ops, 0);
-  VARR_CREATE (MIR_str_t, bin_strings, 512);
-  VARR_CREATE (uint64_t, insn_label_string_nums, 64);
-  VARR_CREATE (MIR_label_t, func_labels, 512);
+  VARR_CREATE (MIR_var_t, proto_vars, ctx->alloc, 0);
+  VARR_CREATE (MIR_type_t, proto_types, ctx->alloc, 0);
+  VARR_CREATE (MIR_op_t, read_insn_ops, ctx->alloc, 0);
+  VARR_CREATE (MIR_str_t, bin_strings, ctx->alloc, 512);
+  VARR_CREATE (uint64_t, insn_label_string_nums, ctx->alloc, 64);
+  VARR_CREATE (MIR_label_t, func_labels, ctx->alloc, 512);
 }
 
 static void io_finish (MIR_context_t ctx) {
@@ -5867,7 +5878,7 @@ static void io_finish (MIR_context_t ctx) {
   VARR_DESTROY (MIR_op_t, read_insn_ops);
   VARR_DESTROY (MIR_var_t, proto_vars);
   VARR_DESTROY (MIR_type_t, proto_types);
-  free (ctx->io_ctx);
+  MIR_free (ctx->alloc, ctx->io_ctx);
   ctx->io_ctx = NULL;
 }
 
@@ -5876,6 +5887,11 @@ static void io_finish (MIR_context_t ctx) {
 /* New Page */
 
 /* Reading MIR text file */
+
+int _MIR_name_char_p (MIR_context_t ctx MIR_UNUSED, int ch, int first_p) {
+  if (isalpha (ch) || ch == '_' || ch == '$' || ch == '%' || ch == '.') return TRUE;
+  return !first_p && isdigit (ch);
+}
 
 #if !MIR_NO_SCAN
 
@@ -6124,7 +6140,7 @@ static void scan_string (MIR_context_t ctx, token_t *t, int c, int get_char (MIR
   t->code = TC_STR;
   t->u.str
     = string_store (ctx, &strings, &string_tab,
-                    (MIR_str_t){VARR_LENGTH (char, temp_string), VARR_ADDR (char, temp_string)})
+                    (MIR_str_t) {VARR_LENGTH (char, temp_string), VARR_ADDR (char, temp_string)})
         .str;
 }
 
@@ -6144,11 +6160,6 @@ static void unget_string_char (MIR_context_t ctx, int ch) {
   if (ch == '\n') curr_lno--;
 }
 
-int _MIR_name_char_p (MIR_context_t ctx MIR_UNUSED, int ch, int first_p) {
-  if (isalpha (ch) || ch == '_' || ch == '$' || ch == '%' || ch == '.') return TRUE;
-  return !first_p && isdigit (ch);
-}
-
 static void scan_token (MIR_context_t ctx, token_t *token, int (*get_char) (MIR_context_t),
                         void (*unget_char) (MIR_context_t, int)) {
   int ch;
@@ -6160,8 +6171,7 @@ static void scan_token (MIR_context_t ctx, token_t *token, int (*get_char) (MIR_
     case ' ':
     case '\t': break;
     case '#':
-      while ((ch = get_char (ctx)) != '\n' && ch != EOF)
-        ;
+      while ((ch = get_char (ctx)) != '\n' && ch != EOF);
       /* falls through */
     case '\n': token->code = TC_NL; return;
     case '(': token->code = TC_LEFT_PAR; return;
@@ -6843,15 +6853,16 @@ static void scan_init (MIR_context_t ctx) {
   insn_name_t in, el;
   size_t i;
 
-  if ((ctx->scan_ctx = malloc (sizeof (struct scan_ctx))) == NULL)
+  if ((ctx->scan_ctx = MIR_malloc (ctx->alloc, sizeof (struct scan_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
-  VARR_CREATE (char, error_msg_buf, 0);
-  VARR_CREATE (MIR_var_t, scan_vars, 0);
-  VARR_CREATE (MIR_type_t, scan_types, 0);
-  VARR_CREATE (MIR_op_t, scan_insn_ops, 0);
-  VARR_CREATE (label_name_t, label_names, 0);
-  HTAB_CREATE (label_desc_t, label_desc_tab, 100, label_hash, label_eq, NULL);
-  HTAB_CREATE (insn_name_t, insn_name_tab, MIR_INSN_BOUND, insn_name_hash, insn_name_eq, NULL);
+  VARR_CREATE (char, error_msg_buf, ctx->alloc, 0);
+  VARR_CREATE (MIR_var_t, scan_vars, ctx->alloc, 0);
+  VARR_CREATE (MIR_type_t, scan_types, ctx->alloc, 0);
+  VARR_CREATE (MIR_op_t, scan_insn_ops, ctx->alloc, 0);
+  VARR_CREATE (label_name_t, label_names, ctx->alloc, 0);
+  HTAB_CREATE (label_desc_t, label_desc_tab, ctx->alloc, 100, label_hash, label_eq, NULL);
+  HTAB_CREATE (insn_name_t, insn_name_tab, ctx->alloc, MIR_INSN_BOUND, insn_name_hash, insn_name_eq,
+               NULL);
   for (i = 0; i < MIR_INSN_BOUND; i++) {
     in.code = i;
     in.name = MIR_insn_name (ctx, i);
@@ -6867,7 +6878,7 @@ static void scan_finish (MIR_context_t ctx) {
   VARR_DESTROY (label_name_t, label_names);
   HTAB_DESTROY (label_desc_t, label_desc_tab);
   HTAB_DESTROY (insn_name_t, insn_name_tab);
-  free (ctx->scan_ctx);
+  MIR_free (ctx->alloc, ctx->scan_ctx);
   ctx->scan_ctx = NULL;
 }
 
@@ -6917,7 +6928,7 @@ void _MIR_dump_code (const char *name, uint8_t *code, size_t code_len) {
 #endif
 #else
   sprintf (bfname, "_mir_%lu.bin", (unsigned long) getpid ());
-  if ((bf = fopen (bfname, "w")) == NULL) return;
+  if ((bf = fopen (bfname, "wb")) == NULL) return;
   fprintf (f, "void code (void) {}\n");
   for (i = 0; i < code_len; i++) fputc (code[i], bf);
   fclose (f);
@@ -6989,9 +7000,10 @@ static void hard_reg_name_init (MIR_context_t ctx) {
   hard_reg_desc_t desc, tab_desc;
   int res;
 
-  if ((ctx->hard_reg_ctx = malloc (sizeof (struct hard_reg_ctx))) == NULL)
+  if ((ctx->hard_reg_ctx = MIR_malloc (ctx->alloc, sizeof (struct hard_reg_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
-  HTAB_CREATE (hard_reg_desc_t, hard_reg_desc_tab, 200, hard_reg_desc_hash, hard_reg_desc_eq, NULL);
+  HTAB_CREATE (hard_reg_desc_t, hard_reg_desc_tab, ctx->alloc, 200, hard_reg_desc_hash,
+               hard_reg_desc_eq, NULL);
   for (size_t i = 0; i * sizeof (char *) < sizeof (target_hard_reg_names); i++) {
     desc.num = (int) i;
     desc.name = target_hard_reg_names[i];
@@ -7002,7 +7014,7 @@ static void hard_reg_name_init (MIR_context_t ctx) {
 
 static void hard_reg_name_finish (MIR_context_t ctx) {
   HTAB_DESTROY (hard_reg_desc_t, hard_reg_desc_tab);
-  free (ctx->hard_reg_ctx);
+  MIR_free (ctx->alloc, ctx->hard_reg_ctx);
   ctx->hard_reg_ctx = NULL;
 }
 
