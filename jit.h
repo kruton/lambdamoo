@@ -3,6 +3,7 @@
 
 #include "config.h"
 
+#include "program.h"
 #include "structures.h"
 
 typedef struct JITProgram JITProgram;
@@ -16,6 +17,7 @@ typedef enum {
 
 typedef enum {
     JIT_RUN_FALLBACK,
+    JIT_RUN_CALL_VERB,
     JIT_RUN_RETURNED,
     JIT_RUN_ERROR,
     JIT_RUN_ABORT_TICKS,
@@ -43,6 +45,8 @@ typedef struct {
     unsigned source_lineno;
     unsigned stack_depth;
     int ticks_charged;
+    int builtin_func;
+    int operation;
     JITDeoptReason reason;
 } JITDeoptState;
 
@@ -55,6 +59,7 @@ typedef struct {
 extern const char *jit_deopt_reason_name(JITDeoptReason);
 extern void jit_profile_record_entry(void);
 extern void jit_profile_record_completed(void);
+extern void jit_profile_record_vm_call(void);
 extern void jit_profile_record_deopt(Objid, const char *, const JITDeoptState *);
 extern void jit_profile_maybe_report(int);
 extern void jit_profile_report(void);
@@ -72,10 +77,13 @@ extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
+extern int jit_program_resume_map(JITProgram *, ResumeKey);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
-					enum error *, JITSourceLocation *,
-					JITDeoptState *, Var *, Objid);
+				enum error *, JITSourceLocation *,
+				JITDeoptState *, Var *, Objid, int);
+extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),
+				void *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 extern int jit_program_dump_machine(JITProgram *, void (*)(const char *, void *),

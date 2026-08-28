@@ -13,6 +13,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+static unsigned test_protection_generation = 1;
+static int test_length_protected;
+
+void hir_test_set_length_protected(int);
+
+unsigned
+builtin_protection_generation(void)
+{
+    return test_protection_generation;
+}
+
+int
+builtin_function_is_protected(unsigned n)
+{
+    return n == 6 && test_length_protected;
+}
+
+void
+hir_test_set_length_protected(int protected)
+{
+    if (test_length_protected != protected) {
+	test_length_protected = protected;
+	test_protection_generation++;
+    }
+}
+
 static inline int
 refcount_overhead(Memory_Type type)
 {
@@ -138,6 +164,7 @@ name_func_by_num(unsigned id)
     case 6: return "length";
     case 7: return "index";
     case 8: return "rindex";
+    case 9: return "pass";
     default: return "unknown_func";
     }
 }
@@ -322,6 +349,32 @@ listappend(Var list, Var value)
     return result;
 }
 
+Var
+sublist(Var list, Num first, Num after)
+{
+    Num length = after > first ? after - first : 0;
+    Var result = new_list(length);
+    Num i;
+
+    for (i = 0; i < length; i++)
+	result.v.list[i + 1] = var_ref(list.v.list[first + i]);
+    free_var(list);
+    return result;
+}
+
+Var
+substr(Var str, Num first, Num after)
+{
+    Num length = after > first ? after - first : 0;
+    char *result = mymalloc(length + 1, M_STRING);
+
+    if (length)
+	memcpy(result, str.v.str + first - 1, length);
+    result[length] = '\0';
+    free_var(str);
+    return (Var){ .type = TYPE_STR, .v.str = result };
+}
+
 int
 ismember(Var value, Var list, int case_matters)
 {
@@ -389,6 +442,12 @@ server_int_option(const char *name, Num defallt)
 
 void
 oklog(const char *fmt, ...)
+{
+    (void) fmt;
+}
+
+void
+errlog(const char *fmt, ...)
 {
     (void) fmt;
 }

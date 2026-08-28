@@ -953,9 +953,15 @@ do {								\
     for (;;) {
       next_opcode:
 #ifdef ENABLE_JIT
-	if (bv == bc.vector
+	{
+	    int at_entry = bv == bc.vector && rts == RUN_ACTIV.base_rt_stack;
+	    int resume_map = RUN_ACTIV.prog->jit
+		? jit_program_resume_map(RUN_ACTIV.prog->jit,
+					 RUN_ACTIV.resume_key) : -1;
+
+	if ((at_entry || resume_map >= 0)
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
-	    && rts == RUN_ACTIV.base_rt_stack && RUN_ACTIV.prog->jit
+	    && RUN_ACTIV.prog->jit
 	    && jit_program_is_eligible(RUN_ACTIV.prog->jit)
 	    && (RUN_ACTIV.debug
 		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
@@ -965,13 +971,15 @@ do {								\
 	    JITDeoptState deopt;
 	    enum error jit_error = E_NONE;
 
+	    if (resume_map >= 0)
+		RUN_ACTIV.resume_key = invalid_resume_key();
 	    jit_profile_record_entry();
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
 					     RUN_ACTIV.base_rt_stack,
-					     RUN_ACTIV.progr);
+					     RUN_ACTIV.progr, resume_map);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		jit_profile_record_completed();
 		STORE_STATE_VARIABLES();
@@ -1000,14 +1008,19 @@ do {								\
 		error_bv = bc.vector + source_location.error_pc;
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
-	    } else if (jit_result == JIT_RUN_FALLBACK) {
-		jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
-					 &deopt);
+	    } else if (jit_result == JIT_RUN_FALLBACK
+		       || jit_result == JIT_RUN_CALL_VERB) {
+		if (jit_result == JIT_RUN_FALLBACK)
+		    jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
+					     &deopt);
+		else
+		    jit_profile_record_vm_call();
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;
 		rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
 	    }
+	}
 	}
 #endif
 	error_bv = bv;

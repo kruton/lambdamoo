@@ -3777,6 +3777,7 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 				    * (program->num_deopt_maps + 1), M_PROGRAM);
     map = &program->deopt_maps[program->num_deopt_maps];
     memset(map, 0, sizeof(JITDeoptMap));
+    map->resume_key = instr->resume_key;
     map->bytecode_pc = instr->bytecode_pc;
     map->error_pc = instr->bytecode_pc;
     map->source_lineno = instr->source_lineno;
@@ -3786,10 +3787,25 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	|| instr->kind == HIR_TAC_BRANCH_FALSE
 	|| instr->kind == HIR_TAC_CALL_VERB;
     map->num_locals = instr->num_local_values;
+    map->builtin_func = -1;
+    map->builtin_args = -1;
+    map->operation = -1;
+    if (instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
+	|| instr->kind == HIR_TAC_DEOPT)
+	map->operation = instr->op;
+    if (instr->kind == HIR_TAC_UNARY && instr->func < FUNC_NOT_FOUND) {
+	map->builtin_func = instr->func;
+	map->builtin_args = instr->src1 ? 1 : 0;
+    } else if (instr->kind == HIR_TAC_BINARY
+	       && instr->func < FUNC_NOT_FOUND) {
+	map->builtin_func = instr->func;
+	map->builtin_args = 2;
+    }
 
     switch (instr->kind) {
     case HIR_TAC_CALL:
 	map->reason = JIT_DEOPT_BUILTIN_CALL;
+	map->builtin_func = instr->func;
 	break;
     case HIR_TAC_CALL_VERB:
 	map->reason = JIT_DEOPT_VERB_CALL;
@@ -3850,6 +3866,244 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     return program->num_deopt_maps++;
 }
 
+static int
+jit_instr_defines_value(JITInstruction *instr)
+{
+    return instr->kind == HIR_TAC_CONST || instr->kind == HIR_TAC_LOAD_LOCAL
+	|| instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
+	|| instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB
+	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_RANGE_REF
+	|| instr->kind == HIR_TAC_RANGE_SET || instr->kind == HIR_TAC_UNSUPPORTED;
+}
+
+static void
+jit_instr_liveness(JITProgram *program, JITInstruction *instr,
+		   unsigned char *uses, unsigned char *defs)
+{
+    JITCopy *copy;
+    JITDeoptMap *map;
+    int i;
+
+    if (jit_instr_defines_value(instr) && instr->value > 0
+	&& instr->value < program->num_values)
+	defs[instr->value] = 1;
+    if (instr->kind == HIR_TAC_PARALLEL_COPY)
+	for (copy = instr->copies; copy; copy = copy->next) {
+	    if (copy->src > 0 && copy->src < program->num_values)
+		uses[copy->src] = 1;
+	    if (copy->dst > 0 && copy->dst < program->num_values)
+		defs[copy->dst] = 1;
+	}
+    if (instr->src1 > 0 && instr->src1 < program->num_values)
+	uses[instr->src1] = 1;
+    if (instr->src2 > 0 && instr->src2 < program->num_values)
+	uses[instr->src2] = 1;
+    if (instr->deopt_map <= 0 || instr->deopt_map >= program->num_deopt_maps)
+	return;
+    map = &program->deopt_maps[instr->deopt_map];
+    for (i = 0; i < map->num_locals; i++)
+	if (map->local_values[i] > 0
+	    && map->local_values[i] < program->num_values
+	    && !defs[map->local_values[i]])
+	    uses[map->local_values[i]] = 1;
+    for (i = 0; i < (int) map->stack_depth; i++)
+	if (map->stack_values[i] > 0
+	    && map->stack_values[i] < program->num_values
+	    && !defs[map->stack_values[i]])
+	    uses[map->stack_values[i]] = 1;
+}
+
+static int
+jit_resume_source(JITProgram *program, JITDeoptMap *map,
+		  JITInstruction *call, int value, JITResumeValue *resume)
+{
+    JITBlock *block;
+    int call_operands = jit_call_stack_operands(map);
+    int i;
+
+    resume->value = value;
+    if (value == call->value) {
+	resume->source = JIT_RESUME_RESULT;
+	return 1;
+    }
+    for (i = 0; i < map->num_locals; i++)
+	if (map->local_values[i] == value) {
+	    resume->source = JIT_RESUME_LOCAL;
+	    resume->index = i;
+	    return 1;
+	}
+    for (i = 0; i + call_operands < (int) map->stack_depth; i++)
+	if (map->stack_values[i] == value) {
+	    resume->source = JIT_RESUME_STACK;
+	    resume->index = i;
+	    return 1;
+	}
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CONST && instr->value == value) {
+		resume->source = JIT_RESUME_CONSTANT;
+		resume->literal = instr->literal;
+		resume->literal_type = instr->literal_type;
+		return 1;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static void
+jit_build_resume_liveness(JITProgram *program)
+{
+    JITBlock *block;
+    unsigned char **live_in, **live_out, **block_use, **block_def;
+    int max_block = 0, changed, i;
+
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    live_in = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    live_out = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_use = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_def = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    memset(live_in, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(live_out, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_use, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_def, 0, sizeof(unsigned char *) * (max_block + 1));
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	unsigned char *seen_defs;
+
+	live_in[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	live_out[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_use[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_def[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	seen_defs = mymalloc(program->num_values, M_PROGRAM);
+	memset(live_in[block->id], 0, program->num_values);
+	memset(live_out[block->id], 0, program->num_values);
+	memset(block_use[block->id], 0, program->num_values);
+	memset(block_def[block->id], 0, program->num_values);
+	memset(seen_defs, 0, program->num_values);
+	for (instr = block->first; instr; instr = instr->next) {
+	    unsigned char *uses = mymalloc(program->num_values, M_PROGRAM);
+	    unsigned char *defs = mymalloc(program->num_values, M_PROGRAM);
+	    int value;
+	    memset(uses, 0, program->num_values);
+	    memset(defs, 0, program->num_values);
+	    jit_instr_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++) {
+		if (uses[value] && !seen_defs[value])
+		    block_use[block->id][value] = 1;
+		if (defs[value]) {
+		    seen_defs[value] = 1;
+		    block_def[block->id][value] = 1;
+		}
+	    }
+	    myfree(defs, M_PROGRAM);
+	    myfree(uses, M_PROGRAM);
+	    if (instr == block->last)
+		break;
+	}
+	myfree(seen_defs, M_PROGRAM);
+    }
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    int value, successor;
+	    for (value = 1; value < program->num_values; value++) {
+		int out = 0;
+		for (successor = 0; successor < block->num_successors; successor++)
+		    if (live_in[block->successors[successor]]
+			&& live_in[block->successors[successor]][value])
+			out = 1;
+		if (live_out[block->id][value] != out) {
+		    live_out[block->id][value] = out;
+		    changed = 1;
+		}
+		out = block_use[block->id][value]
+		    || (out && !block_def[block->id][value]);
+		if (live_in[block->id][value] != out) {
+		    live_in[block->id][value] = out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction **instructions;
+	JITInstruction *instr;
+	unsigned char *live;
+	int count = 0, index;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    count++;
+	    if (instr == block->last)
+		break;
+	}
+	instructions = mymalloc(sizeof(JITInstruction *) * count, M_PROGRAM);
+	count = 0;
+	for (instr = block->first; instr; instr = instr->next) {
+	    instructions[count++] = instr;
+	    if (instr == block->last)
+		break;
+	}
+	live = mymalloc(program->num_values, M_PROGRAM);
+	memcpy(live, live_out[block->id], program->num_values);
+	for (index = count - 1; index >= 0; index--) {
+	    unsigned char *uses = mymalloc(program->num_values, M_PROGRAM);
+	    unsigned char *defs = mymalloc(program->num_values, M_PROGRAM);
+	    int value, live_count = 0;
+	    instr = instructions[index];
+	    if (instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps
+		&& (instr->kind == HIR_TAC_CALL_VERB
+		 || jit_deopt_map_can_bridge_builtin(
+		     &program->deopt_maps[instr->deopt_map]))) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		int call_operands = jit_call_stack_operands(map);
+		for (value = 1; value < program->num_values; value++)
+		    if (live[value])
+			live_count++;
+		map->resume_values = live_count
+		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
+		map->num_resume_values = live_count;
+		map->native_resume_valid = map->stack_depth >= (unsigned) call_operands;
+		live_count = 0;
+		for (value = 1; value < program->num_values; value++)
+		    if (live[value]
+			&& !jit_resume_source(program, map, instr, value,
+					      &map->resume_values[live_count++]))
+			map->native_resume_valid = 0;
+	    }
+	    memset(uses = mymalloc(program->num_values, M_PROGRAM), 0,
+		   program->num_values);
+	    memset(defs = mymalloc(program->num_values, M_PROGRAM), 0,
+		   program->num_values);
+	    jit_instr_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++)
+		live[value] = uses[value] || (live[value] && !defs[value]);
+	    myfree(defs, M_PROGRAM);
+	    myfree(uses, M_PROGRAM);
+	}
+	myfree(live, M_PROGRAM);
+	myfree(instructions, M_PROGRAM);
+    }
+    for (i = 0; i <= max_block; i++) {
+	if (live_in[i]) myfree(live_in[i], M_PROGRAM);
+	if (live_out[i]) myfree(live_out[i], M_PROGRAM);
+	if (block_use[i]) myfree(block_use[i], M_PROGRAM);
+	if (block_def[i]) myfree(block_def[i], M_PROGRAM);
+    }
+    myfree(block_def, M_PROGRAM);
+    myfree(block_use, M_PROGRAM);
+    myfree(live_out, M_PROGRAM);
+    myfree(live_in, M_PROGRAM);
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -3885,6 +4139,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps = mymalloc(sizeof(JITDeoptMap), M_PROGRAM);
     memset(&program->deopt_maps[0], 0, sizeof(JITDeoptMap));
     program->deopt_maps[0].bytecode_pc = 0;
+    program->deopt_maps[0].builtin_func = -1;
+    program->deopt_maps[0].builtin_args = -1;
+    program->deopt_maps[0].operation = -1;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].source_lineno = 1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
@@ -4137,6 +4394,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			types_changed = 1;
 		    }
 		}
+		if (si->kind == HIR_TAC_RANGE_REF
+		    && si->value > 0 && si->value < program->num_values
+		    && si->src1 > 0 && si->src1 < program->num_values
+		    && value_types_known[si->src1]) {
+		    var_type base_t = value_types[si->src1];
+		    if (base_t == TYPE_STR || base_t == TYPE_LIST) {
+			if (!value_types_known[si->value]) {
+			    value_types[si->value] = base_t;
+			    value_types_known[si->value] = 1;
+			    types_changed = 1;
+			}
+		    }
+		}
 		if (si == ssa_block->last)
 		    break;
 	    }
@@ -4166,6 +4436,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_INT;
 		    value_types_known[si->src2] = 1;
+		}
+	    }
+	    if (si->kind == HIR_TAC_RANGE_REF) {
+		int from = si->src2;
+		if (from > 0 && from < program->num_values
+		    && !value_types_known[from]) {
+		    value_types[from] = TYPE_INT;
+		    value_types_known[from] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
@@ -4207,14 +4485,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
 		&& si->num_stack_values >= 3) {
-		int base = si->stack_values[si->num_stack_values - 3];
 		int index = si->stack_values[si->num_stack_values - 2];
 
-		if (base > 0 && base < program->num_values
-		    && !value_types_known[base]) {
-		    value_types[base] = TYPE_LIST;
-		    value_types_known[base] = 1;
-		}
 		if (index > 0 && index < program->num_values
 		    && !value_types_known[index]) {
 		    value_types[index] = TYPE_INT;
@@ -4232,13 +4504,19 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 	    }
 
-	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values > 0) {
-		int rhs = si->stack_values[si->num_stack_values - 1];
+	    if (si->kind == HIR_TAC_RANGE_SET && si->num_stack_values >= 4) {
+		int from = si->stack_values[si->num_stack_values - 3];
+		int to = si->stack_values[si->num_stack_values - 2];
 
-		if (rhs > 0 && rhs < program->num_values
-		    && !value_types_known[rhs]) {
-		    value_types[rhs] = TYPE_LIST;
-		    value_types_known[rhs] = 1;
+		if (from > 0 && from < program->num_values
+		    && !value_types_known[from]) {
+		    value_types[from] = TYPE_INT;
+		    value_types_known[from] = 1;
+		}
+		if (to > 0 && to < program->num_values
+		    && !value_types_known[to]) {
+		    value_types[to] = TYPE_INT;
+		    value_types_known[to] = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_CALL_VERB) {
@@ -4273,6 +4551,28 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types[first_arg] = TYPE_OBJ;
 		    value_types_known[first_arg] = 1;
 		}
+		if (func_name && si->value > 0 && si->value < program->num_values
+		    && !value_types_known[si->value]) {
+		    if (!strcmp(func_name, "caller_perms")
+			|| !strcmp(func_name, "toobj")
+			|| !strcmp(func_name, "parent")
+			|| !strcmp(func_name, "owner")
+			|| !strcmp(func_name, "location")) {
+			value_types[si->value] = TYPE_OBJ;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tostr")
+			       || !strcmp(func_name, "toliteral")) {
+			value_types[si->value] = TYPE_STR;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tonum")
+			       || !strcmp(func_name, "toint")) {
+			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tofloat")) {
+			value_types[si->value] = TYPE_FLOAT;
+			value_types_known[si->value] = 1;
+		    }
+		}
 	    }
 	    if (si == ssa_block->last)
 		break;
@@ -4285,7 +4585,17 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *si;
 
 	for (si = ssa_block->first; si; si = si->next) {
-	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
+	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_CALL_VERB
+		 || si->kind == HIR_TAC_RANGE_REF)
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
+	    if (si->kind == HIR_TAC_BINARY
+		&& (si->op == HIR_OP_INDEX || si->op == HIR_OP_GET_PROP)
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
+	    if (si->kind == HIR_TAC_LOAD_LOCAL && si->bytecode_pc == NO_BYTECODE_PC
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
@@ -4411,6 +4721,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
+	    instr->resume_key = ssa_instr->resume_key;
 	    instr->source_lineno = ssa_instr->source_lineno;
 	    instr->bytecode_pc = ssa_instr->bytecode_pc;
 	    if (ssa_instr->bytecode_pc != NO_BYTECODE_PC)
@@ -4419,6 +4730,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->src1 = ssa_instr->src1;
 	    instr->src2 = ssa_instr->src2;
 	    instr->local_id = ssa_instr->local_id;
+	    instr->func = ssa_instr->func;
 	    instr->op = ssa_instr->op;
 	    if (((ssa_instr->src1 > 0
 		  && ssa_instr->src1 < program->num_values
@@ -4440,8 +4752,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		instr->kind = HIR_TAC_DEOPT;
 	    if (uses_tagged
 		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		     || ssa_instr->kind == HIR_TAC_RETURN
+		     || ssa_instr->kind == HIR_TAC_CALL_VERB
+		     || ssa_instr->kind == HIR_TAC_CALL
+		     || ssa_instr->kind == HIR_TAC_RANGE_REF
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
+			     || ssa_instr->op == HIR_OP_TYPEOF
 			     || ssa_instr->op == HIR_OP_LENGTH
 			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
 			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE))
@@ -4456,7 +4773,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			     || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
 			     || ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
 			     || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
-			     || ssa_instr->op == HIR_OP_MOD
+			     || ssa_instr->op == HIR_OP_MOD || ssa_instr->op == HIR_OP_EXP
 			     || ssa_instr->op == HIR_OP_INDEX_BF
 			     || ssa_instr->op == HIR_OP_RINDEX_BF
 			     || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_BITOR
@@ -4466,16 +4783,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& (ssa_instr->kind == HIR_TAC_UNARY
 		    || ssa_instr->kind == HIR_TAC_BINARY
 		    || ssa_instr->kind == HIR_TAC_RETURN
+		    || ssa_instr->kind == HIR_TAC_CALL
+		    || ssa_instr->kind == HIR_TAC_CALL_VERB
 		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
-		instr->kind = HIR_TAC_DEOPT;
-	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
-		&& value_types_known[ssa_instr->src1]
-		&& value_types[ssa_instr->src1] == TYPE_STR
-		&& (ssa_instr->kind == HIR_TAC_UNARY
-		    && ssa_instr->op == HIR_OP_LENGTH
-		    && jit_extended_anchor_matches(&bytecode_program->main_vector,
-						   ssa_instr->bytecode_pc,
-						   EOP_LENGTH)))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->kind == HIR_TAC_UNARY
 		&& (ssa_instr->op == HIR_OP_COMPLEMENT
@@ -4645,6 +4955,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_build_resume_liveness(program);
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */
@@ -5098,6 +5409,8 @@ op_name(HIROp op)
 	return "PARENT";
     case HIR_OP_SUBLIST_FROM:
 	return "SUBLIST_FROM";
+    case HIR_OP_FORK:
+	return "FORK";
     }
 
     return "?";
@@ -6360,6 +6673,7 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
     instr->label = 0;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;
+    instr->func = FUNC_NOT_FOUND;
     instr->num_stack_values = 0;
     instr->stack_values = 0;
     return instr;
@@ -6609,6 +6923,7 @@ append_deopt_boundary(HIRContext *ctx, HIRTacProgram *program,
 {
     HIRTacInstr *deopt = new_tac(ctx, HIR_TAC_DEOPT, source_lineno);
 
+    deopt->op = HIR_OP_FORK;
     deopt->bytecode_pc = bytecode_pc;
     snapshot_lower_stack(ctx, deopt);
     append_tac(program, deopt);
@@ -7701,9 +8016,6 @@ lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int finally_val = new_temp(ctx);
     HIRTacInstr *finally_marker;
 
-    append_deopt_boundary(ctx, program, stmt->source_lineno,
-			  stmt->bytecode_pc);
-
     finally_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
     finally_marker->dst = finally_val;
     finally_marker->literal.type = TYPE_FINALLY;
@@ -7733,9 +8045,6 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int done_label = new_label(ctx);
     int catch_marker_val;
     HIRTacInstr *catch_marker;
-
-    append_deopt_boundary(ctx, program, stmt->source_lineno,
-			  stmt->bytecode_pc);
 
     for (ex = stmt->u.try_except.excepts; ex; ex = ex->next)
 	arm_count++;

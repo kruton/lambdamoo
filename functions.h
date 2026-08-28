@@ -216,6 +216,8 @@ extern void free_bi_func_data(Byte f_id, void *vdata);
  |  protection  |
  *--------------*/
 
+extern unsigned builtin_protection_generation(void);
+extern int builtin_function_is_protected(unsigned);
 extern void load_server_options(void);
 
 #endif		/* !Functions_H */

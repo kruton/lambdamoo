@@ -13,16 +13,32 @@
 #include <limits.h>
 
 #define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
-    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2)
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1)
 
 static int failures;
 
 static void check(int, const char *);
+extern void hir_test_set_length_protected(int);
 
 struct machine_dump {
     int lines;
     int valid_first_line;
 };
+
+struct mir_dump {
+    int lines;
+    int found_source_marker;
+};
+
+static void
+check_mir_line(const char *line, void *data)
+{
+    struct mir_dump *dump = data;
+
+    dump->lines++;
+    if (strstr(line, "pc_11_line_7_"))
+	dump->found_source_marker = 1;
+}
 
 static void
 check_machine_line(const char *line, void *data)
@@ -48,6 +64,7 @@ instruction(HIRTacKind kind)
     JITInstruction *result = allocate(sizeof(JITInstruction));
 
     result->kind = kind;
+    result->func = FUNC_NOT_FOUND;
     return result;
 }
 
@@ -56,6 +73,8 @@ add_entry_deopt_map(JITProgram *program)
 {
     program->num_deopt_maps = 1;
     program->deopt_maps = allocate(sizeof(JITDeoptMap));
+    program->deopt_maps[0].builtin_args = -1;
+    program->deopt_maps[0].operation = -1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
 }
 
@@ -424,6 +443,8 @@ call_boundary_program(void)
     map->bytecode_pc = map->error_pc = 25;
     map->stack_depth = 1;
     map->ticks_charged = 0;
+    map->builtin_func = 17;
+    map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->num_locals = 1;
     map->local_values = allocate(sizeof(int) * 1);
     map->local_values[0] = 1;
@@ -444,6 +465,69 @@ call_boundary_program(void)
 
     block->first = c1;
     block->last = call;
+    return program;
+}
+
+static JITProgram *
+builtin_call_program(unsigned func)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *call = instruction(HIR_TAC_CALL);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_is_tagged = allocate(3);
+    program->value_types[1] = TYPE_LIST;
+    program->value_is_tagged[2] = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    map->resume_key.code_unit = 0;
+    map->resume_key.site = 2;
+    map->reason = JIT_DEOPT_BUILTIN_CALL;
+    map->builtin_func = func;
+    map->native_resume_valid = 1;
+    map->num_resume_values = 1;
+    map->resume_values = allocate(sizeof(JITResumeValue));
+    map->resume_values[0].value = 2;
+    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->bytecode_pc = map->error_pc = 25;
+    map->stack_depth = 1;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int));
+    map->local_types = allocate(sizeof(var_type));
+    map->local_values[0] = 1;
+    map->local_types[0] = TYPE_LIST;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_LIST;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    load_args->value = 1;
+    load_args->local_id = 0;
+    load_args->literal_type = TYPE_LIST;
+    load_args->next = call;
+    call->value = 2;
+    call->src1 = 1;
+    call->deopt_map = 1;
+    call->resume_key = map->resume_key;
+    call->bytecode_pc = 25;
+    call->next = return_instr;
+    return_instr->src1 = 2;
+    return_instr->literal_type = TYPE_ANY;
+    block->first = load_args;
+    block->last = return_instr;
     return program;
 }
 
@@ -754,17 +838,32 @@ call_verb_program(void)
     JITInstruction *load_args = instruction(HIR_TAC_LOAD_LOCAL);
     JITInstruction *tick = instruction(HIR_TAC_TICK);
     JITInstruction *call_verb = instruction(HIR_TAC_CALL_VERB);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
     JITDeoptMap *map;
 
     program->num_values = 5;
     program->num_vars = 3;
     program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_is_tagged = allocate(5);
+    program->value_types[1] = TYPE_OBJ;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_LIST;
+    program->value_is_tagged[4] = 1;
     add_entry_deopt_map(program);
     program->deopt_maps = myrealloc(program->deopt_maps,
 				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
     map = &program->deopt_maps[1];
     memset(map, 0, sizeof(JITDeoptMap));
     program->num_deopt_maps = 2;
+    map->resume_key.code_unit = 0;
+    map->resume_key.site = 1;
+    map->reason = JIT_DEOPT_VERB_CALL;
+    map->native_resume_valid = 1;
+    map->num_resume_values = 1;
+    map->resume_values = allocate(sizeof(JITResumeValue));
+    map->resume_values[0].value = 4;
+    map->resume_values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
@@ -806,8 +905,12 @@ call_verb_program(void)
     call_verb->src1 = 1;
     call_verb->src2 = 2;
     call_verb->deopt_map = 1;
+    call_verb->resume_key = map->resume_key;
+    call_verb->next = return_instr;
+    return_instr->src1 = 4;
+    return_instr->literal_type = TYPE_ANY;
     block->first = load_obj;
-    block->last = call_verb;
+    block->last = return_instr;
     return program;
 }
 
@@ -1265,8 +1368,22 @@ string_length_program(const char *s)
     JITInstruction *constant = program->blocks->first;
     JITInstruction *return_instr = constant->next;
     JITInstruction *length_instr = instruction(HIR_TAC_UNARY);
+    JITDeoptMap *map;
 
     program->num_values = 3;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    memset(&program->deopt_maps[1], 0, sizeof(JITDeoptMap));
+    map = &program->deopt_maps[1];
+    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+    map->builtin_func = 6;
+    map->builtin_args = 1;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 1;
+    map->stack_types[0] = TYPE_STR;
     myfree(program->value_types, M_PROGRAM);
     program->value_types = allocate(sizeof(var_type) * 3);
     program->value_types[0] = TYPE_INT;
@@ -1275,8 +1392,9 @@ string_length_program(const char *s)
     constant->next = length_instr;
     length_instr->value = 2;
     length_instr->src1 = 1;
+    length_instr->func = 6;
     length_instr->op = HIR_OP_LENGTH;
-    length_instr->deopt_map = 0;
+    length_instr->deopt_map = 1;
     length_instr->next = return_instr;
     return_instr->src1 = 2;
     return_instr->literal_type = TYPE_INT;
@@ -1455,6 +1573,154 @@ finally_stack_marker_deopt_program(void)
 
     block->first = const_finally;
     block->last = deopt_op;
+    return program;
+}
+
+static JITProgram *
+nested_try_except_finally_deopt_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *const_finally = instruction(HIR_TAC_CONST);
+    JITInstruction *const_codes = instruction(HIR_TAC_CONST);
+    JITInstruction *const_pc = instruction(HIR_TAC_CONST);
+    JITInstruction *const_catch = instruction(HIR_TAC_CONST);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_FINALLY;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = TYPE_CATCH;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 60;
+    map->error_pc = 60;
+    map->stack_depth = 4;
+    map->ticks_charged = 1;
+    map->num_locals = 0;
+    map->stack_values = allocate(sizeof(int) * 4);
+    map->stack_types = allocate(sizeof(var_type) * 4);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_values[3] = 4;
+    map->stack_types[0] = TYPE_FINALLY;
+    map->stack_types[1] = TYPE_INT;
+    map->stack_types[2] = TYPE_INT;
+    map->stack_types[3] = TYPE_CATCH;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    const_finally->value = 1;
+    const_finally->literal = 99;
+    const_finally->literal_type = TYPE_FINALLY;
+    const_finally->next = const_codes;
+
+    const_codes->value = 2;
+    const_codes->literal = 0;
+    const_codes->literal_type = TYPE_INT;
+    const_codes->next = const_pc;
+
+    const_pc->value = 3;
+    const_pc->literal = 55;
+    const_pc->literal_type = TYPE_INT;
+    const_pc->next = const_catch;
+
+    const_catch->value = 4;
+    const_catch->literal = 1;
+    const_catch->literal_type = TYPE_CATCH;
+    const_catch->next = deopt_op;
+
+    deopt_op->deopt_map = 1;
+    deopt_op->bytecode_pc = 60;
+
+    block->first = const_finally;
+    block->last = deopt_op;
+    return program;
+}
+
+static JITProgram *
+range_ref_test_program(var_type base_type)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_base = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *const_from = instruction(HIR_TAC_CONST);
+    JITInstruction *const_to = instruction(HIR_TAC_CONST);
+    JITInstruction *range_op = instruction(HIR_TAC_RANGE_REF);
+    JITInstruction *ret_op = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[0] = TYPE_NONE;
+    program->value_types[1] = base_type;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = base_type;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 10;
+    map->error_pc = 10;
+    map->stack_depth = 3;
+    map->ticks_charged = 1;
+    map->num_locals = 1;
+    map->local_values = allocate(sizeof(int));
+    map->local_types = allocate(sizeof(var_type));
+    map->local_values[0] = 1;
+    map->local_types[0] = base_type;
+    map->stack_values = allocate(sizeof(int) * 3);
+    map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_types[0] = base_type;
+    map->stack_types[1] = TYPE_INT;
+    map->stack_types[2] = TYPE_INT;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_base->value = 1;
+    load_base->local_id = 0;
+    load_base->literal_type = base_type;
+    load_base->next = const_from;
+
+    const_from->value = 2;
+    const_from->literal = 2;
+    const_from->literal_type = TYPE_INT;
+    const_from->next = const_to;
+
+    const_to->value = 3;
+    const_to->literal = 4;
+    const_to->literal_type = TYPE_INT;
+    const_to->next = range_op;
+
+    range_op->value = 4;
+    range_op->src1 = 1;
+    range_op->src2 = 2;
+    range_op->deopt_map = 1;
+    range_op->bytecode_pc = 10;
+    range_op->next = ret_op;
+
+    ret_op->src1 = 4;
+    ret_op->literal_type = base_type;
+
+    block->first = load_base;
+    block->last = ret_op;
     return program;
 }
 
@@ -1739,6 +2005,83 @@ list_index_tagged_consumer_program(HIROp op)
     ret->src1 = 5;
     ret->literal_type = TYPE_INT;
     block->first = load_list;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_unary_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *unary = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 3;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_is_tagged = allocate(3);
+    program->value_is_tagged[1] = 1;
+    program->value_types[2] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load->value = 1;
+    load->local_id = 0;
+    load->literal_type = TYPE_ANY;
+    load->next = unary;
+    unary->value = 2;
+    unary->src1 = 1;
+    unary->op = op;
+    unary->next = ret;
+    ret->src1 = 2;
+    ret->literal_type = TYPE_INT;
+    block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_binary_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_lhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_rhs = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *binary = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_is_tagged = allocate(4);
+    program->value_is_tagged[1] = 1;
+    program->value_is_tagged[2] = 1;
+    program->value_is_tagged[3] = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_lhs->value = 1;
+    load_lhs->local_id = 0;
+    load_lhs->literal_type = TYPE_ANY;
+    load_lhs->next = load_rhs;
+    load_rhs->value = 2;
+    load_rhs->local_id = 1;
+    load_rhs->literal_type = TYPE_ANY;
+    load_rhs->next = binary;
+    binary->value = 3;
+    binary->src1 = 1;
+    binary->src2 = 2;
+    binary->op = op;
+    binary->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = TYPE_INT;
+    block->first = load_lhs;
     block->last = ret;
     return program;
 }
@@ -2093,6 +2436,7 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
     JITBlock *block = program->blocks;
     JITSourceLocation ignored_loc;
     int deopt_map_index = -1;
+    JITRunResult fallback_result = JIT_RUN_FALLBACK;
 
     if (!source_location)
 	source_location = &ignored_loc;
@@ -2102,11 +2446,15 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
+	deopt->builtin_func = -1;
+	deopt->operation = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
 	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
+	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
+	    deopt->operation = program->deopt_maps[0].operation;
 	}
     }
 
@@ -2135,11 +2483,14 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
 		break;
 	    case HIR_TAC_DEOPT:
 	    case HIR_TAC_CALL:
-	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		deopt_map_index = instr->deopt_map;
+		goto do_fallback;
+	    case HIR_TAC_CALL_VERB:
+		deopt_map_index = instr->deopt_map;
+		fallback_result = JIT_RUN_CALL_VERB;
 		goto do_fallback;
 	    case HIR_TAC_CONST:
 		if (instr->literal_type == TYPE_FLOAT)
@@ -2438,10 +2789,12 @@ do_fallback:
 	    deopt->error_pc = map->error_pc;
 	    deopt->stack_depth = map->stack_depth;
 	    deopt->ticks_charged = map->ticks_charged;
+	    deopt->builtin_func = map->builtin_func;
+	    deopt->operation = map->operation;
 	}
     }
     myfree(values, M_PROGRAM);
-    return JIT_RUN_FALLBACK;
+    return fallback_result;
 }
 
 static void
@@ -2510,6 +2863,7 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 	check(native_deopt.error_pc == ref_deopt.error_pc, message);
 	check(native_deopt.stack_depth == ref_deopt.stack_depth, message);
 	check(native_deopt.ticks_charged == ref_deopt.ticks_charged, message);
+	check(native_deopt.builtin_func == ref_deopt.builtin_func, message);
 	for (i = 0; i < (int) native_deopt.stack_depth; i++) {
 	    check(native_deopt_stack[i].type == ref_deopt_stack[i].type, message);
 	    if (native_deopt_stack[i].type == TYPE_INT)
@@ -2565,15 +2919,6 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 }
 
 static void
-count_line(const char *line, void *data)
-{
-    int *count = data;
-
-    if (line && *line)
-	(*count)++;
-}
-
-static void
 check(int condition, const char *message)
 {
     if (!condition) {
@@ -2623,14 +2968,20 @@ main(void)
     int ticks = 10;
     int timed_out = 0;
     enum error error = E_NONE;
-    int lines = 0;
+    struct mir_dump mir_dump = {0, 0};
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
 
-    check(jit_program_dump_mir(program, count_line, &lines),
+    check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
-    check(lines > 0, "MIR dump was empty");
+    check(mir_dump.lines > 0, "MIR dump was empty");
+    check(mir_dump.found_source_marker,
+	  "MIR dump did not contain PC and line information");
+    mir_dump.lines = 0;
+    check(jit_program_dump_hir(program, check_mir_line, &mir_dump),
+	  "HIR dump failed");
+    check(mir_dump.lines > 0, "HIR dump was empty");
     check(jit_program_deopt_map_count(program) == 1,
 	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,
@@ -2942,7 +3293,7 @@ main(void)
     env[0].type = TYPE_INT;
     env[0].v.num = 0;
 
-    /* Call boundary deopt test */
+    /* Generic built-in VM call boundary test */
     {
 	JITProgram *call_prog = call_boundary_program();
 	deopt_stack[0].type = TYPE_INT;
@@ -2950,11 +3301,84 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(call_prog, env, &result, &ticks, &timed_out,
 				  &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_FALLBACK, "call boundary did not return fallback");
+	      == JIT_RUN_CALL_VERB, "call boundary did not request a VM call");
 	check(deopt.bytecode_pc == 25, "call boundary wrong bytecode_pc");
 	check(deopt.stack_depth == 1, "call boundary wrong stack depth");
 	check(deopt_stack[0].v.num == 99, "call boundary wrong stack value");
 	jit_program_free(call_prog);
+    }
+
+    /* pass() VM call and native continuation tests */
+    {
+	JITProgram *pass_prog = builtin_call_program(9);
+	ResumeKey pass_key = { 0, 2 };
+	Var pass_env[1];
+	Var *pass_args = new_list(0).v.list;
+
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	ticks = 10;
+	check(jit_program_resume_map(pass_prog, pass_key) == 1,
+	      "pass continuation key did not resolve");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB, "pass did not request a VM call");
+	check(ticks == 10 && deopt.ticks_charged == 0,
+	      "pass reported the wrong charged tick count");
+	check(deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST,
+	      "pass did not materialize its argument list");
+	free_var(deopt_stack[0]);
+	deopt_stack[0].type = TYPE_STR;
+	deopt_stack[0].v.str = str_dup("passed");
+	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "pass continuation did not return");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "passed"),
+	      "pass continuation returned the wrong value");
+	free_var(result);
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	pass_prog = builtin_call_program(9);
+	pass_prog->deopt_maps[1].native_resume_valid = 0;
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	check(jit_program_resume_map(pass_prog, pass_key) == -1,
+	      "unsafe pass continuation key resolved");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "pass without a native continuation did not request a VM call");
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	/* The same continuation machinery applies to ordinary built-ins. */
+	pass_prog = builtin_call_program(17);
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	check(jit_program_resume_map(pass_prog, pass_key) == 1,
+	      "generic built-in continuation key did not resolve");
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "generic built-in did not request a VM call");
+	free_var(deopt_stack[0]);
+	deopt_stack[0].type = TYPE_INT;
+	deopt_stack[0].v.num = 41;
+	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "generic built-in continuation did not return");
+	check(result.type == TYPE_INT && result.v.num == 41,
+	      "generic built-in continuation returned the wrong value");
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
     }
 
     /* Property read deopt test */
@@ -2978,6 +3402,28 @@ main(void)
     /* Verb call deopt boundary tests */
     {
 	JITProgram *call_prog = call_verb_program();
+	ResumeKey call_key = { 0, 1 };
+	ResumeKey wrong_key = { 0, 2 };
+	check(jit_program_resume_map(call_prog, call_key) == 1,
+	      "verb call resume key did not resolve");
+	check(jit_program_resume_map(call_prog, wrong_key) == -1,
+	      "unknown verb call resume key resolved");
+	{
+	    JITProgram *non_tail = call_verb_program();
+	    JITInstruction *call = non_tail->blocks->first;
+	    JITInstruction *extra = instruction(HIR_TAC_CONST);
+
+	    while (call->kind != HIR_TAC_CALL_VERB)
+		call = call->next;
+	    extra->value = 1;
+	    extra->literal_type = TYPE_OBJ;
+	    extra->next = call->next;
+	    call->next = extra;
+	    non_tail->deopt_maps[1].native_resume_valid = 0;
+	    check(jit_program_resume_map(non_tail, call_key) == -1,
+		  "non-tail verb call exposed an unsafe continuation");
+	    jit_program_free(non_tail);
+	}
 	deep_env[0].type = TYPE_OBJ;
 	deep_env[0].v.obj = 0;
 	deep_env[1].type = TYPE_STR;
@@ -2989,7 +3435,7 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(call_prog, deep_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_FALLBACK, "call_verb did not return fallback");
+	      == JIT_RUN_CALL_VERB, "call_verb did not request a VM call");
 	check(ticks == 9 && deopt.ticks_charged == 1,
 	      "call_verb reported the wrong charged tick count");
 	check(deopt.bytecode_pc == 30, "call_verb wrong bytecode_pc");
@@ -3004,6 +3450,16 @@ main(void)
 	      "call_verb wrong argument stack value");
 	free_var(deopt_stack[1]);
 	free_var(deopt_stack[2]);
+	deopt_stack[0].type = TYPE_STR;
+	deopt_stack[0].v.str = str_dup("returned");
+	check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "call_verb continuation did not return");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "returned"),
+	      "call_verb continuation returned the wrong value");
+	free_var(result);
+	free_var(deopt_stack[0]);
 	free_var(deep_env[1]);
 	free_var(deep_env[2]);
 	jit_program_free(call_prog);
@@ -3344,6 +3800,33 @@ main(void)
 	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
 	      "string length returned wrong configured character length");
 	check_differential(str_length, 0, 10, 0, "string length differential");
+
+	/* Protection changes regenerate code and bridge the builtin through the VM. */
+	hir_test_set_length_protected(1);
+	{
+	    JITDeoptState protected_deopt;
+	    Var protected_stack[1];
+
+	    ticks = 10;
+	    check(jit_program_execute(str_length, 0, &result, &ticks,
+				      &timed_out, &error, 0, &protected_deopt,
+				      protected_stack)
+		  == JIT_RUN_CALL_VERB, "protected length did not enter VM");
+	    check(protected_deopt.stack_depth == 1
+		  && protected_stack[0].type == TYPE_LIST
+		  && protected_stack[0].v.list[0].v.num == 1
+		  && protected_stack[0].v.list[1].type == TYPE_STR,
+		  "protected length did not materialize its arguments");
+	    free_var(protected_stack[0]);
+	}
+	hir_test_set_length_protected(0);
+	ticks = 10;
+	check(jit_program_execute(str_length, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "unprotected length did not return to native");
+	check(result.type == TYPE_INT
+	      && result.v.num == (Num) memo_strlen_utf("h\xc3\xa9llo"),
+	      "recompiled length returned the wrong value");
 	jit_program_free(str_length);
 
 	JITProgram *str_cat = string_concat_program("Hello, ", "world!");
@@ -3587,6 +4070,50 @@ main(void)
 	jit_program_free(tagged_in);
     }
 
+    /* Type inspection reads a dynamic value's runtime tag without deoptimizing. */
+    {
+	JITProgram *tagged_typeof = tagged_unary_program(HIR_OP_TYPEOF);
+	Var tagged_env[1];
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("dynamic type");
+	ticks = 10;
+	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged typeof executed natively");
+	check(result.type == TYPE_INT && result.v.num == TYPE_STR,
+	      "tagged typeof returned the runtime type");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged_typeof);
+    }
+
+    /* Tagged exponentiation accepts integers and guards other runtime types. */
+    {
+	JITProgram *tagged_exp = tagged_binary_program(HIR_OP_EXP);
+	Var tagged_env[2];
+
+	tagged_env[0].type = TYPE_INT;
+	tagged_env[0].v.num = 3;
+	tagged_env[1].type = TYPE_INT;
+	tagged_env[1].v.num = 4;
+	ticks = 10;
+	check(jit_program_execute(tagged_exp, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged exponentiation executed natively");
+	check(result.type == TYPE_INT && result.v.num == 81,
+	      "tagged exponentiation returned the wrong value");
+
+	tagged_env[1].type = TYPE_STR;
+	tagged_env[1].v.str = str_dup("not an exponent");
+	ticks = 10;
+	check(jit_program_execute(tagged_exp, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer exponent did not deoptimize");
+	free_var(tagged_env[1]);
+	jit_program_free(tagged_exp);
+    }
+
     /* Tagged strings retain their type through concatenation and index(). */
     {
 	JITProgram *pipeline = tagged_string_pipeline_program();
@@ -3684,6 +4211,28 @@ main(void)
 	free_var(deopt_stack[0]);
 	jit_program_free(fin_deopt);
 
+	/* Nested try-except inside try-finally deoptimization test */
+	JITProgram *nested_deopt = nested_try_except_finally_deopt_program();
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	check(jit_program_execute(nested_deopt, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_FALLBACK, "nested catch/finally marker deopt failed");
+	check(deopt_state.stack_depth == 4, "nested marker deopt depth wrong");
+	check(deopt_stack[0].type == TYPE_FINALLY && deopt_stack[0].v.num == 99,
+	      "nested finally marker wrong");
+	check(deopt_stack[1].type == TYPE_INT && deopt_stack[1].v.num == 0,
+	      "nested catch marker codes wrong");
+	check(deopt_stack[2].type == TYPE_INT && deopt_stack[2].v.num == 55,
+	      "nested catch marker handler pc wrong");
+	check(deopt_stack[3].type == TYPE_CATCH && deopt_stack[3].v.num == 1,
+	      "nested catch marker type/arm wrong");
+	free_var(deopt_stack[0]);
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	free_var(deopt_stack[3]);
+	jit_program_free(nested_deopt);
+
 	/* Fork boundary deoptimization tests */
 	JITProgram *fork_deopt = fork_boundary_deopt_program();
 	memset(deopt_stack, 0, sizeof(deopt_stack));
@@ -3699,6 +4248,43 @@ main(void)
 	      "fork boundary time value on stack wrong");
 	free_var(deopt_stack[0]);
 	jit_program_free(fork_deopt);
+
+	/* Native string and list range reference tests */
+	{
+	    Var str_input;
+	    str_input.type = TYPE_STR;
+	    str_input.v.str = str_dup("abcdef");
+	    JITProgram *str_range_p = range_ref_test_program(TYPE_STR);
+	    ticks = 10;
+	    check(jit_program_execute(str_range_p, &str_input, &result, &ticks,
+				      &timed_out, &error, 0, &deopt_state, 0)
+		  == JIT_RUN_RETURNED, "string range ref did not return");
+	    check(result.type == TYPE_STR && !strcmp(result.v.str, "bcd"),
+		  "string range ref returned wrong substring");
+	    free_var(result);
+	    free_var(str_input);
+	    jit_program_free(str_range_p);
+
+	    Var list_input = new_list(5);
+	    list_input.v.list[1] = (Var){ .type = TYPE_INT, .v.num = 10 };
+	    list_input.v.list[2] = (Var){ .type = TYPE_INT, .v.num = 20 };
+	    list_input.v.list[3] = (Var){ .type = TYPE_INT, .v.num = 30 };
+	    list_input.v.list[4] = (Var){ .type = TYPE_INT, .v.num = 40 };
+	    list_input.v.list[5] = (Var){ .type = TYPE_INT, .v.num = 50 };
+	    JITProgram *list_range_p = range_ref_test_program(TYPE_LIST);
+	    ticks = 10;
+	    check(jit_program_execute(list_range_p, &list_input, &result, &ticks,
+				      &timed_out, &error, 0, &deopt_state, 0)
+		  == JIT_RUN_RETURNED, "list range ref did not return");
+	    check(result.type == TYPE_LIST && result.v.list[0].v.num == 3
+		  && result.v.list[1].v.num == 20
+		  && result.v.list[2].v.num == 30
+		  && result.v.list[3].v.num == 40,
+		  "list range ref returned wrong sublist");
+	    free_var(result);
+	    free_var(list_input);
+	    jit_program_free(list_range_p);
+	}
     }
 
     /* Nested control flow (loop + conditional) differential test */
@@ -3814,6 +4400,86 @@ main(void)
 	      "in native execution index value");
 	free_var(env[1]);
 	jit_program_free(in_p);
+    }
+
+    {
+	/* Regression test: empty JIT program compilation and fallback */
+	JITProgram *empty_prog = new_jit_program();
+	check(jit_program_compile(empty_prog) == 1, "empty JIT program compile succeeds");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	JITRunResult res = jit_program_execute(empty_prog, 0, &result,
+					       &ticks, &timed_out, &error,
+					       0, 0, 0);
+	check(res == JIT_RUN_FALLBACK, "empty JIT program execute falls back");
+	jit_program_free(empty_prog);
+    }
+
+    {
+	/* Regression test: deoptimization of indexed string operation must not corrupt local type to TYPE_LIST */
+	JITProgram *deopt_prog = new_jit_program();
+	JITBlock *block = allocate(sizeof(JITBlock));
+	JITInstruction *load = instruction(HIR_TAC_LOAD_LOCAL);
+	JITInstruction *deopt_inst = instruction(HIR_TAC_DEOPT);
+	JITDeoptMap *map;
+	Var env[1];
+	Var stack[4];
+	JITDeoptState deopt_state;
+
+	deopt_prog->num_values = 2;
+	deopt_prog->num_vars = 1;
+	deopt_prog->num_blocks = 1;
+	deopt_prog->value_types = allocate(sizeof(var_type) * 2);
+	deopt_prog->value_types[1] = TYPE_STR;
+	add_entry_deopt_map(deopt_prog);
+	deopt_prog->deopt_maps = myrealloc(deopt_prog->deopt_maps,
+					   sizeof(JITDeoptMap) * 2, M_PROGRAM);
+	map = &deopt_prog->deopt_maps[1];
+	memset(map, 0, sizeof(JITDeoptMap));
+	deopt_prog->num_deopt_maps = 2;
+	map->bytecode_pc = map->error_pc = 20;
+	map->stack_depth = 0;
+	map->ticks_charged = 1;
+	map->num_locals = 1;
+	map->local_values = allocate(sizeof(int) * 1);
+	map->local_values[0] = 1;
+	map->local_types = allocate(sizeof(var_type) * 1);
+	map->local_types[0] = TYPE_STR;
+	map->operation = HIR_OP_INDEX;
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+
+	deopt_prog->blocks = deopt_prog->last_block = block;
+	block->id = 1;
+	load->value = 1;
+	load->local_id = 0;
+	load->literal_type = TYPE_STR;
+	load->deopt_map = 0;
+	deopt_inst->kind = HIR_TAC_DEOPT;
+	deopt_inst->deopt_map = 1;
+
+	load->next = deopt_inst;
+	block->first = load;
+	block->last = deopt_inst;
+
+	env[0].type = TYPE_STR;
+	env[0].v.str = str_dup("root class");
+
+	check(jit_program_compile(deopt_prog) == 1, "indexed string deopt program compile");
+	ticks = 50;
+	timed_out = 0;
+	error = E_NONE;
+	memset(&deopt_state, 0, sizeof(deopt_state));
+	JITRunResult res = jit_program_execute(deopt_prog, env, &result,
+					       &ticks, &timed_out, &error,
+					       0, &deopt_state, stack);
+	check(res == JIT_RUN_FALLBACK, "indexed string deopt returns fallback");
+	check(deopt_state.operation == HIR_OP_INDEX,
+	      "indexed string deopt preserves operation identity");
+	check(env[0].type == TYPE_STR, "deoptimized string local retains TYPE_STR");
+	check(strcmp(env[0].v.str, "root class") == 0, "deoptimized string local retains value");
+	free_var(env[0]);
+	jit_program_free(deopt_prog);
     }
 
     jit_program_free(program);
@@ -3992,6 +4658,7 @@ main(void)
 	jit_profile_record_entry();
 	jit_profile_record_entry();
 	jit_profile_record_completed();
+	jit_profile_record_vm_call();
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));
@@ -4002,8 +4669,15 @@ main(void)
 
 	deopt_sample.bytecode_pc = 18;
 	deopt_sample.source_lineno = 5;
+	deopt_sample.operation = HIR_OP_GET_PROP;
 	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
 	jit_profile_record_deopt(1, "eval", &deopt_sample);
+
+	deopt_sample.bytecode_pc = 20;
+	deopt_sample.source_lineno = 6;
+	deopt_sample.operation = HIR_OP_SCATTER;
+	deopt_sample.reason = JIT_DEOPT_UNSUPPORTED_OP;
+	jit_profile_record_deopt(69, "parse_parties", &deopt_sample);
 
 	/* Trigger report generation */
 	jit_profile_report();
