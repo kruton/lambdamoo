@@ -4636,6 +4636,15 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     instr->op, instr->value, instr->src1, instr->src2,
 		     type, tagged, instr->local_id, instr->deopt_map);
 	    add_line(line, data);
+	    if (instr->kind == HIR_TAC_PARALLEL_COPY) {
+		JITCopy *copy;
+
+		for (copy = instr->copies; copy; copy = copy->next) {
+		    snprintf(line, sizeof(line), "    v%d <- v%d",
+			     copy->dst, copy->src);
+		    add_line(line, data);
+		}
+	    }
 	    if (instr == block->last)
 		break;
 	}
