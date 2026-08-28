@@ -46,6 +46,7 @@ typedef struct {
     unsigned stack_depth;
     int ticks_charged;
     int builtin_func;
+    int operation;
     JITDeoptReason reason;
 } JITDeoptState;
 

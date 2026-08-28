@@ -45,6 +45,7 @@ struct JITDeoptMap {
     int native_resume_valid;
     int builtin_func;
     int builtin_args;
+    int operation;
     JITDeoptReason reason;
 };
 

@@ -4058,6 +4058,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
 	deopt->builtin_func = -1;
+	deopt->operation = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
@@ -4065,6 +4066,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
 	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
+	    deopt->operation = program->deopt_maps[0].operation;
 	    deopt->reason = program->deopt_maps[0].reason;
 	}
     }
@@ -4132,6 +4134,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->stack_depth = materialized_depth;
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
+	    deopt->operation = map->operation;
 	    deopt->reason = map->reason;
 	}
     }
@@ -4245,6 +4248,7 @@ typedef struct JITDeoptSite {
     Objid vloc;
     char *verbname;
     int builtin_func;
+    int operation;
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITDeoptReason reason;
@@ -4259,6 +4263,7 @@ static uint64_t total_jit_completed = 0;
 static uint64_t total_vm_calls = 0;
 static uint64_t total_deopts = 0;
 static uint64_t deopt_reason_counts[JIT_DEOPT_NUM_REASONS];
+static uint64_t unsupported_operation_counts[HIR_OP_FORK + 1];
 static time_t last_deopt_report_time = 0;
 
 const char *
@@ -4318,32 +4323,45 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
     Num log_mode;
     int builtin_func = reason == JIT_DEOPT_BUILTIN_CALL && deopt
 	? deopt->builtin_func : -1;
+    int operation = deopt ? deopt->operation : -1;
     const char *builtin_name = builtin_func >= 0
 	? name_func_by_num((unsigned) builtin_func) : 0;
+    char operation_label[32];
+    const char *operation_name = 0;
     unsigned h;
     JITDeoptSite *site;
 
     total_deopts++;
     deopt_reason_counts[reason]++;
+    if (operation >= 0 && operation <= HIR_OP_FORK) {
+	snprintf(operation_label, sizeof(operation_label), "op=%d", operation);
+	operation_name = operation_label;
+    }
+    if (reason == JIT_DEOPT_UNSUPPORTED_OP && operation_name)
+	unsupported_operation_counts[operation]++;
 
     log_mode = server_int_option("jit_deopt_log_mode", 0);
     if (log_mode == 1) {
-	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s%s%s%s\n",
+	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s\n",
 	      vloc, verbname ? verbname : "?",
 	      deopt ? deopt->source_lineno : 0,
 	      deopt ? deopt->bytecode_pc : 0,
 	      jit_deopt_reason_name(reason), builtin_name ? " [" : "",
-	      builtin_name ? builtin_name : "", builtin_name ? "]" : "");
+	      builtin_name ? builtin_name : "", builtin_name ? "]" : "",
+	      operation_name ? " [" : "", operation_name ? operation_name : "",
+	      operation_name ? "]" : "");
     }
 
     h = ((unsigned) vloc * 31 + (deopt ? deopt->bytecode_pc : 0) * 17
-	 + (unsigned) reason + (unsigned) (builtin_func + 1) * 13)
+	 + (unsigned) reason + (unsigned) (builtin_func + 1) * 13
+	 + (unsigned) (operation + 1) * 19)
 	% JIT_DEOPT_HASH_SIZE;
     for (site = deopt_sites_hash[h]; site; site = site->next) {
 	if (site->vloc == vloc
 	    && site->bytecode_pc == (deopt ? deopt->bytecode_pc : 0)
 	    && site->reason == reason
 	    && site->builtin_func == builtin_func
+	    && site->operation == operation
 	    && ((!site->verbname && !verbname)
 		|| (site->verbname && verbname && strcmp(site->verbname, verbname) == 0))) {
 	    site->count++;
@@ -4354,6 +4372,7 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
     site->vloc = vloc;
     site->verbname = verbname ? str_dup(verbname) : 0;
     site->builtin_func = builtin_func;
+    site->operation = operation;
     site->bytecode_pc = deopt ? deopt->bytecode_pc : 0;
     site->source_lineno = deopt ? deopt->source_lineno : 0;
     site->reason = reason;
@@ -4391,6 +4410,14 @@ jit_profile_report(void)
 	}
     }
 
+    if (deopt_reason_counts[JIT_DEOPT_UNSUPPORTED_OP] > 0) {
+	oklog("JIT: Unsupported Operation Breakdown:\n");
+	for (i = 0; i <= HIR_OP_FORK; i++)
+	    if (unsupported_operation_counts[i] > 0)
+		oklog("JIT:   op=%-19d: %10"PRIu64"\n", i,
+		      unsupported_operation_counts[i]);
+    }
+
     memset(top_sites, 0, sizeof(top_sites));
     for (i = 0; i < JIT_DEOPT_HASH_SIZE; i++) {
 	for (JITDeoptSite *s = deopt_sites_hash[i]; s; s = s->next) {
@@ -4411,12 +4438,22 @@ jit_profile_report(void)
 	    JITDeoptSite *s = top_sites[j];
 	    const char *builtin_name = s->builtin_func >= 0
 		? name_func_by_num((unsigned) s->builtin_func) : 0;
-	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s%s%s%s (count: %"PRIu64")\n",
+	    char operation_label[32];
+	    const char *operation_name = 0;
+	    if (s->operation >= 0 && s->operation <= HIR_OP_FORK) {
+		snprintf(operation_label, sizeof(operation_label), "op=%d",
+			 s->operation);
+		operation_name = operation_label;
+	    }
+	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s (count: %"PRIu64")\n",
 		  s->vloc, s->verbname ? s->verbname : "?",
 		  s->source_lineno, s->bytecode_pc,
 		  jit_deopt_reason_name(s->reason),
 		  builtin_name ? " [" : "", builtin_name ? builtin_name : "",
 		  builtin_name ? "]" : "",
+		  operation_name ? " [" : "",
+		  operation_name ? operation_name : "",
+		  operation_name ? "]" : "",
 		  s->count);
 	}
     }
@@ -4467,5 +4504,7 @@ jit_profile_reset(void)
     total_vm_calls = 0;
     total_deopts = 0;
     memset(deopt_reason_counts, 0, sizeof(deopt_reason_counts));
+    memset(unsupported_operation_counts, 0,
+	   sizeof(unsupported_operation_counts));
     last_deopt_report_time = 0;
 }

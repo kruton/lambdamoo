@@ -3789,6 +3789,10 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->num_locals = instr->num_local_values;
     map->builtin_func = -1;
     map->builtin_args = -1;
+    map->operation = -1;
+    if (instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
+	|| instr->kind == HIR_TAC_DEOPT)
+	map->operation = instr->op;
     if (instr->kind == HIR_TAC_UNARY && instr->func < FUNC_NOT_FOUND) {
 	map->builtin_func = instr->func;
 	map->builtin_args = instr->src1 ? 1 : 0;
@@ -4137,6 +4141,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps[0].bytecode_pc = 0;
     program->deopt_maps[0].builtin_func = -1;
     program->deopt_maps[0].builtin_args = -1;
+    program->deopt_maps[0].operation = -1;
     program->deopt_maps[0].error_pc = 0;
     program->deopt_maps[0].source_lineno = 1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
@@ -5404,6 +5409,8 @@ op_name(HIROp op)
 	return "PARENT";
     case HIR_OP_SUBLIST_FROM:
 	return "SUBLIST_FROM";
+    case HIR_OP_FORK:
+	return "FORK";
     }
 
     return "?";
@@ -6916,6 +6923,7 @@ append_deopt_boundary(HIRContext *ctx, HIRTacProgram *program,
 {
     HIRTacInstr *deopt = new_tac(ctx, HIR_TAC_DEOPT, source_lineno);
 
+    deopt->op = HIR_OP_FORK;
     deopt->bytecode_pc = bytecode_pc;
     snapshot_lower_stack(ctx, deopt);
     append_tac(program, deopt);

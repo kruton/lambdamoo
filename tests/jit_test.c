@@ -74,6 +74,7 @@ add_entry_deopt_map(JITProgram *program)
     program->num_deopt_maps = 1;
     program->deopt_maps = allocate(sizeof(JITDeoptMap));
     program->deopt_maps[0].builtin_args = -1;
+    program->deopt_maps[0].operation = -1;
     program->deopt_maps[0].reason = JIT_DEOPT_TYPE_GUARD;
 }
 
@@ -2446,12 +2447,14 @@ reference_execute(JITProgram *program, Var *env, Var *result, int *ticks,
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
 	deopt->builtin_func = -1;
+	deopt->operation = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
 	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
 	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
+	    deopt->operation = program->deopt_maps[0].operation;
 	}
     }
 
@@ -2787,6 +2790,7 @@ do_fallback:
 	    deopt->stack_depth = map->stack_depth;
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
+	    deopt->operation = map->operation;
 	}
     }
     myfree(values, M_PROGRAM);
@@ -4442,6 +4446,7 @@ main(void)
 	map->local_values[0] = 1;
 	map->local_types = allocate(sizeof(var_type) * 1);
 	map->local_types[0] = TYPE_STR;
+	map->operation = HIR_OP_INDEX;
 	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
 
 	deopt_prog->blocks = deopt_prog->last_block = block;
@@ -4469,6 +4474,8 @@ main(void)
 					       &ticks, &timed_out, &error,
 					       0, &deopt_state, stack);
 	check(res == JIT_RUN_FALLBACK, "indexed string deopt returns fallback");
+	check(deopt_state.operation == HIR_OP_INDEX,
+	      "indexed string deopt preserves operation identity");
 	check(env[0].type == TYPE_STR, "deoptimized string local retains TYPE_STR");
 	check(strcmp(env[0].v.str, "root class") == 0, "deoptimized string local retains value");
 	free_var(env[0]);
@@ -4662,8 +4669,15 @@ main(void)
 
 	deopt_sample.bytecode_pc = 18;
 	deopt_sample.source_lineno = 5;
+	deopt_sample.operation = HIR_OP_GET_PROP;
 	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
 	jit_profile_record_deopt(1, "eval", &deopt_sample);
+
+	deopt_sample.bytecode_pc = 20;
+	deopt_sample.source_lineno = 6;
+	deopt_sample.operation = HIR_OP_SCATTER;
+	deopt_sample.reason = JIT_DEOPT_UNSUPPORTED_OP;
+	jit_profile_record_deopt(69, "parse_parties", &deopt_sample);
 
 	/* Trigger report generation */
 	jit_profile_report();
