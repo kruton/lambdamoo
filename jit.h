@@ -74,7 +74,7 @@ typedef struct {
     size_t runtime_bytes;
     size_t machine_code_bytes;
     size_t native_allocated_bytes;
-    int64_t mir_bytes;
+    size_t mir_bytes;
     size_t accounted_bytes;
 } JITProgramStats;
 

@@ -21,6 +21,7 @@
 #include "mir.h"
 #include "mir-gen.h"
 
+#include <assert.h>
 #include <limits.h>
 #include <stddef.h>
 #include <string.h>
@@ -415,8 +416,166 @@ typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *, Objid,
 				   int, Var *);
 
+typedef union JITMIRAllocationHeader JITMIRAllocationHeader;
+
+/* Preserve malloc alignment while recording actual retained bytes.  The list
+ * also lets allocator teardown reclaim detached MIR allocations. */
+union JITMIRAllocationHeader {
+    struct {
+	size_t size;
+	JITMIRAllocationHeader *previous;
+	JITMIRAllocationHeader *next;
+    } allocation;
+    long double align_long_double;
+    void *align_pointer;
+    void (*align_function)(void);
+};
+
+typedef struct {
+    struct MIR_alloc interface;
+    JITMIRAllocationHeader *allocations;
+    size_t live_bytes;
+    size_t live_allocations;
+} JITMIRAllocator;
+
+static void *
+jit_mir_allocate(size_t size, int clear, JITMIRAllocator *allocator)
+{
+    JITMIRAllocationHeader *header;
+    size_t total;
+
+    if (size > UINT_MAX - sizeof(JITMIRAllocationHeader))
+	return 0;
+    total = sizeof(JITMIRAllocationHeader) + size;
+    header = mymalloc((unsigned) total, M_PROGRAM);
+    if (clear)
+	memset(header, 0, total);
+    header->allocation.size = size;
+    header->allocation.previous = 0;
+    header->allocation.next = allocator->allocations;
+    if (allocator->allocations)
+	allocator->allocations->allocation.previous = header;
+    allocator->allocations = header;
+    allocator->live_bytes += total;
+    allocator->live_allocations++;
+    return header + 1;
+}
+
+static void *
+jit_mir_malloc(size_t size, void *data)
+{
+    return jit_mir_allocate(size, 0, data);
+}
+
+static void *
+jit_mir_calloc(size_t count, size_t size, void *data)
+{
+    if (count && size > (size_t) -1 / count)
+	return 0;
+    return jit_mir_allocate(count * size, 1, data);
+}
+
+static void *
+jit_mir_realloc(void *ptr, size_t old_size, size_t new_size, void *data)
+{
+    JITMIRAllocator *allocator = data;
+    JITMIRAllocationHeader *header;
+    JITMIRAllocationHeader *new_header;
+    size_t old_total, new_total;
+
+    if (!ptr)
+	return jit_mir_allocate(new_size, 0, allocator);
+    header = (JITMIRAllocationHeader *) ptr - 1;
+    assert(header->allocation.size == old_size);
+    (void) old_size;
+    if (!new_size) {
+	old_total = sizeof(JITMIRAllocationHeader) + header->allocation.size;
+	if (header->allocation.previous)
+	    header->allocation.previous->allocation.next
+		= header->allocation.next;
+	else
+	    allocator->allocations = header->allocation.next;
+	if (header->allocation.next)
+	    header->allocation.next->allocation.previous
+		= header->allocation.previous;
+	allocator->live_bytes -= old_total;
+	allocator->live_allocations--;
+	myfree(header, M_PROGRAM);
+	return 0;
+    }
+    if (new_size > UINT_MAX - sizeof(JITMIRAllocationHeader))
+	return 0;
+    old_total = sizeof(JITMIRAllocationHeader) + header->allocation.size;
+    new_total = sizeof(JITMIRAllocationHeader) + new_size;
+    new_header = myrealloc(header, (unsigned) new_total, M_PROGRAM);
+    new_header->allocation.size = new_size;
+    if (new_header->allocation.previous)
+	new_header->allocation.previous->allocation.next = new_header;
+    else
+	allocator->allocations = new_header;
+    if (new_header->allocation.next)
+	new_header->allocation.next->allocation.previous = new_header;
+    allocator->live_bytes = allocator->live_bytes - old_total + new_total;
+    return new_header + 1;
+}
+
+static void
+jit_mir_free(void *ptr, void *data)
+{
+    JITMIRAllocator *allocator = data;
+    JITMIRAllocationHeader *header;
+
+    if (!ptr)
+	return;
+    header = (JITMIRAllocationHeader *) ptr - 1;
+    if (header->allocation.previous)
+	header->allocation.previous->allocation.next = header->allocation.next;
+    else
+	allocator->allocations = header->allocation.next;
+    if (header->allocation.next)
+	header->allocation.next->allocation.previous = header->allocation.previous;
+    allocator->live_bytes -= (sizeof(JITMIRAllocationHeader)
+			      + header->allocation.size);
+    allocator->live_allocations--;
+    myfree(header, M_PROGRAM);
+}
+
+static JITMIRAllocator *
+jit_mir_allocator_new(void)
+{
+    JITMIRAllocator *allocator = mymalloc(sizeof(JITMIRAllocator), M_PROGRAM);
+
+    memset(allocator, 0, sizeof(JITMIRAllocator));
+    allocator->interface.malloc = jit_mir_malloc;
+    allocator->interface.calloc = jit_mir_calloc;
+    allocator->interface.realloc = jit_mir_realloc;
+    allocator->interface.free = jit_mir_free;
+    allocator->interface.user_data = allocator;
+    return allocator;
+}
+
+static void
+jit_mir_allocator_free(JITMIRAllocator *allocator)
+{
+    JITMIRAllocationHeader *header;
+
+    if (!allocator)
+	return;
+    while ((header = allocator->allocations)) {
+	allocator->allocations = header->allocation.next;
+	allocator->live_bytes -= (sizeof(JITMIRAllocationHeader)
+				 + header->allocation.size);
+	allocator->live_allocations--;
+	myfree(header, M_PROGRAM);
+    }
+    assert(allocator->live_bytes == 0);
+    assert(allocator->live_allocations == 0);
+    myfree(allocator, M_PROGRAM);
+}
+
 typedef struct {
     MIR_context_t context;
+    JITMIRAllocator *allocator;
     MIR_module_t module;
     MIR_item_t function;
     MIR_item_t proto_is_true;
@@ -844,9 +1003,13 @@ build_mir(JITProgram *program, MIRBuild *build)
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
-    build->context = MIR_init();
-    if (!build->context)
+    build->allocator = jit_mir_allocator_new();
+    build->context = MIR_init2(&build->allocator->interface, 0);
+    if (!build->context) {
+	jit_mir_allocator_free(build->allocator);
+	build->allocator = 0;
 	return 0;
+    }
     build->module = MIR_new_module(build->context, "lambda_moo_jit");
     MIR_type_t res_i64 = MIR_T_I64;
     MIR_type_t res_p = MIR_T_P;
@@ -3751,6 +3914,10 @@ jit_program_release_native(JITProgram *program)
 	MIR_finish((MIR_context_t) program->mir_context);
 	program->mir_context = 0;
     }
+    if (program->mir_allocator) {
+	jit_mir_allocator_free(program->mir_allocator);
+	program->mir_allocator = 0;
+    }
     if (program->deopt_values) {
 	myfree(program->deopt_values, M_PROGRAM);
 	program->deopt_values = 0;
@@ -3849,6 +4016,8 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(unsigned char) * program->num_values;
     if (program->usage)
 	bytes += sizeof(JITProgramUsage);
+    if (program->mir_allocator)
+	bytes += sizeof(JITMIRAllocator);
     for (i = 0; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
 
@@ -3882,7 +4051,6 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     if (!stats)
 	return;
     memset(stats, 0, sizeof(*stats));
-    stats->mir_bytes = -1;
     if (!program)
 	return;
     if (program->usage) {
@@ -3908,8 +4076,10 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->machine_code_bytes = program->machine_code_len;
     stats->native_allocated_bytes = program->mir_context
 	? _MIR_code_allocated_size((MIR_context_t) program->mir_context) : 0;
+    stats->mir_bytes = program->mir_allocator
+	? ((JITMIRAllocator *) program->mir_allocator)->live_bytes : 0;
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes;
+	+ stats->native_allocated_bytes + stats->mir_bytes;
 }
 
 int
@@ -4060,6 +4230,7 @@ jit_program_compile(JITProgram *program)
 	    program->compile_failures++;
 	MIR_gen_finish(build.context);
 	MIR_finish(build.context);
+	jit_mir_allocator_free(build.allocator);
 	program->state = JIT_STATE_FAILED;
 	if (program->reason)
 	    free_str(program->reason);
@@ -4072,6 +4243,7 @@ jit_program_compile(JITProgram *program)
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
     program->mir_context = build.context;
+    program->mir_allocator = build.allocator;
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
     memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
@@ -4337,6 +4509,7 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     file = tmpfile();
     if (!file) {
 	MIR_finish(build.context);
+	jit_mir_allocator_free(build.allocator);
 	return 0;
     }
     MIR_output_module(build.context, file, build.module);
@@ -4349,6 +4522,7 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     }
     fclose(file);
     MIR_finish(build.context);
+    jit_mir_allocator_free(build.allocator);
     return 1;
 }
 

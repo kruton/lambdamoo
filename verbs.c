@@ -364,9 +364,8 @@ jit_metadata(JITProgram *program)
 					       stats.machine_code_bytes);
     metadata.v.list[24] = jit_metadata_num_pair("native_allocated_bytes",
 					       stats.native_allocated_bytes);
-    value.type = TYPE_INT;
-    value.v.num = stats.mir_bytes;
-    metadata.v.list[25] = jit_metadata_pair("mir_bytes", value);
+    metadata.v.list[25] = jit_metadata_num_pair("mir_bytes",
+					       stats.mir_bytes);
     metadata.v.list[26] = jit_metadata_num_pair("accounted_bytes",
 					       stats.accounted_bytes);
     return metadata;

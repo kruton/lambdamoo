@@ -138,6 +138,7 @@ struct JITProgram {
     JITBlock *blocks;
     JITBlock *last_block;
     void *mir_context;
+    void *mir_allocator;
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
