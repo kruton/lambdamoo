@@ -3414,6 +3414,22 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     return ctx->error_count == errors_before;
 }
 
+static int
+resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
+		     int call_operands)
+{
+    int outer_depth;
+    int i;
+
+    if (stack_depth < (unsigned) call_operands)
+	return 0;
+    outer_depth = stack_depth - call_operands;
+    for (i = 0; i < outer_depth; i++)
+	if (stack_types[i] == TYPE_CATCH || stack_types[i] == TYPE_FINALLY)
+	    return 0;
+    return 1;
+}
+
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
 static int
 jit_op_is_supported(HIROp op)
@@ -4155,7 +4171,9 @@ jit_build_resume_liveness(JITProgram *program)
 		map->resume_values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
 		map->num_resume_values = live_count;
-		map->native_resume_valid = map->stack_depth >= (unsigned) call_operands;
+		map->native_resume_valid = resume_stack_is_safe(map->stack_types,
+							 map->stack_depth,
+							 call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value]
@@ -8321,6 +8339,13 @@ lower_stmt_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 #ifdef HIR_TESTING
+int
+hir_test_resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
+			      int call_operands)
+{
+    return resume_stack_is_safe(stack_types, stack_depth, call_operands);
+}
+
 int
 hir_test_string_builtin_length_anchor(Bytecodes *bc, unsigned pc,
 				      unsigned func, HIROp op)

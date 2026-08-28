@@ -188,6 +188,7 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 #endif
 
 #ifdef HIR_TESTING
+extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);

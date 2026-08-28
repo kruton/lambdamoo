@@ -37,6 +37,25 @@ check_rejected(const char *name, int accepted, int before_errors,
 }
 
 static void
+test_resume_stack_safety(void)
+{
+    var_type plain[] = {TYPE_INT, TYPE_STR, TYPE_LIST};
+    var_type caught[] = {TYPE_INT, TYPE_CATCH, TYPE_STR};
+    var_type finalizing[] = {TYPE_FINALLY, TYPE_INT, TYPE_STR};
+
+    check_int("plain resume stack accepted",
+	      hir_test_resume_stack_is_safe(plain, 3, 1), 1);
+    check_int("call operands may contain catch values",
+	      hir_test_resume_stack_is_safe(caught, 3, 2), 1);
+    check_int("catch marker in outer stack rejected",
+	      hir_test_resume_stack_is_safe(caught, 3, 1), 0);
+    check_int("finally marker in outer stack rejected",
+	      hir_test_resume_stack_is_safe(finalizing, 3, 1), 0);
+    check_int("insufficient resume stack rejected",
+	      hir_test_resume_stack_is_safe(plain, 1, 2), 0);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -3411,6 +3430,7 @@ test_constant_folded_branch_clears_bytecode_pc(void)
 int
 main(void)
 {
+    test_resume_stack_safety();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_list_operand_inference();
