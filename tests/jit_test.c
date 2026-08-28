@@ -3545,6 +3545,24 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == TYPE_INT,
 	      "typeof returned wrong value");
 	jit_program_free(typeof_p);
+
+	{
+	    const char *static_value = str_dup("static type");
+	    JITProgram *typeof_str = unary_program(
+		(Num) (uintptr_t) static_value, HIR_OP_TYPEOF);
+	    JITInstruction *constant = typeof_str->blocks->first;
+	    JITInstruction *unary = constant->next;
+
+	    constant->literal_type = TYPE_STR;
+	    unary->literal = TYPE_STR;
+	    ticks = 10;
+	    check(jit_program_execute(typeof_str, env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED, "string typeof execution failed");
+	    check(result.type == TYPE_INT && result.v.num == _TYPE_STR,
+		  "string typeof returned internal runtime tag");
+	    jit_program_free(typeof_str);
+	}
     }
 
     /* Scalar object tests */
@@ -4097,8 +4115,17 @@ main(void)
 	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
 				  &timed_out, &error, 0, 0, 0)
 	      == JIT_RUN_RETURNED, "tagged typeof executed natively");
-	check(result.type == TYPE_INT && result.v.num == TYPE_STR,
-	      "tagged typeof returned the runtime type");
+	check(result.type == TYPE_INT && result.v.num == _TYPE_STR,
+	      "tagged string typeof returned the internal runtime tag");
+	free_var(tagged_env[0]);
+
+	tagged_env[0] = new_list(0);
+	ticks = 10;
+	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged list typeof executed natively");
+	check(result.type == TYPE_INT && result.v.num == _TYPE_LIST,
+	      "tagged list typeof returned the internal runtime tag");
 	free_var(tagged_env[0]);
 	jit_program_free(tagged_typeof);
     }

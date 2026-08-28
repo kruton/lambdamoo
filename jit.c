@@ -1766,16 +1766,21 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 								 values[instr->src1])));
 		    } else if (instr->op == HIR_OP_TYPEOF) {
 			if (program->value_is_tagged
-			    && program->value_is_tagged[instr->src1])
+			    && program->value_is_tagged[instr->src1]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_mem_op(build->context, tag_t,
 				    (program->num_values + instr->src1) * sizeof(Num),
 				    deopt_values, 0, 1)));
-			else
+			    append(build, MIR_new_insn(build->context, MIR_AND,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, TYPE_DB_MASK)));
+			} else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, values[instr->value]),
-				MIR_new_int_op(build->context, instr->literal)));
+				MIR_new_int_op(build->context,
+					       instr->literal & TYPE_DB_MASK)));
 		    } else if (instr->op == HIR_OP_ABS) {
 			int val_fl = program->value_types
 			    && program->value_types[instr->value] == TYPE_FLOAT;
