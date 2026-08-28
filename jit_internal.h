@@ -12,6 +12,7 @@ typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 typedef struct JITResumeValue JITResumeValue;
+typedef struct JITProgramUsage JITProgramUsage;
 
 typedef enum {
     JIT_RESUME_LOCAL,
@@ -112,6 +113,16 @@ struct JITBlock {
     JITBlock *next;
 };
 
+struct JITProgramUsage {
+    uint64_t entries;
+    uint64_t completions;
+    uint64_t vm_calls;
+    uint64_t deopts;
+    uint32_t deopts_by_reason[JIT_DEOPT_NUM_REASONS];
+    uint64_t last_used_generation;
+    time_t last_used_time;
+};
+
 struct JITProgram {
     JITState state;
     const char *reason;
@@ -126,14 +137,21 @@ struct JITProgram {
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;
-    void *mir_context;
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
+    uint64_t pool_generation;
+    JITProgram *pool_prev;
+    JITProgram *pool_next;
     Num *deopt_values;
     var_type *value_types;
     unsigned char *value_is_tagged;
     unsigned protection_generation;
+    JITProgramUsage *usage;
+    uint32_t compile_attempts;
+    uint32_t compile_successes;
+    uint32_t compile_failures;
+    uint64_t compile_time_us;
 };
 
 extern int jit_rt_is_true(int64_t, int);

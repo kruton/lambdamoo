@@ -37,6 +37,25 @@ check_rejected(const char *name, int accepted, int before_errors,
 }
 
 static void
+test_resume_stack_safety(void)
+{
+    var_type plain[] = {TYPE_INT, TYPE_STR, TYPE_LIST};
+    var_type caught[] = {TYPE_INT, TYPE_CATCH, TYPE_STR};
+    var_type finalizing[] = {TYPE_FINALLY, TYPE_INT, TYPE_STR};
+
+    check_int("plain resume stack accepted",
+	      hir_test_resume_stack_is_safe(plain, 3, 1), 1);
+    check_int("call operands may contain catch values",
+	      hir_test_resume_stack_is_safe(caught, 3, 2), 1);
+    check_int("catch marker in outer stack rejected",
+	      hir_test_resume_stack_is_safe(caught, 3, 1), 0);
+    check_int("finally marker in outer stack rejected",
+	      hir_test_resume_stack_is_safe(finalizing, 3, 1), 0);
+    check_int("insufficient resume stack rejected",
+	      hir_test_resume_stack_is_safe(plain, 1, 2), 0);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -1822,6 +1841,45 @@ test_builtin_call_tac_ssa(void)
 }
 
 static void
+test_zero_argument_builtin_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr call_expr;
+    Stmt ret;
+
+    memset(&call_expr, 0, sizeof(call_expr));
+    call_expr.kind = EXPR_CALL;
+    call_expr.lineno = 10;
+    call_expr.bytecode_pc = 1;
+    call_expr.e.call.func = 10; /* time */
+    call_expr.e.call.args = 0;
+
+    ret = return_stmt(&call_expr);
+    ret.bytecode_pc = 3;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("zero-argument builtin unary count",
+	      hir_tac_count_unary_op(tac, HIR_OP_TIME), 1);
+    check_int("zero-argument builtin verify errors",
+	      hir_context_error_count(ctx), 0);
+    check_int("zero-argument builtin destroy ssa",
+	      hir_destroy_ssa(ctx, ssa), 1);
+    check_int("zero-argument builtin out-of-ssa valid",
+	      hir_verify_out_of_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_pure_builtin_inlining_tac_ssa(void)
 {
     Names names;
@@ -2129,6 +2187,8 @@ test_for_list_loop_tac_ssa(void)
     Expr result = id_expr(1, 13);
     Stmt ret = return_stmt(&result);
 
+    add.bytecode_pc = 42;
+    loop.bytecode_pc = 41;
     loop.next = &ret;
     memset(&names, 0, sizeof(names));
     names.size = 32;
@@ -2147,6 +2207,9 @@ test_for_list_loop_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_TICK), 3);
     check_int("for list ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("for list body stack uses incremented index",
+	      hir_ssa_stack_value_at_bytecode_pc(ssa, 42, 1),
+	      hir_ssa_binary_value_at_bytecode_pc(ssa, 41, HIR_OP_ADD));
 
     check_int("for list destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
@@ -3130,6 +3193,71 @@ test_list_operand_inference(void)
 }
 
 static void
+test_unknown_type_inference(void)
+{
+    var_type types[4] = { TYPE_INT, TYPE_INT, TYPE_STR, TYPE_OBJ };
+    unsigned char known[4] = { 1, 1, 1, 1 };
+    unsigned char tagged[4] = { 1, 1, 1, 1 };
+
+    hir_test_initialize_inferred_value_types(types, known, tagged, 4);
+    check_int("unknown inference initializes value to any", types[1], TYPE_ANY);
+    check_int("unknown inference initializes value as unknown", known[1], 0);
+    check_int("unknown inference does not tag before analysis", tagged[1], 0);
+
+    types[2] = TYPE_STR;
+    known[2] = 1;
+    hir_test_tag_unknown_inferred_value_types(types, known, tagged, 4);
+    check_int("unresolved value remains any", types[1], TYPE_ANY);
+    check_int("unresolved value is runtime tagged", tagged[1], 1);
+    check_int("known value retains inferred type", types[2], TYPE_STR);
+    check_int("known value is not needlessly tagged", tagged[2], 0);
+    check_int("second unresolved value remains any", types[3], TYPE_ANY);
+    check_int("second unresolved value is runtime tagged", tagged[3], 1);
+
+    check_int("equality does not constrain operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_EQ), 0);
+    check_int("inequality does not constrain operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_NE), 0);
+    check_int("ordering constrains operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_LT), 1);
+
+    check_int("integer min result is inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MIN, TYPE_INT, TYPE_INT,
+					    &types[1]), 1);
+    check_int("integer min result type", types[1], TYPE_INT);
+    check_int("float max result is inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MAX, TYPE_FLOAT, TYPE_FLOAT,
+					    &types[1]), 1);
+    check_int("float max result type", types[1], TYPE_FLOAT);
+    check_int("mixed min result is not inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MIN, TYPE_INT, TYPE_FLOAT,
+					    &types[1]), 0);
+    check_int("unrelated binary result is not inferred",
+	      hir_test_infer_min_max_result(HIR_OP_ADD, TYPE_INT, TYPE_INT,
+					    &types[1]), 0);
+}
+
+static void
+test_builtin_result_type_inference(void)
+{
+    var_type inferred = TYPE_NONE;
+
+    check_int("caller_perms result type is inferred",
+	      hir_test_infer_builtin_result_type("caller_perms", &inferred), 1);
+    check_int("caller_perms result is object", inferred, TYPE_OBJ);
+#ifdef WAIF_CORE
+    inferred = TYPE_NONE;
+    check_int("new_waif result type is inferred",
+	      hir_test_infer_builtin_result_type("new_waif", &inferred), 1);
+    check_int("new_waif result is waif", inferred, TYPE_WAIF);
+#endif
+    inferred = TYPE_NONE;
+    check_int("unknown builtin result type is not inferred",
+	      hir_test_infer_builtin_result_type("not_new_waif", &inferred), 0);
+    check_int("unknown builtin leaves result type alone", inferred, TYPE_NONE);
+}
+
+static void
 test_uninitialized_entry_load_classification(void)
 {
     int first_user = SLOT_FLOAT + 1;
@@ -3302,9 +3430,12 @@ test_constant_folded_branch_clears_bytecode_pc(void)
 int
 main(void)
 {
+    test_resume_stack_safety();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_list_operand_inference();
+    test_unknown_type_inference();
+    test_builtin_result_type_inference();
     test_uninitialized_entry_load_classification();
     test_builtin_entry_types();
     test_arithmetic_and_local_tac();
@@ -3331,6 +3462,7 @@ main(void)
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
+    test_zero_argument_builtin_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
     test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();

@@ -1402,7 +1402,7 @@ string_length_program(const char *s)
 }
 
 static JITProgram *
-catch_stack_marker_deopt_program(void)
+catch_stack_marker_program(int native_error)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -1412,16 +1412,21 @@ catch_stack_marker_deopt_program(void)
     JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
     JITDeoptMap *map;
 
-    program->num_values = 4;
+    program->num_values = native_error ? 7 : 4;
     program->num_vars = 0;
     program->num_blocks = 1;
     program->num_deopt_maps = 2;
     program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
-    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_types[0] = TYPE_INT;
     program->value_types[1] = TYPE_INT;
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_CATCH;
+    if (native_error) {
+	program->value_types[4] = TYPE_INT;
+	program->value_types[5] = TYPE_INT;
+	program->value_types[6] = TYPE_INT;
+    }
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 25;
@@ -1454,13 +1459,36 @@ catch_stack_marker_deopt_program(void)
     const_catch->value = 3;
     const_catch->literal = 1;
     const_catch->literal_type = TYPE_CATCH;
-    const_catch->next = deopt_op;
+    if (native_error) {
+	JITInstruction *const_lhs = instruction(HIR_TAC_CONST);
+	JITInstruction *const_rhs = instruction(HIR_TAC_CONST);
 
-    deopt_op->deopt_map = 1;
-    deopt_op->bytecode_pc = 25;
+	const_catch->next = const_lhs;
+	const_lhs->value = 4;
+	const_lhs->literal = 1;
+	const_lhs->literal_type = TYPE_INT;
+	const_lhs->next = const_rhs;
+	const_rhs->value = 5;
+	const_rhs->literal = 0;
+	const_rhs->literal_type = TYPE_INT;
+	const_rhs->next = deopt_op;
+	deopt_op->kind = HIR_TAC_BINARY;
+	deopt_op->value = 6;
+	deopt_op->src1 = 4;
+	deopt_op->src2 = 5;
+	deopt_op->op = HIR_OP_DIV;
+	deopt_op->deopt_map = 1;
+	deopt_op->bytecode_pc = 25;
+	deopt_op->source_lineno = 9;
+	block->last = deopt_op;
+    } else {
+	const_catch->next = deopt_op;
+	deopt_op->deopt_map = 1;
+	deopt_op->bytecode_pc = 25;
+	block->last = deopt_op;
+    }
 
     block->first = const_codes;
-    block->last = deopt_op;
     return program;
 }
 
@@ -2993,6 +3021,22 @@ main(void)
 	  "machine-code dump did not contain hex bytes");
     check(jit_program_state(program) == JIT_STATE_COMPILED,
 	  "machine-code dump did not compile lazily");
+    {
+	JITProgramStats stats;
+
+	jit_program_stats(program, &stats);
+	check(stats.compile_attempts == 1 && stats.compile_successes == 1
+	      && stats.compile_failures == 0,
+	      "JIT compilation statistics are wrong");
+	check(stats.metadata_bytes > sizeof(JITProgram)
+	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
+	      && stats.machine_code_bytes == program->machine_code_len
+	      && stats.native_allocated_bytes >= stats.machine_code_bytes,
+	      "JIT memory statistics are wrong");
+	check(stats.accounted_bytes == stats.metadata_bytes + stats.runtime_bytes
+	      + stats.native_allocated_bytes,
+	      "JIT accounted byte total is wrong");
+    }
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
 			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
@@ -3381,6 +3425,27 @@ main(void)
 	jit_program_free(pass_prog);
     }
 
+    /* Specialized built-in fallback reconstructs the bytecode argument list. */
+    {
+	JITProgram *builtin_deopt = string_length_program("hello");
+	JITInstruction *length_instr = builtin_deopt->blocks->first->next;
+
+	length_instr->kind = HIR_TAC_DEOPT;
+	ticks = 10;
+	check(jit_program_execute(builtin_deopt, env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK,
+	      "specialized built-in fallback did not deopt");
+	check(deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST,
+	      "specialized built-in fallback did not pack its arguments");
+	check(deopt_stack[0].v.list[0].v.num == 1
+	      && deopt_stack[0].v.list[1].type == TYPE_STR
+	      && !strcmp(deopt_stack[0].v.list[1].v.str, "hello"),
+	      "specialized built-in fallback packed the wrong argument");
+	free_var(deopt_stack[0]);
+	jit_program_free(builtin_deopt);
+    }
+
     /* Property read deopt test */
     {
 	JITProgram *get_prog = get_prop_program();
@@ -3460,6 +3525,25 @@ main(void)
 	      "call_verb continuation returned the wrong value");
 	free_var(result);
 	free_var(deopt_stack[0]);
+	{
+	    JITProgram *fallthrough = call_verb_program();
+	    JITInstruction *call = fallthrough->blocks->first;
+	    JITInstruction *terminal = instruction(HIR_TAC_LABEL);
+
+	    while (call->kind != HIR_TAC_CALL_VERB)
+		call = call->next;
+	    call->next = terminal;
+	    fallthrough->blocks->last = terminal;
+	    deopt_stack[0].type = TYPE_INT;
+	    deopt_stack[0].v.num = 17;
+	    check((jit_program_execute)(fallthrough, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+		  "fallthrough continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 0,
+		  "fallthrough continuation did not return zero");
+	    jit_program_free(fallthrough);
+	}
 	free_var(deep_env[1]);
 	free_var(deep_env[2]);
 	jit_program_free(call_prog);
@@ -3529,6 +3613,24 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == TYPE_INT,
 	      "typeof returned wrong value");
 	jit_program_free(typeof_p);
+
+	{
+	    const char *static_value = str_dup("static type");
+	    JITProgram *typeof_str = unary_program(
+		(Num) (uintptr_t) static_value, HIR_OP_TYPEOF);
+	    JITInstruction *constant = typeof_str->blocks->first;
+	    JITInstruction *unary = constant->next;
+
+	    constant->literal_type = TYPE_STR;
+	    unary->literal = TYPE_STR;
+	    ticks = 10;
+	    check(jit_program_execute(typeof_str, env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED, "string typeof execution failed");
+	    check(result.type == TYPE_INT && result.v.num == _TYPE_STR,
+		  "string typeof returned internal runtime tag");
+	    jit_program_free(typeof_str);
+	}
     }
 
     /* Scalar object tests */
@@ -4081,10 +4183,45 @@ main(void)
 	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
 				  &timed_out, &error, 0, 0, 0)
 	      == JIT_RUN_RETURNED, "tagged typeof executed natively");
-	check(result.type == TYPE_INT && result.v.num == TYPE_STR,
-	      "tagged typeof returned the runtime type");
+	check(result.type == TYPE_INT && result.v.num == _TYPE_STR,
+	      "tagged string typeof returned the internal runtime tag");
+	free_var(tagged_env[0]);
+
+	tagged_env[0] = new_list(0);
+	ticks = 10;
+	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged list typeof executed natively");
+	check(result.type == TYPE_INT && result.v.num == _TYPE_LIST,
+	      "tagged list typeof returned the internal runtime tag");
 	free_var(tagged_env[0]);
 	jit_program_free(tagged_typeof);
+    }
+
+    /* Tagged absolute value accepts integers and guards other runtime types. */
+    {
+	JITProgram *tagged_abs = tagged_unary_program(HIR_OP_ABS);
+	Var tagged_env[1];
+
+	tagged_abs->value_is_tagged[2] = 1;
+	tagged_env[0].type = TYPE_INT;
+	tagged_env[0].v.num = -42;
+	ticks = 10;
+	check(jit_program_execute(tagged_abs, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged abs executed natively");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "tagged abs returned the wrong value");
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("not a number");
+	ticks = 10;
+	check(jit_program_execute(tagged_abs, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer abs did not deoptimize");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged_abs);
     }
 
     /* Tagged exponentiation accepts integers and guards other runtime types. */
@@ -4163,6 +4300,19 @@ main(void)
 	free_var(base);
     }
 
+#ifdef WAIF_CORE
+    /* Complex extension values retain the full pointer through resumes. */
+    {
+	Var waif;
+	uintptr_t pointer = UINTPTR_MAX - 0x1234;
+
+	waif.type = TYPE_WAIF;
+	waif.v.waif = (Waif *) pointer;
+	check((uintptr_t) jit_rt_var_raw(&waif) == pointer,
+	      "jit_rt_var_raw truncated waif pointer");
+    }
+#endif
+
     /* Exception and finally stack marker deoptimization tests */
     {
 	JITProgram *boundary = exception_boundary_deopt_program();
@@ -4179,7 +4329,7 @@ main(void)
 	      "exception boundary charged a tick");
 	jit_program_free(boundary);
 
-	JITProgram *catch_deopt = catch_stack_marker_deopt_program();
+	JITProgram *catch_deopt = catch_stack_marker_program(0);
 	JITDeoptState deopt_state;
 	Var deopt_stack[10];
 	memset(deopt_stack, 0, sizeof(deopt_stack));
@@ -4198,6 +4348,29 @@ main(void)
 	free_var(deopt_stack[1]);
 	free_var(deopt_stack[2]);
 	jit_program_free(catch_deopt);
+
+	JITProgram *catch_error = catch_stack_marker_program(1);
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	error = E_NONE;
+	check(jit_program_execute(catch_error, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_ERROR && error == E_DIV,
+	      "native error with catch marker failed");
+	check(deopt_state.stack_depth == 3,
+	      "native error catch marker depth wrong");
+	check(deopt_state.materialized,
+	      "native error did not report materialized state");
+	check(deopt_stack[0].type == TYPE_INT && deopt_stack[0].v.num == 0,
+	      "native error catch codes wrong");
+	check(deopt_stack[1].type == TYPE_INT && deopt_stack[1].v.num == 77,
+	      "native error catch handler pc wrong");
+	check(deopt_stack[2].type == TYPE_CATCH && deopt_stack[2].v.num == 1,
+	      "native error catch marker wrong");
+	free_var(deopt_stack[0]);
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	jit_program_free(catch_error);
 
 	JITProgram *fin_deopt = finally_stack_marker_deopt_program();
 	memset(deopt_stack, 0, sizeof(deopt_stack));
@@ -4631,6 +4804,9 @@ main(void)
 
     /* Deoptimization profiling tests */
     {
+	JITProgram *profile_program = new_jit_program();
+	JITProgramStats stats;
+
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
 	      "deopt reason name none");
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BUILTIN_CALL), "builtin_call") == 0,
@@ -4655,29 +4831,41 @@ main(void)
 	      "deopt reason name unsupported_operation");
 
 	jit_profile_reset();
-	jit_profile_record_entry();
-	jit_profile_record_entry();
-	jit_profile_record_completed();
-	jit_profile_record_vm_call();
+	jit_profile_record_entry(profile_program);
+	jit_profile_record_entry(profile_program);
+	jit_profile_record_completed(profile_program);
+	jit_profile_record_vm_call(profile_program);
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));
 	deopt_sample.bytecode_pc = 42;
 	deopt_sample.source_lineno = 10;
 	deopt_sample.reason = JIT_DEOPT_BUILTIN_CALL;
-	jit_profile_record_deopt(0, "do_command", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 0, "do_command", &deopt_sample);
 
 	deopt_sample.bytecode_pc = 18;
 	deopt_sample.source_lineno = 5;
 	deopt_sample.operation = HIR_OP_GET_PROP;
 	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
-	jit_profile_record_deopt(1, "eval", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 1, "eval", &deopt_sample);
 
 	deopt_sample.bytecode_pc = 20;
 	deopt_sample.source_lineno = 6;
 	deopt_sample.operation = HIR_OP_SCATTER;
 	deopt_sample.reason = JIT_DEOPT_UNSUPPORTED_OP;
-	jit_profile_record_deopt(69, "parse_parties", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 69, "parse_parties",
+				 &deopt_sample);
+
+	jit_program_stats(profile_program, &stats);
+	check(stats.entries == 2 && stats.completions == 1
+	      && stats.vm_calls == 1 && stats.deopts == 3,
+	      "per-program JIT usage totals are wrong");
+	check(stats.deopts_by_reason[JIT_DEOPT_BUILTIN_CALL] == 1
+	      && stats.deopts_by_reason[JIT_DEOPT_PROPERTY_READ] == 1
+	      && stats.deopts_by_reason[JIT_DEOPT_UNSUPPORTED_OP] == 1,
+	      "per-program JIT deopt reason totals are wrong");
+	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
+	      "per-program JIT last-use statistics are wrong");
 
 	/* Trigger report generation */
 	jit_profile_report();
@@ -4687,6 +4875,38 @@ main(void)
 	jit_profile_maybe_report(2000);
 
 	jit_profile_reset();
+	jit_program_free(profile_program);
+    }
+    {
+	JITPoolStats pool_stats;
+	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
+
+	check(prog != 0, "failed to create test program for pool verification");
+	check(jit_program_compile(prog), "failed to compile program for pool test");
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs >= 1, "pool active program count is wrong");
+	check(pool_stats.total_machine_code_bytes >= prog->machine_code_len,
+	      "pool machine code byte count is wrong");
+	check(pool_stats.total_native_allocated_bytes >= pool_stats.total_machine_code_bytes,
+	      "pool native allocated byte count is wrong");
+
+	/* Reset pool and verify invalidation of active programs */
+	jit_pool_reset();
+	check(jit_program_state(prog) == JIT_STATE_PENDING,
+	      "jit_pool_reset did not return program to pending state");
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs == 0, "pool has remaining active programs after reset");
+	check(pool_stats.total_machine_code_bytes == 0, "pool machine code bytes not zeroed");
+
+	/* Recompile after reset */
+	check(jit_program_compile(prog), "failed to recompile program after pool reset");
+	check(jit_program_state(prog) == JIT_STATE_COMPILED,
+	      "program did not compile after pool reset");
+
+	jit_program_free(prog);
+	jit_shutdown();
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");
     }
 
     return failures != 0;

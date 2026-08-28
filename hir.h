@@ -188,6 +188,7 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 #endif
 
 #ifdef HIR_TESTING
+extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
@@ -209,6 +210,9 @@ extern int hir_ssa_count_kind(HIRSSAProgram *, HIRTacKind);
 extern int hir_ssa_out_of_range_load_count(HIRSSAProgram *, int);
 extern int hir_ssa_count_bytecode_pc(HIRSSAProgram *, unsigned);
 extern int hir_ssa_stack_depth_at_bytecode_pc(HIRSSAProgram *, unsigned);
+extern int hir_ssa_stack_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
+extern int hir_ssa_binary_value_at_bytecode_pc(HIRSSAProgram *, unsigned,
+					       HIROp);
 extern int hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
 extern int hir_ssa_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
@@ -224,6 +228,14 @@ extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
 						 unsigned, HIROp);
 extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
+extern int hir_test_binary_operands_constrain_each_other(HIROp);
+extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,
+					 var_type *);
+extern int hir_test_infer_builtin_result_type(const char *, var_type *);
+extern void hir_test_initialize_inferred_value_types(var_type *,
+					      unsigned char *, unsigned char *, int);
+extern void hir_test_tag_unknown_inferred_value_types(var_type *,
+					       unsigned char *, unsigned char *, int);
 extern int hir_test_is_uninitialized_entry_load(HIRTacKind, unsigned, int,
 						int);
 extern int hir_test_builtin_entry_type(HIRTacKind, unsigned, int, int,

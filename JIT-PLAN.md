@@ -60,7 +60,8 @@ The current branch has already established the first compiler backbone:
 * positive SSA phi tests for `if`/`else` joins and `while` loop backedges;
 * critical-edge splitting and SSA destruction;
 * explicit tick operations retained through native lowering;
-* an optional `--enable-jit` extension using vendored MIR 1.0.0 at O0;
+* an optional `--enable-jit` extension using vendored MIR master pinned at
+  `a8ab7c31cd5f9b23b77d84c60b3d83e62d9d304c`, at O0;
 * lazy, per-program native generation for a guarded multi-type tier;
 * native entry and return through the existing activation unwinder;
 * JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
@@ -409,6 +410,20 @@ lazy machine-code compilation. JIT state is observable through
 `verb_info()`, `jit_compile()`, and `disassemble()`; the test tooling includes
 eligibility and runtime-deoptimization censuses.
 
+Passing a true third argument to `verb_info()` includes per-program JIT usage
+and memory statistics. These include native entries and completions, VM-call
+crossings, deoptimizations by reason, last-use time and generation, compilation
+attempts/results/time, persistent metadata bytes, runtime materialization
+storage, and generated machine-code bytes. `accounted_bytes` is included by
+`program_bytes()` and uses the proportional share of executable pages reported
+by `native_allocated_bytes`, reflecting actual code-holder page utilization
+and alignment across the shared context. All compiled verbs reside in a
+generation-based shared `MIR_context` pool where generator scratch memory is
+reclaimed immediately via `MIR_gen_finish()`, eliminating duplicate per-verb
+context baselines. Whole-pool invalidation (`jit_pool_reset()`) cleanly reclaims
+executable memory and MIR modules when built-in protections change or the pool
+rotates, resetting active programs back to pending.
+
 All 6,319 verbs in the current testmoo.db eligibility census compile successfully.
 There are no remaining top-level `unsupported-program`,
 `unsupported-value-types`, `invalid-bytecode-anchor`, or `invalid-ir`
@@ -572,8 +587,13 @@ VM, but their callers can resume native execution.
    levels. Deopt-aware liveness is intentionally broader than machine-operand
    liveness: values named by a later interpreter-state map are genuinely live
    even if no later native instruction reads them. Reduce that pressure by
-   coalescing equivalent deopt states and omitting maps from instructions that
-   cannot exit, not by dropping their implicit uses. Every optimization must
+   running an explicit deopt-point simplification pass after type and effect
+   analysis. That pass should omit maps from instructions proven unable to
+   guard, raise, call, suspend, abort, or exhaust resources; coalesce adjacent
+   maps only when resume key, materialization, source/error location, and tick
+   state are identical; and eliminate a guard only when an equivalent
+   dominating guard remains valid across intervening calls and writes. Do not
+   reduce pressure by dropping implicit deopt uses. Every optimization must
    preserve exact timeout, source-location, error, and deoptimization behavior
    and be measured against interpreter and JIT O0 baselines.
 
@@ -584,7 +604,54 @@ VM, but their callers can resume native execution.
     and suspension. Track native completion percentage, reason distribution,
     compile time, code size, and execution time for stable workloads.
 
-### 14.4 Definition of a completed coverage milestone
+### 14.4 JIT pool efficiency roadmap
+
+Per-program usage and retained-memory measurements are now sufficient to begin
+pool policy work. Pool accounting should continue to keep these quantities
+separate: compiler metadata, runtime materialization storage, live MIR heap,
+used machine-code bytes, and executable pages. Add executable address-space
+reservation and mapping counters through MIR's code-allocator interface before
+treating `accounted_bytes` as a complete virtual-memory measurement.
+
+Implement pool efficiency in this order:
+
+1. **Aggregate current measurements.** Report total compiled-program count,
+   bytes by category, entries, native completions, VM crossings, deoptimizations,
+   compilation time, evictions, and recompilations. Preserve per-verb values in
+   `verb_info()` so a global total can always be reconciled with its members.
+
+2. **Separate native eviction from eligibility.** Releasing a MIR context,
+   executable mappings, and runtime materialization buffer should return the
+   program to a lazily compilable pending state. Eviction or a high deopt rate
+   must never permanently prevent an interpreted verb from being compiled
+   again.
+
+3. **Add a configurable byte budget with hysteresis.** Select cold native
+   programs using retained bytes, last-used generation/time, entry count,
+   native-completion rate, deopt rate, and recompilation cost. Evict to a low
+   watermark rather than repeatedly crossing one hard limit. Use minimum sample
+   counts and cooldowns before deprioritizing a frequently deoptimizing verb.
+
+4. **Manage shared pool memory and rotation.** Maintain the generation-based
+   shared `MIR_context` pool with immediate generator scratch finalization
+   (`MIR_gen_finish()`). Rotate or compact the pool when memory limits are
+   reached or built-in protections change, safely returning cold or invalidated
+   programs to the pending state without leaking module or executable state.
+
+5. **Reduce deopt metadata and register pressure.** Implement the
+   deopt-point simplification described in priority 9, then measure its effect
+   on map count, live SSA values, MIR heap, machine code, executable-page
+   utilization, and native completion. Add verifier checks that every remaining
+   potentially exiting instruction still has exactly one valid reconstruction
+   state.
+
+6. **Benchmark policy rather than assuming it.** Run stable interpreter/JIT
+   workloads at several pool budgets. Record peak and steady-state bytes,
+   compilation and recompilation time, eviction churn, native completion, and
+   execution time. A smaller pool is not an improvement if repeated compilation
+   costs more than the memory it saves.
+
+### 14.5 Definition of a completed coverage milestone
 
 A new operation or call path is complete only when:
 
