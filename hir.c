@@ -4259,6 +4259,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	}
     }
 
+    /* Operand constraints below can seed types that must propagate through
+       parallel-copy joins. */
+    infer_value_types:
     do {
 	types_changed = 0;
 	for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
@@ -4445,6 +4448,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (!value_types_known[operand]) {
 		    value_types[operand] = TYPE_LIST;
 		    value_types_known[operand] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_SUBLIST_FROM) {
@@ -4454,6 +4458,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_INT;
 		    value_types_known[si->src2] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_RANGE_REF) {
@@ -4462,6 +4467,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[from]) {
 		    value_types[from] = TYPE_INT;
 		    value_types_known[from] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
@@ -4472,11 +4478,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[object]) {
 		    value_types[object] = TYPE_OBJ;
 		    value_types_known[object] = 1;
+		    types_changed = 1;
 		}
 		if (property > 0 && property < program->num_values
 		    && !value_types_known[property]) {
 		    value_types[property] = TYPE_STR;
 		    value_types_known[property] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_BINARY
@@ -4486,11 +4494,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src1]) {
 		    value_types[si->src1] = TYPE_STR;
 		    value_types_known[si->src1] = 1;
+		    types_changed = 1;
 		}
 		if (si->src2 > 0 && si->src2 < program->num_values
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_STR;
 		    value_types_known[si->src2] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_UNARY
@@ -4499,6 +4509,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src1]) {
 		    value_types[si->src1] = TYPE_OBJ;
 		    value_types_known[si->src1] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_INDEX
@@ -4509,6 +4520,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[index]) {
 		    value_types[index] = TYPE_INT;
 		    value_types_known[index] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_DEOPT && si->op == HIR_OP_SCATTER
@@ -4519,6 +4531,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[rhs]) {
 		    value_types[rhs] = TYPE_LIST;
 		    value_types_known[rhs] = 1;
+		    types_changed = 1;
 		}
 	    }
 
@@ -4530,11 +4543,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[from]) {
 		    value_types[from] = TYPE_INT;
 		    value_types_known[from] = 1;
+		    types_changed = 1;
 		}
 		if (to > 0 && to < program->num_values
 		    && !value_types_known[to]) {
 		    value_types[to] = TYPE_INT;
 		    value_types_known[to] = 1;
+		    types_changed = 1;
 		}
 	    }
 	    if (si->kind == HIR_TAC_CALL_VERB) {
@@ -4542,11 +4557,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[si->src1]) {
 		    value_types[si->src1] = TYPE_OBJ;
 		    value_types_known[si->src1] = 1;
+		    types_changed = 1;
 		}
 		if (si->src2 > 0 && si->src2 < program->num_values
 		    && !value_types_known[si->src2]) {
 		    value_types[si->src2] = TYPE_STR;
 		    value_types_known[si->src2] = 1;
+		    types_changed = 1;
 		}
 		if (si->num_stack_values > 0) {
 		    int args_val = si->stack_values[si->num_stack_values - 1];
@@ -4555,6 +4572,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			&& !value_types_known[args_val]) {
 			value_types[args_val] = TYPE_LIST;
 			value_types_known[args_val] = 1;
+			types_changed = 1;
 		    }
 		}
 	    }
@@ -4568,6 +4586,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[first_arg]) {
 		    value_types[first_arg] = TYPE_OBJ;
 		    value_types_known[first_arg] = 1;
+		    types_changed = 1;
 		}
 		if (func_name && si->value > 0 && si->value < program->num_values
 		    && !value_types_known[si->value]) {
@@ -4578,17 +4597,21 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			|| !strcmp(func_name, "location")) {
 			value_types[si->value] = TYPE_OBJ;
 			value_types_known[si->value] = 1;
+			types_changed = 1;
 		    } else if (!strcmp(func_name, "tostr")
 			       || !strcmp(func_name, "toliteral")) {
 			value_types[si->value] = TYPE_STR;
 			value_types_known[si->value] = 1;
+			types_changed = 1;
 		    } else if (!strcmp(func_name, "tonum")
 			       || !strcmp(func_name, "toint")) {
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
+			types_changed = 1;
 		    } else if (!strcmp(func_name, "tofloat")) {
 			value_types[si->value] = TYPE_FLOAT;
 			value_types_known[si->value] = 1;
+			types_changed = 1;
 		    }
 		}
 	    }
@@ -4596,6 +4619,14 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		break;
 	}
     }
+    if (types_changed)
+	goto infer_value_types;
+    for (i = 1; i < program->num_values; i++)
+	if (value_types_conflicted[i]) {
+	    value_is_tagged[i] = 1;
+	    value_types[i] = TYPE_ANY;
+	    value_types_known[i] = 0;
+	}
     /* Preserve runtime tags for values whose result type is selected at run
        time.  Parallel-copy destinations need a tag as well, including joins
        with a statically typed default value. */
@@ -4603,8 +4634,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	HIRSSAInstr *si;
 
 	for (si = ssa_block->first; si; si = si->next) {
-	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_CALL_VERB
-		 || si->kind == HIR_TAC_RANGE_REF)
+	    if (si->kind == HIR_TAC_CALL_VERB
+		&& si->value > 0 && si->value < program->num_values) {
+		value_is_tagged[si->value] = 1;
+		value_types[si->value] = TYPE_ANY;
+		value_types_known[si->value] = 0;
+	    }
+	    if ((si->kind == HIR_TAC_CALL || si->kind == HIR_TAC_RANGE_REF)
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
