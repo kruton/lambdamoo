@@ -349,6 +349,32 @@ listappend(Var list, Var value)
     return result;
 }
 
+Var
+sublist(Var list, Num first, Num after)
+{
+    Num length = after > first ? after - first : 0;
+    Var result = new_list(length);
+    Num i;
+
+    for (i = 0; i < length; i++)
+	result.v.list[i + 1] = var_ref(list.v.list[first + i]);
+    free_var(list);
+    return result;
+}
+
+Var
+substr(Var str, Num first, Num after)
+{
+    Num length = after > first ? after - first : 0;
+    char *result = mymalloc(length + 1, M_STRING);
+
+    if (length)
+	memcpy(result, str.v.str + first - 1, length);
+    result[length] = '\0';
+    free_var(str);
+    return (Var){ .type = TYPE_STR, .v.str = result };
+}
+
 int
 ismember(Var value, Var list, int case_matters)
 {

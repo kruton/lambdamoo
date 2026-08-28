@@ -1695,6 +1695,7 @@ range_ref_test_program(var_type base_type)
 
     load_base->value = 1;
     load_base->local_id = 0;
+    load_base->literal_type = base_type;
     load_base->next = const_from;
 
     const_from->value = 2;
