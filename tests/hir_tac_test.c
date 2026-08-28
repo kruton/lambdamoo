@@ -3174,6 +3174,36 @@ test_list_operand_inference(void)
 }
 
 static void
+test_unknown_type_inference(void)
+{
+    var_type types[4] = { TYPE_INT, TYPE_INT, TYPE_STR, TYPE_OBJ };
+    unsigned char known[4] = { 1, 1, 1, 1 };
+    unsigned char tagged[4] = { 1, 1, 1, 1 };
+
+    hir_test_initialize_inferred_value_types(types, known, tagged, 4);
+    check_int("unknown inference initializes value to any", types[1], TYPE_ANY);
+    check_int("unknown inference initializes value as unknown", known[1], 0);
+    check_int("unknown inference does not tag before analysis", tagged[1], 0);
+
+    types[2] = TYPE_STR;
+    known[2] = 1;
+    hir_test_tag_unknown_inferred_value_types(types, known, tagged, 4);
+    check_int("unresolved value remains any", types[1], TYPE_ANY);
+    check_int("unresolved value is runtime tagged", tagged[1], 1);
+    check_int("known value retains inferred type", types[2], TYPE_STR);
+    check_int("known value is not needlessly tagged", tagged[2], 0);
+    check_int("second unresolved value remains any", types[3], TYPE_ANY);
+    check_int("second unresolved value is runtime tagged", tagged[3], 1);
+
+    check_int("equality does not constrain operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_EQ), 0);
+    check_int("inequality does not constrain operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_NE), 0);
+    check_int("ordering constrains operand types",
+	      hir_test_binary_operands_constrain_each_other(HIR_OP_LT), 1);
+}
+
+static void
 test_uninitialized_entry_load_classification(void)
 {
     int first_user = SLOT_FLOAT + 1;
@@ -3349,6 +3379,7 @@ main(void)
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_list_operand_inference();
+    test_unknown_type_inference();
     test_uninitialized_entry_load_classification();
     test_builtin_entry_types();
     test_arithmetic_and_local_tac();

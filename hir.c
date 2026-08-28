@@ -40,6 +40,38 @@ unary_operand_defaults_to_list(HIROp op)
 }
 
 static int
+binary_operands_constrain_each_other(HIROp op)
+{
+    return op == HIR_OP_LT || op == HIR_OP_LE
+	|| op == HIR_OP_GT || op == HIR_OP_GE;
+}
+
+static void
+initialize_inferred_value_types(var_type *types, unsigned char *known,
+				unsigned char *tagged, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+	types[i] = TYPE_ANY;
+    memset(known, 0, count > 0 ? count : 1);
+    memset(tagged, 0, count > 0 ? count : 1);
+}
+
+static void
+tag_unknown_inferred_value_types(var_type *types, unsigned char *known,
+				  unsigned char *tagged, int count)
+{
+    int i;
+
+    for (i = 1; i < count; i++)
+	if (!known[i]) {
+	    types[i] = TYPE_ANY;
+	    tagged[i] = 1;
+	}
+}
+
+static int
 is_uninitialized_entry_load(HIRTacKind kind, unsigned bytecode_pc,
 			    int local_id, int first_user_local)
 {
@@ -4188,13 +4220,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				      ? program->num_values : 1, M_PROGRAM);
     value_is_tagged = mymalloc(program->num_values > 0
 			      ? program->num_values : 1, M_PROGRAM);
-    for (i = 0; i < program->num_values; i++)
-	value_types[i] = TYPE_INT;
-    memset(value_types_known, 0, program->num_values > 0
-	   ? program->num_values : 1);
+    initialize_inferred_value_types(value_types, value_types_known,
+				    value_is_tagged, program->num_values);
     memset(value_types_conflicted, 0, program->num_values > 0
-	   ? program->num_values : 1);
-    memset(value_is_tagged, 0, program->num_values > 0
 	   ? program->num_values : 1);
 
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
@@ -4335,9 +4363,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			    types_changed = 1;
 		    }
 
-		    if (src1_known || src2_known) {
-			var_type t1 = src1_known ? value_types[si->src1] : TYPE_INT;
-			var_type t2 = src2_known ? value_types[si->src2] : TYPE_INT;
+		    if (src1_known && src2_known) {
+			var_type t1 = value_types[si->src1];
+			var_type t2 = value_types[si->src2];
 			var_type inferred = TYPE_INT;
 			int valid = 1;
 			int object_range_add = si->op == HIR_OP_ADD
@@ -4371,31 +4399,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
-		    && (si->op == HIR_OP_EQ || si->op == HIR_OP_NE)) {
-		    int src1_known = si->src1 > 0 && si->src1 < program->num_values
-			&& value_types_known[si->src1];
-		    int src2_known = si->src2 > 0 && si->src2 < program->num_values
-			&& value_types_known[si->src2];
-
-		    if (src1_known && (value_types[si->src1] == TYPE_OBJ
-				       || value_types[si->src1] == TYPE_FLOAT
-				       || value_types[si->src1] == TYPE_STR)
-			&& !src2_known) {
-			value_types[si->src2] = value_types[si->src1];
-			value_types_known[si->src2] = 1;
-			types_changed = 1;
-		    } else if (src2_known && (value_types[si->src2] == TYPE_OBJ
-					      || value_types[si->src2] == TYPE_FLOAT
-					      || value_types[si->src2] == TYPE_STR)
-			       && !src1_known) {
-			value_types[si->src1] = value_types[si->src2];
-			value_types_known[si->src1] = 1;
-			types_changed = 1;
-		    }
-		}
-		if (si->kind == HIR_TAC_BINARY
-		    && (si->op == HIR_OP_LT || si->op == HIR_OP_LE
-			|| si->op == HIR_OP_GT || si->op == HIR_OP_GE)) {
+		    && binary_operands_constrain_each_other(si->op)) {
 		    int src1_known = si->src1 > 0 && si->src1 < program->num_values
 			&& value_types_known[si->src1];
 		    int src2_known = si->src2 > 0 && si->src2 < program->num_values
@@ -4627,6 +4631,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    value_types[i] = TYPE_ANY;
 	    value_types_known[i] = 0;
 	}
+    tag_unknown_inferred_value_types(value_types, value_types_known,
+				     value_is_tagged, program->num_values);
     /* Preserve runtime tags for values whose result type is selected at run
        time.  Parallel-copy destinations need a tag as well, including joins
        with a statically typed default value. */
@@ -8302,6 +8308,28 @@ int
 hir_test_unary_operand_defaults_to_list(HIROp op)
 {
     return unary_operand_defaults_to_list(op);
+}
+
+int
+hir_test_binary_operands_constrain_each_other(HIROp op)
+{
+    return binary_operands_constrain_each_other(op);
+}
+
+void
+hir_test_initialize_inferred_value_types(var_type *types,
+					 unsigned char *known,
+					 unsigned char *tagged, int count)
+{
+    initialize_inferred_value_types(types, known, tagged, count);
+}
+
+void
+hir_test_tag_unknown_inferred_value_types(var_type *types,
+					  unsigned char *known,
+					  unsigned char *tagged, int count)
+{
+    tag_unknown_inferred_value_types(types, known, tagged, count);
 }
 
 int
