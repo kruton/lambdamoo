@@ -1619,6 +1619,12 @@ build_mir(JITProgram *program, MIRBuild *build)
 			    MIR_new_mem_op(build->context,
 				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
 				offsetof(Var, v.num), list_ptr, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+						  MIR_new_label_op(build->context, loaded)));
+			append(build, deopt);
+			append_deopt_exit(build, program, instr->deopt_map, values,
+					  deopt_map_out, deopt_values, status, common_return);
+			append(build, loaded);
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -1627,12 +1633,6 @@ build_mir(JITProgram *program, MIRBuild *build)
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			}
-			append(build, MIR_new_insn(build->context, MIR_JMP,
-						  MIR_new_label_op(build->context, loaded)));
-			append(build, deopt);
-			append_deopt_exit(build, program, instr->deopt_map, values,
-					  deopt_map_out, deopt_values, status, common_return);
-			append(build, loaded);
 		    } else if (instr->op == HIR_OP_NEGATE) {
 			int val_fl = program->value_types
 			    && program->value_types[instr->value] == TYPE_FLOAT;
