@@ -4525,6 +4525,28 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types[first_arg] = TYPE_OBJ;
 		    value_types_known[first_arg] = 1;
 		}
+		if (func_name && si->value > 0 && si->value < program->num_values
+		    && !value_types_known[si->value]) {
+		    if (!strcmp(func_name, "caller_perms")
+			|| !strcmp(func_name, "toobj")
+			|| !strcmp(func_name, "parent")
+			|| !strcmp(func_name, "owner")
+			|| !strcmp(func_name, "location")) {
+			value_types[si->value] = TYPE_OBJ;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tostr")
+			       || !strcmp(func_name, "toliteral")) {
+			value_types[si->value] = TYPE_STR;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tonum")
+			       || !strcmp(func_name, "toint")) {
+			value_types[si->value] = TYPE_INT;
+			value_types_known[si->value] = 1;
+		    } else if (!strcmp(func_name, "tofloat")) {
+			value_types[si->value] = TYPE_FLOAT;
+			value_types_known[si->value] = 1;
+		    }
+		}
 	    }
 	    if (si == ssa_block->last)
 		break;
@@ -4543,6 +4565,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		value_is_tagged[si->value] = 1;
 	    if (si->kind == HIR_TAC_BINARY
 		&& (si->op == HIR_OP_INDEX || si->op == HIR_OP_GET_PROP)
+		&& si->value > 0 && si->value < program->num_values
+		&& !value_types_known[si->value])
+		value_is_tagged[si->value] = 1;
+	    if (si->kind == HIR_TAC_LOAD_LOCAL && si->bytecode_pc == NO_BYTECODE_PC
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
