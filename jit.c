@@ -1099,6 +1099,8 @@ build_mir(JITProgram *program, MIRBuild *build)
 			MIR_label_t deopt = MIR_new_label(build->context);
 			MIR_label_t loaded = MIR_new_label(build->context);
 			var_type expected_type = instr->literal_type;
+			int tagged = program->value_is_tagged
+			    && program->value_is_tagged[instr->value];
 			char name[32];
 			sprintf(name, "var_type%d", copy_serial++);
 			MIR_reg_t var_type = new_reg(build, name);
@@ -1108,11 +1110,34 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_mem_op(build->context, MIR_T_I32,
 					instr->local_id * sizeof(Var)
 					+ offsetof(Var, type), env, 0, 1)));
-			append(build, MIR_new_insn(build->context, MIR_BNE,
+			if (tagged) {
+			    MIR_reg_t address;
+
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, tag_t,
+				    (program->num_values + instr->value) * sizeof(Num),
+				    deopt_values, 0, 1),
+				MIR_new_reg_op(build->context, var_type)));
+			    sprintf(name, "local_addr%d", copy_serial++);
+			    address = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, address),
+				MIR_new_reg_op(build->context, env),
+				MIR_new_int_op(build->context,
+				    instr->local_id * sizeof(Var))));
+			    append(build, MIR_new_call_insn(build->context, 4,
+				MIR_new_ref_op(build->context, build->proto_var_raw),
+				MIR_new_ref_op(build->context, build->import_var_raw),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, address)));
+			} else
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
 				MIR_new_reg_op(build->context, var_type),
 				MIR_new_int_op(build->context, expected_type)));
-			if (expected_type == TYPE_NONE) {
+			if (tagged) {
+			    /* The helper loaded the tagged representation above. */
+			} else if (expected_type == TYPE_NONE) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context,
 					       values[instr->value]),
@@ -2541,6 +2566,30 @@ build_mir(JITProgram *program, MIRBuild *build)
 			if (program->value_types
 			    && program->value_types[instr->src1] == TYPE_STR) {
 			    char name[32];
+			    int tagged_index = program->value_is_tagged
+				&& program->value_is_tagged[instr->src2];
+			    int tagged_result = program->value_is_tagged
+				&& program->value_is_tagged[instr->value];
+			    MIR_label_t deopt = 0;
+			    MIR_label_t loaded = 0;
+
+			    if (tagged_index) {
+				MIR_reg_t index_type;
+
+				deopt = MIR_new_label(build->context);
+				loaded = MIR_new_label(build->context);
+				sprintf(name, "str_index_type%d", copy_serial++);
+				index_type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, index_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->src2) * sizeof(Num),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, index_type),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    }
 			    sprintf(name, "str_idx_err%d", copy_serial++);
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t range_err = new_status_exit(build, &status_exits,
@@ -2560,6 +2609,21 @@ build_mir(JITProgram *program, MIRBuild *build)
 				MIR_new_label_op(build->context, range_err),
 				MIR_new_reg_op(build->context, err_reg),
 				MIR_new_int_op(build->context, E_NONE)));
+			    if (tagged_result)
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->value) * sizeof(Num),
+					deopt_values, 0, 1),
+				    MIR_new_int_op(build->context, TYPE_STR)));
+			    if (tagged_index) {
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, loaded)));
+				append(build, deopt);
+				append_deopt_exit(build, program, instr->deopt_map,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				append(build, loaded);
+			    }
 			    break;
 			}
 			MIR_label_t deopt = MIR_new_label(build->context);
@@ -3618,6 +3682,12 @@ jit_program_compile(JITProgram *program)
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
     memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
+    {
+	int i;
+
+	for (i = 0; i < program->num_values; i++)
+	    program->deopt_values[program->num_values + i] = TYPE_ANY;
+    }
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
     return 1;
@@ -3654,6 +3724,60 @@ materialize_deopt_value(var_type type, Num raw)
     return var_ref(value);
 }
 
+static int
+jit_runtime_type_is_valid(var_type type)
+{
+    switch (type) {
+    case TYPE_INT:
+    case TYPE_OBJ:
+    case TYPE_STR:
+    case TYPE_ERR:
+    case TYPE_LIST:
+    case TYPE_CLEAR:
+    case TYPE_NONE:
+    case TYPE_CATCH:
+    case TYPE_FINALLY:
+    case TYPE_FLOAT:
+#ifdef WAIF_CORE
+    case TYPE_WAIF:
+#endif
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static void
+jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
+{
+    int i;
+
+    for (i = 0; i < map->num_locals; i++) {
+	int value = map->local_values[i];
+
+	if (value > 0 && value < program->num_values
+	    && program->value_is_tagged && program->value_is_tagged[value]
+	    && !jit_runtime_type_is_valid((var_type)
+		program->deopt_values[program->num_values + value])) {
+	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
+		   value, i, map->bytecode_pc);
+	    panic("JIT runtime tag invariant violated");
+	}
+    }
+    for (i = 0; i < (int) map->stack_depth; i++) {
+	int value = map->stack_values[i];
+
+	if (value > 0 && value < program->num_values
+	    && program->value_is_tagged && program->value_is_tagged[value]
+	    && !jit_runtime_type_is_valid((var_type)
+		program->deopt_values[program->num_values + value])) {
+	    errlog("JIT: missing runtime tag for value %d in stack slot %d at pc %u\n",
+		   value, i, map->bytecode_pc);
+	    panic("JIT runtime tag invariant violated");
+	}
+    }
+}
+
 JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
 		    int *ticks, int *timed_out, enum error *error,
@@ -3663,7 +3787,6 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
-    int resume_depth = 0;
     JITSourceLocation ignored_location;
 
     if (!source_location)
@@ -3686,15 +3809,6 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
-    if (resume_map > 0 && resume_map < program->num_deopt_maps) {
-	JITDeoptMap *map = &program->deopt_maps[resume_map];
-
-	if (map->reason == JIT_DEOPT_VERB_CALL && map->stack_depth >= 3)
-	    resume_depth = map->stack_depth - 2;
-	else if (jit_deopt_map_bridges_builtin(map)
-		 && map->stack_depth >= (unsigned) jit_call_stack_operands(map))
-	    resume_depth = map->stack_depth - jit_call_stack_operands(map) + 1;
-    }
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
@@ -3710,6 +3824,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
 	    return JIT_RUN_FALLBACK;
 	map = &program->deopt_maps[deopt_map];
+	jit_validate_materialized_tags(program, map);
 	materialized_depth = map->stack_depth;
 	for (i = 0; i < map->num_locals; i++)
 	    if (map->local_values[i] > 0) {
@@ -3746,8 +3861,6 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    materialized_depth = outer_depth + 1;
 	}
 	if (new_stack) {
-	    for (i = 0; i < resume_depth; i++)
-		free_var(deopt_stack[i]);
 	    memcpy(deopt_stack, new_stack, sizeof(Var) * materialized_depth);
 	    myfree(new_stack, M_PROGRAM);
 	}

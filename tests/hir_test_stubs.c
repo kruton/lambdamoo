@@ -419,3 +419,9 @@ oklog(const char *fmt, ...)
 {
     (void) fmt;
 }
+
+void
+errlog(const char *fmt, ...)
+{
+    (void) fmt;
+}
