@@ -3769,6 +3769,49 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 }
 
 int
+jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *),
+		     void *data)
+{
+    JITBlock *block;
+    char line[512];
+    int i;
+
+    if (!program || !program->eligible)
+	return 0;
+    snprintf(line, sizeof(line), "HIR values=%d blocks=%d deopt-maps=%d",
+	     program->num_values, program->num_blocks, program->num_deopt_maps);
+    add_line(line, data);
+    for (i = 1; i < program->num_values; i++) {
+	snprintf(line, sizeof(line), "v%d type=%d tagged=%d", i,
+		 program->value_types ? program->value_types[i] : TYPE_ANY,
+		 program->value_is_tagged ? program->value_is_tagged[i] : 0);
+	add_line(line, data);
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	snprintf(line, sizeof(line), "B%d:", block->id);
+	add_line(line, data);
+	for (instr = block->first; instr; instr = instr->next) {
+	    int tagged = instr->value > 0 && program->value_is_tagged
+		&& program->value_is_tagged[instr->value];
+	    int type = instr->value > 0 && program->value_types
+		? program->value_types[instr->value] : TYPE_ANY;
+
+	    snprintf(line, sizeof(line),
+		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d type=%d tagged=%d local=%d deopt=%d",
+		     instr->bytecode_pc, instr->source_lineno, instr->kind,
+		     instr->op, instr->value, instr->src1, instr->src2,
+		     type, tagged, instr->local_id, instr->deopt_map);
+	    add_line(line, data);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 1;
+}
+
+int
 jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *),
 		     void *data)
 {

@@ -2749,6 +2749,10 @@ main(void)
     check(mir_dump.lines > 0, "MIR dump was empty");
     check(mir_dump.found_source_marker,
 	  "MIR dump did not contain PC and line information");
+    mir_dump.lines = 0;
+    check(jit_program_dump_hir(program, check_mir_line, &mir_dump),
+	  "HIR dump failed");
+    check(mir_dump.lines > 0, "HIR dump was empty");
     check(jit_program_deopt_map_count(program) == 1,
 	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,

@@ -79,8 +79,10 @@ extern int jit_program_deopt_map_count(JITProgram *);
 extern int jit_program_resume_map(JITProgram *, ResumeKey);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
-					enum error *, JITSourceLocation *,
-					JITDeoptState *, Var *, Objid, int);
+				enum error *, JITSourceLocation *,
+				JITDeoptState *, Var *, Objid, int);
+extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),
+				void *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),
 				void *);
 extern int jit_program_dump_machine(JITProgram *, void (*)(const char *, void *),

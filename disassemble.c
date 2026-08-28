@@ -429,13 +429,16 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 #ifdef ENABLE_JIT
     enum {
 	FORMAT_BYTECODE,
+	FORMAT_HIR,
 	FORMAT_MIR,
 	FORMAT_MACHINE
     } format = FORMAT_BYTECODE;
 
     if (arglist.v.list[0].v.num == 3) {
 	const char *name = arglist.v.list[3].v.str;
-	if (!strcmp(name, "mir"))
+	if (!strcmp(name, "hir"))
+	    format = FORMAT_HIR;
+	else if (!strcmp(name, "mir"))
 	    format = FORMAT_MIR;
 	else if (!strcmp(name, "machine"))
 	    format = FORMAT_MACHINE;
@@ -462,7 +465,10 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     data.lines = 0;
     data.used = data.max = 0;
 #ifdef ENABLE_JIT
-    if (format == FORMAT_MIR) {
+    if (format == FORMAT_HIR) {
+	if (!jit_program_dump_hir(db_verb_program(h)->jit, add_line, &data))
+	    return make_error_pack(E_INVARG);
+    } else if (format == FORMAT_MIR) {
 	if (!jit_program_dump_mir(db_verb_program(h)->jit, add_line, &data))
 	    return make_error_pack(E_INVARG);
     } else if (format == FORMAT_MACHINE) {
