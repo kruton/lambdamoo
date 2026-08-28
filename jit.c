@@ -430,6 +430,22 @@ new_reg(MIRBuild *build, const char *name)
 			    MIR_T_I64, name);
 }
 
+static void
+append_source_marker(MIRBuild *build, JITInstruction *instr, int *serial)
+{
+    MIR_reg_t marker;
+    char name[64];
+
+    if (instr->source_lineno == 0)
+	return;
+    sprintf(name, "pc_%u_line_%u_%d", instr->bytecode_pc,
+	    instr->source_lineno, (*serial)++);
+    marker = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_PRSET,
+	MIR_new_reg_op(build->context, marker),
+	MIR_new_int_op(build->context, 1)));
+}
+
 static MIR_insn_code_t
 binary_code(HIROp op)
 {
@@ -750,6 +766,7 @@ build_mir(JITProgram *program, MIRBuild *build)
     JITBlock *block;
     int max_block_id = 0;
     int copy_serial = 0;
+    int source_marker_serial = 0;
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
@@ -994,6 +1011,7 @@ build_mir(JITProgram *program, MIRBuild *build)
 
 	    append(build, labels[block->id]);
 	    for (instr = block->first; instr; instr = instr->next) {
+		append_source_marker(build, instr, &source_marker_serial);
 		switch (instr->kind) {
 		case HIR_TAC_TICK:
 		    if (instr->op != HIR_OP_CHARGE_TICK) {

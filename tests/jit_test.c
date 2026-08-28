@@ -25,6 +25,21 @@ struct machine_dump {
     int valid_first_line;
 };
 
+struct mir_dump {
+    int lines;
+    int found_source_marker;
+};
+
+static void
+check_mir_line(const char *line, void *data)
+{
+    struct mir_dump *dump = data;
+
+    dump->lines++;
+    if (strstr(line, "pc_11_line_7_"))
+	dump->found_source_marker = 1;
+}
+
 static void
 check_machine_line(const char *line, void *data)
 {
@@ -2675,15 +2690,6 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 }
 
 static void
-count_line(const char *line, void *data)
-{
-    int *count = data;
-
-    if (line && *line)
-	(*count)++;
-}
-
-static void
 check(int condition, const char *message)
 {
     if (!condition) {
@@ -2733,14 +2739,16 @@ main(void)
     int ticks = 10;
     int timed_out = 0;
     enum error error = E_NONE;
-    int lines = 0;
+    struct mir_dump mir_dump = {0, 0};
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
 
-    check(jit_program_dump_mir(program, count_line, &lines),
+    check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
-    check(lines > 0, "MIR dump was empty");
+    check(mir_dump.lines > 0, "MIR dump was empty");
+    check(mir_dump.found_source_marker,
+	  "MIR dump did not contain PC and line information");
     check(jit_program_deopt_map_count(program) == 1,
 	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,
