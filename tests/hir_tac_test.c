@@ -3201,6 +3201,21 @@ test_unknown_type_inference(void)
 	      hir_test_binary_operands_constrain_each_other(HIR_OP_NE), 0);
     check_int("ordering constrains operand types",
 	      hir_test_binary_operands_constrain_each_other(HIR_OP_LT), 1);
+
+    check_int("integer min result is inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MIN, TYPE_INT, TYPE_INT,
+					    &types[1]), 1);
+    check_int("integer min result type", types[1], TYPE_INT);
+    check_int("float max result is inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MAX, TYPE_FLOAT, TYPE_FLOAT,
+					    &types[1]), 1);
+    check_int("float max result type", types[1], TYPE_FLOAT);
+    check_int("mixed min result is not inferred",
+	      hir_test_infer_min_max_result(HIR_OP_MIN, TYPE_INT, TYPE_FLOAT,
+					    &types[1]), 0);
+    check_int("unrelated binary result is not inferred",
+	      hir_test_infer_min_max_result(HIR_OP_ADD, TYPE_INT, TYPE_INT,
+					    &types[1]), 0);
 }
 
 static void

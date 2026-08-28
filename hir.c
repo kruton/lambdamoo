@@ -46,6 +46,18 @@ binary_operands_constrain_each_other(HIROp op)
 	|| op == HIR_OP_GT || op == HIR_OP_GE;
 }
 
+static int
+infer_min_max_result(HIROp op, var_type left, var_type right,
+		     var_type *result)
+{
+    if ((op != HIR_OP_MIN && op != HIR_OP_MAX) || left != right
+	|| (left != TYPE_INT && left != TYPE_FLOAT))
+	return 0;
+
+    *result = left;
+    return 1;
+}
+
 static void
 initialize_inferred_value_types(var_type *types, unsigned char *known,
 				unsigned char *tagged, int count)
@@ -4399,6 +4411,25 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    }
 		}
 		if (si->kind == HIR_TAC_BINARY
+		    && (si->op == HIR_OP_MIN || si->op == HIR_OP_MAX)
+		    && si->value > 0 && si->value < program->num_values
+		    && si->src1 > 0 && si->src1 < program->num_values
+		    && si->src2 > 0 && si->src2 < program->num_values
+		    && value_types_known[si->src1]
+		    && value_types_known[si->src2]) {
+		    var_type inferred;
+
+		    if (infer_min_max_result(si->op, value_types[si->src1],
+					value_types[si->src2], &inferred)) {
+			if (!value_types_known[si->value]) {
+			    value_types[si->value] = inferred;
+			    value_types_known[si->value] = 1;
+			    types_changed = 1;
+			} else if (value_types[si->value] != inferred)
+			    value_types_conflicted[si->value] = 1;
+		    }
+		}
+		if (si->kind == HIR_TAC_BINARY
 		    && binary_operands_constrain_each_other(si->op)) {
 		    int src1_known = si->src1 > 0 && si->src1 < program->num_values
 			&& value_types_known[si->src1];
@@ -4893,6 +4924,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			 && t1 == TYPE_STR && t2 == TYPE_STR))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
+	    if (ssa_instr->kind == HIR_TAC_BINARY
+		&& (ssa_instr->op == HIR_OP_MIN || ssa_instr->op == HIR_OP_MAX)
+		&& (value_is_tagged[ssa_instr->value]
+		    || value_types[ssa_instr->value] != TYPE_INT
+		    || value_types[ssa_instr->src1] != TYPE_INT
+		    || value_types[ssa_instr->src2] != TYPE_INT))
+		instr->kind = HIR_TAC_DEOPT;
 	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 		    || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
@@ -8314,6 +8352,13 @@ int
 hir_test_binary_operands_constrain_each_other(HIROp op)
 {
     return binary_operands_constrain_each_other(op);
+}
+
+int
+hir_test_infer_min_max_result(HIROp op, var_type left, var_type right,
+			      var_type *result)
+{
+    return infer_min_max_result(op, left, right, result);
 }
 
 void
