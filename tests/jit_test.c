@@ -1576,6 +1576,78 @@ finally_stack_marker_deopt_program(void)
 }
 
 static JITProgram *
+nested_try_except_finally_deopt_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *const_finally = instruction(HIR_TAC_CONST);
+    JITInstruction *const_codes = instruction(HIR_TAC_CONST);
+    JITInstruction *const_pc = instruction(HIR_TAC_CONST);
+    JITInstruction *const_catch = instruction(HIR_TAC_CONST);
+    JITInstruction *deopt_op = instruction(HIR_TAC_DEOPT);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 0;
+    program->num_blocks = 1;
+    program->num_deopt_maps = 2;
+    program->deopt_maps = allocate(sizeof(JITDeoptMap) * 2);
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[0] = TYPE_INT;
+    program->value_types[1] = TYPE_FINALLY;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = TYPE_CATCH;
+
+    map = &program->deopt_maps[1];
+    map->bytecode_pc = 60;
+    map->error_pc = 60;
+    map->stack_depth = 4;
+    map->ticks_charged = 1;
+    map->num_locals = 0;
+    map->stack_values = allocate(sizeof(int) * 4);
+    map->stack_types = allocate(sizeof(var_type) * 4);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 3;
+    map->stack_values[3] = 4;
+    map->stack_types[0] = TYPE_FINALLY;
+    map->stack_types[1] = TYPE_INT;
+    map->stack_types[2] = TYPE_INT;
+    map->stack_types[3] = TYPE_CATCH;
+
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    const_finally->value = 1;
+    const_finally->literal = 99;
+    const_finally->literal_type = TYPE_FINALLY;
+    const_finally->next = const_codes;
+
+    const_codes->value = 2;
+    const_codes->literal = 0;
+    const_codes->literal_type = TYPE_INT;
+    const_codes->next = const_pc;
+
+    const_pc->value = 3;
+    const_pc->literal = 55;
+    const_pc->literal_type = TYPE_INT;
+    const_pc->next = const_catch;
+
+    const_catch->value = 4;
+    const_catch->literal = 1;
+    const_catch->literal_type = TYPE_CATCH;
+    const_catch->next = deopt_op;
+
+    deopt_op->deopt_map = 1;
+    deopt_op->bytecode_pc = 60;
+
+    block->first = const_finally;
+    block->last = deopt_op;
+    return program;
+}
+
+static JITProgram *
 list_index_typed_program(var_type elem_type)
 {
     JITProgram *program = new_jit_program();
@@ -3937,6 +4009,28 @@ main(void)
 	      "finally marker type/handler wrong");
 	free_var(deopt_stack[0]);
 	jit_program_free(fin_deopt);
+
+	/* Nested try-except inside try-finally deoptimization test */
+	JITProgram *nested_deopt = nested_try_except_finally_deopt_program();
+	memset(deopt_stack, 0, sizeof(deopt_stack));
+	ticks = 10;
+	check(jit_program_execute(nested_deopt, 0, &result, &ticks, &timed_out,
+				  &error, 0, &deopt_state, deopt_stack)
+	      == JIT_RUN_FALLBACK, "nested catch/finally marker deopt failed");
+	check(deopt_state.stack_depth == 4, "nested marker deopt depth wrong");
+	check(deopt_stack[0].type == TYPE_FINALLY && deopt_stack[0].v.num == 99,
+	      "nested finally marker wrong");
+	check(deopt_stack[1].type == TYPE_INT && deopt_stack[1].v.num == 0,
+	      "nested catch marker codes wrong");
+	check(deopt_stack[2].type == TYPE_INT && deopt_stack[2].v.num == 55,
+	      "nested catch marker handler pc wrong");
+	check(deopt_stack[3].type == TYPE_CATCH && deopt_stack[3].v.num == 1,
+	      "nested catch marker type/arm wrong");
+	free_var(deopt_stack[0]);
+	free_var(deopt_stack[1]);
+	free_var(deopt_stack[2]);
+	free_var(deopt_stack[3]);
+	jit_program_free(nested_deopt);
 
 	/* Fork boundary deoptimization tests */
 	JITProgram *fork_deopt = fork_boundary_deopt_program();
