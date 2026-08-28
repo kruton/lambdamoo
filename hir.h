@@ -230,6 +230,7 @@ extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
 extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,
 					 var_type *);
+extern int hir_test_infer_builtin_result_type(const char *, var_type *);
 extern void hir_test_initialize_inferred_value_types(var_type *,
 					      unsigned char *, unsigned char *, int);
 extern void hir_test_tag_unknown_inferred_value_types(var_type *,

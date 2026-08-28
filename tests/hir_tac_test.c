@@ -3219,6 +3219,26 @@ test_unknown_type_inference(void)
 }
 
 static void
+test_builtin_result_type_inference(void)
+{
+    var_type inferred = TYPE_NONE;
+
+    check_int("caller_perms result type is inferred",
+	      hir_test_infer_builtin_result_type("caller_perms", &inferred), 1);
+    check_int("caller_perms result is object", inferred, TYPE_OBJ);
+#ifdef WAIF_CORE
+    inferred = TYPE_NONE;
+    check_int("new_waif result type is inferred",
+	      hir_test_infer_builtin_result_type("new_waif", &inferred), 1);
+    check_int("new_waif result is waif", inferred, TYPE_WAIF);
+#endif
+    inferred = TYPE_NONE;
+    check_int("unknown builtin result type is not inferred",
+	      hir_test_infer_builtin_result_type("not_new_waif", &inferred), 0);
+    check_int("unknown builtin leaves result type alone", inferred, TYPE_NONE);
+}
+
+static void
 test_uninitialized_entry_load_classification(void)
 {
     int first_user = SLOT_FLOAT + 1;
@@ -3395,6 +3415,7 @@ main(void)
     test_string_add_operand_inference();
     test_list_operand_inference();
     test_unknown_type_inference();
+    test_builtin_result_type_inference();
     test_uninitialized_entry_load_classification();
     test_builtin_entry_types();
     test_arithmetic_and_local_tac();

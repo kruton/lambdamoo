@@ -58,6 +58,28 @@ infer_min_max_result(HIROp op, var_type left, var_type right,
     return 1;
 }
 
+static int
+infer_builtin_result_type(const char *name, var_type *result)
+{
+    if (!strcmp(name, "caller_perms") || !strcmp(name, "toobj")
+	|| !strcmp(name, "parent") || !strcmp(name, "owner")
+	|| !strcmp(name, "location"))
+	*result = TYPE_OBJ;
+    else if (!strcmp(name, "tostr") || !strcmp(name, "toliteral"))
+	*result = TYPE_STR;
+    else if (!strcmp(name, "tonum") || !strcmp(name, "toint"))
+	*result = TYPE_INT;
+    else if (!strcmp(name, "tofloat"))
+	*result = TYPE_FLOAT;
+#ifdef WAIF_CORE
+    else if (!strcmp(name, "new_waif"))
+	*result = TYPE_WAIF;
+#endif
+    else
+	return 0;
+    return 1;
+}
+
 static void
 initialize_inferred_value_types(var_type *types, unsigned char *known,
 				unsigned char *tagged, int count)
@@ -4625,26 +4647,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		}
 		if (func_name && si->value > 0 && si->value < program->num_values
 		    && !value_types_known[si->value]) {
-		    if (!strcmp(func_name, "caller_perms")
-			|| !strcmp(func_name, "toobj")
-			|| !strcmp(func_name, "parent")
-			|| !strcmp(func_name, "owner")
-			|| !strcmp(func_name, "location")) {
-			value_types[si->value] = TYPE_OBJ;
-			value_types_known[si->value] = 1;
-			types_changed = 1;
-		    } else if (!strcmp(func_name, "tostr")
-			       || !strcmp(func_name, "toliteral")) {
-			value_types[si->value] = TYPE_STR;
-			value_types_known[si->value] = 1;
-			types_changed = 1;
-		    } else if (!strcmp(func_name, "tonum")
-			       || !strcmp(func_name, "toint")) {
-			value_types[si->value] = TYPE_INT;
-			value_types_known[si->value] = 1;
-			types_changed = 1;
-		    } else if (!strcmp(func_name, "tofloat")) {
-			value_types[si->value] = TYPE_FLOAT;
+		    var_type result_type;
+
+		    if (infer_builtin_result_type(func_name, &result_type)) {
+			value_types[si->value] = result_type;
 			value_types_known[si->value] = 1;
 			types_changed = 1;
 		    }
@@ -8359,6 +8365,12 @@ hir_test_infer_min_max_result(HIROp op, var_type left, var_type right,
 			      var_type *result)
 {
     return infer_min_max_result(op, left, right, result);
+}
+
+int
+hir_test_infer_builtin_result_type(const char *name, var_type *result)
+{
+    return infer_builtin_result_type(name, result);
 }
 
 void
