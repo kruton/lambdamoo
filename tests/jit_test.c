@@ -2993,6 +2993,24 @@ main(void)
 	  "machine-code dump did not contain hex bytes");
     check(jit_program_state(program) == JIT_STATE_COMPILED,
 	  "machine-code dump did not compile lazily");
+    {
+	JITProgramStats stats;
+
+	jit_program_stats(program, &stats);
+	check(stats.compile_attempts == 1 && stats.compile_successes == 1
+	      && stats.compile_failures == 0,
+	      "JIT compilation statistics are wrong");
+	check(stats.metadata_bytes > sizeof(JITProgram)
+	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
+	      && stats.machine_code_bytes == program->machine_code_len
+	      && stats.native_allocated_bytes >= stats.machine_code_bytes,
+	      "JIT memory statistics are wrong");
+	check(stats.accounted_bytes == stats.metadata_bytes + stats.runtime_bytes
+	      + stats.native_allocated_bytes,
+	      "JIT accounted byte total is wrong");
+	check(stats.mir_bytes == -1,
+	      "unavailable MIR memory statistic is not marked unavailable");
+    }
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
 			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
 	  "native execution failed");
@@ -4657,6 +4675,9 @@ main(void)
 
     /* Deoptimization profiling tests */
     {
+	JITProgram *profile_program = new_jit_program();
+	JITProgramStats stats;
+
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
 	      "deopt reason name none");
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_BUILTIN_CALL), "builtin_call") == 0,
@@ -4681,29 +4702,41 @@ main(void)
 	      "deopt reason name unsupported_operation");
 
 	jit_profile_reset();
-	jit_profile_record_entry();
-	jit_profile_record_entry();
-	jit_profile_record_completed();
-	jit_profile_record_vm_call();
+	jit_profile_record_entry(profile_program);
+	jit_profile_record_entry(profile_program);
+	jit_profile_record_completed(profile_program);
+	jit_profile_record_vm_call(profile_program);
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));
 	deopt_sample.bytecode_pc = 42;
 	deopt_sample.source_lineno = 10;
 	deopt_sample.reason = JIT_DEOPT_BUILTIN_CALL;
-	jit_profile_record_deopt(0, "do_command", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 0, "do_command", &deopt_sample);
 
 	deopt_sample.bytecode_pc = 18;
 	deopt_sample.source_lineno = 5;
 	deopt_sample.operation = HIR_OP_GET_PROP;
 	deopt_sample.reason = JIT_DEOPT_PROPERTY_READ;
-	jit_profile_record_deopt(1, "eval", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 1, "eval", &deopt_sample);
 
 	deopt_sample.bytecode_pc = 20;
 	deopt_sample.source_lineno = 6;
 	deopt_sample.operation = HIR_OP_SCATTER;
 	deopt_sample.reason = JIT_DEOPT_UNSUPPORTED_OP;
-	jit_profile_record_deopt(69, "parse_parties", &deopt_sample);
+	jit_profile_record_deopt(profile_program, 69, "parse_parties",
+				 &deopt_sample);
+
+	jit_program_stats(profile_program, &stats);
+	check(stats.entries == 2 && stats.completions == 1
+	      && stats.vm_calls == 1 && stats.deopts == 3,
+	      "per-program JIT usage totals are wrong");
+	check(stats.deopts_by_reason[JIT_DEOPT_BUILTIN_CALL] == 1
+	      && stats.deopts_by_reason[JIT_DEOPT_PROPERTY_READ] == 1
+	      && stats.deopts_by_reason[JIT_DEOPT_UNSUPPORTED_OP] == 1,
+	      "per-program JIT deopt reason totals are wrong");
+	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
+	      "per-program JIT last-use statistics are wrong");
 
 	/* Trigger report generation */
 	jit_profile_report();
@@ -4713,6 +4746,7 @@ main(void)
 	jit_profile_maybe_report(2000);
 
 	jit_profile_reset();
+	jit_program_free(profile_program);
     }
 
     return failures != 0;

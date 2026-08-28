@@ -922,7 +922,7 @@ do {								\
 
 	    if (resume_map >= 0)
 		RUN_ACTIV.resume_key = invalid_resume_key();
-	    jit_profile_record_entry();
+	    jit_profile_record_entry(RUN_ACTIV.prog->jit);
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
@@ -930,7 +930,7 @@ do {								\
 					     RUN_ACTIV.base_rt_stack,
 					     RUN_ACTIV.progr, resume_map);
 	    if (jit_result == JIT_RUN_RETURNED) {
-		jit_profile_record_completed();
+		jit_profile_record_completed(RUN_ACTIV.prog->jit);
 		STORE_STATE_VARIABLES();
 		if (unwind_stack(FIN_RETURN, ret_val, &outcome)) {
 		    if (result && outcome == OUTCOME_DONE)
@@ -960,10 +960,10 @@ do {								\
 	    } else if (jit_result == JIT_RUN_FALLBACK
 		       || jit_result == JIT_RUN_CALL_VERB) {
 		if (jit_result == JIT_RUN_FALLBACK)
-		    jit_profile_record_deopt(RUN_ACTIV.vloc, RUN_ACTIV.verbname,
-					     &deopt);
+		    jit_profile_record_deopt(RUN_ACTIV.prog->jit, RUN_ACTIV.vloc,
+					     RUN_ACTIV.verbname, &deopt);
 		else
-		    jit_profile_record_vm_call();
+		    jit_profile_record_vm_call(RUN_ACTIV.prog->jit);
 		ticks_remaining += deopt.ticks_charged;
 		bv = bc.vector + deopt.bytecode_pc;
 		error_bv = bc.vector + deopt.error_pc;

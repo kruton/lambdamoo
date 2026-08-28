@@ -4536,6 +4536,16 @@ static void code_finish (MIR_context_t ctx) {
   ctx->machine_code_ctx = NULL;
 }
 
+size_t _MIR_code_allocated_size (MIR_context_t ctx) {
+  size_t result = 0;
+
+  for (size_t i = 0; i < VARR_LENGTH (code_holder_t, code_holders); i++) {
+    code_holder_t *holder = VARR_ADDR (code_holder_t, code_holders) + i;
+    result += holder->bound - holder->start;
+  }
+  return result;
+}
+
 /* New Page */
 
 #if !MIR_NO_IO || !MIR_NO_SCAN

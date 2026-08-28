@@ -472,6 +472,25 @@ struct JITStatusExit {
     JITStatusExit *next;
 };
 
+static uint64_t
+elapsed_us(const struct timeval *started, const struct timeval *finished)
+{
+    uint64_t seconds;
+    long microseconds;
+
+    if (finished->tv_sec < started->tv_sec
+	|| (finished->tv_sec == started->tv_sec
+	    && finished->tv_usec < started->tv_usec))
+	return 0;
+    seconds = finished->tv_sec - started->tv_sec;
+    microseconds = finished->tv_usec - started->tv_usec;
+    if (microseconds < 0) {
+	seconds--;
+	microseconds += 1000000;
+    }
+    return seconds * 1000000 + microseconds;
+}
+
 static void
 append(MIRBuild *build, MIR_insn_t instruction)
 {
@@ -3772,6 +3791,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->usage)
+	myfree(program->usage, M_PROGRAM);
     block = program->blocks;
     while (block) {
 	JITBlock *next_block = block->next;
@@ -3807,25 +3828,41 @@ jit_program_free(JITProgram *program)
     myfree(program, M_PROGRAM);
 }
 
-int
-jit_program_bytes(JITProgram *program)
+static size_t
+jit_program_metadata_bytes(JITProgram *program)
 {
-    int bytes = 0;
+    size_t bytes = 0;
     int i;
     JITBlock *block;
 
     if (!program)
 	return 0;
     bytes = sizeof(JITProgram);
+    if (program->reason)
+	bytes += memo_strlen(program->reason) + 1;
+    if (program->diagnostic)
+	bytes += memo_strlen(program->diagnostic) + 1;
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
-    bytes += sizeof(Num) * program->num_values * 2;
     if (program->value_types)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
-    for (i = 0; i < program->num_deopt_maps; i++)
-	bytes += sizeof(int) * (program->deopt_maps[i].num_locals
-			      + program->deopt_maps[i].stack_depth);
+    if (program->usage)
+	bytes += sizeof(JITProgramUsage);
+    for (i = 0; i < program->num_deopt_maps; i++) {
+	JITDeoptMap *map = &program->deopt_maps[i];
+
+	if (map->local_values)
+	    bytes += sizeof(int) * map->num_locals;
+	if (map->local_types)
+	    bytes += sizeof(var_type) * map->num_locals;
+	if (map->stack_values)
+	    bytes += sizeof(int) * map->stack_depth;
+	if (map->stack_types)
+	    bytes += sizeof(var_type) * map->stack_depth;
+	if (map->resume_values)
+	    bytes += sizeof(JITResumeValue) * map->num_resume_values;
+    }
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 	bytes += sizeof(JITBlock);
@@ -3837,6 +3874,51 @@ jit_program_bytes(JITProgram *program)
 	}
     }
     return bytes;
+}
+
+void
+jit_program_stats(JITProgram *program, JITProgramStats *stats)
+{
+    if (!stats)
+	return;
+    memset(stats, 0, sizeof(*stats));
+    stats->mir_bytes = -1;
+    if (!program)
+	return;
+    if (program->usage) {
+	int reason;
+
+	stats->entries = program->usage->entries;
+	stats->completions = program->usage->completions;
+	stats->vm_calls = program->usage->vm_calls;
+	stats->deopts = program->usage->deopts;
+	for (reason = 0; reason < JIT_DEOPT_NUM_REASONS; reason++)
+	    stats->deopts_by_reason[reason]
+		= program->usage->deopts_by_reason[reason];
+	stats->last_used_generation = program->usage->last_used_generation;
+	stats->last_used_time = program->usage->last_used_time;
+    }
+    stats->compile_attempts = program->compile_attempts;
+    stats->compile_successes = program->compile_successes;
+    stats->compile_failures = program->compile_failures;
+    stats->compile_time_us = program->compile_time_us;
+    stats->metadata_bytes = jit_program_metadata_bytes(program);
+    stats->runtime_bytes = program->deopt_values
+	? sizeof(Num) * program->num_values * 2 : 0;
+    stats->machine_code_bytes = program->machine_code_len;
+    stats->native_allocated_bytes = program->mir_context
+	? _MIR_code_allocated_size((MIR_context_t) program->mir_context) : 0;
+    stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
+	+ stats->native_allocated_bytes;
+}
+
+int
+jit_program_bytes(JITProgram *program)
+{
+    JITProgramStats stats;
+
+    jit_program_stats(program, &stats);
+    return stats.accounted_bytes > INT_MAX ? INT_MAX : stats.accounted_bytes;
 }
 
 JITState
@@ -3935,6 +4017,7 @@ int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
+    struct timeval started, finished;
     unsigned generation;
 
     if (!program || program->state == JIT_STATE_UNSUPPORTED
@@ -3948,7 +4031,14 @@ jit_program_compile(JITProgram *program)
     }
     if (program->state == JIT_STATE_COMPILED)
 	return 1;
+    if (program->compile_attempts < UINT32_MAX)
+	program->compile_attempts++;
+    gettimeofday(&started, 0);
     if (!build_mir(program, &build)) {
+	gettimeofday(&finished, 0);
+	program->compile_time_us += elapsed_us(&started, &finished);
+	if (program->compile_failures < UINT32_MAX)
+	    program->compile_failures++;
 	program->state = JIT_STATE_FAILED;
 	if (program->reason)
 	    free_str(program->reason);
@@ -3964,6 +4054,10 @@ jit_program_compile(JITProgram *program)
     MIR_link(build.context, MIR_set_gen_interface, 0);
     program->native_function = MIR_gen(build.context, build.function);
     if (!program->native_function) {
+	gettimeofday(&finished, 0);
+	program->compile_time_us += elapsed_us(&started, &finished);
+	if (program->compile_failures < UINT32_MAX)
+	    program->compile_failures++;
 	MIR_gen_finish(build.context);
 	MIR_finish(build.context);
 	program->state = JIT_STATE_FAILED;
@@ -3989,6 +4083,10 @@ jit_program_compile(JITProgram *program)
     }
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
+    gettimeofday(&finished, 0);
+    program->compile_time_us += elapsed_us(&started, &finished);
+    if (program->compile_successes < UINT32_MAX)
+	program->compile_successes++;
     return 1;
 }
 
@@ -4296,6 +4394,7 @@ typedef struct JITDeoptSite {
 
 #define JIT_DEOPT_HASH_SIZE 256
 static JITDeoptSite *deopt_sites_hash[JIT_DEOPT_HASH_SIZE];
+static uint64_t jit_use_generation = 0;
 static uint64_t total_jit_entries = 0;
 static uint64_t total_jit_completed = 0;
 static uint64_t total_vm_calls = 0;
@@ -4335,28 +4434,42 @@ jit_deopt_reason_name(JITDeoptReason reason)
 }
 
 void
-jit_profile_record_entry(void)
+jit_profile_record_entry(JITProgram *program)
 {
     total_jit_entries++;
+    if (program) {
+	if (!program->usage) {
+	    program->usage = mymalloc(sizeof(JITProgramUsage), M_PROGRAM);
+	    memset(program->usage, 0, sizeof(JITProgramUsage));
+	}
+	program->usage->entries++;
+	program->usage->last_used_generation = ++jit_use_generation;
+	program->usage->last_used_time = time(0);
+    }
 }
 
 void
-jit_profile_record_completed(void)
+jit_profile_record_completed(JITProgram *program)
 {
     total_jit_completed++;
+    if (program && program->usage)
+	program->usage->completions++;
 }
 
 void
-jit_profile_record_vm_call(void)
+jit_profile_record_vm_call(JITProgram *program)
 {
     total_vm_calls++;
+    if (program && program->usage)
+	program->usage->vm_calls++;
 }
 
 void
-jit_profile_record_deopt(Objid vloc, const char *verbname,
+jit_profile_record_deopt(JITProgram *program, Objid vloc, const char *verbname,
 			 const JITDeoptState *deopt)
 {
-    JITDeoptReason reason = (deopt && deopt->reason < JIT_DEOPT_NUM_REASONS)
+    JITDeoptReason reason = (deopt && (int) deopt->reason >= 0
+	&& deopt->reason < JIT_DEOPT_NUM_REASONS)
 	? deopt->reason : JIT_DEOPT_UNSUPPORTED_OP;
     Num log_mode;
     int builtin_func = reason == JIT_DEOPT_BUILTIN_CALL && deopt
@@ -4371,6 +4484,11 @@ jit_profile_record_deopt(Objid vloc, const char *verbname,
 
     total_deopts++;
     deopt_reason_counts[reason]++;
+    if (program && program->usage) {
+	program->usage->deopts++;
+	if (program->usage->deopts_by_reason[reason] < UINT32_MAX)
+	    program->usage->deopts_by_reason[reason]++;
+    }
     if (operation >= 0 && operation <= HIR_OP_FORK) {
 	snprintf(operation_label, sizeof(operation_label), "op=%d", operation);
 	operation_name = operation_label;

@@ -143,10 +143,10 @@ moo:	$(OBJS) $(XT_LOBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@
 
 mir-vendor.o: $(abs_srcdir)/vendor/mir/mir.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -std=gnu99 -w -c -o $@ $<
 
 mir-gen-vendor.o: $(abs_srcdir)/vendor/mir/mir-gen.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -std=gnu99 -w -c -o $@ $<
 
 tests/hir_test_hir.o: hir.c hir.h
 	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ hir.c
