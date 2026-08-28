@@ -137,11 +137,12 @@ struct JITProgram {
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;
-    void *mir_context;
-    void *mir_allocator;
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
+    uint64_t pool_generation;
+    JITProgram *pool_prev;
+    JITProgram *pool_next;
     Num *deopt_values;
     var_type *value_types;
     unsigned char *value_is_tagged;

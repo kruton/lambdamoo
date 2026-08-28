@@ -547,6 +547,7 @@ main_loop(void)
     oklog("SHUTDOWN: %s\n", shutdown_message);
 #ifdef ENABLE_JIT
     jit_profile_report();
+    jit_shutdown();
 #endif
     send_shutdown_message(shutdown_message);
 }
@@ -924,8 +925,10 @@ emergency_mode(void)
     oklog("EMERGENCY_MODE: Leaving mode; %s continue...\n",
 	  start_ok ? "will" : "won't");
 #ifdef ENABLE_JIT
-    if (!start_ok)
+    if (!start_ok) {
 	jit_profile_report();
+	jit_shutdown();
+    }
 #endif
     return start_ok;
  abort:

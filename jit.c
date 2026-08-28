@@ -573,8 +573,17 @@ jit_mir_allocator_free(JITMIRAllocator *allocator)
     myfree(allocator, M_PROGRAM);
 }
 
-static MIR_context_t shared_mir_context = 0;
-static JITMIRAllocator *shared_mir_allocator = 0;
+typedef struct JITPool {
+    MIR_context_t context;
+    JITMIRAllocator *allocator;
+    uint64_t generation;
+    uint64_t compiled_count;
+    size_t total_machine_code_bytes;
+    JITProgram *active_head;
+    JITProgram *active_tail;
+} JITPool;
+
+static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 static uint64_t next_module_serial = 0;
 
 static void
@@ -605,19 +614,125 @@ jit_load_externals(MIR_context_t context)
 static int
 jit_ensure_shared_context(void)
 {
-    if (shared_mir_context)
+    if (jit_shared_pool.context)
 	return 1;
-    shared_mir_allocator = jit_mir_allocator_new();
-    if (!shared_mir_allocator)
+    jit_shared_pool.allocator = jit_mir_allocator_new();
+    if (!jit_shared_pool.allocator)
 	return 0;
-    shared_mir_context = MIR_init2(&shared_mir_allocator->interface, 0);
-    if (!shared_mir_context) {
-	jit_mir_allocator_free(shared_mir_allocator);
-	shared_mir_allocator = 0;
+    jit_shared_pool.context = MIR_init2(&jit_shared_pool.allocator->interface, 0);
+    if (!jit_shared_pool.context) {
+	jit_mir_allocator_free(jit_shared_pool.allocator);
+	jit_shared_pool.allocator = 0;
 	return 0;
     }
-    jit_load_externals(shared_mir_context);
+    jit_load_externals(jit_shared_pool.context);
     return 1;
+}
+
+static void
+jit_pool_register(JITProgram *program)
+{
+    if (!program || program->pool_generation == jit_shared_pool.generation)
+	return;
+    program->pool_generation = jit_shared_pool.generation;
+    program->pool_prev = jit_shared_pool.active_tail;
+    program->pool_next = 0;
+    if (jit_shared_pool.active_tail)
+	jit_shared_pool.active_tail->pool_next = program;
+    else
+	jit_shared_pool.active_head = program;
+    jit_shared_pool.active_tail = program;
+    jit_shared_pool.compiled_count++;
+    jit_shared_pool.total_machine_code_bytes += program->machine_code_len;
+}
+
+static void
+jit_pool_unregister(JITProgram *program)
+{
+    if (!program || program->pool_generation != jit_shared_pool.generation) {
+	if (program) {
+	    program->pool_generation = 0;
+	    program->pool_prev = 0;
+	    program->pool_next = 0;
+	}
+	return;
+    }
+    if (program->pool_prev)
+	program->pool_prev->pool_next = program->pool_next;
+    else
+	jit_shared_pool.active_head = program->pool_next;
+    if (program->pool_next)
+	program->pool_next->pool_prev = program->pool_prev;
+    else
+	jit_shared_pool.active_tail = program->pool_prev;
+    if (jit_shared_pool.compiled_count > 0)
+	jit_shared_pool.compiled_count--;
+    if (jit_shared_pool.total_machine_code_bytes >= program->machine_code_len)
+	jit_shared_pool.total_machine_code_bytes -= program->machine_code_len;
+    else
+	jit_shared_pool.total_machine_code_bytes = 0;
+    program->pool_generation = 0;
+    program->pool_prev = 0;
+    program->pool_next = 0;
+}
+
+void
+jit_pool_reset(void)
+{
+    JITProgram *current = jit_shared_pool.active_head;
+
+    while (current) {
+	JITProgram *next = current->pool_next;
+	current->state = JIT_STATE_PENDING;
+	current->native_function = 0;
+	current->machine_code = 0;
+	current->machine_code_len = 0;
+	if (current->deopt_values) {
+	    myfree(current->deopt_values, M_PROGRAM);
+	    current->deopt_values = 0;
+	}
+	current->pool_generation = 0;
+	current->pool_prev = 0;
+	current->pool_next = 0;
+	current = next;
+    }
+    jit_shared_pool.active_head = 0;
+    jit_shared_pool.active_tail = 0;
+    jit_shared_pool.compiled_count = 0;
+    jit_shared_pool.total_machine_code_bytes = 0;
+    if (jit_shared_pool.context) {
+	MIR_finish(jit_shared_pool.context);
+	jit_shared_pool.context = 0;
+    }
+    if (jit_shared_pool.allocator) {
+	jit_mir_allocator_free(jit_shared_pool.allocator);
+	jit_shared_pool.allocator = 0;
+    }
+    jit_shared_pool.generation++;
+    if (jit_shared_pool.generation == 0)
+	jit_shared_pool.generation = 1;
+}
+
+void
+jit_shutdown(void)
+{
+    jit_pool_reset();
+}
+
+void
+jit_pool_stats(JITPoolStats *stats)
+{
+    if (!stats)
+	return;
+    memset(stats, 0, sizeof(*stats));
+    stats->generation = jit_shared_pool.generation;
+    stats->active_programs = jit_shared_pool.compiled_count;
+    stats->total_machine_code_bytes = jit_shared_pool.total_machine_code_bytes;
+    if (jit_shared_pool.context)
+	stats->total_native_allocated_bytes
+	    = _MIR_code_allocated_size(jit_shared_pool.context);
+    if (jit_shared_pool.allocator)
+	stats->total_mir_heap_bytes = jit_shared_pool.allocator->live_bytes;
 }
 
 typedef struct {
@@ -3932,6 +4047,9 @@ jit_program_unsupported(const char *reason)
 static void
 jit_program_release_native(JITProgram *program)
 {
+    if (!program)
+	return;
+    jit_pool_unregister(program);
     if (program->deopt_values) {
 	myfree(program->deopt_values, M_PROGRAM);
 	program->deopt_values = 0;
@@ -3939,8 +4057,6 @@ jit_program_release_native(JITProgram *program)
     program->native_function = 0;
     program->machine_code = 0;
     program->machine_code_len = 0;
-    program->mir_context = 0;
-    program->mir_allocator = 0;
 }
 
 void
@@ -4032,8 +4148,6 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(unsigned char) * program->num_values;
     if (program->usage)
 	bytes += sizeof(JITProgramUsage);
-    if (program->mir_allocator)
-	bytes += sizeof(JITMIRAllocator);
     for (i = 0; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
 
@@ -4090,7 +4204,16 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->runtime_bytes = program->deopt_values
 	? sizeof(Num) * program->num_values * 2 : 0;
     stats->machine_code_bytes = program->machine_code_len;
-    stats->native_allocated_bytes = program->machine_code_len;
+    if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
+	&& program->machine_code_len > 0) {
+	size_t total_allocated = _MIR_code_allocated_size(jit_shared_pool.context);
+	size_t share = (size_t) (((uint64_t) total_allocated * program->machine_code_len)
+				 / jit_shared_pool.total_machine_code_bytes);
+	stats->native_allocated_bytes = share > program->machine_code_len
+	    ? share : program->machine_code_len;
+    } else {
+	stats->native_allocated_bytes = program->machine_code_len;
+    }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
 	+ stats->native_allocated_bytes;
 }
@@ -4209,6 +4332,10 @@ jit_program_compile(JITProgram *program)
     generation = builtin_protection_generation();
     if (program->state == JIT_STATE_COMPILED
 	&& program->protection_generation != generation) {
+	jit_pool_reset();
+    }
+    if (program->state == JIT_STATE_COMPILED
+	&& program->pool_generation != jit_shared_pool.generation) {
 	jit_program_release_native(program);
 	program->state = JIT_STATE_PENDING;
     }
@@ -4217,7 +4344,7 @@ jit_program_compile(JITProgram *program)
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
-    if (!jit_ensure_shared_context() || !build_mir(program, &build, shared_mir_context)) {
+    if (!jit_ensure_shared_context() || !build_mir(program, &build, jit_shared_pool.context)) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
@@ -4231,17 +4358,17 @@ jit_program_compile(JITProgram *program)
 	program->diagnostic = str_dup("mir build module failed");
 	return 0;
     }
-    MIR_load_module(shared_mir_context, build.module);
-    MIR_gen_init(shared_mir_context);
-    MIR_gen_set_optimize_level(shared_mir_context, 0);
-    MIR_link(shared_mir_context, MIR_set_gen_interface, 0);
-    program->native_function = MIR_gen(shared_mir_context, build.function);
+    MIR_load_module(jit_shared_pool.context, build.module);
+    MIR_gen_init(jit_shared_pool.context);
+    MIR_gen_set_optimize_level(jit_shared_pool.context, 0);
+    MIR_link(jit_shared_pool.context, MIR_set_gen_interface, 0);
+    program->native_function = MIR_gen(jit_shared_pool.context, build.function);
     if (!program->native_function) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
 	    program->compile_failures++;
-	MIR_gen_finish(shared_mir_context);
+	MIR_gen_finish(jit_shared_pool.context);
 	program->state = JIT_STATE_FAILED;
 	if (program->reason)
 	    free_str(program->reason);
@@ -4253,9 +4380,7 @@ jit_program_compile(JITProgram *program)
     }
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
-    MIR_gen_finish(shared_mir_context);
-    program->mir_context = 0;
-    program->mir_allocator = 0;
+    MIR_gen_finish(jit_shared_pool.context);
     program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
 				     M_PROGRAM);
     memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
@@ -4267,6 +4392,7 @@ jit_program_compile(JITProgram *program)
     }
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
+    jit_pool_register(program);
     gettimeofday(&finished, 0);
     program->compile_time_us += elapsed_us(&started, &finished);
     if (program->compile_successes < UINT32_MAX)

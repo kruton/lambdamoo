@@ -415,15 +415,14 @@ and memory statistics. These include native entries and completions, VM-call
 crossings, deoptimizations by reason, last-use time and generation, compilation
 attempts/results/time, persistent metadata bytes, runtime materialization
 storage, and generated machine-code bytes. `accounted_bytes` is included by
-`program_bytes()` and uses the executable pages reported by
-`native_allocated_bytes`, rather than only the used instruction length in
-`machine_code_bytes`. The pinned MIR allocator interface now provides exact
-per-context accounting of live MIR allocation requests, including the
-allocator's per-allocation bookkeeping, through `mir_bytes`. It also reclaims
-any context-owned allocations left after `MIR_finish()`. `accounted_bytes`
-therefore includes metadata, runtime materialization storage, retained MIR
-heap, and executable pages. Allocator rounding and reserved-but-uncommitted
-executable address space are not yet included.
+`program_bytes()` and uses the proportional share of executable pages reported
+by `native_allocated_bytes`, reflecting actual code-holder page utilization
+and alignment across the shared context. All compiled verbs reside in a
+generation-based shared `MIR_context` pool where generator scratch memory is
+reclaimed immediately via `MIR_gen_finish()`, eliminating duplicate per-verb
+context baselines. Whole-pool invalidation (`jit_pool_reset()`) cleanly reclaims
+executable memory and MIR modules when built-in protections change or the pool
+rotates, resetting active programs back to pending.
 
 All 6,319 verbs in the current Opal.db eligibility census compile successfully.
 There are no remaining top-level `unsupported-program`,
@@ -633,12 +632,11 @@ Implement pool efficiency in this order:
    watermark rather than repeatedly crossing one hard limit. Use minimum sample
    counts and cooldowns before deprioritizing a frequently deoptimizing verb.
 
-4. **Reduce retained compiler state.** Verify that `MIR_gen_finish()` can run
-   immediately after generating a callable function, instead of retaining
-   generator scratch state for the life of the compiled verb. Use the measured
-   `mir_bytes` delta to decide whether further context compaction or allocation
-   changes are worthwhile. Avoid a no-op-free arena while MIR contexts remain
-   long-lived, because it retains generation temporaries until eviction.
+4. **Manage shared pool memory and rotation.** Maintain the generation-based
+   shared `MIR_context` pool with immediate generator scratch finalization
+   (`MIR_gen_finish()`). Rotate or compact the pool when memory limits are
+   reached or built-in protections change, safely returning cold or invalidated
+   programs to the pending state without leaking module or executable state.
 
 5. **Reduce deopt metadata and register pressure.** Implement the
    deopt-point simplification described in priority 9, then measure its effect

@@ -4746,6 +4746,37 @@ main(void)
 	jit_profile_reset();
 	jit_program_free(profile_program);
     }
+    {
+	JITPoolStats pool_stats;
+	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
+
+	check(prog != 0, "failed to create test program for pool verification");
+	check(jit_program_compile(prog), "failed to compile program for pool test");
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs >= 1, "pool active program count is wrong");
+	check(pool_stats.total_machine_code_bytes >= prog->machine_code_len,
+	      "pool machine code byte count is wrong");
+	check(pool_stats.total_native_allocated_bytes >= pool_stats.total_machine_code_bytes,
+	      "pool native allocated byte count is wrong");
+
+	/* Reset pool and verify invalidation of active programs */
+	jit_pool_reset();
+	check(jit_program_state(prog) == JIT_STATE_PENDING,
+	      "jit_pool_reset did not return program to pending state");
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs == 0, "pool has remaining active programs after reset");
+	check(pool_stats.total_machine_code_bytes == 0, "pool machine code bytes not zeroed");
+
+	/* Recompile after reset */
+	check(jit_program_compile(prog), "failed to recompile program after pool reset");
+	check(jit_program_state(prog) == JIT_STATE_COMPILED,
+	      "program did not compile after pool reset");
+
+	jit_program_free(prog);
+	jit_shutdown();
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");
+    }
 
     return failures != 0;
 }

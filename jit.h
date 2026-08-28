@@ -77,6 +77,14 @@ typedef struct {
     size_t accounted_bytes;
 } JITProgramStats;
 
+typedef struct {
+    uint64_t generation;
+    uint64_t active_programs;
+    size_t total_machine_code_bytes;
+    size_t total_native_allocated_bytes;
+    size_t total_mir_heap_bytes;
+} JITPoolStats;
+
 extern const char *jit_deopt_reason_name(JITDeoptReason);
 extern void jit_profile_record_entry(JITProgram *);
 extern void jit_profile_record_completed(JITProgram *);
@@ -86,6 +94,9 @@ extern void jit_profile_record_deopt(JITProgram *, Objid, const char *,
 extern void jit_profile_maybe_report(int);
 extern void jit_profile_report(void);
 extern void jit_profile_reset(void);
+extern void jit_pool_stats(JITPoolStats *);
+extern void jit_pool_reset(void);
+extern void jit_shutdown(void);
 
 extern JITProgram *jit_program_unsupported(const char *);
 extern JITProgram *jit_program_unsupported_with_diagnostic(const char *, const char *);
