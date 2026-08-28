@@ -7993,9 +7993,6 @@ lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int finally_val = new_temp(ctx);
     HIRTacInstr *finally_marker;
 
-    append_deopt_boundary(ctx, program, stmt->source_lineno,
-			  stmt->bytecode_pc);
-
     finally_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
     finally_marker->dst = finally_val;
     finally_marker->literal.type = TYPE_FINALLY;
@@ -8025,9 +8022,6 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     int done_label = new_label(ctx);
     int catch_marker_val;
     HIRTacInstr *catch_marker;
-
-    append_deopt_boundary(ctx, program, stmt->source_lineno,
-			  stmt->bytecode_pc);
 
     for (ex = stmt->u.try_except.excepts; ex; ex = ex->next)
 	arm_count++;

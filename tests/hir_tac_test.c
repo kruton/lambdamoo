@@ -2897,7 +2897,7 @@ test_try_except_tac_ssa(void)
     check_int("try except tac returns",
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
     check_int("try except deopt boundary",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     check_int("try except cfg blocks", hir_cfg_block_count(cfg), 1);
     check_int("try except ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try except verify errors", hir_context_error_count(ctx), 0);
@@ -2935,7 +2935,7 @@ test_try_finally_tac_ssa(void)
     check_int("try finally tac returns",
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("try finally deopt boundary",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     check_int("try finally cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
     check_int("try finally ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("try finally verify errors", hir_context_error_count(ctx), 0);
