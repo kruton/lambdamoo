@@ -4091,9 +4091,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	? sizeof(Num) * program->num_values * 2 : 0;
     stats->machine_code_bytes = program->machine_code_len;
     stats->native_allocated_bytes = program->machine_code_len;
-    stats->mir_bytes = 0;
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes + stats->mir_bytes;
+	+ stats->native_allocated_bytes;
 }
 
 int

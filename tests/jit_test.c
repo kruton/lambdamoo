@@ -2986,13 +2986,6 @@ main(void)
 	  "JIT program has the wrong deopt map count");
     check(jit_program_state(program) == JIT_STATE_PENDING,
 	  "MIR dump changed JIT state");
-    {
-	JITProgramStats stats;
-
-	jit_program_stats(program, &stats);
-	check(stats.mir_bytes == 0,
-	      "MIR dump retained temporary allocator memory");
-    }
     check(jit_program_dump_machine(program, check_machine_line, &machine_dump),
 	  "machine-code dump failed");
     check(machine_dump.lines > 0, "machine-code dump was empty");
@@ -3010,11 +3003,10 @@ main(void)
 	check(stats.metadata_bytes > sizeof(JITProgram)
 	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
 	      && stats.machine_code_bytes == program->machine_code_len
-	      && stats.native_allocated_bytes >= stats.machine_code_bytes
-	      && stats.mir_bytes == 0,
+	      && stats.native_allocated_bytes >= stats.machine_code_bytes,
 	      "JIT memory statistics are wrong");
 	check(stats.accounted_bytes == stats.metadata_bytes + stats.runtime_bytes
-	      + stats.native_allocated_bytes + stats.mir_bytes,
+	      + stats.native_allocated_bytes,
 	      "JIT accounted byte total is wrong");
     }
     check(jit_program_execute(program, env, &result, &ticks, &timed_out,
