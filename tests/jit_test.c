@@ -4087,6 +4087,32 @@ main(void)
 	jit_program_free(tagged_typeof);
     }
 
+    /* Tagged absolute value accepts integers and guards other runtime types. */
+    {
+	JITProgram *tagged_abs = tagged_unary_program(HIR_OP_ABS);
+	Var tagged_env[1];
+
+	tagged_abs->value_is_tagged[2] = 1;
+	tagged_env[0].type = TYPE_INT;
+	tagged_env[0].v.num = -42;
+	ticks = 10;
+	check(jit_program_execute(tagged_abs, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged abs executed natively");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "tagged abs returned the wrong value");
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("not a number");
+	ticks = 10;
+	check(jit_program_execute(tagged_abs, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged non-integer abs did not deoptimize");
+	free_var(tagged_env[0]);
+	jit_program_free(tagged_abs);
+    }
+
     /* Tagged exponentiation accepts integers and guards other runtime types. */
     {
 	JITProgram *tagged_exp = tagged_binary_program(HIR_OP_EXP);

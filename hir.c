@@ -4758,6 +4758,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		     || ssa_instr->kind == HIR_TAC_RANGE_REF
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
+			     || ssa_instr->op == HIR_OP_ABS
 			     || ssa_instr->op == HIR_OP_TYPEOF
 			     || ssa_instr->op == HIR_OP_LENGTH
 			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
@@ -4787,7 +4788,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    || ssa_instr->kind == HIR_TAC_CALL_VERB
 		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
-	    if (ssa_instr->kind == HIR_TAC_UNARY
+	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_UNARY
 		&& (ssa_instr->op == HIR_OP_COMPLEMENT
 		    || ssa_instr->op == HIR_OP_NEGATE || ssa_instr->op == HIR_OP_ABS)) {
 		int src1_known = ssa_instr->src1 > 0

@@ -1461,6 +1461,28 @@ build_mir(JITProgram *program, MIRBuild *build)
 			    && program->value_types[instr->value] == TYPE_FLOAT;
 			int src_fl = program->value_types
 			    && program->value_types[instr->src1] == TYPE_FLOAT;
+			int tagged_src = program->value_is_tagged
+			    && program->value_is_tagged[instr->src1];
+			MIR_label_t deopt = 0;
+			MIR_label_t done = 0;
+			if (tagged_src) {
+			    char name[32];
+			    MIR_reg_t type;
+
+			    sprintf(name, "abs_type%d", copy_serial++);
+			    type = new_reg(build, name);
+			    deopt = MIR_new_label(build->context);
+			    done = MIR_new_label(build->context);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, type),
+				MIR_new_mem_op(build->context, tag_t,
+				    (program->num_values + instr->src1) * sizeof(Num),
+				    deopt_values, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, type),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			}
 			if (val_fl != src_fl) {
 			    append_deopt_exit(build, program, instr->deopt_map,
 					      values, deopt_map_out, deopt_values,
@@ -1509,6 +1531,22 @@ build_mir(JITProgram *program, MIRBuild *build)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 						      MIR_new_reg_op(build->context, values[instr->value]),
 						      MIR_new_reg_op(build->context, values[instr->src1])));
+			    append(build, done);
+			}
+			if (tagged_src) {
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[instr->value])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->value) * sizeof(Num),
+					deopt_values, 0, 1),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, deopt);
+			    append_deopt_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return);
 			    append(build, done);
 			}
 		    } else if (instr->op == HIR_OP_LENGTH) {
