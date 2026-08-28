@@ -4541,7 +4541,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
-	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_INDEX
+	    if (si->kind == HIR_TAC_BINARY
+		&& (si->op == HIR_OP_INDEX || si->op == HIR_OP_GET_PROP)
 		&& si->value > 0 && si->value < program->num_values
 		&& !value_types_known[si->value])
 		value_is_tagged[si->value] = 1;
@@ -4698,6 +4699,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		instr->kind = HIR_TAC_DEOPT;
 	    if (uses_tagged
 		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
+		     || ssa_instr->kind == HIR_TAC_RETURN
+		     || ssa_instr->kind == HIR_TAC_CALL_VERB
+		     || ssa_instr->kind == HIR_TAC_CALL
 		     || (ssa_instr->kind == HIR_TAC_UNARY
 			 && (ssa_instr->op == HIR_OP_NOT
 			     || ssa_instr->op == HIR_OP_LENGTH
@@ -4724,6 +4728,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		&& (ssa_instr->kind == HIR_TAC_UNARY
 		    || ssa_instr->kind == HIR_TAC_BINARY
 		    || ssa_instr->kind == HIR_TAC_RETURN
+		    || ssa_instr->kind == HIR_TAC_CALL
+		    || ssa_instr->kind == HIR_TAC_CALL_VERB
 		    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
 	    if (ssa_instr->src1 > 0 && ssa_instr->src1 < program->num_values
