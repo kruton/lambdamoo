@@ -904,9 +904,21 @@ do {								\
 #ifdef ENABLE_JIT
 	{
 	    int at_entry = bv == bc.vector && rts == RUN_ACTIV.base_rt_stack;
-	    int resume_map = RUN_ACTIV.prog->jit
-		? jit_program_resume_map(RUN_ACTIV.prog->jit,
-					 RUN_ACTIV.resume_key) : -1;
+	    int resume_map = -1;
+
+	    if (resume_key_is_valid(RUN_ACTIV.resume_key)) {
+		const ResumePoint *point =
+		    resume_point_for_key(RUN_ACTIV.prog, RUN_ACTIV.resume_key);
+
+		if (point && point->vector == current_activ_vector()
+		    && point->pc == (unsigned) (bv - bc.vector)
+		    && point->error_pc == (unsigned) (error_bv - bc.vector)
+		    && RUN_ACTIV.prog->jit)
+		    resume_map = jit_program_resume_map(RUN_ACTIV.prog->jit,
+						RUN_ACTIV.resume_key);
+		if (resume_map < 0)
+		    RUN_ACTIV.resume_key = invalid_resume_key();
+	    }
 
 	if ((at_entry || resume_map >= 0)
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
