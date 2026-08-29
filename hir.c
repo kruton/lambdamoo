@@ -4781,6 +4781,22 @@ jit_coalesce_deopt_locals(JITProgram *program)
 }
 
 static void
+jit_build_tag_slots(JITProgram *program)
+{
+    int value;
+
+    if (!program || program->num_values <= 0)
+	return;
+    program->value_tag_slots = mymalloc(sizeof(int) * program->num_values,
+					M_PROGRAM);
+    for (value = 0; value < program->num_values; value++) {
+	program->value_tag_slots[value] = -1;
+	if (program->value_is_tagged[value])
+	    program->value_tag_slots[value] = program->num_tag_slots++;
+    }
+}
+
+static void
 jit_build_deopt_tag_values(JITProgram *program)
 {
     unsigned char *seen;
@@ -6041,6 +6057,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_build_tag_slots(program);
     jit_build_value_ownership(program);
     jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {

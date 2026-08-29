@@ -1085,6 +1085,27 @@ new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
     return exit->label;
 }
 
+static int
+jit_tag_index(JITProgram *program, int value)
+{
+    if (!program->value_tag_slots)
+	return program->num_values + value;
+    return program->num_values + program->value_tag_slots[value];
+}
+
+static size_t
+jit_tag_offset(JITProgram *program, int value)
+{
+    return (size_t) jit_tag_index(program, value) * sizeof(Num);
+}
+
+static int
+jit_runtime_value_slots(JITProgram *program)
+{
+    return program->num_values + (program->value_tag_slots
+	? program->num_tag_slots : program->num_values);
+}
+
 static void
 append_float_result_check(MIRBuild *build, JITInstruction *instr,
 			  MIR_reg_t *values, MIR_reg_t deopt_values,
@@ -1332,7 +1353,7 @@ append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
 	append(build, MIR_new_insn(build->context, MIR_MOV,
 	    MIR_new_mem_op(build->context,
 		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-		    (program->num_values + value) * sizeof(Num),
+		    jit_tag_offset(program, value),
 		    deopt_values, 0, 1),
 	    MIR_new_mem_op(build->context, MIR_T_I32,
 		    stack_index * sizeof(Var) + offsetof(Var, type),
@@ -1648,7 +1669,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 			MIR_new_mem_op(build->context,
 			    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-			    (program->num_values + resume->value) * sizeof(Num),
+			    jit_tag_offset(program, resume->value),
 			    deopt_values, 0, 1),
 			    MIR_new_int_op(build->context, resume->literal_type)));
 	    }
@@ -1741,7 +1762,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			&& program->value_is_tagged[instr->value]) {
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_mem_op(build->context, tag_t,
-				(program->num_values + instr->value) * sizeof(Num),
+				jit_tag_offset(program, instr->value),
 				deopt_values, 0, 1),
 			    MIR_new_int_op(build->context, instr->literal_type)));
 		    }
@@ -1767,7 +1788,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_reg_op(build->context, var_type)));
 			    sprintf(name, "local_addr%d", copy_serial++);
@@ -1874,7 +1895,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			} else {
 			    var_type elem_type = (program->value_types
@@ -1897,7 +1918,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -1914,7 +1935,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, tag),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -1927,7 +1948,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_LIST)));
 			    }
@@ -1946,7 +1967,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_LIST)));
 			    }
@@ -1993,7 +2014,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, operand_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, operand_ok),
@@ -2032,7 +2053,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, operand_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, operand_ok),
@@ -2066,7 +2087,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_OBJ)));
 			    break;
@@ -2097,7 +2118,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_AND,
 				MIR_new_reg_op(build->context, values[instr->value]),
@@ -2128,7 +2149,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -2190,7 +2211,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -2219,7 +2240,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, tag),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BEQ,
 				MIR_new_label_op(build->context, is_list),
@@ -2319,7 +2340,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			}
@@ -2365,7 +2386,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_call_insn(build->context, 5,
 				MIR_new_ref_op(build->context, build->proto_is_true),
@@ -2381,7 +2402,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    }
@@ -2489,7 +2510,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, list_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -2503,7 +2524,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			} else {
 			    var_type elem_type = (program->value_types
@@ -2527,7 +2548,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -2571,7 +2592,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, obj_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, obj_ok),
@@ -2590,7 +2611,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_ADD,
 				MIR_new_reg_op(build->context, out_type_ptr),
 				MIR_new_reg_op(build->context, deopt_values),
-				MIR_new_int_op(build->context, (program->num_values + instr->value) * sizeof(Num))));
+				MIR_new_int_op(build->context, jit_tag_offset(program, instr->value))));
 			    append(build, MIR_new_call_insn(build->context, 9,
 				MIR_new_ref_op(build->context, build->proto_get_prop),
 				MIR_new_ref_op(build->context, build->import_get_prop),
@@ -2639,7 +2660,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2654,7 +2675,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2695,7 +2716,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2709,7 +2730,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2728,7 +2749,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -2764,7 +2785,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, list_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2776,7 +2797,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, in_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 			    else
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2795,7 +2816,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    if (tagged_list) {
@@ -2846,8 +2867,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, type),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->src1)
-					    * sizeof(Num), deopt_values, 0, 1)));
+					    jit_tag_offset(program, instr->src1), deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
 					MIR_new_reg_op(build->context, type),
@@ -2861,8 +2881,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, type),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->src2)
-					    * sizeof(Num), deopt_values, 0, 1)));
+					    jit_tag_offset(program, instr->src2), deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
 					MIR_new_reg_op(build->context, type),
@@ -2910,7 +2929,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type1),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2921,7 +2940,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type2),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2957,7 +2976,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value])
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			break;
@@ -3068,7 +3087,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -3095,7 +3114,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 			    } else {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3106,7 +3125,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 			    } else {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3144,7 +3163,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    }
@@ -3171,7 +3190,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -3375,7 +3394,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, index_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3405,7 +3424,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tagged_result)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    if (tagged_index) {
@@ -3452,7 +3471,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, index_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -3467,7 +3486,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, base_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BEQ,
 				MIR_new_label_op(build->context, is_list),
@@ -3506,7 +3525,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tagged_result) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -3548,7 +3567,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			if (tagged_result)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_reg_op(build->context, elem_type)));
 			else
@@ -3624,7 +3643,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3638,7 +3657,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3655,7 +3674,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			if (tagged_dst) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			}
@@ -3892,7 +3911,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, tag_temps[n]),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + copy->src) * sizeof(Num),
+					    jit_tag_offset(program, copy->src),
 					    deopt_values, 0, 1)));
 				else
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3957,7 +3976,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tag_temps[n])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + copy->dst) * sizeof(Num),
+					jit_tag_offset(program, copy->dst),
 					deopt_values, 0, 1),
 				    MIR_new_reg_op(build->context, tag_temps[n])));
 			    n++;
@@ -4011,7 +4030,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_call_insn(build->context, 5,
 				MIR_new_ref_op(build->context, build->proto_is_true),
@@ -4074,7 +4093,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_reg_op(build->context, return_type),
 			    MIR_new_mem_op(build->context, tag_t,
-				(program->num_values + instr->src1) * sizeof(Num),
+				jit_tag_offset(program, instr->src1),
 				deopt_values, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_mem_op(build->context, MIR_T_I32,
@@ -4170,7 +4189,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, obj_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, obj_ok),
@@ -4186,7 +4205,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, rhs_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + rhs) * sizeof(Num),
+					jit_tag_offset(program, rhs),
 					deopt_values, 0, 1)));
 			    else
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -4227,7 +4246,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_reg_op(build->context, rhs_type)));
 			    append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -4282,7 +4301,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, base_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -4297,7 +4316,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, index_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -4335,7 +4354,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, value_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src3) * sizeof(Num),
+				    jit_tag_offset(program, instr->src3),
 				    deopt_values, 0, 1)));
 			else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -4408,7 +4427,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, ft),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + from_val) * sizeof(Num),
+					    jit_tag_offset(program, from_val),
 					    deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
@@ -4422,7 +4441,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, tt),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + to_val) * sizeof(Num),
+					    jit_tag_offset(program, to_val),
 					    deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
@@ -4450,7 +4469,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_STR)));
 			    } else if (base_type == TYPE_LIST) {
@@ -4472,7 +4491,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_LIST)));
 			    } else {
@@ -4484,7 +4503,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, bt),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + base_val) * sizeof(Num),
+					jit_tag_offset(program, base_val),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, is_list),
@@ -4513,7 +4532,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_STR)));
 				append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -4538,7 +4557,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_LIST)));
 				append(build, done);
@@ -4602,8 +4621,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type[operand]),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + operands[operand])
-					* sizeof(Num), deopt_values, 0, 1)));
+					jit_tag_offset(program, operands[operand]), deopt_values, 0, 1)));
 			    else
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type[operand]),
@@ -4629,7 +4647,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_new_reg_op(build->context, type_out),
 			    MIR_new_reg_op(build->context, deopt_values),
 			    MIR_new_int_op(build->context,
-				(program->num_values + instr->value) * sizeof(Num))));
+				jit_tag_offset(program, instr->value))));
 			append(build, MIR_new_call_insn(build->context, 14,
 			    MIR_new_ref_op(build->context,
 				build->proto_direct_verb_call),
@@ -4906,6 +4924,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->value_tag_slots)
+	myfree(program->value_tag_slots, M_PROGRAM);
     if (program->value_ownership)
 	myfree(program->value_ownership, M_PROGRAM);
     if (program->value_owner_root)
@@ -4942,6 +4962,8 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_tag_slots)
+	bytes += sizeof(int) * program->num_values;
     if (program->value_ownership)
 	bytes += sizeof(unsigned char) * program->num_values;
     if (program->value_owner_root)
@@ -5347,8 +5369,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
 	    continue;
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
-	    ? (var_type) deopt_values[program->num_values
-		+ resume->value]
+	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
 	if (!jit_runtime_type_is_valid(type)) {
 	    jit_continuation_free(frame);
@@ -5368,8 +5389,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
 	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
-	    ? (var_type) deopt_values[program->num_values
-		+ resume->value]
+	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
 	frame->values[i] = materialize_deopt_value(type,
 		deopt_values[resume->value]);
@@ -5588,7 +5608,7 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 	return env[local].type;
     if (value > 0 && value < program->num_values) {
 	if (program->value_is_tagged && program->value_is_tagged[value])
-	    return (var_type) deopt_values[program->num_values + value];
+	    return (var_type) deopt_values[jit_tag_index(program, value)];
 	if (program->value_types)
 	    return program->value_types[value];
     }
@@ -5605,7 +5625,7 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
 	int value = map->tagged_values[i];
 
 	if (!jit_runtime_type_is_valid((var_type)
-	    deopt_values[program->num_values + value])) {
+	    deopt_values[jit_tag_index(program, value)])) {
 	    errlog("JIT: missing runtime tag for value %d at pc %u\n",
 		   value, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
@@ -5674,7 +5694,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
-    deopt_bytes = sizeof(Num) * program->num_values * 2;
+    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
     runtime_bytes = deopt_bytes
 	+ sizeof(Var) * program->num_borrowed_locals;
     deopt_values = mymalloc(deopt_bytes ? deopt_bytes : sizeof(Num),
@@ -5682,8 +5702,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     memset(deopt_values, 0, deopt_bytes);
     {
 	int i;
+	int tag_slots = program->value_tag_slots
+	    ? program->num_tag_slots : program->num_values;
 
-	for (i = 0; i < program->num_values; i++)
+	for (i = 0; i < tag_slots; i++)
 	    deopt_values[program->num_values + i] = TYPE_ANY;
 	if (program->num_borrowed_locals) {
 	    borrowed_locals = mymalloc(sizeof(Var)
@@ -5747,8 +5769,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    if (local_value > 0) {
 		var_type type = jit_deopt_map_local_type(program, map, i);
 		if (type == TYPE_ANY)
-		    type = (var_type) deopt_values[program->num_values
-			+ local_value];
+		    type = (var_type) deopt_values[jit_tag_index(program,
+			local_value)];
 		Var value = materialize_deopt_value(type,
 		    deopt_values[local_value]);
 
@@ -5773,8 +5795,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		continue;
 	    }
 	    if (type == TYPE_ANY)
-		type = (var_type) deopt_values[program->num_values
-		    + map->stack_values[i]];
+		type = (var_type) deopt_values[jit_tag_index(program,
+		    map->stack_values[i])];
 
 	    new_stack[i - stack_start] = materialize_deopt_value(type,
 		deopt_values[map->stack_values[i]]);
@@ -5852,8 +5874,11 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     release_ir = !program->blocks;
     if (release_ir && !jit_program_restore_ir(program))
 	return 0;
-    snprintf(line, sizeof(line), "HIR values=%d blocks=%d deopt-maps=%d",
-	     program->num_values, program->num_blocks, program->num_deopt_maps);
+    snprintf(line, sizeof(line),
+	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d",
+	     program->num_values, program->num_tag_slots,
+	     jit_runtime_value_slots(program), program->num_blocks,
+	     program->num_deopt_maps);
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
 	snprintf(line, sizeof(line), "v%d type=%d tagged=%d ownership=%d root=%d", i,

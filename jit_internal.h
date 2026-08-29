@@ -197,6 +197,8 @@ struct JITProgram {
     JITProgram *pool_next;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    int num_tag_slots;
+    int *value_tag_slots;
     unsigned char *value_ownership;
     int *value_owner_root;
     int num_borrowed_locals;

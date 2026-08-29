@@ -113,6 +113,19 @@ set_program_value_type(JITProgram *program, int value, var_type type)
     program->value_types[value] = type;
 }
 
+static void
+use_compact_tag_slots(JITProgram *program)
+{
+    int value;
+
+    program->value_tag_slots = allocate(sizeof(int) * program->num_values);
+    for (value = 0; value < program->num_values; value++) {
+	program->value_tag_slots[value] = -1;
+	if (program->value_is_tagged[value])
+	    program->value_tag_slots[value] = program->num_tag_slots++;
+    }
+}
+
 static JITProgram *
 arithmetic_program(void)
 {
@@ -556,6 +569,7 @@ builtin_call_program(unsigned func)
     return_instr->literal_type = TYPE_ANY;
     block->first = load_args;
     block->last = return_instr;
+    use_compact_tag_slots(program);
     return program;
 }
 
