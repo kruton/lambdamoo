@@ -1370,6 +1370,26 @@ append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
 		    stack, 0, 1)));
 }
 
+static void
+append_stored_resume_value(MIRBuild *build, JITProgram *program,
+			   MIR_reg_t *values, int value,
+			   MIR_reg_t deopt_values)
+{
+    if (value <= 0 || value >= program->num_values)
+	return;
+    if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+	append(build, MIR_new_insn(build->context, MIR_DMOV,
+	    MIR_new_reg_op(build->context, values[value]),
+	    MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+		deopt_values, 0, 1)));
+    else
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_reg_op(build->context, values[value]),
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		value * sizeof(Num), deopt_values, 0, 1)));
+}
+
 static int
 jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 {
@@ -1664,10 +1684,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	     && j < map->native_resume->num_values; j++) {
 	    JITResumeValue *resume = &map->native_resume->values[j];
 
-	    if (resume->source != JIT_RESUME_CONSTANT)
+	    if (resume->source == JIT_RESUME_RESULT)
 		append_resume_value(build, program, values, resume->value,
 				    continuation_values, j, deopt_values,
 				    &copy_serial);
+	    else if (resume->source != JIT_RESUME_CONSTANT)
+		append_stored_resume_value(build, program, values,
+		    resume->value, deopt_values);
 	}
 	append(build, values_loaded);
 	for (j = 0; map->native_resume
@@ -5382,6 +5405,16 @@ jit_program_compile(JITProgram *program)
 
 static int jit_runtime_type_is_valid(var_type);
 
+static int
+jit_continuation_type_needs_owner(var_type type)
+{
+    return type == TYPE_STR || type == TYPE_LIST
+#ifdef WAIF_CORE
+	|| type == TYPE_WAIF
+#endif
+	;
+}
+
 static Var
 materialize_deopt_value(var_type type, Num raw)
 {
@@ -5419,17 +5452,52 @@ materialize_deopt_value(var_type type, Num raw)
     return var_ref(value);
 }
 
-static Var *
-jit_continuation_value(JITContinuationFrame *frame, int value)
+static JITResumeValue *
+jit_continuation_resume_value(JITContinuationFrame *frame, int value)
 {
     JITNativeResume *resume;
     int i;
 
     resume = frame->program->deopt_maps[frame->map_id].native_resume;
-    for (i = 0; i < frame->num_values; i++)
-	if (resume->values[i].value == value)
-	    return &frame->values[i];
+    for (i = 0; i < frame->num_values; i++) {
+	if (resume->values[i].value == value) {
+	    return &resume->values[i];
+	}
+    }
     return 0;
+}
+
+static int
+jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
+				    Var *materialized)
+{
+    JITResumeValue *resume;
+    var_type type;
+
+    resume = jit_continuation_resume_value(frame, value);
+    if (!resume)
+	return 0;
+    if (resume->source == JIT_RESUME_RESULT) {
+	if (!frame->has_result)
+	    return 0;
+	*materialized = var_ref(frame->result);
+	return 1;
+    }
+    if (resume->source == JIT_RESUME_CONSTANT) {
+	*materialized = materialize_deopt_value(resume->literal_type,
+	    resume->literal);
+	return 1;
+    }
+    type = frame->program->value_is_tagged
+	&& frame->program->value_is_tagged[value]
+	? (var_type) frame->deopt_values[
+	    jit_tag_index(frame->program, value)]
+	: frame->program->value_types[value];
+    if (!jit_runtime_type_is_valid(type))
+	return 0;
+    *materialized = materialize_deopt_value(type,
+	frame->deopt_values[value]);
+    return 1;
 }
 
 static JITContinuationFrame *
@@ -5472,17 +5540,21 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 
 	if (resume->source == JIT_RESUME_RESULT)
 	    continue;
-	if (resume->source == JIT_RESUME_CONSTANT) {
+	if (resume->source == JIT_RESUME_CONSTANT
+	    && jit_continuation_type_needs_owner(resume->literal_type)) {
 	    new_values[i] = materialize_deopt_value(
 		resume->literal_type, resume->literal);
 	    continue;
 	}
+	if (resume->source == JIT_RESUME_CONSTANT)
+	    continue;
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
-	new_values[i] = materialize_deopt_value(type,
-	    deopt_values[resume->value]);
+	if (jit_continuation_type_needs_owner(type))
+	    new_values[i] = materialize_deopt_value(type,
+		deopt_values[resume->value]);
     }
     if (!frame) {
 	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
@@ -5631,20 +5703,21 @@ jit_continuation_materialize(activation *a)
     for (i = 0; i < (unsigned) map->num_locals; i++) {
 	int value = jit_deopt_map_local_value(program, map, i);
 
-	if (value > 0 && !jit_continuation_value(frame, value))
+	if (value > 0 && !jit_continuation_resume_value(frame, value))
 	    return 0;
     }
     for (i = 0; i < depth; i++)
 	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
-	    && !jit_continuation_value(frame, map->stack_values[i]))
+	    && !jit_continuation_resume_value(frame, map->stack_values[i]))
 	    return 0;
     for (i = 0; i < (unsigned) map->num_locals; i++) {
 	int value = jit_deopt_map_local_value(program, map, i);
-	Var *saved = value > 0 ? jit_continuation_value(frame, value) : 0;
+	Var saved;
 
-	if (saved) {
+	if (value > 0
+	    && jit_continuation_materialized_value(frame, value, &saved)) {
 	    free_var(a->rt_env[i]);
-	    a->rt_env[i] = var_ref(*saved);
+	    a->rt_env[i] = saved;
 	}
     }
     while (a->top_rt_stack > a->base_rt_stack)
@@ -5656,8 +5729,9 @@ jit_continuation_materialize(activation *a)
 	Var value;
 
 	if (slot.kind == RSS_VALUE) {
-	    Var *saved = jit_continuation_value(frame, map->stack_values[i]);
-	    value = var_ref(*saved);
+	    if (!jit_continuation_materialized_value(frame,
+		map->stack_values[i], &value))
+		return 0;
 	} else {
 	    value.type = slot.kind == RSS_CATCH ? TYPE_CATCH
 		: slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
