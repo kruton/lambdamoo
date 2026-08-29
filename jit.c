@@ -4809,6 +4809,44 @@ jit_program_release_ir(JITProgram *program, int retain_constants)
     program->blocks = program->last_block = 0;
 }
 
+static void
+jit_program_find_borrowed_locals(JITProgram *program)
+{
+    unsigned char *used;
+    JITBlock *block;
+    int count = 0;
+    int i;
+
+    if (program->borrowed_local_slots || program->num_vars <= 0)
+	return;
+    used = mymalloc(program->num_vars, M_PROGRAM);
+    memset(used, 0, program->num_vars);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL && instr->local_id >= 0
+		&& instr->local_id < program->num_vars)
+		used[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (i = 0; i < program->num_vars; i++)
+	if (used[i])
+	    count++;
+    if (count) {
+	int next = 0;
+
+	program->borrowed_local_slots = mymalloc(sizeof(int) * count, M_PROGRAM);
+	for (i = 0; i < program->num_vars; i++)
+	    if (used[i])
+		program->borrowed_local_slots[next++] = i;
+	program->num_borrowed_locals = count;
+    }
+    myfree(used, M_PROGRAM);
+}
+
 static int
 jit_program_restore_ir(JITProgram *program)
 {
@@ -4866,6 +4904,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->borrowed_local_slots)
+	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
 	myfree(program->usage, M_PROGRAM);
     jit_program_release_ir(program, 0);
@@ -4896,6 +4936,8 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->borrowed_local_slots)
+	bytes += sizeof(int) * program->num_borrowed_locals;
     if (program->usage)
 	bytes += sizeof(JITProgramUsage);
     for (i = 0; i < program->num_deopt_maps; i++) {
@@ -5155,6 +5197,7 @@ jit_program_compile(JITProgram *program)
 	return 1;
     if (!jit_program_restore_ir(program))
 	return 0;
+    jit_program_find_borrowed_locals(program);
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
@@ -5585,6 +5628,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     int64_t native_result;
     int deopt_map = -1;
     Num *deopt_values;
+    Var *borrowed_locals = 0;
+    size_t deopt_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
 
@@ -5632,15 +5677,23 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
-    runtime_bytes = sizeof(Num) * program->num_values * 2;
-    deopt_values = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
+    deopt_bytes = sizeof(Num) * program->num_values * 2;
+    runtime_bytes = deopt_bytes
+	+ sizeof(Var) * program->num_borrowed_locals;
+    deopt_values = mymalloc(deopt_bytes ? deopt_bytes : sizeof(Num),
 			    M_PROGRAM);
-    memset(deopt_values, 0, runtime_bytes);
+    memset(deopt_values, 0, deopt_bytes);
     {
 	int i;
 
 	for (i = 0; i < program->num_values; i++)
 	    deopt_values[program->num_values + i] = TYPE_ANY;
+	if (program->num_borrowed_locals) {
+	    borrowed_locals = mymalloc(sizeof(Var)
+		* program->num_borrowed_locals, M_PROGRAM);
+	    for (i = 0; i < program->num_borrowed_locals; i++)
+		borrowed_locals[i] = var_ref(env[program->borrowed_local_slots[i]]);
+	}
     }
     program->active_runtime_bytes += runtime_bytes;
     function = (NativeFunction) program->native_function;
@@ -5660,6 +5713,12 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
+	    int i;
+
+	    for (i = 0; i < program->num_borrowed_locals; i++)
+		free_var(borrowed_locals[i]);
+	    if (borrowed_locals)
+		myfree(borrowed_locals, M_PROGRAM);
 	    program->active_runtime_bytes -= runtime_bytes;
 	    myfree(deopt_values, M_PROGRAM);
 	    return JIT_RUN_FALLBACK;
@@ -5767,6 +5826,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (native_result == JIT_RUN_RETURNED) {
 	if (result)
 	    *result = var_ref(*result);
+    }
+    {
+	int i;
+
+	for (i = 0; i < program->num_borrowed_locals; i++)
+	    free_var(borrowed_locals[i]);
+	if (borrowed_locals)
+	    myfree(borrowed_locals, M_PROGRAM);
     }
     program->active_runtime_bytes -= runtime_bytes;
     myfree(deopt_values, M_PROGRAM);

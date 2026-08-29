@@ -186,6 +186,8 @@ struct JITProgram {
     JITProgram *pool_next;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    int num_borrowed_locals;
+    int *borrowed_local_slots;
     size_t active_runtime_bytes;
     unsigned protection_generation;
     JITProgramUsage *usage;
