@@ -12,6 +12,7 @@ typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 typedef struct JITResumeValue JITResumeValue;
+typedef struct JITNativeResume JITNativeResume;
 typedef struct JITProgramUsage JITProgramUsage;
 
 typedef enum {
@@ -27,6 +28,12 @@ struct JITResumeValue {
     int index;
     Num literal;
     var_type literal_type;
+};
+
+struct JITNativeResume {
+    int num_values;
+    JITResumeValue *values;
+    int valid;
 };
 
 struct JITDeoptMap {
@@ -46,9 +53,7 @@ struct JITDeoptMap {
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
-    int num_resume_values;
-    JITResumeValue *resume_values;
-    int native_resume_valid;
+    JITNativeResume *native_resume;
     int builtin_func;
     int builtin_args;
     int operation;

@@ -1285,7 +1285,8 @@ static int
 jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 {
     return call->deopt_map > 0 && call->deopt_map < program->num_deopt_maps
-	&& program->deopt_maps[call->deopt_map].native_resume_valid;
+	&& program->deopt_maps[call->deopt_map].native_resume
+	&& program->deopt_maps[call->deopt_map].native_resume->valid;
 }
 
 static int
@@ -1510,8 +1511,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	map = &program->deopt_maps[i];
 	outer_depth = map->stack_depth - jit_call_stack_operands(map);
 	append(build, resume_entries[i]);
-	for (j = 0; j < map->num_resume_values; j++) {
-	    JITResumeValue *resume = &map->resume_values[j];
+	for (j = 0; map->native_resume
+	     && j < map->native_resume->num_values; j++) {
+	    JITResumeValue *resume = &map->native_resume->values[j];
 
 	    if (resume->source == JIT_RESUME_LOCAL)
 		append_resume_value(build, program, values, resume->value, env,
@@ -4538,8 +4540,12 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
 		if (program->deopt_maps[i].stack_slots)
 		    myfree(program->deopt_maps[i].stack_slots, M_PROGRAM);
-		if (program->deopt_maps[i].resume_values)
-		    myfree(program->deopt_maps[i].resume_values, M_PROGRAM);
+		if (program->deopt_maps[i].native_resume) {
+		    if (program->deopt_maps[i].native_resume->values)
+			myfree(program->deopt_maps[i].native_resume->values,
+			       M_PROGRAM);
+		    myfree(program->deopt_maps[i].native_resume, M_PROGRAM);
+		}
 	    }
 	    myfree(program->deopt_maps, M_PROGRAM);
 	}
@@ -4594,8 +4600,11 @@ jit_program_metadata_bytes(JITProgram *program)
 	    bytes += sizeof(var_type) * map->stack_depth;
 	if (map->stack_slots)
 	    bytes += sizeof(ResumeStackSlot) * map->stack_depth;
-	if (map->resume_values)
-	    bytes += sizeof(JITResumeValue) * map->num_resume_values;
+	if (map->native_resume) {
+	    bytes += sizeof(JITNativeResume);
+	    if (map->native_resume->values)
+		bytes += sizeof(JITResumeValue) * map->native_resume->num_values;
+	}
     }
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
@@ -4739,7 +4748,8 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_bridges_builtin(map))
 	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
-	    && map->resume_key.site == key.site && map->native_resume_valid)
+	    && map->resume_key.site == key.site && map->native_resume
+	    && map->native_resume->valid)
 	    return i;
     }
     return -1;

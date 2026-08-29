@@ -502,11 +502,12 @@ builtin_call_program(unsigned func)
     map->resume_key.site = 2;
     map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->builtin_func = func;
-    map->native_resume_valid = 1;
-    map->num_resume_values = 1;
-    map->resume_values = allocate(sizeof(JITResumeValue));
-    map->resume_values[0].value = 2;
-    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->native_resume = allocate(sizeof(JITNativeResume));
+    map->native_resume->valid = 1;
+    map->native_resume->num_values = 1;
+    map->native_resume->values = allocate(sizeof(JITResumeValue));
+    map->native_resume->values[0].value = 2;
+    map->native_resume->values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 25;
     map->stack_depth = 1;
     map->num_locals = 1;
@@ -866,11 +867,12 @@ call_verb_program(void)
     map->resume_key.code_unit = 0;
     map->resume_key.site = 1;
     map->reason = JIT_DEOPT_VERB_CALL;
-    map->native_resume_valid = 1;
-    map->num_resume_values = 1;
-    map->resume_values = allocate(sizeof(JITResumeValue));
-    map->resume_values[0].value = 4;
-    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->native_resume = allocate(sizeof(JITNativeResume));
+    map->native_resume->valid = 1;
+    map->native_resume->num_values = 1;
+    map->native_resume->values = allocate(sizeof(JITResumeValue));
+    map->native_resume->values[0].value = 4;
+    map->native_resume->values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
@@ -3644,7 +3646,7 @@ main(void)
 	jit_program_free(pass_prog);
 
 	pass_prog = builtin_call_program(9);
-	pass_prog->deopt_maps[1].native_resume_valid = 0;
+	pass_prog->deopt_maps[1].native_resume->valid = 0;
 	pass_args = new_list(0).v.list;
 	pass_env[0].type = TYPE_LIST;
 	pass_env[0].v.list = pass_args;
@@ -3769,7 +3771,7 @@ main(void)
 	    extra->literal_type = TYPE_OBJ;
 	    extra->next = call->next;
 	    call->next = extra;
-	    non_tail->deopt_maps[1].native_resume_valid = 0;
+	    non_tail->deopt_maps[1].native_resume->valid = 0;
 	    check(jit_program_resume_map(non_tail, call_key) == -1,
 		  "non-tail verb call exposed an unsafe continuation");
 	    jit_program_free(non_tail);

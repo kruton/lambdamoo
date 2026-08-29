@@ -4756,21 +4756,25 @@ jit_build_resume_liveness(JITProgram *program)
 		 || jit_deopt_map_can_bridge_builtin(
 		     &program->deopt_maps[instr->deopt_map]))) {
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		JITNativeResume *resume = mymalloc(sizeof(JITNativeResume),
+						   M_PROGRAM);
 		int call_operands = jit_call_stack_operands(map);
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value])
 			live_count++;
-		map->resume_values = live_count
+		memset(resume, 0, sizeof(JITNativeResume));
+		map->native_resume = resume;
+		resume->values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
-		map->num_resume_values = live_count;
-		map->native_resume_valid = jit_resume_stack_is_safe(map,
+		resume->num_values = live_count;
+		resume->valid = jit_resume_stack_is_safe(map,
 							      call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value]
 			&& !jit_resume_source(program, map, instr, value,
-					      &map->resume_values[live_count++]))
-			map->native_resume_valid = 0;
+					      &resume->values[live_count++]))
+			resume->valid = 0;
 	    }
 	    memset(uses, 0, program->num_values);
 	    memset(defs, 0, program->num_values);
