@@ -2394,6 +2394,15 @@ tagged_binary_result_program(HIROp op, var_type result_type)
     JITInstruction *ret = binary->next;
 
     program->value_types[3] = result_type;
+    if (op == HIR_OP_LIST_ADD_TAIL) {
+	int i;
+
+	program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+	for (i = 0; i < program->num_values; i++)
+	    program->value_owned_slots[i] = -1;
+	program->value_owned_slots[3] = 0;
+	program->num_owned_slots = 1;
+    }
     ret->literal_type = result_type;
     return program;
 }

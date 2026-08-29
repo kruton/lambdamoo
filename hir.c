@@ -4896,10 +4896,13 @@ jit_build_value_ownership(JITProgram *program)
     program->value_ownership = mymalloc(program->num_values, M_PROGRAM);
     program->value_owner_root = mymalloc(sizeof(int) * program->num_values,
 					 M_PROGRAM);
+    program->value_owned_slots = mymalloc(sizeof(int) * program->num_values,
+					  M_PROGRAM);
     memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
 	   program->num_values);
     for (i = 0; i < program->num_values; i++) {
 	program->value_owner_root[i] = -1;
+	program->value_owned_slots[i] = -1;
 	if (jit_value_type_is_scalar(program, i))
 	    program->value_ownership[i] = JIT_OWNERSHIP_SCALAR;
     }
@@ -4928,6 +4931,20 @@ jit_build_value_ownership(JITProgram *program)
 		    program->value_ownership[instr->value] =
 			JIT_OWNERSHIP_STABLE_OWNED;
 	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value > 0 && instr->value < program->num_values
+		&& instr->kind == HIR_TAC_BINARY
+		&& instr->op == HIR_OP_LIST_ADD_TAIL
+		&& program->value_owned_slots[instr->value] < 0)
+		program->value_owned_slots[instr->value] =
+		    program->num_owned_slots++;
 	    if (instr == block->last)
 		break;
 	}

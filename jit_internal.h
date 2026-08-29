@@ -201,6 +201,8 @@ struct JITProgram {
     int *value_tag_slots;
     unsigned char *value_ownership;
     int *value_owner_root;
+    int num_owned_slots;
+    int *value_owned_slots;
     int num_borrowed_locals;
     int *borrowed_local_slots;
     size_t active_runtime_bytes;
@@ -278,6 +280,7 @@ extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern void jit_rt_owned_replace(Var *, int, int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);

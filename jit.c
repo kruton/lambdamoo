@@ -250,6 +250,13 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
     return res.v.list;
 }
 
+void
+jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
+{
+    free_var(owned_values[value]);
+    owned_values[value] = raw_to_var(raw, type);
+}
+
 Var *
 jit_rt_list_index_set(Var *env, int local_id, Var *list, int64_t index,
 		      int64_t value_raw, int value_type, int32_t *err_out)
@@ -514,7 +521,7 @@ jit_rt_var_raw(const Var *value)
 
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *, Objid,
-				   int, Var *, Var *);
+				   int, Var *, Var *, Var *);
 
 typedef union JITMIRAllocationHeader JITMIRAllocationHeader;
 
@@ -700,6 +707,7 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
     MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
@@ -869,6 +877,8 @@ typedef struct {
     MIR_item_t import_singleton_list;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
+    MIR_item_t proto_owned_replace;
+    MIR_item_t import_owned_replace;
     MIR_item_t proto_list_index_set;
     MIR_item_t import_list_index_set;
     MIR_item_t proto_sublist_from;
@@ -1374,7 +1384,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     MIR_type_t result_type = MIR_T_I64;
     MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
     MIR_reg_t source_location, deopt_values, progr, resume_map, resume_stack;
-    MIR_reg_t continuation_values;
+    MIR_reg_t continuation_values, owned_values;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
@@ -1442,6 +1452,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 3,
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
+
+    build->proto_owned_replace = MIR_new_proto(build->context,
+	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
+	MIR_T_I32, "value", MIR_T_I64, "raw", MIR_T_I32, "type");
+    build->import_owned_replace = MIR_new_import(build->context,
+	"jit_rt_owned_replace");
 
     build->proto_list_index_set = MIR_new_proto(build->context, "proto_list_index_set", 1, &res_p, 7,
 						MIR_T_P, "env", MIR_T_I32, "local", MIR_T_P, "list",
@@ -1511,14 +1527,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64,
 		 next_module_serial);
     build->function = MIR_new_func(build->context, func_name, 1,
-				   &result_type, 12,
+				   &result_type, 13,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
 				   MIR_T_P, "error_out", MIR_T_P, "source_location",
 				   MIR_T_P, "deopt_map_out", MIR_T_P, "deopt_values",
 				   MIR_T_I64, "progr", MIR_T_I32, "resume_map",
 				   MIR_T_P, "resume_stack",
-				   MIR_T_P, "continuation_values");
+				   MIR_T_P, "continuation_values",
+				   MIR_T_P, "owned_values");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
@@ -1535,6 +1552,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     resume_stack = MIR_reg(build->context, "resume_stack", build->function->u.func);
     continuation_values = MIR_reg(build->context, "continuation_values",
 				  build->function->u.func);
+    owned_values = MIR_reg(build->context, "owned_values",
+			  build->function->u.func);
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -4694,6 +4713,32 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		case HIR_TAC_PHI:
 		    break;
 		}
+		if (instr->value > 0 && instr->value < program->num_values
+		    && program->value_owned_slots
+		    && instr->kind == HIR_TAC_BINARY
+		    && instr->op == HIR_OP_LIST_ADD_TAIL) {
+		    MIR_reg_t raw = append_raw_value(build, program, values,
+			instr->value, deopt_values, &copy_serial);
+		    MIR_op_t type;
+
+		    if (program->value_is_tagged
+			&& program->value_is_tagged[instr->value])
+			type = MIR_new_mem_op(build->context, tag_t,
+			    jit_tag_offset(program, instr->value),
+			    deopt_values, 0, 1);
+		    else
+			type = MIR_new_int_op(build->context,
+			    program->value_types[instr->value]);
+		    append(build, MIR_new_call_insn(build->context, 6,
+			MIR_new_ref_op(build->context,
+			    build->proto_owned_replace),
+			MIR_new_ref_op(build->context,
+			    build->import_owned_replace),
+			MIR_new_reg_op(build->context, owned_values),
+			MIR_new_int_op(build->context,
+			    program->value_owned_slots[instr->value]),
+			MIR_new_reg_op(build->context, raw), type));
+		}
 		if (instr == block->last)
 		    break;
 	    }
@@ -4930,6 +4975,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_ownership, M_PROGRAM);
     if (program->value_owner_root)
 	myfree(program->value_owner_root, M_PROGRAM);
+    if (program->value_owned_slots)
+	myfree(program->value_owned_slots, M_PROGRAM);
     if (program->borrowed_local_slots)
 	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
@@ -4967,6 +5014,8 @@ jit_program_metadata_bytes(JITProgram *program)
     if (program->value_ownership)
 	bytes += sizeof(unsigned char) * program->num_values;
     if (program->value_owner_root)
+	bytes += sizeof(int) * program->num_values;
+    if (program->value_owned_slots)
 	bytes += sizeof(int) * program->num_values;
     if (program->borrowed_local_slots)
 	bytes += sizeof(int) * program->num_borrowed_locals;
@@ -5646,6 +5695,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     int deopt_map = -1;
     Num *deopt_values;
     Var *borrowed_locals = 0;
+    Var *owned_values;
     size_t deopt_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
@@ -5696,7 +5746,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	return JIT_RUN_FALLBACK;
     deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
     runtime_bytes = deopt_bytes
-	+ sizeof(Var) * program->num_borrowed_locals;
+	+ sizeof(Var) * (program->num_borrowed_locals
+			 + program->num_owned_slots);
     deopt_values = mymalloc(deopt_bytes ? deopt_bytes : sizeof(Num),
 			    M_PROGRAM);
     memset(deopt_values, 0, deopt_bytes);
@@ -5713,6 +5764,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    for (i = 0; i < program->num_borrowed_locals; i++)
 		borrowed_locals[i] = var_ref(env[program->borrowed_local_slots[i]]);
 	}
+	owned_values = program->num_owned_slots
+	    ? mymalloc(sizeof(Var) * program->num_owned_slots, M_PROGRAM) : 0;
+	for (i = 0; i < program->num_owned_slots; i++)
+	    owned_values[i].type = TYPE_NONE;
     }
     program->active_runtime_bytes += runtime_bytes;
     function = (NativeFunction) program->native_function;
@@ -5720,7 +5775,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 			     source_location, &deopt_map,
 			     deopt_values, progr, resume_map,
 			     deopt_stack,
-			     continuation_in ? continuation_in->values : 0);
+			     continuation_in ? continuation_in->values : 0,
+			     owned_values);
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
@@ -5738,6 +5794,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		free_var(borrowed_locals[i]);
 	    if (borrowed_locals)
 		myfree(borrowed_locals, M_PROGRAM);
+	    for (i = 0; i < program->num_owned_slots; i++)
+		free_var(owned_values[i]);
+	    if (owned_values)
+		myfree(owned_values, M_PROGRAM);
 	    program->active_runtime_bytes -= runtime_bytes;
 	    myfree(deopt_values, M_PROGRAM);
 	    return JIT_RUN_FALLBACK;
@@ -5853,6 +5913,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    free_var(borrowed_locals[i]);
 	if (borrowed_locals)
 	    myfree(borrowed_locals, M_PROGRAM);
+	for (i = 0; i < program->num_owned_slots; i++)
+	    free_var(owned_values[i]);
+	if (owned_values)
+	    myfree(owned_values, M_PROGRAM);
     }
     program->active_runtime_bytes -= runtime_bytes;
     myfree(deopt_values, M_PROGRAM);
