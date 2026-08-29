@@ -3930,25 +3930,6 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
     return 1;
 }
 
-static int
-type_from_singleton_mask(JITTypeMask mask, var_type *type)
-{
-    int db_type;
-
-    if (!mask || (mask & (mask - 1)) != 0)
-	return 0;
-    for (db_type = TYPE_INT; db_type <= _TYPE_WAIF; db_type++)
-	if (mask == JIT_TYPE_MASK(db_type)) {
-	    *type = db_type == _TYPE_STR ? TYPE_STR
-		: db_type == _TYPE_LIST ? TYPE_LIST
-		: db_type == _TYPE_FLOAT ? TYPE_FLOAT
-		: db_type == _TYPE_WAIF ? TYPE_WAIF
-		: (var_type) db_type;
-	    return 1;
-	}
-    return 0;
-}
-
 typedef struct {
     JITTypeMask operands[JIT_MAX_GUARD_OPERANDS];
     int tagged_dispatch;
@@ -4898,24 +4879,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
-	    JITConsumerContract contract = jit_consumer_contract(si);
-	    int operands[JIT_MAX_GUARD_OPERANDS] = { si->src1, si->src2 };
-	    int operand_index;
-
-	    for (operand_index = 0;
-		 operand_index < JIT_MAX_GUARD_OPERANDS; operand_index++) {
-		int operand = operands[operand_index];
-		var_type required;
-
-		if (operand > 0 && operand < program->num_values
-		    && !value_types_known[operand]
-		    && type_from_singleton_mask(contract.operands[operand_index],
-						&required)) {
-		    value_types[operand] = required;
-		    value_types_known[operand] = 1;
-		    types_changed = 1;
-		}
-	    }
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_SUBLIST_FROM) {
 		value_types[si->value] = TYPE_LIST;
 		value_types_known[si->value] = 1;
