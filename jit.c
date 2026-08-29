@@ -4530,10 +4530,6 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
-		if (program->deopt_maps[i].local_slots)
-		    myfree(program->deopt_maps[i].local_slots, M_PROGRAM);
-		if (program->deopt_maps[i].local_types)
-		    myfree(program->deopt_maps[i].local_types, M_PROGRAM);
 		if (program->deopt_maps[i].stack_values)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_types)
@@ -4589,11 +4585,7 @@ jit_program_metadata_bytes(JITProgram *program)
 	JITDeoptMap *map = &program->deopt_maps[i];
 
 	if (map->local_values)
-	    bytes += sizeof(int) * jit_deopt_map_local_count(map);
-	if (map->local_types)
-	    bytes += sizeof(var_type) * jit_deopt_map_local_count(map);
-	if (map->local_slots)
-	    bytes += sizeof(int) * map->num_local_values;
+	    bytes += sizeof(JITLocalValue) * map->num_local_values;
 	if (map->stack_values)
 	    bytes += sizeof(int) * map->stack_depth;
 	if (map->stack_types)

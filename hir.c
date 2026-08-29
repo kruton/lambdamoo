@@ -4220,7 +4220,6 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->stack_depth = instr->num_stack_values;
     map->ticks_charged = jit_boundary_ticks_charged(instr->kind, instr->op);
     map->num_locals = instr->num_local_values;
-    map->locals_are_sparse = 1;
     map->builtin_func = -1;
     map->builtin_args = -1;
     map->operation = -1;
@@ -4285,17 +4284,15 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     if (map->num_local_values) {
 	int entry = 0;
 
-	map->local_slots = mymalloc(sizeof(int) * map->num_local_values,
-				    M_PROGRAM);
-	map->local_values = mymalloc(sizeof(int) * map->num_local_values,
-				     M_PROGRAM);
+	map->local_values = mymalloc(sizeof(JITLocalValue)
+				     * map->num_local_values, M_PROGRAM);
 	for (i = 0; i < map->num_locals; i++) {
 	    int value = instr->local_values[i];
 
 	    if (value <= 0)
 		continue;
-	    map->local_slots[entry] = i;
-	    map->local_values[entry] = value;
+	    map->local_values[entry].slot = i;
+	    map->local_values[entry].value = value;
 	    entry++;
 	}
     }
@@ -4397,8 +4394,7 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			    || map->local_base > instr->deopt_map
 			    || map->num_local_values < 0
 			    || map->num_local_values > map->num_locals
-			    || (map->num_local_values && (!map->local_slots
-					     || !map->local_values))
+			    || (map->num_local_values && !map->local_values)
 			    || (map->stack_depth && (!map->stack_values
 					      || !map->stack_slots))) {
 				record_unsupported_fmt(ctx,
@@ -4415,15 +4411,16 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 				goto invalid;
 			}
 			for (i = 0; i < map->num_local_values; i++)
-				if (map->local_slots[i] < 0
-				    || map->local_slots[i] >= map->num_locals
-				    || (i > 0 && map->local_slots[i]
-					<= map->local_slots[i - 1])
-				    || map->local_values[i] < 0
-				    || map->local_values[i] >= program->num_values) {
+				if (map->local_values[i].slot < 0
+				    || map->local_values[i].slot >= map->num_locals
+				    || (i > 0 && map->local_values[i].slot
+					<= map->local_values[i - 1].slot)
+				    || map->local_values[i].value < 0
+				    || map->local_values[i].value >= program->num_values) {
 					record_unsupported_fmt(ctx,
 					    "deopt-map: map %d local %d has invalid value %d",
-					    instr->deopt_map, i, map->local_values[i]);
+					    instr->deopt_map, i,
+					    map->local_values[i].value);
 					goto invalid;
 				}
 			for (i = 0; i < map->num_locals; i++) {
@@ -4532,10 +4529,8 @@ jit_coalesce_deopt_locals(JITProgram *program)
 	}
 	if (best >= 0) {
 	    JITDeoptMap *base = &program->deopt_maps[best];
-	    int *slots = best_count
-		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
-	    int *values = best_count
-		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
+	    JITLocalValue *values = best_count
+		? mymalloc(sizeof(JITLocalValue) * best_count, M_PROGRAM) : 0;
 	    int entry = 0;
 	    int slot;
 
@@ -4545,19 +4540,13 @@ jit_coalesce_deopt_locals(JITProgram *program)
 
 		if (value == base_value)
 		    continue;
-		slots[entry] = slot;
-		values[entry] = value;
+		values[entry].slot = slot;
+		values[entry].value = value;
 		entry++;
 	    }
-	    if (map->local_slots)
-		myfree(map->local_slots, M_PROGRAM);
 	    if (map->local_values)
 		myfree(map->local_values, M_PROGRAM);
-	    if (map->local_types)
-		myfree(map->local_types, M_PROGRAM);
-	    map->local_slots = slots;
 	    map->local_values = values;
-	    map->local_types = 0;
 	    map->num_local_values = best_count;
 	    map->local_base = best + 1;
 	    depth[map_id] = depth[best] + 1;
@@ -4844,7 +4833,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->deopt_maps[0].stack_depth = 0;
     program->deopt_maps[0].ticks_charged = 0;
     program->deopt_maps[0].num_locals = program->num_vars;
-    program->deopt_maps[0].locals_are_sparse = 1;
     program->deopt_maps[0].stack_values = 0;
     program->deopt_maps[0].stack_types = 0;
 

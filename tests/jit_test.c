@@ -93,6 +93,25 @@ new_jit_program(void)
     return program;
 }
 
+static void
+allocate_map_locals(JITDeoptMap *map, int count)
+{
+    int i;
+
+    map->num_local_values = count;
+    map->local_values = allocate(sizeof(JITLocalValue) * count);
+    for (i = 0; i < count; i++)
+	map->local_values[i].slot = i;
+}
+
+static void
+set_program_value_type(JITProgram *program, int value, var_type type)
+{
+    if (!program->value_types)
+	program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_types[value] = type;
+}
+
 static JITProgram *
 arithmetic_program(void)
 {
@@ -453,8 +472,8 @@ call_boundary_program(void)
     map->builtin_func = 17;
     map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int) * 1);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int));
     map->stack_values[0] = 1;
     program->blocks = program->last_block = block;
@@ -511,10 +530,9 @@ builtin_call_program(unsigned func)
     map->bytecode_pc = map->error_pc = 25;
     map->stack_depth = 1;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int));
-    map->local_types = allocate(sizeof(var_type));
-    map->local_values[0] = 1;
-    map->local_types[0] = TYPE_LIST;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
+    set_program_value_type(program, 1, TYPE_LIST);
     map->stack_values = allocate(sizeof(int));
     map->stack_types = allocate(sizeof(var_type));
     map->stack_values[0] = 1;
@@ -562,8 +580,8 @@ get_prop_program(void)
     map->stack_depth = 2;
     map->ticks_charged = 0;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int) * 1);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int) * 2);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
@@ -615,8 +633,8 @@ deep_guard_program(void)
     map->stack_depth = 1;
     map->ticks_charged = 1;
     map->num_locals = 2;
-    map->local_values = allocate(sizeof(int) * 2);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 2);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int));
     map->stack_values[0] = 1;
     program->blocks = program->last_block = block;
@@ -697,12 +715,10 @@ in_program(void)
     map->stack_depth = 2;
     map->ticks_charged = 1;
     map->num_locals = 2;
-    map->local_values = allocate(sizeof(int) * 2);
-    map->local_values[0] = 1;
-    map->local_values[1] = 2;
-    map->local_types = allocate(sizeof(var_type) * 2);
-    map->local_types[0] = TYPE_INT;
-    map->local_types[1] = TYPE_LIST;
+    allocate_map_locals(map, 2);
+    map->local_values[0].value = 1;
+    map->local_values[1].value = 2;
+    set_program_value_type(program, 2, TYPE_LIST);
     map->stack_values = allocate(sizeof(int) * 2);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
@@ -877,14 +893,13 @@ call_verb_program(void)
     map->stack_depth = 3;
     map->ticks_charged = 1;
     map->num_locals = 3;
-    map->local_values = allocate(sizeof(int) * 3);
-    map->local_types = allocate(sizeof(var_type) * 3);
-    map->local_values[0] = 1;
-    map->local_values[1] = 2;
-    map->local_values[2] = 3;
-    map->local_types[0] = TYPE_OBJ;
-    map->local_types[1] = TYPE_STR;
-    map->local_types[2] = TYPE_LIST;
+    allocate_map_locals(map, 3);
+    map->local_values[0].value = 1;
+    map->local_values[1].value = 2;
+    map->local_values[2].value = 3;
+    set_program_value_type(program, 1, TYPE_OBJ);
+    set_program_value_type(program, 2, TYPE_STR);
+    set_program_value_type(program, 3, TYPE_LIST);
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
     map->stack_slots = allocate(sizeof(ResumeStackSlot) * 3);
@@ -1799,10 +1814,9 @@ range_ref_test_program(var_type base_type)
     map->stack_depth = 3;
     map->ticks_charged = 1;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int));
-    map->local_types = allocate(sizeof(var_type));
-    map->local_values[0] = 1;
-    map->local_types[0] = base_type;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
+    set_program_value_type(program, 1, base_type);
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
     map->stack_values[0] = 1;
@@ -5112,10 +5126,9 @@ main(void)
 	map->stack_depth = 0;
 	map->ticks_charged = 1;
 	map->num_locals = 1;
-	map->local_values = allocate(sizeof(int) * 1);
-	map->local_values[0] = 1;
-	map->local_types = allocate(sizeof(var_type) * 1);
-	map->local_types[0] = TYPE_STR;
+	allocate_map_locals(map, 1);
+	map->local_values[0].value = 1;
+	set_program_value_type(program, 1, TYPE_STR);
 	map->operation = HIR_OP_INDEX;
 	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
 
@@ -5420,39 +5433,24 @@ main(void)
 	JITDeoptMap *remove;
 
 	program->num_deopt_maps = 3;
+	program->num_values = 4;
 	program->deopt_maps = allocate(sizeof(JITDeoptMap) * 3);
 	base = &program->deopt_maps[0];
 	change = &program->deopt_maps[1];
 	remove = &program->deopt_maps[2];
 	base->num_locals = change->num_locals = remove->num_locals = 2;
-	base->locals_are_sparse = change->locals_are_sparse
-	    = remove->locals_are_sparse = 1;
-	base->num_local_values = 2;
-	base->local_slots = allocate(sizeof(int) * 2);
-	base->local_values = allocate(sizeof(int) * 2);
-	base->local_types = allocate(sizeof(var_type) * 2);
-	base->local_slots[0] = 0;
-	base->local_slots[1] = 1;
-	base->local_values[0] = 1;
-	base->local_values[1] = 2;
-	base->local_types[0] = TYPE_INT;
-	base->local_types[1] = TYPE_STR;
+	allocate_map_locals(base, 2);
+	base->local_values[0].value = 1;
+	base->local_values[1].value = 2;
+	set_program_value_type(program, 2, TYPE_STR);
 	change->local_base = 1;
-	change->num_local_values = 1;
-	change->local_slots = allocate(sizeof(int));
-	change->local_values = allocate(sizeof(int));
-	change->local_types = allocate(sizeof(var_type));
-	change->local_slots[0] = 0;
-	change->local_values[0] = 3;
-	change->local_types[0] = TYPE_OBJ;
+	allocate_map_locals(change, 1);
+	change->local_values[0].value = 3;
+	set_program_value_type(program, 3, TYPE_OBJ);
 	remove->local_base = 2;
-	remove->num_local_values = 1;
-	remove->local_slots = allocate(sizeof(int));
-	remove->local_values = allocate(sizeof(int));
-	remove->local_types = allocate(sizeof(var_type));
-	remove->local_slots[0] = 1;
-	remove->local_values[0] = 0;
-	remove->local_types[0] = TYPE_INT;
+	allocate_map_locals(remove, 1);
+	remove->local_values[0].slot = 1;
+	remove->local_values[0].value = 0;
 
 	check(jit_deopt_map_local_value(program, change, 0) == 3
 	      && jit_deopt_map_local_value(program, change, 1) == 2,

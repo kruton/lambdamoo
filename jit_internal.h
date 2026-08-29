@@ -13,6 +13,7 @@ typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 typedef struct JITResumeValue JITResumeValue;
 typedef struct JITNativeResume JITNativeResume;
+typedef struct JITLocalValue JITLocalValue;
 typedef struct JITProgramUsage JITProgramUsage;
 
 typedef enum {
@@ -36,6 +37,11 @@ struct JITNativeResume {
     int valid;
 };
 
+struct JITLocalValue {
+    int slot;
+    int value;
+};
+
 struct JITDeoptMap {
     ResumeKey resume_key;
     unsigned bytecode_pc;
@@ -45,11 +51,8 @@ struct JITDeoptMap {
     int ticks_charged;
     int num_locals;
     int num_local_values;
-    int locals_are_sparse;
     int local_base;
-    int *local_slots;
-    int *local_values;
-    var_type *local_types;
+    JITLocalValue *local_values;
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
@@ -63,18 +66,6 @@ struct JITDeoptMap {
     JITDeoptReason reason;
     int native_error_block;
 };
-
-static inline int
-jit_deopt_map_local_count(JITDeoptMap *map)
-{
-    return map->locals_are_sparse ? map->num_local_values : map->num_locals;
-}
-
-static inline int
-jit_deopt_map_local_slot(JITDeoptMap *map, int index)
-{
-    return map->locals_are_sparse ? map->local_slots[index] : index;
-}
 
 static inline int
 jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
@@ -186,18 +177,15 @@ struct JITProgram {
     unsigned diagnostic_verb;
 };
 
-static inline int
+static inline __attribute__((always_inline)) int
 jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
 {
     while (map) {
 	int i;
 
-	if (map->locals_are_sparse) {
-	    for (i = 0; i < map->num_local_values; i++)
-		if (map->local_slots[i] == slot)
-		    return map->local_values[i];
-	} else if (slot >= 0 && slot < map->num_locals && map->local_values)
-	    return map->local_values[slot];
+	for (i = 0; i < map->num_local_values; i++)
+	    if (map->local_values[i].slot == slot)
+		return map->local_values[i].value;
 	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
 	    break;
 	map = &program->deopt_maps[map->local_base - 1];
@@ -205,34 +193,22 @@ jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
     return 0;
 }
 
-static inline var_type
+static inline __attribute__((always_inline)) var_type
 jit_deopt_map_local_type(JITProgram *program, JITDeoptMap *map, int slot)
 {
     while (map) {
 	int i;
 
-	if (map->locals_are_sparse) {
-	    for (i = 0; i < map->num_local_values; i++)
-		if (map->local_slots[i] == slot) {
-		    int value = map->local_values[i];
+	for (i = 0; i < map->num_local_values; i++)
+	    if (map->local_values[i].slot == slot) {
+		int value = map->local_values[i].value;
 
-		    if (value <= 0)
-			return TYPE_INT;
-		    if (map->local_types)
-			return map->local_types[i];
-		    return program->value_is_tagged
-			&& program->value_is_tagged[value] ? TYPE_ANY
-			: program->value_types ? program->value_types[value] : TYPE_INT;
-		}
-	} else if (slot >= 0 && slot < map->num_locals && map->local_values
-		 && map->local_values[slot] > 0) {
-	    int value = map->local_values[slot];
-
-	    if (map->local_types)
-		return map->local_types[slot];
-	    return program->value_is_tagged && program->value_is_tagged[value]
-		? TYPE_ANY : program->value_types ? program->value_types[value] : TYPE_INT;
-	}
+		if (value <= 0)
+		    return TYPE_INT;
+		return program->value_is_tagged
+		    && program->value_is_tagged[value] ? TYPE_ANY
+		    : program->value_types ? program->value_types[value] : TYPE_INT;
+	    }
 	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
 	    break;
 	map = &program->deopt_maps[map->local_base - 1];
