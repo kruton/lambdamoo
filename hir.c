@@ -1260,21 +1260,17 @@ new_cfg_split_jump(HIRContext *ctx, HIRBasicBlock *from, HIRBasicBlock *to)
 {
     HIRTacInstr *jump = hir_alloc(ctx, sizeof(HIRTacInstr));
 
+    memset(jump, 0, sizeof(HIRTacInstr));
     jump->kind = HIR_TAC_JUMP;
     jump->source_lineno = from && from->last ? from->last->source_lineno : 0;
     jump->bytecode_pc = NO_BYTECODE_PC;
     if (jump->source_lineno == 0 && to)
 	jump->source_lineno = to->first_lineno;
-    jump->dst = 0;
-    jump->src1 = 0;
-    jump->src2 = 0;
-    jump->src3 = 0;
     jump->label = to && to->first && to->first->kind == HIR_TAC_LABEL
 	? to->first->label : 0;
     jump->local_id = -1;
     jump->op = HIR_OP_ADD;
     jump->literal.type = TYPE_NONE;
-    jump->next = 0;
 
     return jump;
 }
@@ -1767,6 +1763,8 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	    && v >= (int) ctx->var_names->size;
 	int uninitialized_local = !internal_local
 	    && v >= ctx->first_user_local;
+
+	memset(load, 0, sizeof(HIRSSAInstr));
 	load->kind = internal_local || uninitialized_local
 	    ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
@@ -2224,6 +2222,8 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			&& live_in[(size_t) y->id * num_locals + i]) {
 			/* Insert Phi node at y for variable i */
 			HIRSSAInstr *phi = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+			memset(phi, 0, sizeof(HIRSSAInstr));
 			phi->kind = HIR_TAC_PHI;
 			phi->source_lineno = y->first_lineno;
 			phi->bytecode_pc = NO_BYTECODE_PC;
@@ -2319,25 +2319,13 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
 	if (ssa_block && !ssa_block->first) {
 	    HIRSSAInstr *label = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+	    memset(label, 0, sizeof(HIRSSAInstr));
 	    label->kind = HIR_TAC_LABEL;
 	    label->source_lineno = cfg_block->first_lineno;
 	    label->bytecode_pc = NO_BYTECODE_PC;
-	    label->value = 0;
-	    label->src1 = 0;
-	    label->src2 = 0;
-	    label->src3 = 0;
-	    label->label = 0;
-	    label->local_id = 0;
 	    label->op = HIR_OP_ADD;
 	    label->literal.type = TYPE_NONE;
-	    label->num_stack_values = 0;
-	    label->stack_values = 0;
-	    label->stack_slots = 0;
-	    label->num_local_values = 0;
-	    label->local_values = 0;
-	    label->phi_args = 0;
-	    label->copies = 0;
-	    label->next = 0;
 	    emit_ssa_instr(ssa, ssa_block, label);
 	}
     }
@@ -3450,6 +3438,7 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     }
 
     copy = hir_alloc(ctx, sizeof(HIRSSAInstr));
+    memset(copy, 0, sizeof(HIRSSAInstr));
     copy->kind = HIR_TAC_PARALLEL_COPY;
     copy->source_lineno = source_lineno;
     copy->bytecode_pc = NO_BYTECODE_PC;
@@ -7869,21 +7858,14 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
 {
     HIRTacInstr *instr = hir_alloc(ctx, sizeof(HIRTacInstr));
 
+    memset(instr, 0, sizeof(HIRTacInstr));
     instr->kind = kind;
     instr->source_lineno = source_lineno;
     instr->bytecode_pc = NO_BYTECODE_PC;
     instr->error_label = ctx->current_error_label;
-    instr->dst = 0;
-    instr->src1 = 0;
-    instr->src2 = 0;
-    instr->src3 = 0;
-    instr->label = 0;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;
     instr->func = FUNC_NOT_FOUND;
-    instr->num_stack_values = 0;
-    instr->stack_values = 0;
-    instr->stack_slots = 0;
     return instr;
 }
 
