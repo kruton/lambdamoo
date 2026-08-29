@@ -705,6 +705,7 @@ bf_jit_compile(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     if (!h.ptr)
 	return make_error_pack(E_VERBNF);
 
+    jit_program_note_location(db_verb_program(h)->jit, oid, db_verb_index(h));
     (void) jit_program_compile(db_verb_program(h)->jit);
     metadata = jit_metadata(db_verb_program(h)->jit);
     return make_var_pack(metadata);

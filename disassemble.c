@@ -465,6 +465,7 @@ bf_disassemble(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     data.lines = 0;
     data.used = data.max = 0;
 #ifdef ENABLE_JIT
+    jit_program_note_location(db_verb_program(h)->jit, oid, db_verb_index(h));
     if (format == FORMAT_HIR) {
 	if (!jit_program_dump_hir(db_verb_program(h)->jit, add_line, &data))
 	    return make_error_pack(E_INVARG);

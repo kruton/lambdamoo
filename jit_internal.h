@@ -41,13 +41,18 @@ struct JITDeoptMap {
     var_type *local_types;
     int *stack_values;
     var_type *stack_types;
+    ResumeStackSlot *stack_slots;
     int num_resume_values;
     JITResumeValue *resume_values;
     int native_resume_valid;
     int builtin_func;
     int builtin_args;
     int operation;
+    int guard_value[JIT_MAX_GUARD_OPERANDS];
+    int guard_local[JIT_MAX_GUARD_OPERANDS];
+    JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
+    int native_error_block;
 };
 
 static inline int
@@ -91,6 +96,8 @@ struct JITInstruction {
     ResumeKey resume_key;
     unsigned source_lineno;
     unsigned bytecode_pc;
+    int error_block;
+    int label;
     int value;
     int src1;
     int src2;
@@ -152,6 +159,8 @@ struct JITProgram {
     uint32_t compile_successes;
     uint32_t compile_failures;
     uint64_t compile_time_us;
+    Objid diagnostic_object;
+    unsigned diagnostic_verb;
 };
 
 extern int jit_rt_is_true(int64_t, int);
@@ -167,6 +176,7 @@ extern Var *jit_rt_list_append(Var *, int64_t, int);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
+extern int jit_rt_put_prop(int64_t, const char *, int64_t, int64_t, int, int32_t *);
 extern int64_t jit_rt_seconds_left(void);
 extern int64_t jit_rt_time(void);
 extern int64_t jit_rt_index(const char *, const char *);

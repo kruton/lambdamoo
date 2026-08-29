@@ -97,7 +97,10 @@ if not jit_lines:
     sys.exit(1)
 
 print("=" * 76)
-print(f"OPAL.DB JIT DEOPT REPORT (objects #{first_object}..#{last_object})")
+print(
+    f"{pathlib.Path(db_file).name} JIT DEOPT REPORT "
+    f"(objects #{first_object}..#{last_object})"
+)
 print("=" * 76)
 for line in jit_lines:
     print(line)

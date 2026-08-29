@@ -120,6 +120,7 @@ typedef enum {
     HIR_TAC_TICK,
     HIR_TAC_DEOPT,
     HIR_TAC_CONST,
+    HIR_TAC_LOAD_ERROR,
     HIR_TAC_LOAD_LOCAL,
     HIR_TAC_STORE_LOCAL,
     HIR_TAC_UNARY,
@@ -189,6 +190,9 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 
 #ifdef HIR_TESTING
 extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
+extern int hir_test_resume_stack_matches_point(ResumeStackSlot *, unsigned,
+					       const ResumePoint *, int);
+extern int hir_test_boundary_ticks_charged(HIRTacKind, HIROp);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);
@@ -196,6 +200,7 @@ extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
 extern int hir_tac_count_bytecode_pc(HIRTacProgram *, unsigned);
 extern int hir_tac_stack_depth_at_bytecode_pc(HIRTacProgram *, unsigned);
+extern int hir_tac_stack_depth_mismatch_count(HIRTacProgram *, unsigned, int);
 extern int hir_cfg_block_count(HIRCFG *);
 extern int hir_cfg_edge_count(HIRCFG *);
 extern int hir_cfg_unsupported_block_count(HIRCFG *);
@@ -227,6 +232,9 @@ extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
 						 unsigned, HIROp);
 extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
+extern int hir_test_binary_type_pair_is_valid(HIROp, var_type, var_type);
+extern unsigned short hir_test_binary_operand_type_mask(HIROp, int, int,
+						 var_type);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
 extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,

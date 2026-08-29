@@ -41,6 +41,12 @@ typedef enum {
     JIT_DEOPT_NUM_REASONS
 } JITDeoptReason;
 
+typedef uint16_t JITTypeMask;
+
+#define JIT_MAX_GUARD_OPERANDS 2
+#define JIT_TYPE_MASK(type) \
+    ((JITTypeMask) 1U << ((unsigned) (type) & TYPE_DB_MASK))
+
 typedef struct {
     unsigned bytecode_pc;
     unsigned error_pc;
@@ -50,6 +56,10 @@ typedef struct {
     int ticks_charged;
     int builtin_func;
     int operation;
+    int guard_value[JIT_MAX_GUARD_OPERANDS];
+    int guard_local[JIT_MAX_GUARD_OPERANDS];
+    JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
+    var_type guard_actual[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
 } JITDeoptState;
 
@@ -113,6 +123,8 @@ extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern void jit_program_stats(JITProgram *, JITProgramStats *);
 extern int jit_program_resume_map(JITProgram *, ResumeKey);
+extern int jit_program_has_location(JITProgram *);
+extern void jit_program_note_location(JITProgram *, Objid, unsigned);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 				enum error *, JITSourceLocation *,

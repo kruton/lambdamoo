@@ -56,6 +56,61 @@ test_resume_stack_safety(void)
 }
 
 static void
+test_resume_stack_shape(void)
+{
+    ResumeStackSlot point_slots[2];
+    ResumeStackSlot boundary_slots[3];
+    ResumePoint point;
+
+    memset(&point, 0, sizeof(point));
+    memset(point_slots, 0, sizeof(point_slots));
+    memset(boundary_slots, 0, sizeof(boundary_slots));
+    point.stack_depth = 2;
+    point.stack_slots = point_slots;
+    point_slots[0].kind = RSS_FINALLY;
+    point_slots[0].data = 41;
+    point_slots[1].kind = RSS_VALUE;
+    boundary_slots[0] = point_slots[0];
+    boundary_slots[1] = point_slots[1];
+    boundary_slots[2].kind = RSS_VALUE;
+
+    check_int("canonical resume stack accepted",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 1);
+    check_int("wrong resume stack depth rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 2,
+					  &point, 1), 0);
+    boundary_slots[0].kind = RSS_VALUE;
+    check_int("wrong resume stack marker rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 0);
+    boundary_slots[0].kind = RSS_FINALLY;
+    boundary_slots[0].data++;
+    check_int("wrong resume stack marker data rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 0);
+}
+
+static void
+test_boundary_tick_refunds(void)
+{
+	check_int("arithmetic boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_BINARY, HIR_OP_ADD), 1);
+	check_int("property write boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_PUT_PROP,
+					  HIR_OP_GET_PROP), 1);
+	check_int("range boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_RANGE_SET,
+					  HIR_OP_INDEX), 1);
+	check_int("scatter boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
+					  HIR_OP_SCATTER), 1);
+	check_int("index-store boundary has no tick to refund",
+		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
+					  HIR_OP_INDEX), 0);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -1535,6 +1590,8 @@ test_scatter_destructuring_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("scatter tac deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("scatter boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, 2, 1), 0);
     check_int("scatter tac binary add count",
 	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("scatter verify errors", hir_context_error_count(ctx), 0);
@@ -1594,6 +1651,8 @@ test_optional_rest_scatter_deopt(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional rest scatter deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("optional rest boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, 2, 1), 0);
     check_int("optional rest scatter default lowered",
 	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc) > 0, 1);
     check_int("optional rest scatter sublist op",
@@ -1668,6 +1727,8 @@ test_optional_scatter_default_lowering(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional scatter invalid deopt preserves rhs",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, assign.bytecode_pc), 1);
+    check_int("optional scatter boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, assign.bytecode_pc, 1), 0);
     check_int("optional scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
     check_int("optional scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     check_int("optional scatter out-of-ssa valid",
@@ -2303,6 +2364,12 @@ test_break_and_continue_tac_ssa(void)
     Stmt brk = break_stmt(-1, 15);
     Cond_Arm arm2 = cond_arm_ast(&cond2, &brk);
     Stmt if_brk = cond_stmt_ast(&arm2, 0, 14);
+    Expr call_obj = id_expr(0, 16);
+    Expr call_name = id_expr(3, 16);
+    Expr call_arg = int_expr(0, 16);
+    Arg_List call_args;
+    Expr call_expr;
+    Stmt call_stmt;
 
     Expr sum_lhs = id_expr(1, 17);
     Expr sum_rhs = id_expr(1, 17);
@@ -2311,7 +2378,24 @@ test_break_and_continue_tac_ssa(void)
     Expr assign = binary_expr(EXPR_ASGN, &sum_lhs, &add);
     Stmt body_assign = expr_stmt(&assign);
 
-    if_cont.next = &if_brk;
+    memset(&call_args, 0, sizeof(call_args));
+    call_args.kind = ARG_NORMAL;
+    call_args.expr = &call_arg;
+    call_args.bytecode_pc = 29;
+    memset(&call_expr, 0, sizeof(call_expr));
+    call_expr.kind = EXPR_VERB;
+    call_expr.lineno = 16;
+    call_expr.bytecode_pc = 30;
+    call_expr.e.verb.obj = &call_obj;
+    call_expr.e.verb.verb = &call_name;
+    call_expr.e.verb.args = &call_args;
+    call_stmt = expr_stmt(&call_expr);
+    call_obj.bytecode_pc = 27;
+    call_name.bytecode_pc = 28;
+    call_arg.bytecode_pc = 29;
+
+    if_cont.next = &call_stmt;
+    call_stmt.next = &if_brk;
     if_brk.next = &body_assign;
 
     Stmt loop = range_stmt(2, &from, &to, &if_cont, 10);
@@ -2328,8 +2412,10 @@ test_break_and_continue_tac_ssa(void)
     check_int("break/cont verify errors", hir_context_error_count(ctx), 0);
     check_int("break/cont ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("break/cont call preserves loop stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 30), 5);
     check_int("break/cont tick count",
-	      hir_tac_count_kind(tac, HIR_TAC_TICK), 9);
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 10);
 
     check_int("break/cont destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
@@ -2896,12 +2982,14 @@ test_catch_expr_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr catch_expr, try_expr, handler_expr;
+    Expr catch_expr, try_expr, lhs_expr, rhs_expr, handler_expr;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    try_expr = id_expr(0, 30);
+    lhs_expr = int_expr(1, 30);
+    rhs_expr = int_expr(0, 30);
+    try_expr = binary_expr(EXPR_DIVIDE, &lhs_expr, &rhs_expr);
     handler_expr = int_expr(42, 30);
     memset(&catch_expr, 0, sizeof(catch_expr));
     catch_expr.kind = EXPR_CATCH;
@@ -2933,14 +3021,16 @@ test_try_except_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr val_expr, handler_val;
+    Expr val_expr, divisor_expr, try_expr, handler_val;
     Stmt body_stmt, handler_stmt, try_stmt;
     Except_Arm except_arm;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
     val_expr = int_expr(10, 40);
-    body_stmt = return_stmt(&val_expr);
+    divisor_expr = int_expr(0, 40);
+    try_expr = binary_expr(EXPR_DIVIDE, &val_expr, &divisor_expr);
+    body_stmt = expr_stmt(&try_expr);
     handler_val = int_expr(20, 42);
     handler_stmt = return_stmt(&handler_val);
 
@@ -2958,11 +3048,11 @@ test_try_except_tac_ssa(void)
     tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
 
     check_int("try except tac returns",
-	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("try except deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
-    check_int("try except cfg blocks", hir_cfg_block_count(cfg), 1);
-    check_int("try except ssa blocks", hir_ssa_block_count(ssa), 1);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("try except verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -2999,8 +3089,8 @@ test_try_finally_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("try finally deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
-    check_int("try finally cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
-    check_int("try finally ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try finally cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("try finally ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try finally verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -3178,6 +3268,59 @@ test_string_add_operand_inference(void)
     check_int("unknown peer does not infer string operand",
 	      hir_test_infer_string_add_operand(HIR_OP_ADD, 0, TYPE_STR,
 						&inferred), 0);
+}
+
+static unsigned short
+type_mask(var_type type)
+{
+    return (unsigned short) 1U << ((unsigned) type & TYPE_DB_MASK);
+}
+
+static void
+test_binary_type_pair_contracts(void)
+{
+    unsigned short numeric = type_mask(TYPE_INT) | type_mask(TYPE_FLOAT);
+
+    check_int("integer addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_INT,
+						 TYPE_INT), 1);
+    check_int("float addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("string addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_STR,
+						 TYPE_STR), 1);
+    check_int("mixed string addition pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_STR,
+						 TYPE_INT), 0);
+    check_int("mixed numeric addition pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_INT,
+						 TYPE_FLOAT), 0);
+    check_int("unknown addition left mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 0, TYPE_NONE),
+	      numeric | type_mask(TYPE_STR));
+    check_int("string peer narrows addition left mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 1, TYPE_STR),
+	      type_mask(TYPE_STR));
+    check_int("float peer narrows addition right mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 1, 1, TYPE_FLOAT),
+	      type_mask(TYPE_FLOAT));
+
+    check_int("float modulus pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_MOD, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("float-to-integer exponent pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_FLOAT,
+						 TYPE_INT), 1);
+    check_int("float exponent pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("integer-to-float exponent pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_INT,
+						 TYPE_FLOAT), 0);
+    check_int("integer base narrows exponent mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_EXP, 1, 1, TYPE_INT),
+	      type_mask(TYPE_INT));
 }
 
 static void
@@ -3431,8 +3574,11 @@ int
 main(void)
 {
     test_resume_stack_safety();
+    test_resume_stack_shape();
+    test_boundary_tick_refunds();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
+    test_binary_type_pair_contracts();
     test_list_operand_inference();
     test_unknown_type_inference();
     test_builtin_result_type_inference();
