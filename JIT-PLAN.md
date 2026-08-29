@@ -585,6 +585,17 @@ the broader ownership-map and synthesized-anchor validation described below.
    tag and add a guarded consumer instead of guessing a static type. Never
    weaken a guard merely to improve census numbers.
 
+   Consumer contracts now centralize expected operand masks and tagged-dispatch
+   capability, and deopt reports include SSA value, local, expected mask, and
+   actual runtime tag. Requirements remain local to consumers: applying a
+   singleton requirement as a global producer fact was shown unsound by
+   `#69:_listify`, whose `args[1]` value legitimately changes type across
+   invocations. Tagged `valid()` dispatch reduced a codepoint.db `#0..#50`
+   sample from 151 deopts (4.02% of 3,753 entries) to 125 deopts (3.34% of
+   3,743 entries). Continue with the measured `length`, dynamic string-index,
+   and list-index result sites, distinguishing operand-tag failures from result
+   representation failures before changing guards.
+
 5. **Finish dynamic complex-value propagation and ownership accounting.**
    Audit every instruction that can produce a runtime-selected type—property
    reads, list indexing, joins, calls, and overloaded arithmetic—and ensure its
