@@ -4235,8 +4235,10 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			if (!point || point->vector != MAIN_VECTOR
 			    || point->error_pc != map->bytecode_pc) {
 				record_unsupported_fmt(ctx,
-				    "deopt-map: map %d has mismatched resume key at pc %u",
-				    instr->deopt_map, map->bytecode_pc);
+				    "deopt-map: map %d has mismatched resume key at pc %u (resume pc %u error pc %u)",
+				    instr->deopt_map, map->bytecode_pc,
+				    point ? point->pc : NO_BYTECODE_PC,
+				    point ? point->error_pc : NO_BYTECODE_PC);
 				goto invalid;
 			}
 			operands = instr->kind == HIR_TAC_CALL_VERB ? 3
@@ -4244,8 +4246,9 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			if (!resume_stack_matches_point(map->stack_slots,
 						map->stack_depth, point, operands)) {
 				record_unsupported_fmt(ctx,
-				    "deopt-map: map %d call stack does not match resume point",
-				    instr->deopt_map);
+				    "deopt-map: map %d call at line %u has stack depth %u, expected resume depth %u plus %d operands",
+				    instr->deopt_map, instr->source_lineno,
+				    map->stack_depth, point->stack_depth, operands);
 				goto invalid;
 			}
 next_instruction:
@@ -8294,11 +8297,15 @@ static void
 lower_if(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     HIRCondArm *arm;
+    int base_depth = ctx->lower_stack_depth;
     int done_label = new_label(ctx);
 
     for (arm = stmt->u.if_stmt.arms; arm; arm = arm->next) {
 	int next_label = new_label(ctx);
-	int cond = lower_expr(ctx, program, arm->condition);
+	int cond;
+
+	ctx->lower_stack_depth = base_depth;
+	cond = lower_expr(ctx, program, arm->condition);
 
 	append_branch_false(ctx, program, cond, next_label, stmt->source_lineno,
 			    arm->bytecode_pc);
@@ -8308,8 +8315,10 @@ lower_if(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	append_label(ctx, program, next_label, stmt->source_lineno);
     }
 
+    ctx->lower_stack_depth = base_depth;
     lower_stmt_list(ctx, program, stmt->u.if_stmt.otherwise);
     append_label(ctx, program, done_label, stmt->source_lineno);
+	ctx->lower_stack_depth = base_depth;
 }
 
 static void

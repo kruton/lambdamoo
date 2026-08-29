@@ -2364,6 +2364,12 @@ test_break_and_continue_tac_ssa(void)
     Stmt brk = break_stmt(-1, 15);
     Cond_Arm arm2 = cond_arm_ast(&cond2, &brk);
     Stmt if_brk = cond_stmt_ast(&arm2, 0, 14);
+    Expr call_obj = id_expr(0, 16);
+    Expr call_name = id_expr(3, 16);
+    Expr call_arg = int_expr(0, 16);
+    Arg_List call_args;
+    Expr call_expr;
+    Stmt call_stmt;
 
     Expr sum_lhs = id_expr(1, 17);
     Expr sum_rhs = id_expr(1, 17);
@@ -2372,7 +2378,24 @@ test_break_and_continue_tac_ssa(void)
     Expr assign = binary_expr(EXPR_ASGN, &sum_lhs, &add);
     Stmt body_assign = expr_stmt(&assign);
 
-    if_cont.next = &if_brk;
+    memset(&call_args, 0, sizeof(call_args));
+    call_args.kind = ARG_NORMAL;
+    call_args.expr = &call_arg;
+    call_args.bytecode_pc = 29;
+    memset(&call_expr, 0, sizeof(call_expr));
+    call_expr.kind = EXPR_VERB;
+    call_expr.lineno = 16;
+    call_expr.bytecode_pc = 30;
+    call_expr.e.verb.obj = &call_obj;
+    call_expr.e.verb.verb = &call_name;
+    call_expr.e.verb.args = &call_args;
+    call_stmt = expr_stmt(&call_expr);
+    call_obj.bytecode_pc = 27;
+    call_name.bytecode_pc = 28;
+    call_arg.bytecode_pc = 29;
+
+    if_cont.next = &call_stmt;
+    call_stmt.next = &if_brk;
     if_brk.next = &body_assign;
 
     Stmt loop = range_stmt(2, &from, &to, &if_cont, 10);
@@ -2389,8 +2412,10 @@ test_break_and_continue_tac_ssa(void)
     check_int("break/cont verify errors", hir_context_error_count(ctx), 0);
     check_int("break/cont ssa phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("break/cont call preserves loop stack",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 30), 5);
     check_int("break/cont tick count",
-	      hir_tac_count_kind(tac, HIR_TAC_TICK), 9);
+	      hir_tac_count_kind(tac, HIR_TAC_TICK), 10);
 
     check_int("break/cont destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
