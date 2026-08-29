@@ -1792,6 +1792,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    }
 		    if (instr->op == HIR_OP_MAKE_SINGLETON_LIST) {
 			char name[32];
+			MIR_reg_t raw_value;
 			sprintf(name, "sing_elem_type%d", copy_serial++);
 			MIR_reg_t type_reg = new_reg(build, name);
 			if (program->value_is_tagged
@@ -1810,11 +1811,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_int_op(build->context, elem_type)));
 			}
+			raw_value = append_raw_value(build, program, values,
+				instr->src1, deopt_values, &copy_serial);
 			append(build, MIR_new_call_insn(build->context, 5,
 			    MIR_new_ref_op(build->context, build->proto_singleton_list),
 			    MIR_new_ref_op(build->context, build->import_singleton_list),
 			    MIR_new_reg_op(build->context, values[instr->value]),
-			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, raw_value),
 			    MIR_new_reg_op(build->context, type_reg)));
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
@@ -2371,6 +2374,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    }
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL) {
 			char name[32];
+			MIR_reg_t raw_value;
 			int tagged_list = program->value_is_tagged
 			    && program->value_is_tagged[instr->src1];
 			MIR_label_t deopt = 0;
@@ -2411,12 +2415,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_int_op(build->context, elem_type)));
 			}
+			raw_value = append_raw_value(build, program, values,
+				instr->src2, deopt_values, &copy_serial);
 			append(build, MIR_new_call_insn(build->context, 6,
 			    MIR_new_ref_op(build->context, build->proto_list_append),
 			    MIR_new_ref_op(build->context, build->import_list_append),
 			    MIR_new_reg_op(build->context, values[instr->value]),
 			    MIR_new_reg_op(build->context, values[instr->src1]),
-			    MIR_new_reg_op(build->context, values[instr->src2]),
+			    MIR_new_reg_op(build->context, raw_value),
 			    MIR_new_reg_op(build->context, type_reg)));
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
@@ -2646,6 +2652,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    var_type elem_type = program->value_types[instr->src1];
 			    char name[32];
 			    MIR_label_t deopt = 0, done = 0;
+			    MIR_reg_t raw_value;
 			    sprintf(name, "in_type%d", copy_serial++);
 			    MIR_reg_t in_type = new_reg(build, name);
 			    if (tagged_list) {
@@ -2676,11 +2683,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, in_type),
 				    MIR_new_int_op(build->context, elem_type)));
+			    raw_value = append_raw_value(build, program, values,
+				instr->src1, deopt_values, &copy_serial);
 			    append(build, MIR_new_call_insn(build->context, 6,
 				MIR_new_ref_op(build->context, build->proto_list_in),
 				MIR_new_ref_op(build->context, build->import_list_in),
 				MIR_new_reg_op(build->context, values[instr->value]),
-				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_reg_op(build->context, raw_value),
 				MIR_new_reg_op(build->context, in_type),
 				MIR_new_reg_op(build->context, values[instr->src2])));
 			    if (tagged_list) {
@@ -4030,6 +4039,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_types[instr->src2] == TYPE_STR) {
 			    char name[32];
 			    MIR_reg_t rhs_type;
+			    MIR_reg_t rhs_raw;
 			    MIR_reg_t prop_ok;
 			    MIR_label_t deopt = MIR_new_label(build->context);
 			    MIR_label_t done = MIR_new_label(build->context);
@@ -4072,6 +4082,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					program->value_types[rhs])));
 			    sprintf(name, "put_prop_ok%d", copy_serial++);
 			    prop_ok = new_reg(build, name);
+			    rhs_raw = append_raw_value(build, program, values, rhs,
+				deopt_values, &copy_serial);
 			    append(build, MIR_new_call_insn(build->context, 9,
 				MIR_new_ref_op(build->context, build->proto_put_prop),
 				MIR_new_ref_op(build->context, build->import_put_prop),
@@ -4079,7 +4091,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, values[instr->src1]),
 				MIR_new_reg_op(build->context, values[instr->src2]),
 				MIR_new_reg_op(build->context, progr),
-				MIR_new_reg_op(build->context, values[rhs]),
+				MIR_new_reg_op(build->context, rhs_raw),
 				MIR_new_reg_op(build->context, rhs_type),
 				MIR_new_reg_op(build->context, error_out)));
 			    append(build, MIR_new_insn(build->context, MIR_BLT,

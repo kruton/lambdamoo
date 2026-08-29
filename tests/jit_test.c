@@ -2225,6 +2225,40 @@ tagged_unary_program(HIROp op)
 }
 
 static JITProgram *
+float_singleton_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *singleton = instruction(HIR_TAC_UNARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    FlNum literal = 1.5;
+
+    program->num_values = 3;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 3);
+    program->value_is_tagged = allocate(3);
+    program->value_types[1] = TYPE_FLOAT;
+    program->value_types[2] = TYPE_LIST;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    constant->value = 1;
+    memcpy(&constant->literal, &literal, sizeof(literal));
+    constant->literal_type = TYPE_FLOAT;
+    constant->next = singleton;
+    singleton->value = 2;
+    singleton->src1 = 1;
+    singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
+    singleton->next = ret;
+    ret->src1 = 2;
+    ret->literal_type = TYPE_LIST;
+    block->first = constant;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 tagged_binary_program(HIROp op)
 {
     JITProgram *program = new_jit_program();
@@ -4369,6 +4403,22 @@ main(void)
 	jit_program_free(tagged_eq);
 	jit_program_free(tagged_float_eq);
 	jit_program_free(tagged_in);
+    }
+
+    /* Float payloads cross raw-value helper ABIs without changing mode. */
+    {
+	JITProgram *singleton = float_singleton_program();
+
+	ticks = 10;
+	check(jit_program_execute(singleton, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "float singleton did not execute natively");
+	check(result.type == TYPE_LIST && result.v.list[0].v.num == 1
+	      && result.v.list[1].type == TYPE_FLOAT
+	      && fl_unbox(result.v.list[1].v.fnum) == 1.5,
+	      "float singleton returned the wrong value");
+	free_var(result);
+	jit_program_free(singleton);
     }
 
     /* Type inspection reads a dynamic value's runtime tag without deoptimizing. */
