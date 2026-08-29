@@ -1174,7 +1174,7 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
     JITDeoptMap *map = &program->deopt_maps[map_id];
     int i;
 
-    for (i = 0; i < map->num_locals; i++) {
+    for (i = 0; i < jit_deopt_map_local_count(map); i++) {
 	int val = map->local_values[i];
 	if (val > 0) {
 	    if (program->value_types && program->value_types[val] == TYPE_FLOAT) {
@@ -4442,6 +4442,8 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
+		if (program->deopt_maps[i].local_slots)
+		    myfree(program->deopt_maps[i].local_slots, M_PROGRAM);
 		if (program->deopt_maps[i].local_types)
 		    myfree(program->deopt_maps[i].local_types, M_PROGRAM);
 		if (program->deopt_maps[i].stack_values)
@@ -4521,9 +4523,11 @@ jit_program_metadata_bytes(JITProgram *program)
 	JITDeoptMap *map = &program->deopt_maps[i];
 
 	if (map->local_values)
-	    bytes += sizeof(int) * map->num_locals;
+	    bytes += sizeof(int) * jit_deopt_map_local_count(map);
 	if (map->local_types)
-	    bytes += sizeof(var_type) * map->num_locals;
+	    bytes += sizeof(var_type) * jit_deopt_map_local_count(map);
+	if (map->local_slots)
+	    bytes += sizeof(int) * map->num_local_values;
 	if (map->stack_values)
 	    bytes += sizeof(int) * map->stack_depth;
 	if (map->stack_types)
@@ -4872,15 +4876,16 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
 {
     int i;
 
-    for (i = 0; i < map->num_locals; i++) {
+    for (i = 0; i < jit_deopt_map_local_count(map); i++) {
 	int value = map->local_values[i];
+	int slot = jit_deopt_map_local_slot(map, i);
 
 	if (value > 0 && value < program->num_values
 	    && program->value_is_tagged && program->value_is_tagged[value]
 	    && !jit_runtime_type_is_valid((var_type)
 		program->deopt_values[program->num_values + value])) {
 	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
-		   value, i, map->bytecode_pc);
+		   value, slot, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
 	}
     }
@@ -4957,8 +4962,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	map = &program->deopt_maps[deopt_map];
 	jit_validate_materialized_tags(program, map);
 	materialized_depth = map->stack_depth;
-	for (i = 0; i < map->num_locals; i++)
+	for (i = 0; i < jit_deopt_map_local_count(map); i++)
 	    if (map->local_values[i] > 0) {
+		int slot = jit_deopt_map_local_slot(map, i);
 		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
 		if (type == TYPE_ANY)
 		    type = (var_type) program->deopt_values[program->num_values
@@ -4966,8 +4972,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		Var value = materialize_deopt_value(type,
 			program->deopt_values[map->local_values[i]]);
 
-		free_var(env[i]);
-		env[i] = value;
+		free_var(env[slot]);
+		env[slot] = value;
 	    }
 	if (deopt_stack && (map->stack_depth
 			    || (jit_deopt_map_is_specialized_builtin(map)

@@ -37,6 +37,9 @@ struct JITDeoptMap {
     unsigned stack_depth;
     int ticks_charged;
     int num_locals;
+    int num_local_values;
+    int locals_are_sparse;
+    int *local_slots;
     int *local_values;
     var_type *local_types;
     int *stack_values;
@@ -54,6 +57,18 @@ struct JITDeoptMap {
     JITDeoptReason reason;
     int native_error_block;
 };
+
+static inline int
+jit_deopt_map_local_count(JITDeoptMap *map)
+{
+    return map->locals_are_sparse ? map->num_local_values : map->num_locals;
+}
+
+static inline int
+jit_deopt_map_local_slot(JITDeoptMap *map, int index)
+{
+    return map->locals_are_sparse ? map->local_slots[index] : index;
+}
 
 static inline int
 jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
