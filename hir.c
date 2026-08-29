@@ -4226,6 +4226,9 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					    instr->deopt_map, i, map->stack_values[i]);
 					goto invalid;
 				}
+			if (instr->kind != HIR_TAC_CALL
+			    && instr->kind != HIR_TAC_CALL_VERB)
+				goto next_instruction;
 			if (!resume_key_is_valid(map->resume_key))
 				goto next_instruction;
 			point = resume_point_for_key(bytecode_program, map->resume_key);
