@@ -5041,7 +5041,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    ResumeStackSlot slot = map->stack_slots
 		? map->stack_slots[i]
 		: (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
-	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
+	    var_type type = jit_deopt_map_stack_type(program, map, i);
 
 	    if (slot.kind != RSS_VALUE) {
 		new_stack[i].type = slot.kind == RSS_CATCH ? TYPE_CATCH

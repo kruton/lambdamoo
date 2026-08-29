@@ -208,17 +208,46 @@ jit_deopt_map_local_type(JITProgram *program, JITDeoptMap *map, int slot)
 
 	if (map->locals_are_sparse) {
 	    for (i = 0; i < map->num_local_values; i++)
-		if (map->local_slots[i] == slot)
-		    return map->local_values[i] > 0 && map->local_types
-			? map->local_types[i] : TYPE_INT;
+		if (map->local_slots[i] == slot) {
+		    int value = map->local_values[i];
+
+		    if (value <= 0)
+			return TYPE_INT;
+		    if (map->local_types)
+			return map->local_types[i];
+		    return program->value_is_tagged
+			&& program->value_is_tagged[value] ? TYPE_ANY
+			: program->value_types ? program->value_types[value] : TYPE_INT;
+		}
 	} else if (slot >= 0 && slot < map->num_locals && map->local_values
-		 && map->local_values[slot] > 0)
-	    return map->local_types ? map->local_types[slot] : TYPE_INT;
+		 && map->local_values[slot] > 0) {
+	    int value = map->local_values[slot];
+
+	    if (map->local_types)
+		return map->local_types[slot];
+	    return program->value_is_tagged && program->value_is_tagged[value]
+		? TYPE_ANY : program->value_types ? program->value_types[value] : TYPE_INT;
+	}
 	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
 	    break;
 	map = &program->deopt_maps[map->local_base - 1];
     }
     return TYPE_INT;
+}
+
+static inline var_type
+jit_deopt_map_stack_type(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    int value;
+
+    if (map->stack_types)
+	return map->stack_types[slot];
+    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+	return map->stack_slots[slot].kind == RSS_CATCH ? TYPE_CATCH
+	    : map->stack_slots[slot].kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+    value = map->stack_values[slot];
+    return program->value_is_tagged && program->value_is_tagged[value]
+	? TYPE_ANY : program->value_types ? program->value_types[value] : TYPE_INT;
 }
 
 extern int jit_rt_is_true(int64_t, int);

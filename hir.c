@@ -3523,6 +3523,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
     return ctx->error_count == errors_before;
 }
 
+#ifdef HIR_TESTING
 static int
 resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 		     int call_operands)
@@ -3538,6 +3539,7 @@ resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 	    return 0;
     return 1;
 }
+#endif
 
 static int
 resume_stack_matches_point(ResumeStackSlot *stack_slots, unsigned stack_depth,
@@ -3569,6 +3571,22 @@ jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 }
 
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
+static int
+jit_resume_stack_is_safe(JITDeoptMap *map, int call_operands)
+{
+    int outer_depth;
+    int i;
+
+    if (map->stack_depth < (unsigned) call_operands)
+	return 0;
+    outer_depth = map->stack_depth - call_operands;
+    for (i = 0; i < outer_depth; i++)
+	if (map->stack_slots[i].kind == RSS_CATCH
+	    || map->stack_slots[i].kind == RSS_FINALLY)
+	    return 0;
+    return 1;
+}
+
 static int
 jit_op_is_supported(HIROp op)
 {
@@ -4271,8 +4289,6 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 				    M_PROGRAM);
 	map->local_values = mymalloc(sizeof(int) * map->num_local_values,
 				     M_PROGRAM);
-	map->local_types = mymalloc(sizeof(var_type) * map->num_local_values,
-				    M_PROGRAM);
 	for (i = 0; i < map->num_locals; i++) {
 	    int value = instr->local_values[i];
 
@@ -4280,25 +4296,17 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 		continue;
 	    map->local_slots[entry] = i;
 	    map->local_values[entry] = value;
-	    map->local_types[entry] = value_is_tagged[value]
-		? TYPE_ANY : value_types[value];
 	    entry++;
 	}
     }
     if (map->stack_depth) {
 	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
-	map->stack_types = mymalloc(sizeof(var_type) * map->stack_depth, M_PROGRAM);
 	map->stack_slots = mymalloc(sizeof(ResumeStackSlot) * map->stack_depth,
 				   M_PROGRAM);
 	memcpy(map->stack_values, instr->stack_values,
 	       sizeof(int) * map->stack_depth);
 	memcpy(map->stack_slots, instr->stack_slots,
 	       sizeof(ResumeStackSlot) * map->stack_depth);
-	for (i = 0; i < (int) map->stack_depth; i++)
-	    map->stack_types[i] = (instr->stack_values[i] > 0
-				   && instr->stack_values[i] < program->num_values)
-		? (value_is_tagged[instr->stack_values[i]]
-		   ? TYPE_ANY : value_types[instr->stack_values[i]]) : TYPE_INT;
     }
     return program->num_deopt_maps++;
 }
@@ -4390,10 +4398,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			    || map->num_local_values < 0
 			    || map->num_local_values > map->num_locals
 			    || (map->num_local_values && (!map->local_slots
-					     || !map->local_values
-					     || !map->local_types))
+					     || !map->local_values))
 			    || (map->stack_depth && (!map->stack_values
-					      || !map->stack_types
 					      || !map->stack_slots))) {
 				record_unsupported_fmt(ctx,
 				    "deopt-map: map %d has incomplete frame at pc %u",
@@ -4516,9 +4522,7 @@ jit_coalesce_deopt_locals(JITProgram *program)
 		int value = jit_deopt_map_local_value(program, map, slot);
 		int base_value = jit_deopt_map_local_value(program, base, slot);
 
-		if (value != base_value
-		    || (value > 0 && jit_deopt_map_local_type(program, map, slot)
-			!= jit_deopt_map_local_type(program, base, slot)))
+		if (value != base_value)
 		    count++;
 	    }
 	    if (count < best_count) {
@@ -4532,23 +4536,17 @@ jit_coalesce_deopt_locals(JITProgram *program)
 		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
 	    int *values = best_count
 		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
-	    var_type *types = best_count
-		? mymalloc(sizeof(var_type) * best_count, M_PROGRAM) : 0;
 	    int entry = 0;
 	    int slot;
 
 	    for (slot = 0; slot < map->num_locals; slot++) {
 		int value = jit_deopt_map_local_value(program, map, slot);
 		int base_value = jit_deopt_map_local_value(program, base, slot);
-		var_type type = jit_deopt_map_local_type(program, map, slot);
 
-		if (value == base_value
-		    && (value <= 0 || type
-			== jit_deopt_map_local_type(program, base, slot)))
+		if (value == base_value)
 		    continue;
 		slots[entry] = slot;
 		values[entry] = value;
-		types[entry] = type;
 		entry++;
 	    }
 	    if (map->local_slots)
@@ -4559,7 +4557,7 @@ jit_coalesce_deopt_locals(JITProgram *program)
 		myfree(map->local_types, M_PROGRAM);
 	    map->local_slots = slots;
 	    map->local_values = values;
-	    map->local_types = types;
+	    map->local_types = 0;
 	    map->num_local_values = best_count;
 	    map->local_base = best + 1;
 	    depth[map_id] = depth[best] + 1;
@@ -4765,9 +4763,8 @@ jit_build_resume_liveness(JITProgram *program)
 		map->resume_values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
 		map->num_resume_values = live_count;
-		map->native_resume_valid = resume_stack_is_safe(map->stack_types,
-							 map->stack_depth,
-							 call_operands);
+		map->native_resume_valid = jit_resume_stack_is_safe(map,
+							      call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
 		    if (live[value]
