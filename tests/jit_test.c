@@ -878,6 +878,7 @@ call_verb_program(void)
     map->local_types[2] = TYPE_LIST;
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_slots = allocate(sizeof(ResumeStackSlot) * 3);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
     map->stack_values[2] = 3;
@@ -1501,12 +1502,18 @@ catch_stack_marker_program(int native_error)
     map->num_locals = 0;
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
+    map->stack_slots = allocate(sizeof(ResumeStackSlot) * 3);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
     map->stack_values[2] = 3;
     map->stack_types[0] = TYPE_INT;
     map->stack_types[1] = TYPE_INT;
     map->stack_types[2] = TYPE_CATCH;
+    map->stack_slots[0].kind = RSS_VALUE;
+    map->stack_slots[1].kind = RSS_HANDLER_PC;
+    map->stack_slots[1].data = 77;
+    map->stack_slots[2].kind = RSS_CATCH;
+    map->stack_slots[2].data = 1;
 
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -1517,7 +1524,7 @@ catch_stack_marker_program(int native_error)
     const_codes->next = const_pc;
 
     const_pc->value = 2;
-    const_pc->literal = 77;
+    const_pc->literal = 999;
     const_pc->literal_type = TYPE_INT;
     const_pc->next = const_catch;
 
@@ -1605,6 +1612,7 @@ fork_boundary_deopt_program(void)
     map->num_locals = 0;
     map->stack_values = allocate(sizeof(int));
     map->stack_types = allocate(sizeof(var_type));
+    map->stack_slots = allocate(sizeof(ResumeStackSlot));
     map->stack_values[0] = 1;
     map->stack_types[0] = TYPE_INT;
 
@@ -1650,8 +1658,11 @@ finally_stack_marker_deopt_program(void)
     map->num_locals = 0;
     map->stack_values = allocate(sizeof(int));
     map->stack_types = allocate(sizeof(var_type));
+    map->stack_slots = allocate(sizeof(ResumeStackSlot));
     map->stack_values[0] = 1;
     map->stack_types[0] = TYPE_FINALLY;
+    map->stack_slots[0].kind = RSS_FINALLY;
+    map->stack_slots[0].data = 88;
 
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -1701,6 +1712,7 @@ nested_try_except_finally_deopt_program(void)
     map->num_locals = 0;
     map->stack_values = allocate(sizeof(int) * 4);
     map->stack_types = allocate(sizeof(var_type) * 4);
+    map->stack_slots = allocate(sizeof(ResumeStackSlot) * 4);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
     map->stack_values[2] = 3;
@@ -1709,6 +1721,13 @@ nested_try_except_finally_deopt_program(void)
     map->stack_types[1] = TYPE_INT;
     map->stack_types[2] = TYPE_INT;
     map->stack_types[3] = TYPE_CATCH;
+    map->stack_slots[0].kind = RSS_FINALLY;
+    map->stack_slots[0].data = 99;
+    map->stack_slots[1].kind = RSS_VALUE;
+    map->stack_slots[2].kind = RSS_HANDLER_PC;
+    map->stack_slots[2].data = 55;
+    map->stack_slots[3].kind = RSS_CATCH;
+    map->stack_slots[3].data = 1;
 
     program->blocks = program->last_block = block;
     block->id = 1;

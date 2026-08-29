@@ -1205,7 +1205,8 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
     }
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int sval = map->stack_values[i];
-	if (sval > 0) {
+	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
+	    && sval > 0) {
 	    if (program->value_types && program->value_types[sval] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
 		    MIR_new_mem_op(build->context, MIR_T_D,
@@ -4390,6 +4391,8 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_types)
 		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
+		if (program->deopt_maps[i].stack_slots)
+		    myfree(program->deopt_maps[i].stack_slots, M_PROGRAM);
 		if (program->deopt_maps[i].resume_values)
 		    myfree(program->deopt_maps[i].resume_values, M_PROGRAM);
 	    }
@@ -4468,6 +4471,8 @@ jit_program_metadata_bytes(JITProgram *program)
 	    bytes += sizeof(int) * map->stack_depth;
 	if (map->stack_types)
 	    bytes += sizeof(var_type) * map->stack_depth;
+	if (map->stack_slots)
+	    bytes += sizeof(ResumeStackSlot) * map->stack_depth;
 	if (map->resume_values)
 	    bytes += sizeof(JITResumeValue) * map->num_resume_values;
     }
@@ -4789,7 +4794,8 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int value = map->stack_values[i];
 
-	if (value > 0 && value < program->num_values
+	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
+	    && value > 0 && value < program->num_values
 	    && program->value_is_tagged && program->value_is_tagged[value]
 	    && !jit_runtime_type_is_valid((var_type)
 		program->deopt_values[program->num_values + value])) {
@@ -4868,7 +4874,17 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 				&& map->builtin_args == 0)))
 	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
 	for (i = 0; new_stack && i < (int) map->stack_depth; i++) {
+	    ResumeStackSlot slot = map->stack_slots
+		? map->stack_slots[i]
+		: (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
 	    var_type type = map->stack_types ? map->stack_types[i] : TYPE_INT;
+
+	    if (slot.kind != RSS_VALUE) {
+		new_stack[i].type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		    : slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+		new_stack[i].v.num = slot.data;
+		continue;
+	    }
 	    if (type == TYPE_ANY)
 		type = (var_type) program->deopt_values[program->num_values
 		    + map->stack_values[i]];

@@ -41,6 +41,7 @@ struct JITDeoptMap {
     var_type *local_types;
     int *stack_values;
     var_type *stack_types;
+    ResumeStackSlot *stack_slots;
     int num_resume_values;
     JITResumeValue *resume_values;
     int native_resume_valid;

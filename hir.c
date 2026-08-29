@@ -373,6 +373,7 @@ struct HIRTacInstr {
     ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
+    ResumeStackSlot *stack_slots;
     HIRTacInstr *next;
 };
 
@@ -454,6 +455,7 @@ struct HIRSSAInstr {
     ResumeKey resume_key;
     int num_stack_values;
     int *stack_values;
+    ResumeStackSlot *stack_slots;
     int num_local_values;
     int *local_values;
     HIRPhiArg *phi_args;
@@ -515,6 +517,7 @@ struct HIRContext {
     int lower_stack_depth;
     int lower_stack_capacity;
     int *lower_stack;
+    ResumeStackSlot *lower_stack_slots;
     HIRLoopContext *current_loop;
     HIRFinallyContext *current_finally;
     int current_error_label;
@@ -554,6 +557,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack_depth = 0;
     ctx->lower_stack_capacity = 0;
     ctx->lower_stack = 0;
+    ctx->lower_stack_slots = 0;
     ctx->current_loop = 0;
     ctx->current_finally = 0;
     ctx->current_error_label = 0;
@@ -1601,6 +1605,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->resume_key = tac->resume_key;
     instr->num_stack_values = tac->num_stack_values;
     instr->stack_values = tac->stack_values;
+    instr->stack_slots = tac->stack_slots;
     instr->num_local_values = 0;
     instr->local_values = 0;
     instr->phi_args = 0;
@@ -1684,6 +1689,7 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	load->literal.v.num = 0;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
+	load->stack_slots = 0;
 	load->num_local_values = 0;
 	load->local_values = 0;
 	load->phi_args = 0;
@@ -1783,6 +1789,10 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 	    if (tac->num_stack_values) {
 		ssa_inst->stack_values = hir_alloc(ctx,
 				 sizeof(int) * tac->num_stack_values);
+		ssa_inst->stack_slots = hir_alloc(ctx,
+				 sizeof(ResumeStackSlot) * tac->num_stack_values);
+		memcpy(ssa_inst->stack_slots, tac->stack_slots,
+		       sizeof(ResumeStackSlot) * tac->num_stack_values);
 		for (j = 0; j < tac->num_stack_values; j++) {
 		    int value = tac->stack_values[j];
 		    ssa_inst->stack_values[j] =
@@ -1966,6 +1976,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			phi->value = 0; /* filled in renaming */
 			phi->num_stack_values = 0;
 			phi->stack_values = 0;
+			phi->stack_slots = 0;
 			phi->num_local_values = 0;
 			phi->local_values = 0;
 			phi->src1 = 0;
@@ -2065,6 +2076,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	    label->literal.type = TYPE_NONE;
 	    label->num_stack_values = 0;
 	    label->stack_values = 0;
+	    label->stack_slots = 0;
 	    label->num_local_values = 0;
 	    label->local_values = 0;
 	    label->phi_args = 0;
@@ -3173,6 +3185,7 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     copy->op = HIR_OP_ADD;
     copy->num_stack_values = 0;
     copy->stack_values = 0;
+    copy->stack_slots = 0;
     copy->num_local_values = 0;
     copy->local_values = 0;
     copy->literal.type = TYPE_NONE;
@@ -3999,8 +4012,12 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     if (map->stack_depth) {
 	map->stack_values = mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM);
 	map->stack_types = mymalloc(sizeof(var_type) * map->stack_depth, M_PROGRAM);
+	map->stack_slots = mymalloc(sizeof(ResumeStackSlot) * map->stack_depth,
+				   M_PROGRAM);
 	memcpy(map->stack_values, instr->stack_values,
 	       sizeof(int) * map->stack_depth);
+	memcpy(map->stack_slots, instr->stack_slots,
+	       sizeof(ResumeStackSlot) * map->stack_depth);
 	for (i = 0; i < (int) map->stack_depth; i++)
 	    map->stack_types[i] = (instr->stack_values[i] > 0
 				   && instr->stack_values[i] < program->num_values)
@@ -4075,7 +4092,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			    || (map->num_locals && (!map->local_values
 					     || !map->local_types))
 			    || (map->stack_depth && (!map->stack_values
-					      || !map->stack_types))) {
+					      || !map->stack_types
+					      || !map->stack_slots))) {
 				record_unsupported_fmt(ctx,
 				    "deopt-map: map %d has incomplete frame at pc %u",
 				    instr->deopt_map, map->bytecode_pc);
@@ -4090,7 +4108,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					goto invalid;
 				}
 			for (i = 0; i < (int) map->stack_depth; i++)
-				if (map->stack_values[i] <= 0
+				if (map->stack_slots[i].kind > RSS_FINALLY
+				    || map->stack_values[i] <= 0
 				    || map->stack_values[i] >= program->num_values) {
 					record_unsupported_fmt(ctx,
 					    "deopt-map: map %d stack slot %d has invalid value %d",
@@ -4116,6 +4135,17 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 				    instr->deopt_map);
 				goto invalid;
 			}
+			for (i = 0; i < (int) point->stack_depth; i++)
+				if (map->stack_slots[i].kind
+					!= point->stack_slots[i].kind
+				    || (map->stack_slots[i].kind != RSS_VALUE
+					&& map->stack_slots[i].data
+					   != point->stack_slots[i].data)) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d stack slot %d does not match resume point",
+					    instr->deopt_map, i);
+					goto invalid;
+				}
 next_instruction:
 			if (instr == block->last)
 				break;
@@ -7049,24 +7079,49 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
     instr->func = FUNC_NOT_FOUND;
     instr->num_stack_values = 0;
     instr->stack_values = 0;
+    instr->stack_slots = 0;
     return instr;
 }
 
 static void
-push_lower_stack(HIRContext *ctx, int value)
+push_lower_stack_slot(HIRContext *ctx, int value, ResumeStackSlotKind kind,
+		      unsigned data)
 {
     if (ctx->lower_stack_depth == ctx->lower_stack_capacity) {
 	int new_capacity = ctx->lower_stack_capacity
 	    ? ctx->lower_stack_capacity * 2 : 8;
 	int *new_stack = hir_alloc(ctx, sizeof(int) * new_capacity);
+	ResumeStackSlot *new_slots = hir_alloc(ctx,
+				      sizeof(ResumeStackSlot) * new_capacity);
 
-	if (ctx->lower_stack_depth)
+	if (ctx->lower_stack_depth) {
 	    memcpy(new_stack, ctx->lower_stack,
 		   sizeof(int) * ctx->lower_stack_depth);
+	    memcpy(new_slots, ctx->lower_stack_slots,
+		   sizeof(ResumeStackSlot) * ctx->lower_stack_depth);
+	}
 	ctx->lower_stack = new_stack;
+	ctx->lower_stack_slots = new_slots;
 	ctx->lower_stack_capacity = new_capacity;
     }
-    ctx->lower_stack[ctx->lower_stack_depth++] = value;
+    ctx->lower_stack[ctx->lower_stack_depth] = value;
+    ctx->lower_stack_slots[ctx->lower_stack_depth].kind = kind;
+    ctx->lower_stack_slots[ctx->lower_stack_depth].data = data;
+    ctx->lower_stack_depth++;
+}
+
+static void
+push_lower_stack(HIRContext *ctx, int value)
+{
+    push_lower_stack_slot(ctx, value, RSS_VALUE, 0);
+}
+
+static void
+replace_lower_stack(HIRContext *ctx, int index, int value)
+{
+    ctx->lower_stack[index] = value;
+    ctx->lower_stack_slots[index].kind = RSS_VALUE;
+    ctx->lower_stack_slots[index].data = 0;
 }
 
 static void
@@ -7079,8 +7134,12 @@ snapshot_lower_stack_depth(HIRContext *ctx, HIRTacInstr *instr, int depth)
 	instr->num_stack_values = depth;
 	if (depth) {
 		instr->stack_values = hir_alloc(ctx, sizeof(int) * depth);
+		instr->stack_slots = hir_alloc(ctx,
+					 sizeof(ResumeStackSlot) * depth);
 		memcpy(instr->stack_values, ctx->lower_stack,
 		       sizeof(int) * depth);
+		memcpy(instr->stack_slots, ctx->lower_stack_slots,
+		       sizeof(ResumeStackSlot) * depth);
 	}
 }
 
@@ -7571,7 +7630,8 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     handler_pc_tac->bytecode_pc = expr->bytecode_pc;
     snapshot_lower_stack(ctx, handler_pc_tac);
     append_tac(program, handler_pc_tac);
-    push_lower_stack(ctx, handler_pc_val);
+    push_lower_stack_slot(ctx, handler_pc_val, RSS_HANDLER_PC,
+			  expr->u.catch_expr.handler_pc);
 
     catch_marker_tac = new_tac(ctx, HIR_TAC_CONST, expr->source_lineno);
     catch_marker_tac->dst = catch_marker_val;
@@ -7580,7 +7640,7 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     catch_marker_tac->bytecode_pc = expr->bytecode_pc;
     snapshot_lower_stack(ctx, catch_marker_tac);
     append_tac(program, catch_marker_tac);
-    push_lower_stack(ctx, catch_marker_val);
+    push_lower_stack_slot(ctx, catch_marker_val, RSS_CATCH, 1);
 
     if (!expr->u.catch_expr.codes)
 	ctx->current_error_label = handler_label;
@@ -7723,7 +7783,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	instr->op = expr->u.unary.op;
 	snapshot_lower_stack(ctx, instr);
 	append_tac(program, instr);
-	ctx->lower_stack[ctx->lower_stack_depth - 1] = instr->dst;
+	replace_lower_stack(ctx, ctx->lower_stack_depth - 1, instr->dst);
 	return instr->dst;
     case HIR_EXPR_BINARY:
 	if (expr->u.binary.op == HIR_OP_AND
@@ -7905,7 +7965,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		single_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, single_tac);
 		append_tac(program, single_tac);
-		ctx->lower_stack[ctx->lower_stack_depth - 1] = single_tac->dst;
+	    replace_lower_stack(ctx, ctx->lower_stack_depth - 1,
+				single_tac->dst);
 		return single_tac->dst;
 	    }
 
@@ -7919,7 +7980,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		single_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, single_tac);
 		append_tac(program, single_tac);
-		ctx->lower_stack[ctx->lower_stack_depth - 1] = single_tac->dst;
+		replace_lower_stack(ctx, ctx->lower_stack_depth - 1,
+				    single_tac->dst);
 		list_temp = single_tac->dst;
 	    } else {
 		int elem_temp = lower_expr(ctx, program, item->expr);
@@ -7931,7 +7993,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		check_tac->bytecode_pc = item->bytecode_pc;
 		snapshot_lower_stack(ctx, check_tac);
 		append_tac(program, check_tac);
-		ctx->lower_stack[ctx->lower_stack_depth - 1] = check_tac->dst;
+		replace_lower_stack(ctx, ctx->lower_stack_depth - 1,
+				    check_tac->dst);
 		list_temp = check_tac->dst;
 	    }
 
@@ -8012,7 +8075,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		tac->bytecode_pc = expr->bytecode_pc;
 		snapshot_lower_stack(ctx, tac);
 		append_tac(program, tac);
-		ctx->lower_stack[ctx->lower_stack_depth - 1] = dst_temp;
+		replace_lower_stack(ctx, ctx->lower_stack_depth - 1, dst_temp);
 		return dst_temp;
 	    }
 	    if (func_name && (!strcmp(func_name, "min") || !strcmp(func_name, "max")
@@ -8063,7 +8126,8 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    call_tac->bytecode_pc = expr->bytecode_pc;
 	    snapshot_lower_stack(ctx, call_tac);
 	    append_tac(program, call_tac);
-	    ctx->lower_stack[ctx->lower_stack_depth - 1] = call_tac->dst;
+	    replace_lower_stack(ctx, ctx->lower_stack_depth - 1,
+				call_tac->dst);
 	    return call_tac->dst;
 	}
     case HIR_EXPR_VERB_CALL:
@@ -8213,7 +8277,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     /* Check if current loop variable <= to_temp (handles from > to on entry) */
     curr_local = append_internal_load(ctx, program, stmt->u.for_range.local_id,
 				     stmt->source_lineno);
-    ctx->lower_stack[base_depth] = curr_local;
+    replace_lower_stack(ctx, base_depth, curr_local);
     cond_temp = new_temp(ctx);
     instr = new_tac(ctx, HIR_TAC_BINARY, stmt->source_lineno);
     instr->dst = cond_temp;
@@ -8322,7 +8386,7 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
     index_temp = append_internal_load(ctx, program, index_local,
 				      stmt->source_lineno);
-    ctx->lower_stack[ctx->lower_stack_depth - 1] = index_temp;
+    replace_lower_stack(ctx, ctx->lower_stack_depth - 1, index_temp);
 
     length_temp = new_temp(ctx);
     instr = new_tac(ctx, HIR_TAC_UNARY, stmt->source_lineno);
@@ -8377,7 +8441,7 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_tac(program, instr);
     append_internal_store(ctx, program, index_local, next_index,
 			  stmt->source_lineno);
-    ctx->lower_stack[ctx->lower_stack_depth - 1] = next_index;
+    replace_lower_stack(ctx, ctx->lower_stack_depth - 1, next_index);
 
     lower_stmt_list(ctx, program, stmt->u.for_list.body);
     append_jump(ctx, program, top_label, stmt->source_lineno);
@@ -8466,7 +8530,8 @@ lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     finally_marker->bytecode_pc = stmt->bytecode_pc;
     snapshot_lower_stack(ctx, finally_marker);
     append_tac(program, finally_marker);
-    push_lower_stack(ctx, finally_val);
+    push_lower_stack_slot(ctx, finally_val, RSS_FINALLY,
+			  stmt->u.try_finally.handler_pc);
 
     finally_context.handler = stmt->u.try_finally.handler;
     finally_context.base_depth = base_depth;
@@ -8509,7 +8574,8 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	handler_pc->bytecode_pc = stmt->bytecode_pc;
 	snapshot_lower_stack(ctx, handler_pc);
 	append_tac(program, handler_pc);
-	push_lower_stack(ctx, handler_pc_val);
+	push_lower_stack_slot(ctx, handler_pc_val, RSS_HANDLER_PC,
+			      ex->handler_pc);
     }
 
     catch_marker_val = new_temp(ctx);
@@ -8520,7 +8586,7 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     catch_marker->bytecode_pc = stmt->bytecode_pc;
     snapshot_lower_stack(ctx, catch_marker);
     append_tac(program, catch_marker);
-    push_lower_stack(ctx, catch_marker_val);
+    push_lower_stack_slot(ctx, catch_marker_val, RSS_CATCH, arm_count);
 
     if (arm_count == 1 && !stmt->u.try_except.excepts->codes
 	&& stmt->u.try_except.excepts->local_id < 0)
