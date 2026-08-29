@@ -2123,7 +2123,7 @@ list_index_tagged_base_program(void)
 }
 
 static JITProgram *
-list_index_tagged_consumer_program(HIROp op)
+list_index_tagged_consumer_program(HIROp op, var_type rhs_type)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -2143,7 +2143,7 @@ list_index_tagged_consumer_program(HIROp op)
     program->value_types[1] = TYPE_LIST;
     program->value_types[2] = TYPE_INT;
     program->value_is_tagged[3] = 1;
-    program->value_types[4] = op == HIR_OP_IN ? TYPE_LIST : TYPE_STR;
+    program->value_types[4] = op == HIR_OP_IN ? TYPE_LIST : rhs_type;
     program->value_types[5] = TYPE_INT;
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
@@ -2166,6 +2166,11 @@ list_index_tagged_consumer_program(HIROp op)
     if (op == HIR_OP_IN) {
 	rhs_instr->local_id = 1;
 	rhs_instr->literal_type = TYPE_LIST;
+    } else if (rhs_type == TYPE_FLOAT) {
+	FlNum literal = 1.5;
+
+	memcpy(&rhs_instr->literal, &literal, sizeof(literal));
+	rhs_instr->literal_type = TYPE_FLOAT;
     } else {
 	const char *literal = str_dup("tagged element");
 	rhs_instr->literal = (Num) (intptr_t) literal;
@@ -4324,8 +4329,12 @@ main(void)
 
     /* Equality and membership consume dynamically tagged values natively. */
     {
-	JITProgram *tagged_eq = list_index_tagged_consumer_program(HIR_OP_EQ);
-	JITProgram *tagged_in = list_index_tagged_consumer_program(HIR_OP_IN);
+	JITProgram *tagged_eq = list_index_tagged_consumer_program(HIR_OP_EQ,
+							      TYPE_STR);
+	JITProgram *tagged_float_eq = list_index_tagged_consumer_program(HIR_OP_EQ,
+								    TYPE_FLOAT);
+	JITProgram *tagged_in = list_index_tagged_consumer_program(HIR_OP_IN,
+							      TYPE_LIST);
 	Var tagged_env[2];
 
 	tagged_env[0] = new_list(1);
@@ -4346,9 +4355,19 @@ main(void)
 	      == JIT_RUN_RETURNED && result.type == TYPE_INT
 	      && result.v.num == 1,
 	      "tagged membership returned the wrong value");
+	free_var(tagged_env[0].v.list[1]);
+	tagged_env[0].v.list[1].type = TYPE_FLOAT;
+	tagged_env[0].v.list[1].v.fnum = box_fl(1.5);
+	ticks = 10;
+	check(jit_program_execute(tagged_float_eq, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED && result.type == TYPE_INT
+	      && result.v.num == 1,
+	      "tagged equality with a static float returned the wrong value");
 	free_var(tagged_env[0]);
 	free_var(tagged_env[1]);
 	jit_program_free(tagged_eq);
+	jit_program_free(tagged_float_eq);
 	jit_program_free(tagged_in);
     }
 

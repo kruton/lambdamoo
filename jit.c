@@ -1120,6 +1120,29 @@ append_float_result_check(MIRBuild *build, JITInstruction *instr,
 	MIR_new_reg_op(build->context, exponent_mask)));
 }
 
+static MIR_reg_t
+append_raw_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
+		 int value, MIR_reg_t deopt_values, int *serial)
+{
+    MIR_reg_t raw;
+    char name[32];
+
+    if (!program->value_types || program->value_types[value] != TYPE_FLOAT)
+	return values[value];
+    sprintf(name, "raw_value%d", (*serial)++);
+    raw = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_DMOV,
+	MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+		       deopt_values, 0, 1),
+	MIR_new_reg_op(build->context, values[value])));
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, raw),
+	MIR_new_mem_op(build->context,
+		       sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		       value * sizeof(Num), deopt_values, 0, 1)));
+    return raw;
+}
+
 static void
 append_materialized_exit(MIRBuild *, JITProgram *, int, MIR_reg_t *,
 			 MIR_reg_t, MIR_reg_t, MIR_reg_t, MIR_label_t,
@@ -2752,7 +2775,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			&& (program->value_is_tagged[instr->src1]
 			    || program->value_is_tagged[instr->src2])) {
 			char name[32];
-			MIR_reg_t eq_res, type1, type2, case_reg;
+			MIR_reg_t eq_res, raw1, raw2, type1, type2, case_reg;
 
 			sprintf(name, "tag_eq%d", copy_serial++);
 			eq_res = new_reg(build, name);
@@ -2787,13 +2810,17 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_reg_op(build->context, case_reg),
 			    MIR_new_int_op(build->context, 0)));
+			raw1 = append_raw_value(build, program, values, instr->src1,
+						deopt_values, &copy_serial);
+			raw2 = append_raw_value(build, program, values, instr->src2,
+						deopt_values, &copy_serial);
 			append(build, MIR_new_call_insn(build->context, 8,
 			    MIR_new_ref_op(build->context, build->proto_equality),
 			    MIR_new_ref_op(build->context, build->import_equality),
 			    MIR_new_reg_op(build->context, eq_res),
-			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, raw1),
 			    MIR_new_reg_op(build->context, type1),
-			    MIR_new_reg_op(build->context, values[instr->src2]),
+			    MIR_new_reg_op(build->context, raw2),
 			    MIR_new_reg_op(build->context, type2),
 			    MIR_new_reg_op(build->context, case_reg)));
 			if (instr->op == HIR_OP_EQ)
