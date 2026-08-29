@@ -114,6 +114,17 @@ test_boundary_tick_refunds(void)
 }
 
 static void
+test_list_tail_ownership_slots(void)
+{
+    check_int("last-use list tail reuses ownership slot",
+	      hir_test_list_tail_owner_slot(3, 1, 7), 3);
+    check_int("shared list tail gets new ownership slot",
+	      hir_test_list_tail_owner_slot(3, 2, 7), 7);
+    check_int("unowned list tail gets new ownership slot",
+	      hir_test_list_tail_owner_slot(-1, 1, 7), 7);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -3717,6 +3728,7 @@ main(void)
     test_resume_stack_safety();
     test_resume_stack_shape();
     test_boundary_tick_refunds();
+    test_list_tail_ownership_slots();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_binary_type_pair_contracts();

@@ -23,6 +23,13 @@
 #include <string.h>
 
 static int
+jit_list_tail_owner_slot(int source_slot, unsigned int source_uses,
+			 int next_slot)
+{
+    return source_slot >= 0 && source_uses == 1 ? source_slot : next_slot;
+}
+
+static int
 infer_string_add_operand(HIROp op, int other_known, var_type other_type,
 			 var_type *inferred_type)
 {
@@ -4889,6 +4896,7 @@ jit_value_type_is_scalar(JITProgram *program, int value)
 static void
 jit_build_value_ownership(JITProgram *program)
 {
+    unsigned int *uses;
     JITBlock *block;
     int changed;
     int i;
@@ -4898,6 +4906,8 @@ jit_build_value_ownership(JITProgram *program)
 					 M_PROGRAM);
     program->value_owned_slots = mymalloc(sizeof(int) * program->num_values,
 					  M_PROGRAM);
+    uses = mymalloc(sizeof(unsigned int) * program->num_values, M_PROGRAM);
+    memset(uses, 0, sizeof(unsigned int) * program->num_values);
     memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
 	   program->num_values);
     for (i = 0; i < program->num_values; i++) {
@@ -4939,16 +4949,46 @@ jit_build_value_ownership(JITProgram *program)
 	JITInstruction *instr;
 
 	for (instr = block->first; instr; instr = instr->next) {
-	    if (instr->value > 0 && instr->value < program->num_values
-		&& instr->kind == HIR_TAC_BINARY
-		&& instr->op == HIR_OP_LIST_ADD_TAIL
-		&& program->value_owned_slots[instr->value] < 0)
-		program->value_owned_slots[instr->value] =
-		    program->num_owned_slots++;
+	    JITCopy *copy;
+
+	    if (instr->src1 > 0 && instr->src1 < program->num_values)
+		uses[instr->src1]++;
+	    if (instr->src2 > 0 && instr->src2 < program->num_values)
+		uses[instr->src2]++;
+	    if (instr->src3 > 0 && instr->src3 < program->num_values)
+		uses[instr->src3]++;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values)
+		    uses[copy->src]++;
 	    if (instr == block->last)
 		break;
 	}
     }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value > 0 && instr->value < program->num_values
+		&& instr->kind == HIR_TAC_BINARY
+		&& instr->op == HIR_OP_LIST_ADD_TAIL
+		&& program->value_owned_slots[instr->value] < 0) {
+		if (instr->src1 > 0 && instr->src1 < program->num_values
+		    && program->value_owned_slots[instr->src1] >= 0
+		    && uses[instr->src1] == 1) {
+		    program->value_owned_slots[instr->value] =
+			jit_list_tail_owner_slot(
+			    program->value_owned_slots[instr->src1],
+			    uses[instr->src1], program->num_owned_slots);
+		} else
+		    program->value_owned_slots[instr->value] =
+			jit_list_tail_owner_slot(-1, 0,
+			    program->num_owned_slots++);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    myfree(uses, M_PROGRAM);
     do {
 	changed = 0;
 	for (block = program->blocks; block; block = block->next) {
@@ -9546,6 +9586,13 @@ int
 hir_test_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 {
 	return jit_boundary_ticks_charged(kind, op);
+}
+
+int
+hir_test_list_tail_owner_slot(int source_slot, unsigned int source_uses,
+			      int next_slot)
+{
+    return jit_list_tail_owner_slot(source_slot, source_uses, next_slot);
 }
 
 int

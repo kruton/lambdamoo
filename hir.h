@@ -240,6 +240,7 @@ extern unsigned short hir_test_binary_operand_type_mask(HIROp, int, int,
 						 var_type);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
+extern int hir_test_list_tail_owner_slot(int, unsigned int, int);
 extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,
 					 var_type *);
 extern int hir_test_infer_builtin_result_type(const char *, var_type *);
