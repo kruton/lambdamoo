@@ -4950,6 +4950,56 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
     return 0;
 }
 
+static int
+jit_owned_value_is_fresh(JITProgram *program, JITInstruction *call, int value)
+{
+    JITBlock *block;
+
+    if (program->value_ownership[value] != JIT_OWNERSHIP_OWNED
+	&& program->value_ownership[value] != JIT_OWNERSHIP_STABLE_OWNED)
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	int found = 0;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr == call)
+		return found;
+	    if (found) {
+		JITCopy *copy;
+
+		if (instr->src1 == value || instr->src2 == value
+		    || instr->src3 == value || instr->kind == HIR_TAC_CALL
+		    || instr->kind == HIR_TAC_CALL_VERB
+		    || instr->kind == HIR_TAC_PUT_PROP
+		    || instr->kind == HIR_TAC_INDEX_SET
+		    || instr->kind == HIR_TAC_RANGE_SET)
+		    return 0;
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src == value || copy->dst == value)
+			return 0;
+	    }
+	    if (instr->value == value && jit_instr_defines_value(instr))
+		found = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static int
+jit_resume_value_can_capture(JITProgram *program, JITInstruction *call,
+			     int value)
+{
+    if (value <= 0 || value >= program->num_values
+	|| !program->value_ownership)
+	return 0;
+    return program->value_ownership[value] == JIT_OWNERSHIP_BORROWED_LOCAL
+	|| program->value_ownership[value] == JIT_OWNERSHIP_IMMORTAL
+	|| jit_owned_value_is_fresh(program, call, value);
+}
+
 static void
 jit_build_resume_liveness(JITProgram *program)
 {
@@ -5102,12 +5152,15 @@ jit_build_resume_liveness(JITProgram *program)
 			const char *func_name = instr->kind == HIR_TAC_CALL
 			    ? name_func_by_num(instr->func) : 0;
 
-			if (func_name && !strcmp(func_name, "suspend")) {
+			if ((func_name && !strcmp(func_name, "suspend"))
+			    || jit_resume_value_can_capture(program, instr, value)) {
 			    resume->values[live_count - 1].source =
 				JIT_RESUME_CAPTURED;
 			    resume->rehydratable = 0;
-			} else
+			} else {
 			    resume->valid = 0;
+			    resume->values[live_count - 1].index = -1;
+			}
 		    }
 		myfree(needed, M_PROGRAM);
 	    }

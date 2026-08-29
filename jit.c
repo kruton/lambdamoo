@@ -5903,6 +5903,23 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
 		     : -1);
 	    add_line(line, data);
+	    if (instr->deopt_map > 0
+		&& program->deopt_maps[instr->deopt_map].native_resume) {
+		JITNativeResume *resume =
+		    program->deopt_maps[instr->deopt_map].native_resume;
+		int j;
+
+		for (j = 0; j < resume->num_values; j++) {
+		    JITResumeValue *value = &resume->values[j];
+
+		    snprintf(line, sizeof(line),
+			     "    resume v%d source=%d index=%d type=%d tagged=%d",
+			     value->value, value->source, value->index,
+			     program->value_types[value->value],
+			     program->value_is_tagged[value->value]);
+		    add_line(line, data);
+		}
+	    }
 	    if (instr->kind == HIR_TAC_PARALLEL_COPY) {
 		JITCopy *copy;
 
