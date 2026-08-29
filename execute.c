@@ -972,8 +972,11 @@ do {								\
 		    RUN_ACTIV.resume_key = invalid_resume_key();
 	    }
 
+	/* Transient eval programs have no vloc and cannot release individual
+	 * modules from the shared MIR context. */
 	if ((at_entry || resume_map >= 0 || continuation_in)
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
+	    && RUN_ACTIV.vloc != NOTHING
 	    && RUN_ACTIV.prog->jit
 	    && jit_program_is_eligible(RUN_ACTIV.prog->jit)
 	    && (RUN_ACTIV.debug
