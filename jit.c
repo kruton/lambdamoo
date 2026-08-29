@@ -5433,10 +5433,13 @@ jit_continuation_value(JITContinuationFrame *frame, int value)
 }
 
 static JITContinuationFrame *
-jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
+jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
+			 void *runtime_storage, Var *borrowed_locals,
+			 Var *owned_values, size_t runtime_bytes,
+			 JITContinuationFrame *frame)
 {
-    JITContinuationFrame *frame;
     JITDeoptMap *map;
+    Var *new_values;
     int i;
 
     if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
@@ -5444,17 +5447,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
     map = &program->deopt_maps[map_id];
     if (!map->native_resume || !map->native_resume->valid)
 	return 0;
-    frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
-    memset(frame, 0, sizeof(JITContinuationFrame));
-    frame->program = program;
-    frame->map_id = map_id;
-    frame->num_values = map->native_resume->num_values;
-    frame->values = frame->num_values
-	? mymalloc(sizeof(Var) * frame->num_values, M_PROGRAM)
-	: 0;
-    for (i = 0; i < frame->num_values; i++)
-	frame->values[i].type = TYPE_NONE;
-    for (i = 0; i < frame->num_values; i++) {
+    for (i = 0; i < map->native_resume->num_values; i++) {
 	JITResumeValue *resume = &map->native_resume->values[i];
 	var_type type;
 
@@ -5465,19 +5458,22 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
-	if (!jit_runtime_type_is_valid(type)) {
-	    jit_continuation_free(frame);
+	if (!jit_runtime_type_is_valid(type))
 	    return 0;
-	}
     }
-    for (i = 0; i < frame->num_values; i++) {
+    new_values = map->native_resume->num_values
+	? mymalloc(sizeof(Var) * map->native_resume->num_values, M_PROGRAM)
+	: 0;
+    for (i = 0; i < map->native_resume->num_values; i++)
+	new_values[i].type = TYPE_NONE;
+    for (i = 0; i < map->native_resume->num_values; i++) {
 	JITResumeValue *resume = &map->native_resume->values[i];
 	var_type type;
 
 	if (resume->source == JIT_RESUME_RESULT)
 	    continue;
 	if (resume->source == JIT_RESUME_CONSTANT) {
-	    frame->values[i] = materialize_deopt_value(
+	    new_values[i] = materialize_deopt_value(
 		resume->literal_type, resume->literal);
 	    continue;
 	}
@@ -5485,9 +5481,31 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
-	frame->values[i] = materialize_deopt_value(type,
-		deopt_values[resume->value]);
+	new_values[i] = materialize_deopt_value(type,
+	    deopt_values[resume->value]);
     }
+    if (!frame) {
+	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
+	memset(frame, 0, sizeof(JITContinuationFrame));
+    } else {
+	for (i = 0; i < frame->num_values; i++)
+	    free_var(frame->values[i]);
+	if (frame->values)
+	    myfree(frame->values, M_PROGRAM);
+	if (frame->has_result)
+	    free_var(frame->result);
+	frame->has_result = 0;
+	frame->dispatched = 0;
+    }
+    frame->program = program;
+    frame->map_id = map_id;
+    frame->num_values = map->native_resume->num_values;
+    frame->values = new_values;
+    frame->runtime_storage = runtime_storage;
+    frame->deopt_values = deopt_values;
+    frame->borrowed_locals = borrowed_locals;
+    frame->owned_values = owned_values;
+    frame->runtime_bytes = runtime_bytes;
     if (program->usage)
 	program->usage->continuation_captures++;
     return frame;
@@ -5497,6 +5515,8 @@ void
 jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
 {
     if (!frame || !owner)
+	return;
+    if (frame->owner == owner && owner->jit_continuation == frame)
 	return;
     frame->owner = owner;
     owner->jit_continuation = frame;
@@ -5568,6 +5588,14 @@ jit_continuation_free(JITContinuationFrame *frame)
 	myfree(frame->values, M_PROGRAM);
     if (frame->has_result)
 	free_var(frame->result);
+    if (frame->runtime_storage) {
+	for (i = 0; i < frame->program->num_borrowed_locals; i++)
+	    free_var(frame->borrowed_locals[i]);
+	for (i = 0; i < frame->program->num_owned_slots; i++)
+	    free_var(frame->owned_values[i]);
+	frame->program->active_runtime_bytes -= frame->runtime_bytes;
+	myfree(frame->runtime_storage, M_PROGRAM);
+    }
     myfree(frame, M_PROGRAM);
 }
 
@@ -5746,6 +5774,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     size_t deopt_storage_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
+    int runtime_from_continuation = continuation_in != 0;
+    int runtime_transferred = 0;
 
     (void) continuation_in;
     if (continuation_out)
@@ -5797,31 +5827,39 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     runtime_bytes = deopt_storage_bytes
 	+ sizeof(Var) * (program->num_borrowed_locals
 			 + program->num_owned_slots);
-    runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
-			       M_PROGRAM);
-    deopt_values = runtime_storage;
-    /* Float lowering uses raw slot zero as its native 0.0 constant. */
-    deopt_values[0] = 0;
-    {
-	int i;
-	int tag_slots = program->value_tag_slots
-	    ? program->num_tag_slots : program->num_values;
+    if (runtime_from_continuation) {
+	runtime_storage = continuation_in->runtime_storage;
+	deopt_values = continuation_in->deopt_values;
+	borrowed_locals = continuation_in->borrowed_locals;
+	owned_values = continuation_in->owned_values;
+    } else {
+	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
+				   M_PROGRAM);
+	deopt_values = runtime_storage;
+	/* Float lowering uses raw slot zero as its native 0.0 constant. */
+	deopt_values[0] = 0;
+	{
+	    int i;
+	    int tag_slots = program->value_tag_slots
+		? program->num_tag_slots : program->num_values;
 
-	for (i = 0; i < tag_slots; i++)
-	    deopt_values[program->num_values + i] = TYPE_ANY;
-	if (program->num_borrowed_locals) {
-	    borrowed_locals = (Var *) ((char *) runtime_storage
-		+ deopt_storage_bytes);
-	    for (i = 0; i < program->num_borrowed_locals; i++)
-		borrowed_locals[i] = var_ref(env[program->borrowed_local_slots[i]]);
+	    for (i = 0; i < tag_slots; i++)
+		deopt_values[program->num_values + i] = TYPE_ANY;
+	    if (program->num_borrowed_locals) {
+		borrowed_locals = (Var *) ((char *) runtime_storage
+		    + deopt_storage_bytes);
+		for (i = 0; i < program->num_borrowed_locals; i++)
+		    borrowed_locals[i] = var_ref(
+			env[program->borrowed_local_slots[i]]);
+	    }
+	    owned_values = program->num_owned_slots
+		? (Var *) ((char *) runtime_storage + deopt_storage_bytes
+		    + sizeof(Var) * program->num_borrowed_locals) : 0;
+	    for (i = 0; i < program->num_owned_slots; i++)
+		owned_values[i].type = TYPE_NONE;
 	}
-	owned_values = program->num_owned_slots
-	    ? (Var *) ((char *) runtime_storage + deopt_storage_bytes
-		+ sizeof(Var) * program->num_borrowed_locals) : 0;
-	for (i = 0; i < program->num_owned_slots; i++)
-	    owned_values[i].type = TYPE_NONE;
+	program->active_runtime_bytes += runtime_bytes;
     }
-    program->active_runtime_bytes += runtime_bytes;
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
@@ -5840,14 +5878,16 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
-	    int i;
+	    if (!runtime_from_continuation) {
+		int i;
 
-	    for (i = 0; i < program->num_borrowed_locals; i++)
-		free_var(borrowed_locals[i]);
-	    for (i = 0; i < program->num_owned_slots; i++)
-		free_var(owned_values[i]);
-	    program->active_runtime_bytes -= runtime_bytes;
-	    myfree(runtime_storage, M_PROGRAM);
+		for (i = 0; i < program->num_borrowed_locals; i++)
+		    free_var(borrowed_locals[i]);
+		for (i = 0; i < program->num_owned_slots; i++)
+		    free_var(owned_values[i]);
+		program->active_runtime_bytes -= runtime_bytes;
+		myfree(runtime_storage, M_PROGRAM);
+	    }
 	    return JIT_RUN_FALLBACK;
 	}
 	map = &program->deopt_maps[deopt_map];
@@ -5856,19 +5896,20 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	if (native_result == JIT_RUN_CALL_VERB && continuation_out
 	    && (map->reason == JIT_DEOPT_VERB_CALL
 		|| jit_deopt_map_bridges_builtin(map))) {
-	    JITContinuationFrame *frame =
-		jit_continuation_capture(program, deopt_map, deopt_values);
+	    int operands = jit_call_stack_operands(map);
+	    JITContinuationFrame *frame = 0;
+
+	    if (operands >= 0 && (unsigned) operands <= map->stack_depth)
+		frame = jit_continuation_capture(program, deopt_map,
+		    deopt_values, runtime_storage, borrowed_locals,
+		    owned_values, runtime_bytes, continuation_in);
 
 	    if (frame) {
-		int operands = jit_call_stack_operands(map);
-
-		if (operands >= 0 && (unsigned) operands <= map->stack_depth) {
-		    *continuation_out = frame;
-		    compact_boundary = 1;
-		    stack_start = map->stack_depth - operands;
-		    materialized_depth = operands;
-		} else
-		    jit_continuation_free(frame);
+		*continuation_out = frame;
+		runtime_transferred = 1;
+		compact_boundary = 1;
+		stack_start = map->stack_depth - operands;
+		materialized_depth = operands;
 	    }
 	}
 	for (i = 0; !compact_boundary && i < map->num_locals; i++) {
@@ -5954,16 +5995,16 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	if (result)
 	    *result = var_ref(*result);
     }
-    {
+    if (!runtime_from_continuation && !runtime_transferred) {
 	int i;
 
 	for (i = 0; i < program->num_borrowed_locals; i++)
 	    free_var(borrowed_locals[i]);
 	for (i = 0; i < program->num_owned_slots; i++)
 	    free_var(owned_values[i]);
+	program->active_runtime_bytes -= runtime_bytes;
+	myfree(runtime_storage, M_PROGRAM);
     }
-    program->active_runtime_bytes -= runtime_bytes;
-    myfree(runtime_storage, M_PROGRAM);
     return native_result;
 }
 

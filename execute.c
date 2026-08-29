@@ -1132,7 +1132,7 @@ do {								\
 					     RUN_ACTIV.progr, resume_map,
 					     continuation_in,
 					     &continuation);
-	    if (continuation_in)
+	    if (continuation_in && continuation_in != continuation)
 		jit_continuation_free(continuation_in);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		jit_profile_record_completed(RUN_ACTIV.prog->jit);
