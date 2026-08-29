@@ -56,6 +56,42 @@ test_resume_stack_safety(void)
 }
 
 static void
+test_resume_stack_shape(void)
+{
+    ResumeStackSlot point_slots[2];
+    ResumeStackSlot boundary_slots[3];
+    ResumePoint point;
+
+    memset(&point, 0, sizeof(point));
+    memset(point_slots, 0, sizeof(point_slots));
+    memset(boundary_slots, 0, sizeof(boundary_slots));
+    point.stack_depth = 2;
+    point.stack_slots = point_slots;
+    point_slots[0].kind = RSS_FINALLY;
+    point_slots[0].data = 41;
+    point_slots[1].kind = RSS_VALUE;
+    boundary_slots[0] = point_slots[0];
+    boundary_slots[1] = point_slots[1];
+    boundary_slots[2].kind = RSS_VALUE;
+
+    check_int("canonical resume stack accepted",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 1);
+    check_int("wrong resume stack depth rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 2,
+					  &point, 1), 0);
+    boundary_slots[0].kind = RSS_VALUE;
+    check_int("wrong resume stack marker rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 0);
+    boundary_slots[0].kind = RSS_FINALLY;
+    boundary_slots[0].data++;
+    check_int("wrong resume stack marker data rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 0);
+}
+
+static void
 test_boundary_tick_refunds(void)
 {
 	check_int("arithmetic boundary refunds tick",
@@ -3460,6 +3496,7 @@ int
 main(void)
 {
     test_resume_stack_safety();
+    test_resume_stack_shape();
     test_boundary_tick_refunds();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();

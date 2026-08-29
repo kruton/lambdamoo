@@ -190,6 +190,8 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 
 #ifdef HIR_TESTING
 extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
+extern int hir_test_resume_stack_matches_point(ResumeStackSlot *, unsigned,
+					       const ResumePoint *, int);
 extern int hir_test_boundary_ticks_charged(HIRTacKind, HIROp);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);

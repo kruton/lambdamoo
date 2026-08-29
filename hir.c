@@ -3478,6 +3478,25 @@ resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 }
 
 static int
+resume_stack_matches_point(ResumeStackSlot *stack_slots, unsigned stack_depth,
+			   const ResumePoint *point, int call_operands)
+{
+    int i;
+
+    if (!point || call_operands < 0
+	|| stack_depth < (unsigned) call_operands
+	|| point->stack_depth != stack_depth - call_operands
+	|| (point->stack_depth && (!stack_slots || !point->stack_slots)))
+	return 0;
+    for (i = 0; i < (int) point->stack_depth; i++)
+	if (stack_slots[i].kind != point->stack_slots[i].kind
+	    || (stack_slots[i].kind != RSS_VALUE
+		&& stack_slots[i].data != point->stack_slots[i].data))
+	    return 0;
+    return 1;
+}
+
+static int
 jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 {
 	return kind == HIR_TAC_UNARY || kind == HIR_TAC_BINARY
@@ -4128,24 +4147,13 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			}
 			operands = instr->kind == HIR_TAC_CALL_VERB ? 3
 			    : instr->kind == HIR_TAC_CALL ? 1 : -1;
-			if (operands < 0 || map->stack_depth < (unsigned) operands
-			    || point->stack_depth != map->stack_depth - operands) {
+			if (!resume_stack_matches_point(map->stack_slots,
+						map->stack_depth, point, operands)) {
 				record_unsupported_fmt(ctx,
 				    "deopt-map: map %d call stack does not match resume point",
 				    instr->deopt_map);
 				goto invalid;
 			}
-			for (i = 0; i < (int) point->stack_depth; i++)
-				if (map->stack_slots[i].kind
-					!= point->stack_slots[i].kind
-				    || (map->stack_slots[i].kind != RSS_VALUE
-					&& map->stack_slots[i].data
-					   != point->stack_slots[i].data)) {
-					record_unsupported_fmt(ctx,
-					    "deopt-map: map %d stack slot %d does not match resume point",
-					    instr->deopt_map, i);
-					goto invalid;
-				}
 next_instruction:
 			if (instr == block->last)
 				break;
@@ -8710,6 +8718,15 @@ hir_test_resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 			      int call_operands)
 {
     return resume_stack_is_safe(stack_types, stack_depth, call_operands);
+}
+
+int
+hir_test_resume_stack_matches_point(ResumeStackSlot *stack_slots,
+				    unsigned stack_depth,
+				    const ResumePoint *point, int call_operands)
+{
+    return resume_stack_matches_point(stack_slots, stack_depth, point,
+				      call_operands);
 }
 
 int
