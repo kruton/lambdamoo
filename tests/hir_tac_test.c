@@ -2999,8 +2999,8 @@ test_try_finally_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("try finally deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
-    check_int("try finally cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
-    check_int("try finally ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
+    check_int("try finally cfg blocks", hir_cfg_block_count(cfg), 1);
+    check_int("try finally ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try finally verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);

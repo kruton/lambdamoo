@@ -484,11 +484,20 @@ struct HIRValueAnalysis {
 };
 
 typedef struct HIRLoopContext HIRLoopContext;
+typedef struct HIRFinallyContext HIRFinallyContext;
+
+struct HIRFinallyContext {
+    HIRStmt *handler;
+    int base_depth;
+    HIRFinallyContext *parent;
+};
+
 struct HIRLoopContext {
     int loop_id;
     int cont_label;
     int done_label;
     int saved_depth;
+    HIRFinallyContext *finally_context;
     HIRLoopContext *parent;
 };
 
@@ -505,6 +514,7 @@ struct HIRContext {
     int lower_stack_capacity;
     int *lower_stack;
     HIRLoopContext *current_loop;
+    HIRFinallyContext *current_finally;
     int current_length_base;
 };
 
@@ -542,6 +552,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack_capacity = 0;
     ctx->lower_stack = 0;
     ctx->current_loop = 0;
+    ctx->current_finally = 0;
     ctx->current_length_base = 0;
 
     return ctx;
@@ -7910,6 +7921,7 @@ lower_while(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     loop.cont_label = top_label;
     loop.done_label = done_label;
     loop.saved_depth = ctx->lower_stack_depth;
+    loop.finally_context = ctx->current_finally;
     loop.parent = ctx->current_loop;
     ctx->current_loop = &loop;
 
@@ -7948,6 +7960,7 @@ lower_for_range(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     loop.cont_label = cont_label;
     loop.done_label = done_label;
     loop.saved_depth = base_depth;
+    loop.finally_context = ctx->current_finally;
     loop.parent = ctx->current_loop;
     ctx->current_loop = &loop;
 
@@ -8053,6 +8066,7 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     loop.cont_label = top_label;
     loop.done_label = done_label;
     loop.saved_depth = base_depth;
+    loop.finally_context = ctx->current_finally;
     loop.parent = ctx->current_loop;
     ctx->current_loop = &loop;
 
@@ -8136,6 +8150,21 @@ lower_for_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 static void
+lower_finally_handlers(HIRContext *ctx, HIRTacProgram *program,
+		       HIRFinallyContext *stop)
+{
+    HIRFinallyContext *saved = ctx->current_finally;
+    HIRFinallyContext *current;
+
+    for (current = saved; current && current != stop; current = current->parent) {
+	ctx->current_finally = current->parent;
+	ctx->lower_stack_depth = current->base_depth;
+	lower_stmt_list(ctx, program, current->handler);
+    }
+    ctx->current_finally = saved;
+}
+
+static void
 lower_break(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     HIRLoopContext *loop = ctx->current_loop;
@@ -8151,6 +8180,7 @@ lower_break(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	return;
     }
 
+    lower_finally_handlers(ctx, program, loop->finally_context);
     ctx->lower_stack_depth = loop->saved_depth;
     append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
     instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
@@ -8175,6 +8205,7 @@ lower_continue(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	return;
     }
 
+    lower_finally_handlers(ctx, program, loop->finally_context);
     ctx->lower_stack_depth = loop->saved_depth;
     append_charge_tick(ctx, program, stmt->source_lineno, stmt->bytecode_pc);
     instr = new_tac(ctx, HIR_TAC_JUMP, stmt->source_lineno);
@@ -8187,10 +8218,9 @@ static void
 lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     int base_depth = ctx->lower_stack_depth;
-    int handler_label = new_label(ctx);
-    int done_label = new_label(ctx);
     int finally_val = new_temp(ctx);
     HIRTacInstr *finally_marker;
+    HIRFinallyContext finally_context;
 
     finally_marker = new_tac(ctx, HIR_TAC_CONST, stmt->source_lineno);
     finally_marker->dst = finally_val;
@@ -8201,15 +8231,15 @@ lower_try_finally(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_tac(program, finally_marker);
     push_lower_stack(ctx, finally_val);
 
+    finally_context.handler = stmt->u.try_finally.handler;
+    finally_context.base_depth = base_depth;
+    finally_context.parent = ctx->current_finally;
+    ctx->current_finally = &finally_context;
     lower_stmt_list(ctx, program, stmt->u.try_finally.body);
+    ctx->current_finally = finally_context.parent;
 
     ctx->lower_stack_depth = base_depth;
-    append_jump(ctx, program, done_label, stmt->source_lineno);
-
-    append_label(ctx, program, handler_label, stmt->source_lineno);
     lower_stmt_list(ctx, program, stmt->u.try_finally.handler);
-
-    append_label(ctx, program, done_label, stmt->source_lineno);
 }
 
 static void
@@ -8282,7 +8312,7 @@ static void
 lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     HIRTacInstr *instr;
-    int result;
+    int result = 0;
 
     switch (stmt->kind) {
     case HIR_STMT_SEQUENCE:
@@ -8297,13 +8327,19 @@ lower_stmt(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 	    ctx->lower_stack_depth--;
 	break;
     case HIR_STMT_RETURN:
+	if (stmt->u.expr) {
+	    result = lower_expr(ctx, program, stmt->u.expr);
+	    lower_finally_handlers(ctx, program, 0);
+	    ctx->lower_stack_depth = 0;
+	    push_lower_stack(ctx, result);
+	}
+	else
+	    lower_finally_handlers(ctx, program, 0);
 	instr = new_tac(ctx, stmt->u.expr ? HIR_TAC_RETURN : HIR_TAC_RETURN0,
 			stmt->source_lineno);
 	instr->bytecode_pc = stmt->bytecode_pc;
-	if (stmt->u.expr) {
-	    result = lower_expr(ctx, program, stmt->u.expr);
+	if (stmt->u.expr)
 	    instr->src1 = result;
-	}
 	snapshot_lower_stack(ctx, instr);
 	append_tac(program, instr);
 	ctx->lower_stack_depth = 0;
