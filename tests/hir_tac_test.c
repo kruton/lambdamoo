@@ -102,6 +102,9 @@ test_boundary_tick_refunds(void)
 	check_int("range boundary refunds tick",
 		  hir_test_boundary_ticks_charged(HIR_TAC_RANGE_SET,
 					  HIR_OP_INDEX), 1);
+	check_int("native index-store boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_INDEX_SET,
+					  HIR_OP_INDEX), 1);
 	check_int("scatter boundary refunds tick",
 		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
 					  HIR_OP_SCATTER), 1);

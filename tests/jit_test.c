@@ -5408,6 +5408,40 @@ main(void)
 	lapp_var.v.list = lapp;
 	free_var(lapp_var);
 
+	/* Indexed local updates preserve shared lists and acquire the RHS. */
+	{
+	    Var env[1];
+	    Var shared;
+	    Var *updated;
+	    const char *replacement = str_dup("replacement");
+
+	    env[0] = new_list(2);
+	    env[0].v.list[1].type = TYPE_INT;
+	    env[0].v.list[1].v.num = 10;
+	    env[0].v.list[2].type = TYPE_INT;
+	    env[0].v.list[2].v.num = 20;
+	    shared = var_ref(env[0]);
+	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 2,
+		(int64_t) (intptr_t) replacement, TYPE_STR, &rt_err);
+	    check(rt_err == E_NONE && updated == env[0].v.list,
+		  "jit_rt_list_index_set updates local");
+	    check(env[0].v.list != shared.v.list
+		  && shared.v.list[2].type == TYPE_INT
+		  && shared.v.list[2].v.num == 20,
+		  "jit_rt_list_index_set preserves shared list");
+	    check(env[0].v.list[2].type == TYPE_STR
+		  && !strcmp(env[0].v.list[2].v.str, "replacement"),
+		  "jit_rt_list_index_set stores complex value");
+	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 0,
+		42, TYPE_INT, &rt_err);
+	    check(!updated && rt_err == E_RANGE
+		  && env[0].v.list[2].type == TYPE_STR,
+		  "jit_rt_list_index_set rejects range without mutation");
+	    free_str(replacement);
+	    free_var(shared);
+	    free_var(env[0]);
+	}
+
 	/* 6. list_in test */
 	check(jit_rt_list_in(111, TYPE_INT, l1.v.list) == 1, "jit_rt_list_in found");
 	check(jit_rt_list_in(999, TYPE_INT, l1.v.list) == 0, "jit_rt_list_in not found");

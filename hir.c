@@ -2983,6 +2983,7 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		case HIR_TAC_CALL:
 		case HIR_TAC_CALL_VERB:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_INDEX_SET:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
 		case HIR_TAC_UNSUPPORTED:
@@ -3786,7 +3787,7 @@ jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 	return kind == HIR_TAC_UNARY || kind == HIR_TAC_BINARY
 	    || kind == HIR_TAC_BRANCH_FALSE || kind == HIR_TAC_CALL_VERB
 	    || kind == HIR_TAC_PUT_PROP || kind == HIR_TAC_RANGE_REF
-	    || kind == HIR_TAC_RANGE_SET
+	    || kind == HIR_TAC_RANGE_SET || kind == HIR_TAC_INDEX_SET
 	    || (kind == HIR_TAC_DEOPT && op == HIR_OP_SCATTER);
 }
 
@@ -4199,9 +4200,10 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		break;
 	    case HIR_TAC_INDEX_SET:
 		if (instr->bytecode_pc == NO_BYTECODE_PC
-		    || instr->bytecode_pc >= bc->size
-		    || bc->vector[instr->bytecode_pc] != OP_INDEXSET) {
-		    record_unsupported_fmt(ctx, "anchor: pc %u index_set expected OP_INDEXSET (got opcode %u)",
+		    || instr->bytecode_pc + 1 >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
+		    || bc->vector[instr->bytecode_pc + 1] != OP_INDEXSET) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u index_set expected OP_PUT_TEMP/OP_INDEXSET (got opcode %u)",
 					   instr->bytecode_pc,
 					   instr->bytecode_pc < bc->size
 					   ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
@@ -4551,7 +4553,8 @@ jit_instr_defines_value(JITInstruction *instr)
 	|| instr->kind == HIR_TAC_LOAD_ERROR
 	|| instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB
-	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_RANGE_REF
+	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_INDEX_SET
+	|| instr->kind == HIR_TAC_RANGE_REF
 	|| instr->kind == HIR_TAC_RANGE_SET || instr->kind == HIR_TAC_UNSUPPORTED;
 }
 
@@ -4860,25 +4863,6 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
     return 0;
 }
 
-static int
-jit_value_is_entry_load(JITProgram *program, int value)
-{
-    JITBlock *block;
-
-    for (block = program->blocks; block; block = block->next) {
-	JITInstruction *instr;
-
-	for (instr = block->first; instr; instr = instr->next) {
-	    if (instr->value == value)
-		return instr->kind == HIR_TAC_LOAD_LOCAL
-		    && instr->bytecode_pc == NO_BYTECODE_PC;
-	    if (instr == block->last)
-		break;
-	}
-    }
-    return 0;
-}
-
 static void
 jit_build_resume_liveness(JITProgram *program)
 {
@@ -5031,10 +5015,7 @@ jit_build_resume_liveness(JITProgram *program)
 			const char *func_name = instr->kind == HIR_TAC_CALL
 			    ? name_func_by_num(instr->func) : 0;
 
-			if (func_name && !strcmp(func_name, "suspend")
-			    && (!(program->value_is_tagged
-				  && program->value_is_tagged[value])
-				|| jit_value_is_entry_load(program, value))) {
+			if (func_name && !strcmp(func_name, "suspend")) {
 			    resume->values[live_count - 1].source =
 				JIT_RESUME_CAPTURED;
 			    resume->rehydratable = 0;
@@ -5186,6 +5167,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
 		    }
+		} else if (si->kind == HIR_TAC_INDEX_SET) {
+		    value_types[si->value] = TYPE_LIST;
+		    value_types_known[si->value] = 1;
 		}
 	    }
 	    if (si == ssa_block->last)
@@ -5372,6 +5356,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[from] = 1;
 		    types_changed = 1;
 		}
+	    }
+	    if (si->kind == HIR_TAC_INDEX_SET
+		&& si->src2 > 0 && si->src2 < program->num_values
+		&& !value_types_known[si->src2]) {
+		value_types[si->src2] = TYPE_INT;
+		value_types_known[si->src2] = 1;
+		types_changed = 1;
 	    }
 	    if (si->kind == HIR_TAC_PUT_PROP) {
 		int rhs = si->num_stack_values >= 1

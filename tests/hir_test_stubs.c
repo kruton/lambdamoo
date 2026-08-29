@@ -204,6 +204,21 @@ complex_var_ref(Var value)
     return value;
 }
 
+Var
+complex_var_dup(Var value)
+{
+    if (value.type == TYPE_LIST) {
+	Var copy = new_list(value.v.list[0].v.num);
+	int i;
+
+	for (i = 1; i <= value.v.list[0].v.num; i++)
+	    copy.v.list[i] = var_ref(value.v.list[i]);
+	value = copy;
+    } else
+	value = var_ref(value);
+    return value;
+}
+
 int
 var_refcount(Var v)
 {
@@ -419,6 +434,14 @@ listappend(Var list, Var value)
     result.v.list[len + 1] = value;
     free_var(list);
     return result;
+}
+
+Var
+listset(Var list, Var value, int pos)
+{
+    free_var(list.v.list[pos]);
+    list.v.list[pos] = value;
+    return list;
 }
 
 Var
