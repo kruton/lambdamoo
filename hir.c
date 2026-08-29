@@ -4667,10 +4667,8 @@ jit_build_resume_liveness(JITProgram *program)
 					      &map->resume_values[live_count++]))
 			map->native_resume_valid = 0;
 	    }
-	    memset(uses = mymalloc(program->num_values, M_PROGRAM), 0,
-		   program->num_values);
-	    memset(defs = mymalloc(program->num_values, M_PROGRAM), 0,
-		   program->num_values);
+	    memset(uses, 0, program->num_values);
+	    memset(defs, 0, program->num_values);
 	    jit_instr_liveness(program, instr, uses, defs);
 	    for (value = 1; value < program->num_values; value++)
 		live[value] = uses[value] || (live[value] && !defs[value]);
