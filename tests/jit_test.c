@@ -4341,18 +4341,48 @@ main(void)
 	{
 	    JITDeoptState protected_deopt;
 	    Var protected_stack[1];
+	    JITContinuationFrame *continuation = 0;
+	    JITDeoptMap *map = &str_length->deopt_maps[1];
+	    Var returned;
+
+	    map->resume_key.code_unit = 0;
+	    map->resume_key.site = 1;
+	    map->native_resume = allocate(sizeof(JITNativeResume));
+	    map->native_resume->valid = 1;
+	    map->native_resume->rehydratable = 1;
+	    map->native_resume->num_values = 1;
+	    map->native_resume->values = allocate(sizeof(JITResumeValue));
+	    map->native_resume->values[0].value = 2;
+	    map->native_resume->values[0].source = JIT_RESUME_RESULT;
 
 	    ticks = 10;
-	    check(jit_program_execute(str_length, 0, &result, &ticks,
-				      &timed_out, &error, 0, &protected_deopt,
-				      protected_stack)
+	    check((jit_program_execute)(str_length, 0, &result, &ticks,
+				       &timed_out, &error, 0, &protected_deopt,
+				       protected_stack, 2, -1, 0,
+				       &continuation)
 		  == JIT_RUN_CALL_VERB, "protected length did not enter VM");
+	    check(protected_deopt.reason == JIT_DEOPT_ARITHMETIC_TYPE
+		  && protected_deopt.boundary == JIT_BOUNDARY_BUILTIN,
+		  "protected length lost its boundary classification");
+	    check(continuation != 0,
+		  "protected length did not capture a native continuation");
 	    check(protected_deopt.stack_depth == 1
 		  && protected_stack[0].type == TYPE_LIST
 		  && protected_stack[0].v.list[0].v.num == 1
 		  && protected_stack[0].v.list[1].type == TYPE_STR,
 		  "protected length did not materialize its arguments");
 	    free_var(protected_stack[0]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 5;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(str_length, 0, &result, &ticks,
+				       &timed_out, &error, 0, &protected_deopt,
+				       protected_stack, 2, -1,
+				       continuation, 0) == JIT_RUN_RETURNED,
+		  "protected length continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 5,
+		  "protected length continuation returned the wrong value");
+	    jit_continuation_free(continuation);
 	}
 	hir_test_set_length_protected(0);
 	ticks = 10;

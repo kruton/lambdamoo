@@ -43,6 +43,12 @@ typedef enum {
     JIT_DEOPT_NUM_REASONS
 } JITDeoptReason;
 
+typedef enum {
+    JIT_BOUNDARY_NONE,
+    JIT_BOUNDARY_BUILTIN,
+    JIT_BOUNDARY_VERB
+} JITBoundaryKind;
+
 typedef uint16_t JITTypeMask;
 
 #define JIT_MAX_GUARD_OPERANDS 2
@@ -63,6 +69,7 @@ typedef struct {
     JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     var_type guard_actual[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
+    JITBoundaryKind boundary;
 } JITDeoptState;
 
 typedef struct {

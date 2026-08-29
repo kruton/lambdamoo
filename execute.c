@@ -1170,7 +1170,7 @@ do {								\
 	    } else if (jit_result == JIT_RUN_FALLBACK
 		       || jit_result == JIT_RUN_CALL_VERB) {
 		if (jit_result == JIT_RUN_CALL_VERB && continuation
-		    && deopt.reason == JIT_DEOPT_BUILTIN_CALL) {
+		    && deopt.boundary == JIT_BOUNDARY_BUILTIN) {
 		    activation *caller = &RUN_ACTIV;
 		    Var args = RUN_ACTIV.base_rt_stack[0];
 		    package p;
@@ -1235,7 +1235,7 @@ do {								\
 		    }
 		}
 		if (jit_result == JIT_RUN_CALL_VERB && continuation
-		    && deopt.reason == JIT_DEOPT_VERB_CALL) {
+		    && deopt.boundary == JIT_BOUNDARY_VERB) {
 		    activation *caller = &RUN_ACTIV;
 		    enum error err = E_NONE;
 		    Var obj = RUN_ACTIV.base_rt_stack[0];

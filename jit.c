@@ -5665,7 +5665,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	materialized_depth = map->stack_depth;
 	if (native_result == JIT_RUN_CALL_VERB && continuation_out
 	    && (map->reason == JIT_DEOPT_VERB_CALL
-		|| map->reason == JIT_DEOPT_BUILTIN_CALL)) {
+		|| jit_deopt_map_bridges_builtin(map))) {
 	    JITContinuationFrame *frame =
 		jit_continuation_capture(program, deopt_map, deopt_values);
 
@@ -5719,9 +5719,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    new_stack[i - stack_start] = materialize_deopt_value(type,
 		deopt_values[map->stack_values[i]]);
 	}
-	if (new_stack && !compact_boundary
-	    && jit_deopt_map_is_specialized_builtin(map)) {
-	    int outer_depth = map->stack_depth - map->builtin_args;
+	if (new_stack && jit_deopt_map_is_specialized_builtin(map)) {
+	    int outer_depth = compact_boundary ? 0
+		: map->stack_depth - map->builtin_args;
 	    Var args = new_list(map->builtin_args);
 
 	    for (i = 0; i < map->builtin_args; i++)
@@ -5752,6 +5752,12 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		deopt->guard_actual[i] = jit_guard_actual_type(program, map,
 						      env, deopt_values, i);
 	    deopt->reason = map->reason;
+	    if (native_result == JIT_RUN_CALL_VERB) {
+		if (map->reason == JIT_DEOPT_VERB_CALL)
+		    deopt->boundary = JIT_BOUNDARY_VERB;
+		else if (jit_deopt_map_bridges_builtin(map))
+		    deopt->boundary = JIT_BOUNDARY_BUILTIN;
+	    }
 	}
     }
     if (native_result == JIT_RUN_RETURNED) {
