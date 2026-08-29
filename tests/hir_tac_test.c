@@ -3270,6 +3270,59 @@ test_string_add_operand_inference(void)
 						&inferred), 0);
 }
 
+static unsigned short
+type_mask(var_type type)
+{
+    return (unsigned short) 1U << ((unsigned) type & TYPE_DB_MASK);
+}
+
+static void
+test_binary_type_pair_contracts(void)
+{
+    unsigned short numeric = type_mask(TYPE_INT) | type_mask(TYPE_FLOAT);
+
+    check_int("integer addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_INT,
+						 TYPE_INT), 1);
+    check_int("float addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("string addition pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_STR,
+						 TYPE_STR), 1);
+    check_int("mixed string addition pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_STR,
+						 TYPE_INT), 0);
+    check_int("mixed numeric addition pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_INT,
+						 TYPE_FLOAT), 0);
+    check_int("unknown addition left mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 0, TYPE_NONE),
+	      numeric | type_mask(TYPE_STR));
+    check_int("string peer narrows addition left mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 1, TYPE_STR),
+	      type_mask(TYPE_STR));
+    check_int("float peer narrows addition right mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 1, 1, TYPE_FLOAT),
+	      type_mask(TYPE_FLOAT));
+
+    check_int("float modulus pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_MOD, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("float-to-integer exponent pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_FLOAT,
+						 TYPE_INT), 1);
+    check_int("float exponent pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("integer-to-float exponent pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_INT,
+						 TYPE_FLOAT), 0);
+    check_int("integer base narrows exponent mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_EXP, 1, 1, TYPE_INT),
+	      type_mask(TYPE_INT));
+}
+
 static void
 test_list_operand_inference(void)
 {
@@ -3525,6 +3578,7 @@ main(void)
     test_boundary_tick_refunds();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
+    test_binary_type_pair_contracts();
     test_list_operand_inference();
     test_unknown_type_inference();
     test_builtin_result_type_inference();

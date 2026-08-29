@@ -4686,6 +4686,53 @@ main(void)
 	jit_program_free(tagged_exp);
     }
 
+    /* Overloaded addition dispatches only semantically valid type pairs. */
+    {
+	JITProgram *tagged_add = tagged_binary_program(HIR_OP_ADD);
+	Var tagged_env[2];
+
+	tagged_env[0].type = tagged_env[1].type = TYPE_INT;
+	tagged_env[0].v.num = 20;
+	tagged_env[1].v.num = 22;
+	ticks = 10;
+	check(jit_program_execute(tagged_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged integer addition executed natively");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "tagged integer addition returned the wrong value");
+
+	tagged_env[0].type = tagged_env[1].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("hello ");
+	tagged_env[1].v.str = str_dup("world");
+	ticks = 10;
+	check(jit_program_execute(tagged_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED, "tagged string addition executed natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "hello world"),
+	      "tagged string addition returned the wrong value");
+	free_var(result);
+	free_var(tagged_env[1]);
+
+	tagged_env[1].type = TYPE_INT;
+	tagged_env[1].v.num = 1;
+	ticks = 10;
+	check(jit_program_execute(tagged_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "mixed tagged addition did not deoptimize");
+	free_var(tagged_env[0]);
+
+	tagged_env[0].type = tagged_env[1].type = TYPE_FLOAT;
+	tagged_env[0].v.fnum = box_fl(1.5);
+	tagged_env[1].v.fnum = box_fl(2.5);
+	ticks = 10;
+	check(jit_program_execute(tagged_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_FALLBACK,
+	      "tagged float addition bypassed its unimplemented dispatch");
+	jit_program_free(tagged_add);
+    }
+
     /* Tagged strings retain their type through concatenation and index(). */
     {
 	JITProgram *pipeline = tagged_string_pipeline_program();

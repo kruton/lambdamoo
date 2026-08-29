@@ -596,6 +596,14 @@ the broader ownership-map and synthesized-anchor validation described below.
    and list-index result sites, distinguishing operand-tag failures from result
    representation failures before changing guards.
 
+   Arithmetic contracts are now pair-sensitive: overloaded operations retain
+   the valid combinations instead of treating independent operand masks as a
+   cross-product. This covers matching integer, float, and string pairs for
+   `+`, matching numeric pairs for the other arithmetic operations, and the
+   asymmetric `FLOAT ^ INT` case. Tagged `+` dispatch currently handles integer
+   addition and string concatenation; float arithmetic and exponentiation still
+   deopt until their tagged MIR paths are implemented.
+
 5. **Finish dynamic complex-value propagation and ownership accounting.**
    Audit every instruction that can produce a runtime-selected type—property
    reads, list indexing, joins, calls, and overloaded arithmetic—and ensure its

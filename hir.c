@@ -33,6 +33,66 @@ infer_string_add_operand(HIROp op, int other_known, var_type other_type,
     return 1;
 }
 
+static int
+binary_type_pair_is_valid(HIROp op, var_type left, var_type right)
+{
+    switch (op) {
+    case HIR_OP_ADD:
+	return (left == TYPE_INT && right == TYPE_INT)
+	    || (left == TYPE_FLOAT && right == TYPE_FLOAT)
+	    || (left == TYPE_STR && right == TYPE_STR);
+    case HIR_OP_SUB:
+    case HIR_OP_MUL:
+    case HIR_OP_DIV:
+    case HIR_OP_MOD:
+	return (left == TYPE_INT && right == TYPE_INT)
+	    || (left == TYPE_FLOAT && right == TYPE_FLOAT);
+    case HIR_OP_EXP:
+	return (left == TYPE_INT && right == TYPE_INT)
+	    || (left == TYPE_FLOAT
+		&& (right == TYPE_INT || right == TYPE_FLOAT));
+    default:
+	return 0;
+    }
+}
+
+static unsigned short
+binary_operand_type_mask(HIROp op, int operand, int other_known,
+			 var_type other_type)
+{
+    static const var_type candidates[] = { TYPE_INT, TYPE_FLOAT, TYPE_STR };
+    unsigned short mask = 0;
+    unsigned i;
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+	var_type candidate = candidates[i];
+
+	if (other_known) {
+	    var_type left = operand == 0 ? candidate : other_type;
+	    var_type right = operand == 0 ? other_type : candidate;
+
+	    if (binary_type_pair_is_valid(op, left, right))
+		mask |= (unsigned short) 1U
+		    << ((unsigned) candidate & TYPE_DB_MASK);
+	} else {
+	    unsigned j;
+
+	    for (j = 0; j < sizeof(candidates) / sizeof(candidates[0]); j++) {
+		var_type peer = candidates[j];
+		var_type left = operand == 0 ? candidate : peer;
+		var_type right = operand == 0 ? peer : candidate;
+
+		if (binary_type_pair_is_valid(op, left, right)) {
+		    mask |= (unsigned short) 1U
+			<< ((unsigned) candidate & TYPE_DB_MASK);
+		    break;
+		}
+	    }
+	}
+    }
+    return mask;
+}
+
 #ifdef HIR_TESTING
 static int
 unary_operand_defaults_to_list(HIROp op)
@@ -3981,18 +4041,17 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	return contract;
     switch (instr->op) {
     case HIR_OP_ADD:
-	contract.operands[0] = contract.operands[1]
-	    = numeric | JIT_TYPE_MASK(TYPE_STR);
-	contract.tagged_dispatch = 1;
-	break;
     case HIR_OP_SUB:
     case HIR_OP_MUL:
     case HIR_OP_DIV:
-	contract.operands[0] = contract.operands[1] = numeric;
-	contract.tagged_dispatch = 1;
-	break;
     case HIR_OP_MOD:
     case HIR_OP_EXP:
+	contract.operands[0] = binary_operand_type_mask(instr->op, 0, 0,
+						       TYPE_NONE);
+	contract.operands[1] = binary_operand_type_mask(instr->op, 1, 0,
+						       TYPE_NONE);
+	contract.tagged_dispatch = 1;
+	break;
     case HIR_OP_BITOR:
     case HIR_OP_BITXOR:
     case HIR_OP_BITAND:
@@ -4082,6 +4141,29 @@ jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
     values[1] = instr->src2;
     expected[0] = contract.operands[0];
     expected[1] = contract.operands[1];
+    if (instr->kind == HIR_TAC_BINARY) {
+	int left_known = instr->src1 > 0 && instr->src1 < num_values
+	    && !value_is_tagged[instr->src1]
+	    && value_types[instr->src1] != TYPE_ANY
+	    && value_types[instr->src1] != TYPE_NONE;
+	int right_known = instr->src2 > 0 && instr->src2 < num_values
+	    && !value_is_tagged[instr->src2]
+	    && value_types[instr->src2] != TYPE_ANY
+	    && value_types[instr->src2] != TYPE_NONE;
+	JITTypeMask left = binary_operand_type_mask(instr->op, 0, right_known,
+						    right_known
+						    ? value_types[instr->src2]
+						    : TYPE_NONE);
+	JITTypeMask right = binary_operand_type_mask(instr->op, 1, left_known,
+						     left_known
+						     ? value_types[instr->src1]
+						     : TYPE_NONE);
+
+	if (left)
+	    expected[0] = left;
+	if (right)
+	    expected[1] = right;
+    }
     return expected[0] != 0 || expected[1] != 0;
 }
 
@@ -4795,14 +4877,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 			if (object_range_add)
 			    inferred = TYPE_OBJ;
-			else if (t1 == TYPE_STR && t2 == TYPE_STR && si->op == HIR_OP_ADD)
-			    inferred = TYPE_STR;
-			else if (t1 == TYPE_FLOAT && t2 == TYPE_FLOAT
-				 && (si->op == HIR_OP_ADD || si->op == HIR_OP_SUB
-				     || si->op == HIR_OP_MUL || si->op == HIR_OP_DIV))
-			    inferred = TYPE_FLOAT;
-			else if (t1 == TYPE_INT && t2 == TYPE_INT)
-			    inferred = TYPE_INT;
+			else if (binary_type_pair_is_valid(si->op, t1, t2))
+			    inferred = t1;
 			else
 			    valid = 0;
 			if (valid && !value_types_known[si->value]) {
@@ -5225,9 +5301,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && value_types_known[ssa_instr->src2];
 		var_type t1 = src1_known ? value_types[ssa_instr->src1] : TYPE_INT;
 		var_type t2 = src2_known ? value_types[ssa_instr->src2] : TYPE_INT;
-		int float_op = ssa_instr->op == HIR_OP_ADD
-		    || ssa_instr->op == HIR_OP_SUB || ssa_instr->op == HIR_OP_MUL
-		    || ssa_instr->op == HIR_OP_DIV;
 		int object_range_add = ssa_instr->op == HIR_OP_ADD
 		    && ssa_instr->bytecode_pc != NO_BYTECODE_PC
 		    && bytecode_program->main_vector.vector[ssa_instr->bytecode_pc]
@@ -5236,10 +5309,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 		if (!uses_tagged && (src1_known || src2_known)
 		    && !object_range_add
-		    && !(t1 == TYPE_INT && t2 == TYPE_INT)
-		    && !(float_op && t1 == TYPE_FLOAT && t2 == TYPE_FLOAT)
-		    && !(ssa_instr->op == HIR_OP_ADD
-			 && t1 == TYPE_STR && t2 == TYPE_STR))
+		    && !binary_type_pair_is_valid(ssa_instr->op, t1, t2))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
 	    if (ssa_instr->kind == HIR_TAC_BINARY
@@ -8834,6 +8904,19 @@ hir_test_infer_string_add_operand(HIROp op, int other_known,
 				  var_type other_type, var_type *inferred_type)
 {
     return infer_string_add_operand(op, other_known, other_type, inferred_type);
+}
+
+int
+hir_test_binary_type_pair_is_valid(HIROp op, var_type left, var_type right)
+{
+    return binary_type_pair_is_valid(op, left, right);
+}
+
+unsigned short
+hir_test_binary_operand_type_mask(HIROp op, int operand, int other_known,
+				  var_type other_type)
+{
+    return binary_operand_type_mask(op, operand, other_known, other_type);
 }
 
 int

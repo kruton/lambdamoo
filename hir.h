@@ -232,6 +232,9 @@ extern int hir_ssa_cfg_critical_edge_count(HIRSSAProgram *);
 extern int hir_test_string_builtin_length_anchor(Bytecodes *, unsigned,
 						 unsigned, HIROp);
 extern int hir_test_infer_string_add_operand(HIROp, int, var_type, var_type *);
+extern int hir_test_binary_type_pair_is_valid(HIROp, var_type, var_type);
+extern unsigned short hir_test_binary_operand_type_mask(HIROp, int, int,
+						 var_type);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
 extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,
