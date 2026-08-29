@@ -153,6 +153,9 @@ struct JITProgramUsage {
     uint32_t deopts_by_reason[JIT_DEOPT_NUM_REASONS];
     uint64_t last_used_generation;
     time_t last_used_time;
+    uint64_t continuation_captures;
+    uint64_t continuation_resumes;
+    uint64_t continuation_materializations;
 };
 
 struct JITProgram {

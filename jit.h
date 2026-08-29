@@ -83,6 +83,11 @@ typedef struct {
     uint64_t compile_successes;
     uint64_t compile_failures;
     uint64_t compile_time_us;
+    uint64_t continuation_captures;
+    uint64_t continuation_resumes;
+    uint64_t continuation_materializations;
+    uint64_t active_continuations;
+    size_t continuation_bytes;
     size_t metadata_bytes;
     size_t runtime_bytes;
     size_t machine_code_bytes;
@@ -96,6 +101,8 @@ typedef struct {
     size_t total_machine_code_bytes;
     size_t total_native_allocated_bytes;
     size_t total_mir_heap_bytes;
+    uint64_t active_continuations;
+    size_t continuation_bytes;
 } JITPoolStats;
 
 extern const char *jit_deopt_reason_name(JITDeoptReason);

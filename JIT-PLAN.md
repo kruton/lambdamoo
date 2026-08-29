@@ -233,18 +233,23 @@ The current tier deoptimizes before general built-in calls, but directly lowers
 a reviewed set of continuation-free built-ins and runtime operations.
 These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
 `index()`, `rindex()`, `ticks_left()`, `seconds_left()`, `time()`, `valid()`, and
-`parent()`. Verb calls use a distinct VM-call exit that materializes the exact
-`OP_CALL_VERB` stack and transfers to the canonical activation-push path without
-counting the transfer as a deoptimization. The callee can therefore enter JIT,
-and a caller that immediately returns the callee result resumes at a native
-`RESUME_PHASE_AFTER_CALL` entry after the callee returns. General caller shapes
-can also resume through an SSA-liveness continuation when every live value is
-materializable. Native continuation is conservatively disabled when the
-caller's outer operand-stack prefix contains a `TYPE_CATCH` or `TYPE_FINALLY`
-marker; those calls resume in the interpreter because the current continuation
-map does not preserve the complete control-stack prefix.
-The interpreter continues to own `bi_func_pc`, `bi_func_id`, `bi_func_data`,
-activation creation, suspension, and traceback behavior.
+`parent()`. Verb calls and general fixed-ID built-in calls can now leave a
+compact native continuation on the caller activation. The frame owns every live
+SSA value plus the canonical locals and stack values required to reconstruct
+the pre-call state. Normal verb and built-in returns inject their tagged `Var`
+result into that frame and resume machine code without first expanding `rt_env`
+and the operand stack. `BI_CALL` chains retain the native caller while the
+interpreter owns activation creation and built-in continuation data.
+`BI_SUSPEND` moves the frame with the queued VM and resumes it from the
+scheduler-provided value.
+
+Errors, aborts, traceback or task-stack introspection, pool invalidation, and
+database writes materialize the frame in place before using canonical VM
+machinery. Database persistence therefore remains bytecode-based and contains
+no native pointers. Continuation maps preserve catch/finally markers and the
+complete canonical stack prefix for these recovery paths. Specialized built-in
+guard exits still use their existing canonical bridge and can adopt compact
+frames after their raw operands are packaged with identical ownership rules.
 
 Built-in inlining must be opt-in and metadata-driven. A built-in may be inlined
 only if its registered contract declares it continuation-free:
@@ -544,28 +549,23 @@ the broader ownership-map and synthesized-anchor validation described below.
    and controls paths. Do not implement an operation until its resume stack,
    error behavior, tick charge, and ownership contract are known.
 
-2. **Validate native continuations across stateful VM calls.**
-   The first bridge stage now materializes the canonical `OP_CALL_VERB` stack,
-   pushes a normal activation, and dispatches an eligible callee through JIT
-   without reporting a caller deoptimization. General normal-return calls now
-   have a native continuation that restores every SSA value live across the call
-   from a runtime local, VM operand-stack slot, constant, or the dynamically
-   typed call result. The liveness calculation treats later deoptimization-map
-   locals and stack entries as implicit uses; otherwise a value needed only to
-   reconstruct interpreter state can be incorrectly discarded. Calls with an
-   unmapped live value retain their interpreter continuation. General fixed-ID
-   built-ins now use the same boundary and no longer report `builtin_call`
-   deoptimizations. Calls with an outer `TYPE_CATCH` or `TYPE_FINALLY` stack
-   marker currently retain their interpreter continuation. To lift that
-   restriction, extend continuation maps to retain the entire canonical caller
-   stack prefix, including handler markers and enclosing range/list-loop state,
-   and verify its exact depth, ordering, ownership, and unwind behavior on
-   return. Add nested catch/finally and loop-around-call regressions before
-   enabling that path. Also add explicit coverage for `BI_RAISE`, `BI_CALL`,
-   `BI_SUSPEND`, and `BI_ABORT`, especially persistence and resumption of a task
-   suspended inside a built-in. Add native temporary spills where the census
-   shows an unmapped-live-value restriction matters. Tail-call activation
-   replacement should wait until normal and exceptional paths are modeled.
+2. **Harden and extend native continuations across stateful VM calls.**
+   Compact frames now cover ordinary verb calls, general fixed-ID built-ins,
+   `BI_CALL`, and `BI_SUSPEND`; normal returns and scheduler resumptions re-enter
+   machine code directly. Canonical locals, the full stack prefix, handler
+   markers, and live SSA values are retained with owned `Var` references.
+   `BI_RAISE`, `BI_ABORT`, introspection, invalidation, and database writes
+   materialize before entering existing VM behavior. `verb_info(..., 1)` reports
+   continuation captures, resumes, materializations, active frames, and bytes.
+
+   Next add focused nested catch/finally, loop-around-call, `BI_CALL`,
+   suspension/resumption, task-stack, checkpoint, and protection-invalidation
+   regressions. Extend compact dispatch to specialized built-in guard exits,
+   then use the counters to identify unexpected materialization sites. A task
+   loaded from a database still resumes canonically and may enter JIT at its
+   bytecode anchor; serializing native frames is intentionally out of scope.
+   Tail-call activation replacement should wait until normal and exceptional
+   continuation paths have sustained database-scale validation.
 
 3. **Use effect metadata to select direct native built-in lowering.**
    Record argument prototypes and effects such as pure, allocation, possible

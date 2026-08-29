@@ -801,6 +801,8 @@ jit_shutdown(void)
 void
 jit_pool_stats(JITPoolStats *stats)
 {
+    JITContinuationFrame *frame;
+
     if (!stats)
 	return;
     memset(stats, 0, sizeof(*stats));
@@ -812,6 +814,11 @@ jit_pool_stats(JITPoolStats *stats)
 	    = _MIR_code_allocated_size(jit_shared_pool.context);
     if (jit_shared_pool.allocator)
 	stats->total_mir_heap_bytes = jit_shared_pool.allocator->live_bytes;
+    for (frame = continuation_frames; frame; frame = frame->next) {
+	stats->active_continuations++;
+	stats->continuation_bytes += sizeof(*frame)
+	    + sizeof(Var) * frame->num_values;
+    }
 }
 
 typedef struct {
@@ -4690,6 +4697,10 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 		= program->usage->deopts_by_reason[reason];
 	stats->last_used_generation = program->usage->last_used_generation;
 	stats->last_used_time = program->usage->last_used_time;
+	stats->continuation_captures = program->usage->continuation_captures;
+	stats->continuation_resumes = program->usage->continuation_resumes;
+	stats->continuation_materializations
+	    = program->usage->continuation_materializations;
     }
     stats->compile_attempts = program->compile_attempts;
     stats->compile_successes = program->compile_successes;
@@ -4709,8 +4720,18 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     } else {
 	stats->native_allocated_bytes = program->machine_code_len;
     }
+    {
+	JITContinuationFrame *frame;
+
+	for (frame = continuation_frames; frame; frame = frame->next)
+	    if (frame->program == program) {
+		stats->active_continuations++;
+		stats->continuation_bytes += sizeof(*frame)
+		    + sizeof(Var) * frame->num_values;
+	    }
+    }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes;
+	+ stats->native_allocated_bytes + stats->continuation_bytes;
 }
 
 int
@@ -4999,6 +5020,8 @@ jit_continuation_capture(JITProgram *program, int map_id)
 	frame->values[i] = materialize_deopt_value(type,
 		program->deopt_values[resume->value]);
     }
+    if (program->usage)
+	program->usage->continuation_captures++;
     return frame;
 }
 
@@ -5093,6 +5116,8 @@ jit_continuation_materialize(activation *a)
 	|| frame->map_id >= program->num_deopt_maps)
 	return 0;
     map = &program->deopt_maps[frame->map_id];
+    if (program->usage)
+	program->usage->continuation_materializations++;
     for (i = 0; i < (unsigned) map->num_locals; i++) {
 	int value = jit_deopt_map_local_value(program, map, i);
 	Var *saved = value > 0 ? jit_continuation_value(frame, value) : 0;
@@ -5255,6 +5280,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	if (continuation_in->program != program)
 	    return JIT_RUN_FALLBACK;
 	resume_map = continuation_in->map_id;
+	if (program->usage)
+	    program->usage->continuation_resumes++;
     }
 
     if (!source_location)
