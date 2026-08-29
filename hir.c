@@ -4014,6 +4014,120 @@ jit_instr_defines_value(JITInstruction *instr)
 	|| instr->kind == HIR_TAC_RANGE_SET || instr->kind == HIR_TAC_UNSUPPORTED;
 }
 
+static int
+jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
+			 Program *bytecode_program)
+{
+	JITBlock *block;
+	unsigned char *seen;
+	int i;
+
+	if (!program || program->num_deopt_maps <= 0) {
+		record_unsupported(ctx, "deopt-map: missing canonical entry map");
+		return 0;
+	}
+	seen = mymalloc(program->num_deopt_maps, M_PROGRAM);
+	memset(seen, 0, program->num_deopt_maps);
+	seen[0] = 1;
+	for (block = program->blocks; block; block = block->next) {
+		JITInstruction *instr;
+
+		for (instr = block->first; instr; instr = instr->next) {
+			JITDeoptMap *map;
+			const ResumePoint *point;
+			int operands;
+
+			if (instr->deopt_map == 0)
+				goto next_instruction;
+			if (instr->deopt_map < 0
+			    || instr->deopt_map >= program->num_deopt_maps) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: invalid map %d at pc %u",
+				    instr->deopt_map, instr->bytecode_pc);
+				goto invalid;
+			}
+			map = &program->deopt_maps[instr->deopt_map];
+			if (seen[instr->deopt_map]) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d is shared by multiple boundaries",
+				    instr->deopt_map);
+				goto invalid;
+			}
+			seen[instr->deopt_map] = 1;
+			if (instr->bytecode_pc == NO_BYTECODE_PC
+			    || map->bytecode_pc != instr->bytecode_pc
+			    || map->bytecode_pc >= bytecode_program->main_vector.size) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d has invalid pc %u for boundary pc %u",
+				    instr->deopt_map, map->bytecode_pc,
+				    instr->bytecode_pc);
+				goto invalid;
+			}
+			if (map->num_locals != program->num_vars
+			    || map->stack_depth > bytecode_program->main_vector.max_stack
+			    || (map->num_locals && (!map->local_values
+					     || !map->local_types))
+			    || (map->stack_depth && (!map->stack_values
+					      || !map->stack_types))) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d has incomplete frame at pc %u",
+				    instr->deopt_map, map->bytecode_pc);
+				goto invalid;
+			}
+			for (i = 0; i < map->num_locals; i++)
+				if (map->local_values[i] < 0
+				    || map->local_values[i] >= program->num_values) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d local %d has invalid value %d",
+					    instr->deopt_map, i, map->local_values[i]);
+					goto invalid;
+				}
+			for (i = 0; i < (int) map->stack_depth; i++)
+				if (map->stack_values[i] <= 0
+				    || map->stack_values[i] >= program->num_values) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d stack slot %d has invalid value %d",
+					    instr->deopt_map, i, map->stack_values[i]);
+					goto invalid;
+				}
+			if (!resume_key_is_valid(map->resume_key))
+				goto next_instruction;
+			point = resume_point_for_key(bytecode_program, map->resume_key);
+			if (!point || point->vector != MAIN_VECTOR
+			    || point->error_pc != map->bytecode_pc) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d has mismatched resume key at pc %u",
+				    instr->deopt_map, map->bytecode_pc);
+				goto invalid;
+			}
+			operands = instr->kind == HIR_TAC_CALL_VERB ? 3
+			    : instr->kind == HIR_TAC_CALL ? 1 : -1;
+			if (operands < 0 || map->stack_depth < (unsigned) operands
+			    || point->stack_depth != map->stack_depth - operands) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d call stack does not match resume point",
+				    instr->deopt_map);
+				goto invalid;
+			}
+next_instruction:
+			if (instr == block->last)
+				break;
+		}
+	}
+	for (i = 1; i < program->num_deopt_maps; i++)
+		if (!seen[i]) {
+			record_unsupported_fmt(ctx,
+			    "deopt-map: map %d has no owning boundary", i);
+			goto invalid;
+		}
+	myfree(seen, M_PROGRAM);
+	return 1;
+
+invalid:
+	myfree(seen, M_PROGRAM);
+	return 0;
+}
+
 static void
 jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 		   unsigned char *uses, unsigned char *defs)
@@ -5138,6 +5252,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
+	const char *diag = hir_context_error_message(ctx);
+	JITProgram *unsupported;
+
+	unsupported = jit_program_unsupported_with_diagnostic("invalid-deopt-map",
+							 diag);
+	jit_program_free(program);
+	return unsupported;
+    }
     jit_build_resume_liveness(program);
     return program;
 }
