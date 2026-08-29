@@ -2225,6 +2225,51 @@ tagged_unary_program(HIROp op)
 }
 
 static JITProgram *
+tagged_unary_result_program(HIROp op, var_type result_type)
+{
+    JITProgram *program = tagged_unary_program(op);
+    JITInstruction *unary = program->blocks->first->next;
+    JITInstruction *ret = unary->next;
+
+    program->value_types[2] = result_type;
+    ret->literal_type = result_type;
+    return program;
+}
+
+static Var
+tagged_test_value(var_type type)
+{
+    Var value;
+
+    value.type = type;
+    switch (type) {
+    case TYPE_INT:
+	value.v.num = 17;
+	break;
+    case TYPE_OBJ:
+	value.v.obj = 17;
+	break;
+    case TYPE_STR:
+	value.v.str = str_dup("tagged value");
+	break;
+    case TYPE_ERR:
+	value.v.err = E_INVARG;
+	break;
+    case TYPE_LIST:
+	value = new_list(1);
+	value.v.list[1].type = TYPE_INT;
+	value.v.list[1].v.num = 17;
+	break;
+    case TYPE_FLOAT:
+	value.v.fnum = box_fl(17.5);
+	break;
+    default:
+	panic("unsupported tagged test value type");
+    }
+    return value;
+}
+
+static JITProgram *
 float_singleton_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -2297,6 +2342,18 @@ tagged_binary_program(HIROp op)
     ret->literal_type = TYPE_INT;
     block->first = load_lhs;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_binary_result_program(HIROp op, var_type result_type)
+{
+    JITProgram *program = tagged_binary_program(op);
+    JITInstruction *binary = program->blocks->first->next->next;
+    JITInstruction *ret = binary->next;
+
+    program->value_types[3] = result_type;
+    ret->literal_type = result_type;
     return program;
 }
 
@@ -4472,30 +4529,97 @@ main(void)
 	jit_program_free(singleton);
     }
 
-    /* Type inspection reads a dynamic value's runtime tag without deoptimizing. */
+    /* Type-transparent consumers accept every core user-visible runtime type. */
     {
 	JITProgram *tagged_typeof = tagged_unary_program(HIR_OP_TYPEOF);
-	Var tagged_env[1];
+	JITProgram *tagged_not = tagged_unary_program(HIR_OP_NOT);
+	JITProgram *tagged_eq = tagged_binary_program(HIR_OP_EQ);
+	JITProgram *tagged_in = tagged_binary_program(HIR_OP_IN);
+	JITProgram *tagged_singleton = tagged_unary_result_program(
+	    HIR_OP_MAKE_SINGLETON_LIST, TYPE_LIST);
+	JITProgram *tagged_append = tagged_binary_result_program(
+	    HIR_OP_LIST_ADD_TAIL, TYPE_LIST);
+	const var_type types[] = {
+	    TYPE_INT, TYPE_OBJ, TYPE_STR, TYPE_ERR, TYPE_LIST, TYPE_FLOAT
+	};
+	unsigned i;
 
-	tagged_env[0].type = TYPE_STR;
-	tagged_env[0].v.str = str_dup("dynamic type");
-	ticks = 10;
-	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
-				  &timed_out, &error, 0, 0, 0)
-	      == JIT_RUN_RETURNED, "tagged typeof executed natively");
-	check(result.type == TYPE_INT && result.v.num == _TYPE_STR,
-	      "tagged string typeof returned the internal runtime tag");
-	free_var(tagged_env[0]);
+	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+	    Var tagged_env[2];
+	    int truth;
 
-	tagged_env[0] = new_list(0);
-	ticks = 10;
-	check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
-				  &timed_out, &error, 0, 0, 0)
-	      == JIT_RUN_RETURNED, "tagged list typeof executed natively");
-	check(result.type == TYPE_INT && result.v.num == _TYPE_LIST,
-	      "tagged list typeof returned the internal runtime tag");
-	free_var(tagged_env[0]);
+	    tagged_env[0] = tagged_test_value(types[i]);
+	    truth = is_true(tagged_env[0]);
+	    ticks = 10;
+	    check(jit_program_execute(tagged_typeof, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged typeof runtime type did not execute natively");
+	    check(result.type == TYPE_INT
+		  && result.v.num == (types[i] & TYPE_DB_MASK),
+		  "tagged typeof returned the wrong runtime type");
+
+	    ticks = 10;
+	    check(jit_program_execute(tagged_not, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged truth test runtime type did not execute natively");
+	    check(result.type == TYPE_INT && result.v.num == !truth,
+		  "tagged truth test returned the wrong value");
+
+	    tagged_env[1] = var_ref(tagged_env[0]);
+	    ticks = 10;
+	    check(jit_program_execute(tagged_eq, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged equality runtime type did not execute natively");
+	    check(result.type == TYPE_INT && result.v.num == 1,
+		  "tagged equality returned the wrong value");
+	    free_var(tagged_env[1]);
+
+	    tagged_env[1] = new_list(1);
+	    tagged_env[1].v.list[1] = var_ref(tagged_env[0]);
+	    ticks = 10;
+	    check(jit_program_execute(tagged_in, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged membership runtime type did not execute natively");
+	    check(result.type == TYPE_INT && result.v.num == 1,
+		  "tagged membership returned the wrong value");
+	    free_var(tagged_env[1]);
+
+	    ticks = 10;
+	    check(jit_program_execute(tagged_singleton, tagged_env, &result,
+				      &ticks, &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged singleton runtime type did not execute natively");
+	    check(result.type == TYPE_LIST && result.v.list[0].v.num == 1
+		  && result.v.list[1].type == types[i]
+		  && equality(result.v.list[1], tagged_env[0], 1),
+		  "tagged singleton did not preserve its element");
+	    free_var(result);
+
+	    tagged_env[1] = var_ref(tagged_env[0]);
+	    tagged_env[0] = new_list(0);
+	    ticks = 10;
+	    check(jit_program_execute(tagged_append, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged list tail runtime type did not execute natively");
+	    check(result.type == TYPE_LIST && result.v.list[0].v.num == 1
+		  && result.v.list[1].type == types[i]
+		  && equality(result.v.list[1], tagged_env[1], 1),
+		  "tagged list tail did not preserve its element");
+	    free_var(result);
+	    free_var(tagged_env[0]);
+	    free_var(tagged_env[1]);
+	}
 	jit_program_free(tagged_typeof);
+	jit_program_free(tagged_not);
+	jit_program_free(tagged_eq);
+	jit_program_free(tagged_in);
+	jit_program_free(tagged_singleton);
+	jit_program_free(tagged_append);
     }
 
     /* Tagged absolute value accepts integers and guards other runtime types. */

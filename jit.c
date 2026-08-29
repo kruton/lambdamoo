@@ -2723,6 +2723,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, raw_value),
 				MIR_new_reg_op(build->context, in_type),
 				MIR_new_reg_op(build->context, values[instr->src2])));
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[instr->value])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->value) * sizeof(Num),
+					deopt_values, 0, 1),
+				    MIR_new_int_op(build->context, TYPE_INT)));
 			    if (tagged_list) {
 				append(build, MIR_new_insn(build->context, MIR_JMP,
 				    MIR_new_label_op(build->context, done)));
@@ -2878,6 +2885,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_reg_op(build->context, eq_res),
 				MIR_new_int_op(build->context, 0)));
+			if (program->value_is_tagged
+			    && program->value_is_tagged[instr->value])
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, tag_t,
+				    (program->num_values + instr->value) * sizeof(Num),
+				    deopt_values, 0, 1),
+				MIR_new_int_op(build->context, TYPE_INT)));
 			break;
 		    }
 		    if (program->value_types
