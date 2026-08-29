@@ -1432,7 +1432,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
 
-    snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64, next_module_serial);
+    if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
+	snprintf(func_name, sizeof(func_name), "jit_o%" PRIdN "_v%u_%" PRIu64,
+		 program->diagnostic_object, program->diagnostic_verb,
+		 next_module_serial);
+    else
+	snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64,
+		 next_module_serial);
     build->function = MIR_new_func(build->context, func_name, 1,
 				   &result_type, 11,
 				   MIR_T_P, "env", MIR_T_P, "result",
@@ -4658,6 +4664,22 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	}
     }
     return -1;
+}
+
+int
+jit_program_has_location(JITProgram *program)
+{
+    return program && program->diagnostic_object >= 0
+	&& program->diagnostic_verb > 0;
+}
+
+void
+jit_program_note_location(JITProgram *program, Objid oid, unsigned verb)
+{
+    if (!program || oid < 0 || verb == 0)
+	return;
+    program->diagnostic_object = oid;
+    program->diagnostic_verb = verb;
 }
 
 int

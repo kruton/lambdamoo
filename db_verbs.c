@@ -612,6 +612,23 @@ db_verb_definer(db_verb_handle vh)
     return h->definer;
 }
 
+unsigned
+db_verb_index(db_verb_handle vh)
+{
+    handle *h = (handle *) vh.ptr;
+    Object *o;
+    Verbdef *v;
+    unsigned index;
+
+    if (!h)
+	return 0;
+    o = dbpriv_find_object(h->definer);
+    for (v = o->verbdefs, index = 1; v; v = v->next, index++)
+	if (v == h->verbdef)
+	    return index;
+    return 0;
+}
+
 const char *
 db_verb_names(db_verb_handle vh)
 {

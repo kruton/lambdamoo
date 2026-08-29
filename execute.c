@@ -934,6 +934,20 @@ do {								\
 
 	    if (resume_map >= 0)
 		RUN_ACTIV.resume_key = invalid_resume_key();
+	    if (!jit_program_has_location(RUN_ACTIV.prog->jit)
+		&& valid(RUN_ACTIV.vloc)) {
+		int i;
+
+		for (i = 1; i <= db_count_verbs(RUN_ACTIV.vloc); i++) {
+		    db_verb_handle h = db_find_indexed_verb(RUN_ACTIV.vloc, i);
+
+		    if (h.ptr && db_verb_program(h) == RUN_ACTIV.prog) {
+			jit_program_note_location(RUN_ACTIV.prog->jit,
+						  RUN_ACTIV.vloc, i);
+			break;
+		    }
+		}
+	    }
 	    jit_profile_record_entry(RUN_ACTIV.prog->jit);
 	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
 					     RUN_ACTIV.rt_env, &ret_val,

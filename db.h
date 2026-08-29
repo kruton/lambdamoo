@@ -542,6 +542,7 @@ extern Objid db_verb_definer(db_verb_handle);
 				/* Returns the object on which the given verb
 				 * is defined.
 				 */
+extern unsigned db_verb_index(db_verb_handle);
 
 extern const char *db_verb_names(db_verb_handle);
 extern void db_set_verb_names(db_verb_handle, const char *);

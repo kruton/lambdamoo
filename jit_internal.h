@@ -159,6 +159,8 @@ struct JITProgram {
     uint32_t compile_successes;
     uint32_t compile_failures;
     uint64_t compile_time_us;
+    Objid diagnostic_object;
+    unsigned diagnostic_verb;
 };
 
 extern int jit_rt_is_true(int64_t, int);
