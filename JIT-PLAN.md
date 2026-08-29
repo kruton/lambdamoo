@@ -464,6 +464,15 @@ properties, and returns. Runtime tags are propagated through SSA copies and
 dynamic-result operations. Native consumers either dispatch on the tag or
 deoptimize before touching a representation they do not support.
 
+Every lowered native boundary now owns a verified deoptimization map. The map
+records the canonical bytecode PC, locals, operand stack, tick state, and fixed
+catch/finally marker data. Synthesized scatter operations retain the stack from
+the original bytecode boundary instead of their internal temporary stack, and
+materialization rebuilds handler markers from canonical metadata rather than
+incidental native values. Call maps are checked against their `ResumePoint`
+stack depth and marker layout before MIR lowering. Negative tests reject
+mismatched call depths, marker kinds, and marker payloads.
+
 ### 14.2 Measurement
 
 Run the compile-eligibility census with:
@@ -568,15 +577,7 @@ the broader ownership-map and synthesized-anchor validation described below.
    Never directly lower a built-in that can return `BI_CALL`, `BI_SUSPEND`, or
    `BI_ABORT` without modeling that outcome.
 
-4. **Make every lowered boundary independently resumable.**
-   A deopt map attached to a synthesized operation must reconstruct the operand
-   stack expected by its bytecode PC, not merely the operation's logical SSA
-   operands. Add verifier checks and negative tests for built-in argument-list
-   construction, scatter, property/index write-back, range operations, caught
-   errors, and other multi-bytecode lowerings. This prevents a guard miss from
-   resuming with a well-typed but structurally invalid interpreter stack.
-
-5. **Reduce type guards using consumer constraints and tagged dispatch.**
+4. **Reduce type guards using consumer constraints and tagged dispatch.**
    Report local/value identity and expected/actual tags for the remaining guard
    failures. Seed only invariant runtime slots, preserve `TYPE_NONE` for
    uninitialized user locals, and infer types backward from exact built-in and
@@ -584,7 +585,7 @@ the broader ownership-map and synthesized-anchor validation described below.
    tag and add a guarded consumer instead of guessing a static type. Never
    weaken a guard merely to improve census numbers.
 
-6. **Finish dynamic complex-value propagation and ownership accounting.**
+5. **Finish dynamic complex-value propagation and ownership accounting.**
    Audit every instruction that can produce a runtime-selected type—property
    reads, list indexing, joins, calls, and overloaded arithmetic—and ensure its
    tag reaches locals, copies, returns, and deopt maps. Add explicit
@@ -592,21 +593,21 @@ the broader ownership-map and synthesized-anchor validation described below.
    error, and deopt exits. Include repeated-execution leak tests for strings,
    lists, properties, and call results.
 
-7. **Lower the hottest remaining range and caught-error paths.**
+6. **Lower the hottest remaining range and caught-error paths.**
    The current sample reaches range operations after earlier string/list work.
    Add native list and string range extraction/assignment only where bounds,
    Unicode indexing, allocation quotas, source locations, and catch transfer are
    exact. A caught error should enter its native handler only after stack-marker
    and tick equivalence are tested; otherwise deopt before the operation.
 
-8. **Compile fork vectors and support native re-entry.**
+7. **Compile fork vectors and support native re-entry.**
    Make code-unit identity explicit in entry and deopt maps, compile fork vectors
    independently, and retain bytecode fallback for serialized tasks. A fork
    statement may remain a scheduling boundary while its body becomes eligible
    for native entry. Add checkpoint/reload and suspended-task tests before
    enabling native resume.
 
-9. **Optimize only after coverage boundaries are trustworthy.**
+8. **Optimize only after coverage boundaries are trustworthy.**
    First remove redundant guards and repeated local/tag loads. Then consider
    block-level tick batching, call-site specialization, and MIR optimization
    levels. Deopt-aware liveness is intentionally broader than machine-operand
