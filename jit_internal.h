@@ -54,6 +54,9 @@ struct JITContinuationFrame {
     int map_id;
     int num_values;
     Var *values;
+    int values_capacity;
+    Var *spare_values;
+    int spare_values_capacity;
     void *runtime_storage;
     Num *deopt_values;
     Var *borrowed_locals;

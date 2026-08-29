@@ -849,7 +849,8 @@ jit_pool_stats(JITPoolStats *stats)
     for (frame = continuation_frames; frame; frame = frame->next) {
 	stats->active_continuations++;
 	stats->continuation_bytes += sizeof(*frame)
-	    + sizeof(Var) * frame->num_values;
+	    + sizeof(Var) * (frame->values_capacity
+		+ frame->spare_values_capacity);
     }
 }
 
@@ -5508,6 +5509,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 {
     JITDeoptMap *map;
     Var *new_values;
+    int new_values_capacity;
     int i;
 
     if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
@@ -5529,9 +5531,23 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	if (!jit_runtime_type_is_valid(type))
 	    return 0;
     }
-    new_values = map->native_resume->num_values
-	? mymalloc(sizeof(Var) * map->native_resume->num_values, M_PROGRAM)
-	: 0;
+    new_values_capacity = map->native_resume->num_values;
+    if (frame) {
+	new_values = frame->spare_values;
+	new_values_capacity = frame->spare_values_capacity;
+	if (new_values_capacity < map->native_resume->num_values) {
+	    if (new_values)
+		new_values = myrealloc(new_values,
+		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
+	    else
+		new_values = mymalloc(
+		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
+	    new_values_capacity = map->native_resume->num_values;
+	}
+    } else
+	new_values = map->native_resume->num_values
+	    ? mymalloc(sizeof(Var) * map->native_resume->num_values, M_PROGRAM)
+	    : 0;
     for (i = 0; i < map->native_resume->num_values; i++)
 	new_values[i].type = TYPE_NONE;
     for (i = 0; i < map->native_resume->num_values; i++) {
@@ -5560,12 +5576,15 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
 	memset(frame, 0, sizeof(JITContinuationFrame));
     } else {
+	Var *old_values = frame->values;
+	int old_values_capacity = frame->values_capacity;
+
 	for (i = 0; i < frame->num_values; i++)
 	    free_var(frame->values[i]);
-	if (frame->values)
-	    myfree(frame->values, M_PROGRAM);
 	if (frame->has_result)
 	    free_var(frame->result);
+	frame->spare_values = old_values;
+	frame->spare_values_capacity = old_values_capacity;
 	frame->has_result = 0;
 	frame->dispatched = 0;
     }
@@ -5573,6 +5592,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     frame->map_id = map_id;
     frame->num_values = map->native_resume->num_values;
     frame->values = new_values;
+    frame->values_capacity = new_values_capacity;
     frame->runtime_storage = runtime_storage;
     frame->deopt_values = deopt_values;
     frame->borrowed_locals = borrowed_locals;
@@ -5658,6 +5678,8 @@ jit_continuation_free(JITContinuationFrame *frame)
 	free_var(frame->values[i]);
     if (frame->values)
 	myfree(frame->values, M_PROGRAM);
+    if (frame->spare_values)
+	myfree(frame->spare_values, M_PROGRAM);
     if (frame->has_result)
 	free_var(frame->result);
     if (frame->runtime_storage) {
