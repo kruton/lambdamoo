@@ -4812,7 +4812,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
 	    && map->resume_key.site == key.site && map->native_resume
-	    && map->native_resume->valid)
+	    && map->native_resume->valid && map->native_resume->rehydratable)
 	    return i;
     }
     return -1;
@@ -4993,11 +4993,29 @@ jit_continuation_capture(JITProgram *program, int map_id)
     frame->values = frame->num_values
 	? mymalloc(sizeof(Var) * frame->num_values, M_PROGRAM)
 	: 0;
+    for (i = 0; i < frame->num_values; i++)
+	frame->values[i].type = TYPE_NONE;
     for (i = 0; i < frame->num_values; i++) {
 	JITResumeValue *resume = &map->native_resume->values[i];
 	var_type type;
 
-	frame->values[i].type = TYPE_NONE;
+	if (resume->source == JIT_RESUME_RESULT
+	    || resume->source == JIT_RESUME_CONSTANT)
+	    continue;
+	type = program->value_is_tagged
+	    && program->value_is_tagged[resume->value]
+	    ? (var_type) program->deopt_values[program->num_values
+		+ resume->value]
+	    : program->value_types[resume->value];
+	if (!jit_runtime_type_is_valid(type)) {
+	    jit_continuation_free(frame);
+	    return 0;
+	}
+    }
+    for (i = 0; i < frame->num_values; i++) {
+	JITResumeValue *resume = &map->native_resume->values[i];
+	var_type type;
+
 	if (resume->source == JIT_RESUME_RESULT)
 	    continue;
 	if (resume->source == JIT_RESUME_CONSTANT) {
@@ -5010,10 +5028,6 @@ jit_continuation_capture(JITProgram *program, int map_id)
 	    ? (var_type) program->deopt_values[program->num_values
 		+ resume->value]
 	    : program->value_types[resume->value];
-	if (!jit_runtime_type_is_valid(type)) {
-	    jit_continuation_free(frame);
-	    return 0;
-	}
 	frame->values[i] = materialize_deopt_value(type,
 		program->deopt_values[resume->value]);
     }
@@ -5478,10 +5492,17 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		? program->value_types[instr->value] : TYPE_ANY;
 
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d type=%d tagged=%d local=%d deopt=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->value, instr->src1, instr->src2,
-		     type, tagged, instr->local_id, instr->deopt_map);
+		     type, tagged, instr->local_id, instr->deopt_map,
+		     instr->deopt_map > 0
+		     && program->deopt_maps[instr->deopt_map].native_resume
+		     ? program->deopt_maps[instr->deopt_map].native_resume->valid : -1,
+		     instr->deopt_map > 0
+		     && program->deopt_maps[instr->deopt_map].native_resume
+		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
+		     : -1);
 	    add_line(line, data);
 	    if (instr->kind == HIR_TAC_PARALLEL_COPY) {
 		JITCopy *copy;

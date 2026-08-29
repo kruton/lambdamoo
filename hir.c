@@ -4786,6 +4786,25 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
     return 0;
 }
 
+static int
+jit_value_is_entry_load(JITProgram *program, int value)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value)
+		return instr->kind == HIR_TAC_LOAD_LOCAL
+		    && instr->bytecode_pc == NO_BYTECODE_PC;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
 static void
 jit_build_resume_liveness(JITProgram *program)
 {
@@ -4899,7 +4918,13 @@ jit_build_resume_liveness(JITProgram *program)
 						   M_PROGRAM);
 		unsigned char *needed = mymalloc(program->num_values, M_PROGRAM);
 		int call_operands = jit_call_stack_operands(map);
+		const char *call_name = instr->kind == HIR_TAC_CALL
+		    ? name_func_by_num(instr->func) : 0;
+		int saved_stack_depth = map->stack_depth;
 		int slot;
+
+		if (call_name && !strcmp(call_name, "suspend"))
+		    saved_stack_depth -= call_operands;
 
 		memcpy(needed, live, program->num_values);
 		for (slot = 0; slot < map->num_locals; slot++) {
@@ -4907,7 +4932,7 @@ jit_build_resume_liveness(JITProgram *program)
 		    if (value > 0 && value < program->num_values)
 			needed[value] = 1;
 		}
-		for (slot = 0; slot < (int) map->stack_depth; slot++)
+		for (slot = 0; slot < saved_stack_depth; slot++)
 		    if ((!map->stack_slots
 			 || map->stack_slots[slot].kind == RSS_VALUE)
 			&& map->stack_values[slot] > 0
@@ -4921,14 +4946,27 @@ jit_build_resume_liveness(JITProgram *program)
 		resume->values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
 		resume->num_values = live_count;
-		resume->valid = jit_resume_stack_is_safe(map,
-							      call_operands);
+		resume->valid = 1;
+		resume->rehydratable = jit_resume_stack_is_safe(map,
+							    call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
 		    if (needed[value]
 			&& !jit_resume_source(program, map, instr, value,
-					      &resume->values[live_count++]))
-			resume->valid = 0;
+					      &resume->values[live_count++])) {
+			const char *func_name = instr->kind == HIR_TAC_CALL
+			    ? name_func_by_num(instr->func) : 0;
+
+			if (func_name && !strcmp(func_name, "suspend")
+			    && (!(program->value_is_tagged
+				  && program->value_is_tagged[value])
+				|| jit_value_is_entry_load(program, value))) {
+			    resume->values[live_count - 1].source =
+				JIT_RESUME_CAPTURED;
+			    resume->rehydratable = 0;
+			} else
+			    resume->valid = 0;
+		    }
 		myfree(needed, M_PROGRAM);
 	    }
 	    memset(uses, 0, program->num_values);

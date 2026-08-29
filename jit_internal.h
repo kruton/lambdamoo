@@ -20,7 +20,8 @@ typedef enum {
     JIT_RESUME_LOCAL,
     JIT_RESUME_STACK,
     JIT_RESUME_RESULT,
-    JIT_RESUME_CONSTANT
+    JIT_RESUME_CONSTANT,
+    JIT_RESUME_CAPTURED
 } JITResumeSource;
 
 struct JITResumeValue {
@@ -35,6 +36,7 @@ struct JITNativeResume {
     int num_values;
     JITResumeValue *values;
     int valid;
+    int rehydratable;
 };
 
 struct JITContinuationFrame {

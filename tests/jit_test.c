@@ -524,6 +524,7 @@ builtin_call_program(unsigned func)
     map->builtin_func = func;
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
+    map->native_resume->rehydratable = 1;
     map->native_resume->num_values = 1;
     map->native_resume->values = allocate(sizeof(JITResumeValue));
     map->native_resume->values[0].value = 2;
@@ -886,6 +887,7 @@ call_verb_program(void)
     map->reason = JIT_DEOPT_VERB_CALL;
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
+    map->native_resume->rehydratable = 1;
     map->native_resume->num_values = 1;
     map->native_resume->values = allocate(sizeof(JITResumeValue));
     map->native_resume->values[0].value = 4;
@@ -3696,6 +3698,41 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == 41,
 	      "generic built-in continuation returned the wrong value");
 	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	/* Native-only continuations need not promise bytecode rehydration. */
+	pass_prog = builtin_call_program(17);
+	pass_prog->deopt_maps[1].native_resume->rehydratable = 0;
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	{
+	    JITContinuationFrame *continuation = 0;
+	    Var returned;
+
+	    check(jit_program_resume_map(pass_prog, pass_key) == -1,
+		  "native-only built-in exposed a bytecode resume map");
+	    check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "native-only built-in did not request a VM call");
+	    check(continuation != 0,
+		  "native-only built-in did not capture its continuation");
+	    free_var(deopt_stack[0]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 42;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, continuation,
+					0) == JIT_RUN_RETURNED,
+		  "native-only built-in continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 42,
+		  "native-only built-in continuation returned the wrong value");
+	    jit_continuation_free(continuation);
+	}
 	free_var(pass_env[0]);
 	jit_program_free(pass_prog);
 
