@@ -21,11 +21,13 @@
 #include "options.h"
 
 #include "code_gen.h"
+#include "decompile.h"
 #include "hir.h"
 #ifdef ENABLE_JIT
 #include "jit.h"
 #endif
 #include "storage.h"
+#include "sym_table.h"
 
 Program *
 compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
@@ -100,3 +102,31 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
 
     return program;
 }
+
+#ifdef ENABLE_JIT
+JITProgram *
+compile_program_to_jit(Program *source)
+{
+    Names *names;
+    Program *copy;
+    JITProgram *jit;
+    unsigned i;
+
+    if (!source)
+	return 0;
+    names = new_builtin_names(source->version);
+    for (i = names->size; i < source->num_var_names; i++)
+	if (find_or_add_name(&names, source->var_names[i]) != i) {
+	    free_names(names);
+	    return 0;
+	}
+    copy = compile_ast_to_program(decompile_program(source, MAIN_VECTOR),
+				  names, source->version);
+    if (!copy)
+	return 0;
+    jit = copy->jit;
+    copy->jit = 0;
+    free_program(copy);
+    return jit;
+}
+#endif

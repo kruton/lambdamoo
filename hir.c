@@ -4718,6 +4718,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program = mymalloc(sizeof(JITProgram), M_PROGRAM);
     memset(program, 0, sizeof(JITProgram));
     program->state = JIT_STATE_PENDING;
+    program->bytecode_program = bytecode_program;
     program->reason = str_dup("none");
     program->diagnostic = str_dup("none");
     program->eligible = 1;

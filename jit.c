@@ -7,6 +7,7 @@
 #include "my-string.h"
 #include "my-time.h"
 
+#include "compiler.h"
 #include "db.h"
 #include "exceptions.h"
 #include "functions.h"
@@ -4426,11 +4427,96 @@ jit_program_release_native(JITProgram *program)
     program->machine_code_len = 0;
 }
 
+static void
+jit_free_instruction(JITInstruction *instr)
+{
+    JITCopy *copy = instr->copies;
+
+    while (copy) {
+	JITCopy *next = copy->next;
+	myfree(copy, M_PROGRAM);
+	copy = next;
+    }
+    if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_STR
+	&& instr->literal)
+	free_str((const char *) (intptr_t) instr->literal);
+    else if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_LIST
+	     && instr->literal) {
+	Var value;
+	value.type = TYPE_LIST;
+	value.v.list = (Var *) (intptr_t) instr->literal;
+	free_var(value);
+    }
+    myfree(instr, M_PROGRAM);
+}
+
+static void
+jit_program_free_retained_constants(JITProgram *program)
+{
+    JITInstruction *instr = program->retained_constants;
+
+    while (instr) {
+	JITInstruction *next = instr->next;
+	jit_free_instruction(instr);
+	instr = next;
+    }
+    program->retained_constants = 0;
+}
+
+static void
+jit_program_release_ir(JITProgram *program, int retain_constants)
+{
+    JITBlock *block = program->blocks;
+
+    while (block) {
+	JITBlock *next_block = block->next;
+	JITInstruction *instr = block->first;
+
+	while (instr) {
+	    JITInstruction *next = instr->next;
+
+	    if (retain_constants && instr->kind == HIR_TAC_CONST
+		&& (instr->literal_type == TYPE_STR
+		    || instr->literal_type == TYPE_LIST) && instr->literal) {
+		instr->next = program->retained_constants;
+		program->retained_constants = instr;
+	    } else
+		jit_free_instruction(instr);
+	    instr = next;
+	}
+	myfree(block, M_PROGRAM);
+	block = next_block;
+    }
+    program->blocks = program->last_block = 0;
+}
+
+static int
+jit_program_restore_ir(JITProgram *program)
+{
+    JITProgram *rebuilt;
+
+    if (program->blocks)
+	return 1;
+    if (!program->bytecode_program)
+	return 1;
+    rebuilt = compile_program_to_jit(program->bytecode_program);
+    if (!rebuilt || !rebuilt->eligible
+	|| rebuilt->num_values != program->num_values
+	|| rebuilt->num_blocks != program->num_blocks
+	|| rebuilt->num_deopt_maps != program->num_deopt_maps) {
+	jit_program_free(rebuilt);
+	return 0;
+    }
+    program->blocks = rebuilt->blocks;
+    program->last_block = rebuilt->last_block;
+    rebuilt->blocks = rebuilt->last_block = 0;
+    jit_program_free(rebuilt);
+    return 1;
+}
+
 void
 jit_program_free(JITProgram *program)
 {
-    JITBlock *block;
-
     if (!program)
 	return;
 
@@ -4463,34 +4549,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_is_tagged, M_PROGRAM);
     if (program->usage)
 	myfree(program->usage, M_PROGRAM);
-    block = program->blocks;
-    while (block) {
-	JITBlock *next_block = block->next;
-	JITInstruction *instr = block->first;
-	while (instr) {
-	    JITInstruction *next_instr = instr->next;
-	    JITCopy *copy = instr->copies;
-	    while (copy) {
-		JITCopy *next_copy = copy->next;
-		myfree(copy, M_PROGRAM);
-		copy = next_copy;
-	    }
-	    if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_STR
-		&& instr->literal)
-		free_str((const char *) (intptr_t) instr->literal);
-	    else if (instr->kind == HIR_TAC_CONST && instr->literal_type == TYPE_LIST
-		&& instr->literal) {
-		Var list_var;
-		list_var.type = TYPE_LIST;
-		list_var.v.list = (Var *) (intptr_t) instr->literal;
-		free_var(list_var);
-	    }
-	    myfree(instr, M_PROGRAM);
-	    instr = next_instr;
-	}
-	myfree(block, M_PROGRAM);
-	block = next_block;
-    }
+    jit_program_release_ir(program, 0);
+    jit_program_free_retained_constants(program);
     if (program->reason)
 	free_str(program->reason);
     if (program->diagnostic)
@@ -4546,6 +4606,12 @@ jit_program_metadata_bytes(JITProgram *program)
 	    for (copy = instr->copies; copy; copy = copy->next)
 		bytes += sizeof(JITCopy);
 	}
+    }
+    {
+	JITInstruction *instr;
+
+	for (instr = program->retained_constants; instr; instr = instr->next)
+	    bytes += sizeof(JITInstruction);
     }
     return bytes;
 }
@@ -4673,23 +4739,8 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_bridges_builtin(map))
 	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
-	    && map->resume_key.site == key.site) {
-	    JITBlock *block;
-
-	    for (block = program->blocks; block; block = block->next) {
-		JITInstruction *instr;
-
-		for (instr = block->first; instr; instr = instr->next) {
-		    if ((instr->kind == HIR_TAC_CALL_VERB
-			 || jit_deopt_map_bridges_builtin(map))
-			&& instr->deopt_map == i
-			&& jit_call_has_native_continuation(program, instr))
-			return i;
-		    if (instr == block->last)
-			break;
-		}
-	    }
-	}
+	    && map->resume_key.site == key.site && map->native_resume_valid)
+	    return i;
     }
     return -1;
 }
@@ -4732,6 +4783,8 @@ jit_program_compile(JITProgram *program)
     }
     if (program->state == JIT_STATE_COMPILED)
 	return 1;
+    if (!jit_program_restore_ir(program))
+	return 0;
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
@@ -4788,6 +4841,10 @@ jit_program_compile(JITProgram *program)
     program->compile_time_us += elapsed_us(&started, &finished);
     if (program->compile_successes < UINT32_MAX)
 	program->compile_successes++;
+    if (program->bytecode_program) {
+	jit_program_free_retained_constants(program);
+	jit_program_release_ir(program, 1);
+    }
     return 1;
 }
 
@@ -5047,7 +5104,12 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     char line[512];
     int i;
 
+    int release_ir;
+
     if (!program || !program->eligible)
+	return 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
 	return 0;
     snprintf(line, sizeof(line), "HIR values=%d blocks=%d deopt-maps=%d",
 	     program->num_values, program->num_blocks, program->num_deopt_maps);
@@ -5088,6 +5150,8 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		break;
 	}
     }
+    if (release_ir)
+	jit_program_release_ir(program, 0);
     return 1;
 }
 
@@ -5100,28 +5164,32 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     MIRBuild build;
     FILE *file;
     char line[1024];
+    int release_ir;
 
     if (!program || !program->eligible)
 	return 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
     allocator = jit_mir_allocator_new();
     if (!allocator)
-	return 0;
+	goto failure;
     context = MIR_init2(&allocator->interface, 0);
     if (!context) {
 	jit_mir_allocator_free(allocator);
-	return 0;
+	goto failure;
     }
     jit_load_externals(context);
     if (!build_mir(program, &build, context)) {
 	MIR_finish(context);
 	jit_mir_allocator_free(allocator);
-	return 0;
+	goto failure;
     }
     file = tmpfile();
     if (!file) {
 	MIR_finish(context);
 	jit_mir_allocator_free(allocator);
-	return 0;
+	goto failure;
     }
     MIR_output_module(context, file, build.module);
     rewind(file);
@@ -5134,7 +5202,14 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     fclose(file);
     MIR_finish(context);
     jit_mir_allocator_free(allocator);
+    if (release_ir)
+	jit_program_release_ir(program, 0);
     return 1;
+
+failure:
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    return 0;
 }
 
 int

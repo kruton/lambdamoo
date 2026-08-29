@@ -159,6 +159,8 @@ struct JITProgram {
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;
+    JITInstruction *retained_constants;
+    Program *bytecode_program;
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
