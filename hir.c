@@ -1785,6 +1785,8 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
     return stacks[v * max_depth + stack_tops[v] - 1];
 }
 
+static int hir_kind_can_materialize(HIRTacKind);
+
 static void
 rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 		     HIRSSAInstr **placed_phis, HIRSSABlock **ssa_blocks,
@@ -1863,6 +1865,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 		}
 	    }
 	    ssa_inst->num_local_values = ctx->var_names
+		&& hir_kind_can_materialize(ssa_inst->kind)
 		? ctx->var_names->size : 0;
 	    if (ssa_inst->num_local_values) {
 		ssa_inst->local_values = hir_alloc(ctx,
@@ -6446,6 +6449,25 @@ hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *program,
 	}
     }
     return -1;
+}
+
+int
+hir_ssa_local_snapshot_count(HIRSSAProgram *program)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->num_local_values > 0)
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return count;
 }
 
 int

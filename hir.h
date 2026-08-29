@@ -219,6 +219,7 @@ extern int hir_ssa_stack_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
 extern int hir_ssa_binary_value_at_bytecode_pc(HIRSSAProgram *, unsigned,
 					       HIROp);
 extern int hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
+extern int hir_ssa_local_snapshot_count(HIRSSAProgram *);
 extern int hir_ssa_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_return_uses_phi_count(HIRSSAProgram *);
