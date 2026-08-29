@@ -4204,6 +4204,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      deopt_map_out, deopt_values, status,
 				      common_return);
 		    break;
+		case HIR_TAC_INDEX_SET:
+		    append_deopt_exit(build, program, instr->deopt_map, values,
+				      deopt_map_out, deopt_values, status,
+				      common_return);
+		    break;
 		case HIR_TAC_RANGE_REF:
 		    if (instr->deopt_map >= 0
 			&& instr->deopt_map < program->num_deopt_maps) {
@@ -5492,9 +5497,10 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		? program->value_types[instr->value] : TYPE_ANY;
 
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d",
+		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->value, instr->src1, instr->src2,
+		     instr->src3,
 		     type, tagged, instr->local_id, instr->deopt_map,
 		     instr->deopt_map > 0
 		     && program->deopt_maps[instr->deopt_map].native_resume

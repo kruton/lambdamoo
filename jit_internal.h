@@ -128,6 +128,7 @@ struct JITInstruction {
     int value;
     int src1;
     int src2;
+    int src3;
     int local_id;
     unsigned func;
     HIROp op;

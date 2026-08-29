@@ -1490,7 +1490,7 @@ test_list_index_tac_ssa(void)
 }
 
 static void
-test_direct_index_assignment_deopt(void)
+test_direct_index_assignment_native(void)
 {
     Names names;
     HIRContext *ctx;
@@ -1516,11 +1516,15 @@ test_direct_index_assignment_deopt(void)
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
     check_int("index assignment accepted", hir_context_error_count(ctx), 0);
+	check_int("index assignment native count",
+	      hir_tac_count_kind(tac, HIR_TAC_INDEX_SET), 1);
     check_int("index assignment deopt count",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
-    check_int("index assignment deopt stack",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
+    check_int("index assignment resume stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 4), 3);
     check_int("index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("index assignment ssa count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_INDEX_SET), 1);
     check_int("index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
@@ -3616,8 +3620,10 @@ test_length_expr_in_stores_and_negatives(void)
     stmt_idx = expr_stmt(&assign_idx);
     tac = lower_stmt(&names, &stmt_idx, &ctx, &cfg, &dom, &ssa);
     check_int("length in index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in index store native count",
+	      hir_tac_count_kind(tac, HIR_TAC_INDEX_SET), 1);
     check_int("length in index store deopt count",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     hir_context_free(ctx);
 
     /* 2. local[1..$] = 42 */
@@ -3733,7 +3739,7 @@ main(void)
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
-    test_direct_index_assignment_deopt();
+    test_direct_index_assignment_native();
     test_nested_index_assignment_deopt();
     test_property_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();

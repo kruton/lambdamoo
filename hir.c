@@ -427,6 +427,7 @@ struct HIRTacInstr {
     int dst;
     int src1;
     int src2;
+    int src3;
     int label;
     int local_id;
     HIROp op;
@@ -509,6 +510,7 @@ struct HIRSSAInstr {
     int value;
     int src1;
     int src2;
+    int src3;
     int label;
     int local_id;
     HIROp op;
@@ -814,6 +816,13 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_RANGE_SET:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_INDEX_SET:
+	    verify_local(ctx, instr->local_id);
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src3, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_LABEL:
@@ -1259,6 +1268,7 @@ new_cfg_split_jump(HIRContext *ctx, HIRBasicBlock *from, HIRBasicBlock *to)
     jump->dst = 0;
     jump->src1 = 0;
     jump->src2 = 0;
+    jump->src3 = 0;
     jump->label = to && to->first && to->first->kind == HIR_TAC_LABEL
 	? to->first->label : 0;
     jump->local_id = -1;
@@ -1630,6 +1640,7 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_CALL
 	    || instr->kind == HIR_TAC_CALL_VERB
 	    || instr->kind == HIR_TAC_PUT_PROP
+	    || instr->kind == HIR_TAC_INDEX_SET
 	    || instr->kind == HIR_TAC_RANGE_REF
 	    || instr->kind == HIR_TAC_RANGE_SET
 	    || instr->kind == HIR_TAC_UNSUPPORTED
@@ -1673,6 +1684,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->value = tac->dst;
     instr->src1 = tac->src1;
     instr->src2 = tac->src2;
+    instr->src3 = tac->src3;
     instr->label = tac->label;
     instr->local_id = tac->local_id;
     instr->op = tac->op;
@@ -1711,7 +1723,8 @@ ssa_stack_depth(HIRContext *ctx, HIRCFG *cfg, HIRSSAInstr **placed_phis,
 	HIRTacInstr *tac;
 
 	for (tac = block->first; tac; tac = tac->next) {
-	    if (tac->kind == HIR_TAC_STORE_LOCAL
+	    if ((tac->kind == HIR_TAC_STORE_LOCAL
+		 || tac->kind == HIR_TAC_INDEX_SET)
 		&& tac->local_id >= 0 && tac->local_id < num_locals)
 		counts[tac->local_id]++;
 	    if (tac == block->last)
@@ -1761,6 +1774,7 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
+	load->src3 = 0;
 	load->label = 0;
 	load->local_id = internal_local || uninitialized_local ? -1 : v;
 	load->op = HIR_OP_ADD;
@@ -1848,6 +1862,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
     for (tac = b->first; tac; tac = tac->next) {
 	int src1_renamed = (tac->src1 > 0 && tac->src1 < temp_map_size) ? temp_map[tac->src1] : tac->src1;
 	int src2_renamed = (tac->src2 > 0 && tac->src2 < temp_map_size) ? temp_map[tac->src2] : tac->src2;
+	int src3_renamed = (tac->src3 > 0 && tac->src3 < temp_map_size) ? temp_map[tac->src3] : tac->src3;
 
 	if (tac->kind == HIR_TAC_LOAD_LOCAL) {
 	    int t_val = current_version(ctx, tac->local_id, num_locals,
@@ -1867,6 +1882,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 
 	    ssa_inst->src1 = src1_renamed;
 	    ssa_inst->src2 = src2_renamed;
+	    ssa_inst->src3 = src3_renamed;
 	    if (tac->num_stack_values) {
 		ssa_inst->stack_values = hir_alloc(ctx,
 				 sizeof(int) * tac->num_stack_values);
@@ -1894,6 +1910,13 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 	    if (tac->dst > 0 && tac->dst < temp_map_size)
 		temp_map[tac->dst] = tac->dst;
 	    emit_ssa_instr(ssa, ssa_block, ssa_inst);
+	    if (tac->kind == HIR_TAC_INDEX_SET) {
+		if (tac->local_id >= 0 && tac->local_id < num_locals)
+		    stacks[tac->local_id * max_depth
+			   + stack_tops[tac->local_id]++] = ssa_inst->value;
+		else
+		    record_unsupported_fmt(ctx, "ssa-build: invalid index-set local id %d", tac->local_id);
+	    }
 	}
 
 	if (tac == b->last)
@@ -1941,7 +1964,8 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 
     /* 6. Pop store_local definitions from version stacks */
     for (tac = b->first; tac; tac = tac->next) {
-	if (tac->kind == HIR_TAC_STORE_LOCAL
+	if ((tac->kind == HIR_TAC_STORE_LOCAL
+	     || tac->kind == HIR_TAC_INDEX_SET)
 	    && tac->local_id >= 0 && tac->local_id < num_locals)
 	    stack_tops[tac->local_id]--;
 	if (tac == b->last)
@@ -1960,6 +1984,7 @@ hir_kind_can_materialize(HIRTacKind kind)
     case HIR_TAC_CALL:
     case HIR_TAC_CALL_VERB:
     case HIR_TAC_PUT_PROP:
+    case HIR_TAC_INDEX_SET:
     case HIR_TAC_RANGE_REF:
     case HIR_TAC_RANGE_SET:
     case HIR_TAC_UNSUPPORTED:
@@ -1998,7 +2023,8 @@ compute_local_live_in(HIRContext *ctx, HIRCFG *cfg, HIRBlockList **preds,
 	unsigned char *block_defs = defs + (size_t) block->id * num_locals;
 
 	for (instr = block->first; instr; instr = instr->next) {
-	    if (instr->kind == HIR_TAC_STORE_LOCAL
+	    if ((instr->kind == HIR_TAC_STORE_LOCAL
+		 || instr->kind == HIR_TAC_INDEX_SET)
 		&& instr->local_id >= 0 && instr->local_id < num_locals)
 		block_defs[instr->local_id] = 1;
 	    if (instr == block->last)
@@ -2048,7 +2074,8 @@ compute_local_live_in(HIRContext *ctx, HIRCFG *cfg, HIRBlockList **preds,
 		for (i = 0; i < num_locals; i++)
 		    if (in[i] && !seen_def[i])
 			block_uses[i] = 1;
-	    if (instr->kind == HIR_TAC_STORE_LOCAL
+	    if ((instr->kind == HIR_TAC_STORE_LOCAL
+		 || instr->kind == HIR_TAC_INDEX_SET)
 		&& instr->local_id >= 0 && instr->local_id < num_locals)
 		seen_def[instr->local_id] = 1;
 	    if (instr == block->last)
@@ -2140,7 +2167,8 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
     for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
 	HIRTacInstr *tac;
 	for (tac = cfg_block->first; tac; tac = tac->next) {
-	    if (tac->kind == HIR_TAC_STORE_LOCAL) {
+	    if (tac->kind == HIR_TAC_STORE_LOCAL
+		|| tac->kind == HIR_TAC_INDEX_SET) {
 		int v = tac->local_id;
 		if (v >= 0 && v < num_locals) {
 		    /* Check if block is already in defs[v] */
@@ -2207,6 +2235,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			phi->local_values = 0;
 			phi->src1 = 0;
 			phi->src2 = 0;
+			phi->src3 = 0;
 			phi->label = 0;
 			phi->local_id = i;
 			phi->op = HIR_OP_ADD;
@@ -2296,6 +2325,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	    label->value = 0;
 	    label->src1 = 0;
 	    label->src2 = 0;
+	    label->src3 = 0;
 	    label->label = 0;
 	    label->local_id = 0;
 	    label->op = HIR_OP_ADD;
@@ -2522,6 +2552,17 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 					   order, 0, max_value,
 					   def_block, def_order);
 		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		verify_ssa_dominating_use(ctx, dom, instr->src2, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		verify_ssa_dominating_use(ctx, dom, instr->src3, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		break;
 	    case HIR_TAC_PHI:
 		{
 		    HIRPhiArg *arg;
@@ -2605,6 +2646,14 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_RANGE_SET:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_local(ctx, instr->local_id);
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_use(ctx, instr->src3, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -3181,7 +3230,7 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 		instr->literal.type = TYPE_INT;
 		instr->literal.v.num = hir_value_constant(analysis,
 							  instr->value);
-		instr->src1 = instr->src2 = 0;
+		instr->src1 = instr->src2 = instr->src3 = 0;
 		instr->phi_args = 0;
 		changes++;
 	    }
@@ -3406,6 +3455,7 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     copy->value = 0;
     copy->src1 = 0;
     copy->src2 = 0;
+    copy->src3 = 0;
     copy->label = 0;
     copy->local_id = -1;
     copy->op = HIR_OP_ADD;
@@ -3591,6 +3641,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_INDEX_SET:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		mark_out_ssa_def(instr->value, defined, max_value);
@@ -3649,6 +3700,11 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_RANGE_SET:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
+		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
+		verify_out_ssa_use(ctx, instr->src3, defined, max_value);
 		break;
 	    case HIR_TAC_BRANCH_FALSE:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
@@ -3817,6 +3873,7 @@ tac_kind_name(HIRTacKind kind)
     case HIR_TAC_CALL: return "call";
     case HIR_TAC_CALL_VERB: return "call-verb";
     case HIR_TAC_PUT_PROP: return "put-prop";
+    case HIR_TAC_INDEX_SET: return "index-set";
     case HIR_TAC_RANGE_REF: return "range-ref";
     case HIR_TAC_RANGE_SET: return "range-set";
     case HIR_TAC_LABEL: return "label";
@@ -3853,6 +3910,7 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_INDEX_SET:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 	    case HIR_TAC_LABEL:
@@ -4139,6 +4197,17 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		    return 0;
 		}
 		break;
+	    case HIR_TAC_INDEX_SET:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_INDEXSET) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u index_set expected OP_INDEXSET (got opcode %u)",
+					   instr->bytecode_pc,
+					   instr->bytecode_pc < bc->size
+					   ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
+		    return 0;
+		}
+		break;
 	    case HIR_TAC_RANGE_REF:
 		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
 		    || bc->vector[instr->bytecode_pc] != OP_RANGE_REF) {
@@ -4413,6 +4482,9 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 	break;
     case HIR_TAC_PUT_PROP:
 	map->reason = JIT_DEOPT_PROPERTY_WRITE;
+	break;
+    case HIR_TAC_INDEX_SET:
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
 	break;
     case HIR_TAC_RANGE_REF:
     case HIR_TAC_RANGE_SET:
@@ -4727,6 +4799,8 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	uses[instr->src1] = 1;
     if (instr->src2 > 0 && instr->src2 < program->num_values)
 	uses[instr->src2] = 1;
+    if (instr->src3 > 0 && instr->src3 < program->num_values)
+	uses[instr->src3] = 1;
     if (!jit_instr_can_materialize(instr) || instr->deopt_map <= 0
 	|| instr->deopt_map >= program->num_deopt_maps)
 	return;
@@ -5553,13 +5627,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
 		    && value_types_conflicted[ssa_instr->src2]
-		    && !value_is_tagged[ssa_instr->src2]);
+		    && !value_is_tagged[ssa_instr->src2])
+		|| (ssa_instr->src3 > 0
+		    && ssa_instr->src3 < program->num_values
+		    && value_types_conflicted[ssa_instr->src3]
+		    && !value_is_tagged[ssa_instr->src3]);
 	    int uses_tagged = (ssa_instr->src1 > 0
 			       && ssa_instr->src1 < program->num_values
 			       && value_is_tagged[ssa_instr->src1])
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
-		    && value_is_tagged[ssa_instr->src2]);
+		    && value_is_tagged[ssa_instr->src2])
+		|| (ssa_instr->src3 > 0
+		    && ssa_instr->src3 < program->num_values
+		    && value_is_tagged[ssa_instr->src3]);
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
@@ -5575,6 +5656,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->value = ssa_instr->value;
 	    instr->src1 = ssa_instr->src1;
 	    instr->src2 = ssa_instr->src2;
+	    instr->src3 = ssa_instr->src3;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->func = ssa_instr->func;
 	    instr->op = ssa_instr->op;
@@ -5832,6 +5914,11 @@ hir_dump_tac(HIRTacProgram *program)
 	case HIR_TAC_STORE_LOCAL:
 	    fprintf(stderr, " local[%d] = t%d", instr->local_id, instr->src1);
 	    break;
+	case HIR_TAC_INDEX_SET:
+	    fprintf(stderr, " t%d = local[%d] = index_set(t%d, t%d, t%d)",
+		    instr->dst, instr->local_id, instr->src1, instr->src2,
+		    instr->src3);
+	    break;
 	case HIR_TAC_UNARY:
 	    fprintf(stderr, " t%d = %s t%d", instr->dst,
 		    op_name(instr->op), instr->src1);
@@ -6018,6 +6105,11 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " local[%d] = t%d", instr->local_id,
 			instr->src1);
 		break;
+	    case HIR_TAC_INDEX_SET:
+		fprintf(file, " t%d = local[%d] = index_set(t%d, t%d, t%d)",
+			instr->value, instr->local_id, instr->src1, instr->src2,
+			instr->src3);
+		break;
 	    case HIR_TAC_UNARY:
 		fprintf(file, " t%d = %s t%d", instr->value,
 			op_name(instr->op), instr->src1);
@@ -6119,6 +6211,8 @@ tac_kind_name(HIRTacKind kind)
 	return "load_local";
     case HIR_TAC_STORE_LOCAL:
 	return "store_local";
+    case HIR_TAC_INDEX_SET:
+	return "index_set";
     case HIR_TAC_UNARY:
 	return "unary";
     case HIR_TAC_BINARY:
@@ -7585,6 +7679,7 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
     instr->dst = 0;
     instr->src1 = 0;
     instr->src2 = 0;
+    instr->src3 = 0;
     instr->label = 0;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;
@@ -8383,10 +8478,22 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    ctx->current_length_base = prev_base;
 	    rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
 
-	    (void) base_temp;
-	    (void) index_temp;
-	    append_index_store_deopt(ctx, program, expr->source_lineno,
-				     expr->bytecode_pc);
+	    if (expr->u.index_store.base->kind == HIR_EXPR_LOCAL_LOAD) {
+		append_tick(ctx, program, expr->source_lineno,
+			    expr->bytecode_pc);
+		instr = new_tac(ctx, HIR_TAC_INDEX_SET, expr->source_lineno);
+		instr->bytecode_pc = expr->bytecode_pc;
+		instr->dst = new_temp(ctx);
+		instr->src1 = base_temp;
+		instr->src2 = index_temp;
+		instr->src3 = rhs_temp;
+		instr->local_id = expr->u.index_store.base->u.local_id;
+		snapshot_lower_stack(ctx, instr);
+		append_tac(program, instr);
+	    } else {
+		append_index_store_deopt(ctx, program, expr->source_lineno,
+					 expr->bytecode_pc);
+	    }
 	    ctx->lower_stack_depth = saved_depth;
 	    push_lower_stack(ctx, rhs_temp);
 	    return rhs_temp;
