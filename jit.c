@@ -792,10 +792,6 @@ jit_pool_reset(void)
 	current->native_function = 0;
 	current->machine_code = 0;
 	current->machine_code_len = 0;
-	if (current->deopt_values) {
-	    myfree(current->deopt_values, M_PROGRAM);
-	    current->deopt_values = 0;
-	}
 	current->pool_generation = 0;
 	current->pool_prev = 0;
 	current->pool_next = 0;
@@ -4632,10 +4628,6 @@ jit_program_release_native(JITProgram *program)
     if (!program)
 	return;
     jit_pool_unregister(program);
-    if (program->deopt_values) {
-	myfree(program->deopt_values, M_PROGRAM);
-	program->deopt_values = 0;
-    }
     program->native_function = 0;
     program->machine_code = 0;
     program->machine_code_len = 0;
@@ -4859,8 +4851,7 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->compile_failures = program->compile_failures;
     stats->compile_time_us = program->compile_time_us;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
-    stats->runtime_bytes = program->deopt_values
-	? sizeof(Num) * program->num_values * 2 : 0;
+    stats->runtime_bytes = program->active_runtime_bytes;
     stats->machine_code_bytes = program->machine_code_len;
     if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
 	&& program->machine_code_len > 0) {
@@ -5053,15 +5044,6 @@ jit_program_compile(JITProgram *program)
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
     MIR_gen_finish(jit_shared_pool.context);
-    program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
-				     M_PROGRAM);
-    memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
-    {
-	int i;
-
-	for (i = 0; i < program->num_values; i++)
-	    program->deopt_values[program->num_values + i] = TYPE_ANY;
-    }
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
     jit_pool_register(program);
@@ -5129,7 +5111,7 @@ jit_continuation_value(JITContinuationFrame *frame, int value)
 }
 
 static JITContinuationFrame *
-jit_continuation_capture(JITProgram *program, int map_id)
+jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values)
 {
     JITContinuationFrame *frame;
     JITDeoptMap *map;
@@ -5159,7 +5141,7 @@ jit_continuation_capture(JITProgram *program, int map_id)
 	    continue;
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
-	    ? (var_type) program->deopt_values[program->num_values
+	    ? (var_type) deopt_values[program->num_values
 		+ resume->value]
 	    : program->value_types[resume->value];
 	if (!jit_runtime_type_is_valid(type)) {
@@ -5180,11 +5162,11 @@ jit_continuation_capture(JITProgram *program, int map_id)
 	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
-	    ? (var_type) program->deopt_values[program->num_values
+	    ? (var_type) deopt_values[program->num_values
 		+ resume->value]
 	    : program->value_types[resume->value];
 	frame->values[i] = materialize_deopt_value(type,
-		program->deopt_values[resume->value]);
+		deopt_values[resume->value]);
     }
     if (program->usage)
 	program->usage->continuation_captures++;
@@ -5389,7 +5371,7 @@ jit_runtime_type_is_valid(var_type type)
 
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
-		      int operand)
+		      Num *deopt_values, int operand)
 {
     int value = map->guard_value[operand];
     int local = map->guard_local[operand];
@@ -5400,7 +5382,7 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 	return env[local].type;
     if (value > 0 && value < program->num_values) {
 	if (program->value_is_tagged && program->value_is_tagged[value])
-	    return (var_type) program->deopt_values[program->num_values + value];
+	    return (var_type) deopt_values[program->num_values + value];
 	if (program->value_types)
 	    return program->value_types[value];
     }
@@ -5408,7 +5390,8 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 }
 
 static void
-jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
+jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
+			       Num *deopt_values)
 {
     int i;
 
@@ -5418,7 +5401,7 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
 	if (value > 0 && value < program->num_values
 	    && program->value_is_tagged && program->value_is_tagged[value]
 	    && !jit_runtime_type_is_valid((var_type)
-		program->deopt_values[program->num_values + value])) {
+	deopt_values[program->num_values + value])) {
 	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
 		   value, i, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
@@ -5431,7 +5414,7 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
 	    && value > 0 && value < program->num_values
 	    && program->value_is_tagged && program->value_is_tagged[value]
 	    && !jit_runtime_type_is_valid((var_type)
-		program->deopt_values[program->num_values + value])) {
+	deopt_values[program->num_values + value])) {
 	    errlog("JIT: missing runtime tag for value %d in stack slot %d at pc %u\n",
 		   value, i, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
@@ -5450,6 +5433,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
+    Num *deopt_values;
+    size_t runtime_bytes;
     JITSourceLocation ignored_location;
 
     (void) continuation_in;
@@ -5492,10 +5477,21 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
+    runtime_bytes = sizeof(Num) * program->num_values * 2;
+    deopt_values = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
+			    M_PROGRAM);
+    memset(deopt_values, 0, runtime_bytes);
+    {
+	int i;
+
+	for (i = 0; i < program->num_values; i++)
+	    deopt_values[program->num_values + i] = TYPE_ANY;
+    }
+    program->active_runtime_bytes += runtime_bytes;
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
-			     program->deopt_values, progr, resume_map,
+			     deopt_values, progr, resume_map,
 			     deopt_stack,
 			     continuation_in ? continuation_in->values : 0);
     if (native_result == JIT_RUN_FALLBACK
@@ -5508,16 +5504,19 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	int compact_boundary = 0;
 	int i;
 
-	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
+	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
+	    program->active_runtime_bytes -= runtime_bytes;
+	    myfree(deopt_values, M_PROGRAM);
 	    return JIT_RUN_FALLBACK;
+	}
 	map = &program->deopt_maps[deopt_map];
-	jit_validate_materialized_tags(program, map);
+	jit_validate_materialized_tags(program, map, deopt_values);
 	materialized_depth = map->stack_depth;
 	if (native_result == JIT_RUN_CALL_VERB && continuation_out
 	    && (map->reason == JIT_DEOPT_VERB_CALL
 		|| map->reason == JIT_DEOPT_BUILTIN_CALL)) {
 	    JITContinuationFrame *frame =
-		jit_continuation_capture(program, deopt_map);
+		jit_continuation_capture(program, deopt_map, deopt_values);
 
 	    if (frame) {
 		int operands = jit_call_stack_operands(map);
@@ -5537,10 +5536,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    if (local_value > 0) {
 		var_type type = jit_deopt_map_local_type(program, map, i);
 		if (type == TYPE_ANY)
-		    type = (var_type) program->deopt_values[program->num_values
+		    type = (var_type) deopt_values[program->num_values
 			+ local_value];
 		Var value = materialize_deopt_value(type,
-			program->deopt_values[local_value]);
+		    deopt_values[local_value]);
 
 		free_var(env[i]);
 		env[i] = value;
@@ -5563,11 +5562,11 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		continue;
 	    }
 	    if (type == TYPE_ANY)
-		type = (var_type) program->deopt_values[program->num_values
+		type = (var_type) deopt_values[program->num_values
 		    + map->stack_values[i]];
 
 	    new_stack[i - stack_start] = materialize_deopt_value(type,
-		program->deopt_values[map->stack_values[i]]);
+		deopt_values[map->stack_values[i]]);
 	}
 	if (new_stack && !compact_boundary
 	    && jit_deopt_map_is_specialized_builtin(map)) {
@@ -5600,7 +5599,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		   sizeof(deopt->guard_expected));
 	    for (i = 0; i < JIT_MAX_GUARD_OPERANDS; i++)
 		deopt->guard_actual[i] = jit_guard_actual_type(program, map,
-							      env, i);
+						      env, deopt_values, i);
 	    deopt->reason = map->reason;
 	}
     }
@@ -5608,6 +5607,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	if (result)
 	    *result = var_ref(*result);
     }
+    program->active_runtime_bytes -= runtime_bytes;
+    myfree(deopt_values, M_PROGRAM);
     return native_result;
 }
 

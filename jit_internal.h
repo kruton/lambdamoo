@@ -183,9 +183,9 @@ struct JITProgram {
     uint64_t pool_generation;
     JITProgram *pool_prev;
     JITProgram *pool_next;
-    Num *deopt_values;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    size_t active_runtime_bytes;
     unsigned protection_generation;
     JITProgramUsage *usage;
     uint32_t compile_attempts;

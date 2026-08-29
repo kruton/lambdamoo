@@ -3301,7 +3301,7 @@ main(void)
 	      && stats.compile_failures == 0,
 	      "JIT compilation statistics are wrong");
 	check(stats.metadata_bytes > sizeof(JITProgram)
-	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
+	      && stats.runtime_bytes == 0
 	      && stats.machine_code_bytes == program->machine_code_len
 	      && stats.native_allocated_bytes >= stats.machine_code_bytes,
 	      "JIT memory statistics are wrong");
