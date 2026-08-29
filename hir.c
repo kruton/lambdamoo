@@ -4781,6 +4781,53 @@ jit_coalesce_deopt_locals(JITProgram *program)
 }
 
 static void
+jit_build_deopt_tag_values(JITProgram *program)
+{
+    unsigned char *seen;
+    int map_id;
+
+    if (!program || program->num_values <= 0)
+	return;
+    seen = mymalloc(program->num_values, M_PROGRAM);
+    for (map_id = 0; map_id < program->num_deopt_maps; map_id++) {
+	JITDeoptMap *map = &program->deopt_maps[map_id];
+	int count = 0;
+	int slot;
+
+	memset(seen, 0, program->num_values);
+	for (slot = 0; slot < map->num_locals; slot++) {
+	    int value = jit_deopt_map_local_value(program, map, slot);
+
+	    if (value > 0 && value < program->num_values
+		&& program->value_is_tagged[value] && !seen[value]) {
+		seen[value] = 1;
+		count++;
+	    }
+	}
+	for (slot = 0; slot < (int) map->stack_depth; slot++) {
+	    int value;
+
+	    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+		continue;
+	    value = map->stack_values[slot];
+	    if (value > 0 && value < program->num_values
+		&& program->value_is_tagged[value] && !seen[value]) {
+		seen[value] = 1;
+		count++;
+	    }
+	}
+	map->num_tagged_values = count;
+	map->tagged_values = count
+	    ? mymalloc(sizeof(int) * count, M_PROGRAM) : 0;
+	count = 0;
+	for (slot = 1; slot < program->num_values; slot++)
+	    if (seen[slot])
+		map->tagged_values[count++] = slot;
+    }
+    myfree(seen, M_PROGRAM);
+}
+
+static void
 jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 		   unsigned char *uses, unsigned char *defs)
 {
@@ -6005,6 +6052,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	jit_program_free(program);
 	return unsupported;
     }
+    jit_build_deopt_tag_values(program);
     jit_build_resume_liveness(program);
     return program;
 }

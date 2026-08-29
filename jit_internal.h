@@ -77,6 +77,8 @@ struct JITDeoptMap {
     int num_local_values;
     int local_base;
     JITLocalValue *local_values;
+    int num_tagged_values;
+    int *tagged_values;
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;

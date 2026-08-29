@@ -4885,6 +4885,8 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
+		if (program->deopt_maps[i].tagged_values)
+		    myfree(program->deopt_maps[i].tagged_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_values)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_types)
@@ -4953,6 +4955,8 @@ jit_program_metadata_bytes(JITProgram *program)
 
 	if (map->local_values)
 	    bytes += sizeof(JITLocalValue) * map->num_local_values;
+	if (map->tagged_values)
+	    bytes += sizeof(int) * map->num_tagged_values;
 	if (map->stack_values)
 	    bytes += sizeof(int) * map->stack_depth;
 	if (map->stack_types)
@@ -5597,28 +5601,13 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
 {
     int i;
 
-    for (i = 0; i < map->num_locals; i++) {
-	int value = jit_deopt_map_local_value(program, map, i);
+    for (i = 0; i < map->num_tagged_values; i++) {
+	int value = map->tagged_values[i];
 
-	if (value > 0 && value < program->num_values
-	    && program->value_is_tagged && program->value_is_tagged[value]
-	    && !jit_runtime_type_is_valid((var_type)
-	deopt_values[program->num_values + value])) {
-	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
-		   value, i, map->bytecode_pc);
-	    panic("JIT runtime tag invariant violated");
-	}
-    }
-    for (i = 0; i < (int) map->stack_depth; i++) {
-	int value = map->stack_values[i];
-
-	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
-	    && value > 0 && value < program->num_values
-	    && program->value_is_tagged && program->value_is_tagged[value]
-	    && !jit_runtime_type_is_valid((var_type)
-	deopt_values[program->num_values + value])) {
-	    errlog("JIT: missing runtime tag for value %d in stack slot %d at pc %u\n",
-		   value, i, map->bytecode_pc);
+	if (!jit_runtime_type_is_valid((var_type)
+	    deopt_values[program->num_values + value])) {
+	    errlog("JIT: missing runtime tag for value %d at pc %u\n",
+		   value, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
 	}
     }
