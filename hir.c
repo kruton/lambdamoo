@@ -33,11 +33,13 @@ infer_string_add_operand(HIROp op, int other_known, var_type other_type,
     return 1;
 }
 
+#ifdef HIR_TESTING
 static int
 unary_operand_defaults_to_list(HIROp op)
 {
     return op == HIR_OP_CHECK_LIST_FOR_SPLICE;
 }
+#endif
 
 static int
 binary_operands_constrain_each_other(HIROp op)
@@ -3929,11 +3931,159 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 }
 
 static int
+type_from_singleton_mask(JITTypeMask mask, var_type *type)
+{
+    int db_type;
+
+    if (!mask || (mask & (mask - 1)) != 0)
+	return 0;
+    for (db_type = TYPE_INT; db_type <= _TYPE_WAIF; db_type++)
+	if (mask == JIT_TYPE_MASK(db_type)) {
+	    *type = db_type == _TYPE_STR ? TYPE_STR
+		: db_type == _TYPE_LIST ? TYPE_LIST
+		: db_type == _TYPE_FLOAT ? TYPE_FLOAT
+		: db_type == _TYPE_WAIF ? TYPE_WAIF
+		: (var_type) db_type;
+	    return 1;
+	}
+    return 0;
+}
+
+typedef struct {
+    JITTypeMask operands[JIT_MAX_GUARD_OPERANDS];
+    int tagged_dispatch;
+} JITConsumerContract;
+
+static JITConsumerContract
+jit_consumer_contract(HIRSSAInstr *instr)
+{
+    JITConsumerContract contract;
+    JITTypeMask numeric = JIT_TYPE_MASK(TYPE_INT) | JIT_TYPE_MASK(TYPE_FLOAT);
+
+    memset(&contract, 0, sizeof(contract));
+    if (instr->kind == HIR_TAC_UNARY) {
+	switch (instr->op) {
+	case HIR_OP_COMPLEMENT:
+	case HIR_OP_TOINT:
+	    contract.operands[0] = JIT_TYPE_MASK(TYPE_INT);
+	    break;
+	case HIR_OP_NEGATE:
+	case HIR_OP_ABS:
+	    contract.operands[0] = numeric;
+	    contract.tagged_dispatch = instr->op == HIR_OP_ABS;
+	    break;
+	case HIR_OP_LENGTH:
+	    contract.operands[0] = JIT_TYPE_MASK(TYPE_STR)
+		| JIT_TYPE_MASK(TYPE_LIST);
+	    contract.tagged_dispatch = 1;
+	    break;
+	case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	    contract.operands[0] = JIT_TYPE_MASK(TYPE_LIST);
+	    contract.tagged_dispatch = 1;
+	    break;
+	case HIR_OP_PARENT:
+	case HIR_OP_VALID:
+	    contract.operands[0] = JIT_TYPE_MASK(TYPE_OBJ);
+	    contract.tagged_dispatch = instr->op == HIR_OP_PARENT;
+	    break;
+	case HIR_OP_NOT:
+	case HIR_OP_TYPEOF:
+	case HIR_OP_MAKE_SINGLETON_LIST:
+	    contract.tagged_dispatch = 1;
+	    break;
+	default:
+	    break;
+	}
+	return contract;
+    }
+    if (instr->kind != HIR_TAC_BINARY)
+	return contract;
+    switch (instr->op) {
+    case HIR_OP_ADD:
+	contract.operands[0] = contract.operands[1]
+	    = numeric | JIT_TYPE_MASK(TYPE_STR);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_SUB:
+    case HIR_OP_MUL:
+    case HIR_OP_DIV:
+	contract.operands[0] = contract.operands[1] = numeric;
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_MOD:
+    case HIR_OP_EXP:
+    case HIR_OP_BITOR:
+    case HIR_OP_BITXOR:
+    case HIR_OP_BITAND:
+    case HIR_OP_SHL:
+    case HIR_OP_SHR:
+    case HIR_OP_LSHR:
+	contract.operands[0] = contract.operands[1] = JIT_TYPE_MASK(TYPE_INT);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_INDEX:
+	contract.operands[0] = JIT_TYPE_MASK(TYPE_LIST)
+	    | JIT_TYPE_MASK(TYPE_STR);
+	contract.operands[1] = JIT_TYPE_MASK(TYPE_INT);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_INDEX_BF:
+    case HIR_OP_RINDEX_BF:
+	contract.operands[0] = contract.operands[1] = JIT_TYPE_MASK(TYPE_STR);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_GET_PROP:
+	contract.operands[0] = JIT_TYPE_MASK(TYPE_OBJ) | JIT_TYPE_MASK(TYPE_WAIF);
+	contract.operands[1] = JIT_TYPE_MASK(TYPE_STR);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_SUBLIST_FROM:
+	contract.operands[0] = JIT_TYPE_MASK(TYPE_LIST);
+	contract.operands[1] = JIT_TYPE_MASK(TYPE_INT);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_LIST_APPEND:
+	contract.operands[0] = contract.operands[1] = JIT_TYPE_MASK(TYPE_LIST);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_LIST_ADD_TAIL:
+	contract.operands[0] = JIT_TYPE_MASK(TYPE_LIST);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_IN:
+	contract.operands[1] = JIT_TYPE_MASK(TYPE_LIST);
+	contract.tagged_dispatch = 1;
+	break;
+    case HIR_OP_EQ:
+    case HIR_OP_NE:
+    case HIR_OP_LT:
+    case HIR_OP_LE:
+    case HIR_OP_GT:
+    case HIR_OP_GE:
+	contract.tagged_dispatch = 1;
+	break;
+    default:
+	break;
+    }
+    return contract;
+}
+
+static int
+jit_tagged_consumer_is_supported(HIRSSAInstr *instr)
+{
+    if (instr->kind == HIR_TAC_BRANCH_FALSE || instr->kind == HIR_TAC_RETURN
+	|| instr->kind == HIR_TAC_CALL_VERB || instr->kind == HIR_TAC_CALL
+	|| instr->kind == HIR_TAC_RANGE_REF)
+	return 1;
+    return jit_consumer_contract(instr).tagged_dispatch;
+}
+
+static int
 jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
 		   unsigned char *value_is_tagged, int num_values,
 		   int *values, int *locals, JITTypeMask *expected)
 {
-    JITTypeMask numeric = JIT_TYPE_MASK(TYPE_INT) | JIT_TYPE_MASK(TYPE_FLOAT);
+    JITConsumerContract contract;
 
     values[0] = values[1] = 0;
     locals[0] = locals[1] = -1;
@@ -3946,72 +4096,11 @@ jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
 	expected[0] = JIT_TYPE_MASK(value_types[instr->value]);
 	return 1;
     }
-    if (instr->kind == HIR_TAC_UNARY) {
-	values[0] = instr->src1;
-	switch (instr->op) {
-	case HIR_OP_COMPLEMENT:
-	case HIR_OP_TOINT:
-	    expected[0] = JIT_TYPE_MASK(TYPE_INT);
-	    break;
-	case HIR_OP_NEGATE:
-	case HIR_OP_ABS:
-	    expected[0] = numeric;
-	    break;
-	case HIR_OP_LENGTH:
-	    expected[0] = JIT_TYPE_MASK(TYPE_STR) | JIT_TYPE_MASK(TYPE_LIST);
-	    break;
-	case HIR_OP_CHECK_LIST_FOR_SPLICE:
-	    expected[0] = JIT_TYPE_MASK(TYPE_LIST);
-	    break;
-	case HIR_OP_PARENT:
-	case HIR_OP_VALID:
-	    expected[0] = JIT_TYPE_MASK(TYPE_OBJ);
-	    break;
-	default:
-	    values[0] = 0;
-	    break;
-	}
-	return expected[0] != 0;
-    }
-    if (instr->kind != HIR_TAC_BINARY)
-	return 0;
+    contract = jit_consumer_contract(instr);
     values[0] = instr->src1;
     values[1] = instr->src2;
-    switch (instr->op) {
-    case HIR_OP_ADD:
-	expected[0] = expected[1] = numeric | JIT_TYPE_MASK(TYPE_STR);
-	break;
-    case HIR_OP_SUB:
-    case HIR_OP_MUL:
-    case HIR_OP_DIV:
-	expected[0] = expected[1] = numeric;
-	break;
-    case HIR_OP_MOD:
-    case HIR_OP_EXP:
-    case HIR_OP_BITOR:
-    case HIR_OP_BITXOR:
-    case HIR_OP_BITAND:
-    case HIR_OP_SHL:
-    case HIR_OP_SHR:
-    case HIR_OP_LSHR:
-	expected[0] = expected[1] = JIT_TYPE_MASK(TYPE_INT);
-	break;
-    case HIR_OP_INDEX:
-	expected[0] = JIT_TYPE_MASK(TYPE_LIST) | JIT_TYPE_MASK(TYPE_STR);
-	expected[1] = JIT_TYPE_MASK(TYPE_INT);
-	break;
-    case HIR_OP_INDEX_BF:
-    case HIR_OP_RINDEX_BF:
-	expected[0] = expected[1] = JIT_TYPE_MASK(TYPE_STR);
-	break;
-    case HIR_OP_GET_PROP:
-	expected[0] = JIT_TYPE_MASK(TYPE_OBJ) | JIT_TYPE_MASK(TYPE_WAIF);
-	expected[1] = JIT_TYPE_MASK(TYPE_STR);
-	break;
-    default:
-	values[0] = values[1] = 0;
-	break;
-    }
+    expected[0] = contract.operands[0];
+    expected[1] = contract.operands[1];
     return expected[0] != 0 || expected[1] != 0;
 }
 
@@ -4809,16 +4898,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     for (ssa_block = ssa->blocks; ssa_block; ssa_block = ssa_block->next) {
 	HIRSSAInstr *si;
 	for (si = ssa_block->first; si; si = si->next) {
-	    int operand = 0;
+	    JITConsumerContract contract = jit_consumer_contract(si);
+	    int operands[JIT_MAX_GUARD_OPERANDS] = { si->src1, si->src2 };
+	    int operand_index;
 
-	    if ((si->kind == HIR_TAC_UNARY
-		 && unary_operand_defaults_to_list(si->op))
-		|| (si->kind == HIR_TAC_BINARY
-		    && si->op == HIR_OP_SUBLIST_FROM))
-		operand = si->src1;
-	    if (operand > 0 && operand < program->num_values) {
-		if (!value_types_known[operand]) {
-		    value_types[operand] = TYPE_LIST;
+	    for (operand_index = 0;
+		 operand_index < JIT_MAX_GUARD_OPERANDS; operand_index++) {
+		int operand = operands[operand_index];
+		var_type required;
+
+		if (operand > 0 && operand < program->num_values
+		    && !value_types_known[operand]
+		    && type_from_singleton_mask(contract.operands[operand_index],
+						&required)) {
+		    value_types[operand] = required;
 		    value_types_known[operand] = 1;
 		    types_changed = 1;
 		}
@@ -4826,12 +4919,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_SUBLIST_FROM) {
 		value_types[si->value] = TYPE_LIST;
 		value_types_known[si->value] = 1;
-		if (si->src2 > 0 && si->src2 < program->num_values
-		    && !value_types_known[si->src2]) {
-		    value_types[si->src2] = TYPE_INT;
-		    value_types_known[si->src2] = 1;
-		    types_changed = 1;
-		}
 	    }
 	    if (si->kind == HIR_TAC_RANGE_REF) {
 		int from = si->src2;
@@ -4839,16 +4926,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !value_types_known[from]) {
 		    value_types[from] = TYPE_INT;
 		    value_types_known[from] = 1;
-		    types_changed = 1;
-		}
-	    }
-	    if (si->kind == HIR_TAC_BINARY && si->op == HIR_OP_GET_PROP) {
-		int property = si->src2;
-
-		if (property > 0 && property < program->num_values
-		    && !value_types_known[property]) {
-		    value_types[property] = TYPE_STR;
-		    value_types_known[property] = 1;
 		    types_changed = 1;
 		}
 	    }
@@ -4860,31 +4937,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && value_types_known[rhs] && !value_types_known[si->value]) {
 		    value_types[si->value] = value_types[rhs];
 		    value_types_known[si->value] = 1;
-		    types_changed = 1;
-		}
-	    }
-	    if (si->kind == HIR_TAC_BINARY
-		&& (si->op == HIR_OP_INDEX_BF
-		    || si->op == HIR_OP_RINDEX_BF)) {
-		if (si->src1 > 0 && si->src1 < program->num_values
-		    && !value_types_known[si->src1]) {
-		    value_types[si->src1] = TYPE_STR;
-		    value_types_known[si->src1] = 1;
-		    types_changed = 1;
-		}
-		if (si->src2 > 0 && si->src2 < program->num_values
-		    && !value_types_known[si->src2]) {
-		    value_types[si->src2] = TYPE_STR;
-		    value_types_known[si->src2] = 1;
-		    types_changed = 1;
-		}
-	    }
-	    if (si->kind == HIR_TAC_UNARY
-		&& (si->op == HIR_OP_VALID || si->op == HIR_OP_PARENT)) {
-		if (si->src1 > 0 && si->src1 < program->num_values
-		    && !value_types_known[si->src1]) {
-		    value_types[si->src1] = TYPE_OBJ;
-		    value_types_known[si->src1] = 1;
 		    types_changed = 1;
 		}
 	    }
@@ -5174,38 +5226,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 				    || ssa_instr->kind == HIR_TAC_RETURN
 				    || ssa_instr->kind == HIR_TAC_BRANCH_FALSE))
 		instr->kind = HIR_TAC_DEOPT;
-	    if (uses_tagged
-		&& !(ssa_instr->kind == HIR_TAC_BRANCH_FALSE
-		     || ssa_instr->kind == HIR_TAC_RETURN
-		     || ssa_instr->kind == HIR_TAC_CALL_VERB
-		     || ssa_instr->kind == HIR_TAC_CALL
-		     || ssa_instr->kind == HIR_TAC_RANGE_REF
-		     || (ssa_instr->kind == HIR_TAC_UNARY
-			 && (ssa_instr->op == HIR_OP_NOT
-			     || ssa_instr->op == HIR_OP_ABS
-			     || ssa_instr->op == HIR_OP_TYPEOF
-			     || ssa_instr->op == HIR_OP_LENGTH
-			     || ssa_instr->op == HIR_OP_MAKE_SINGLETON_LIST
-			     || ssa_instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE
-			     || ssa_instr->op == HIR_OP_PARENT))
-		     || (ssa_instr->kind == HIR_TAC_BINARY
-			 && (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
-			     || ssa_instr->op == HIR_OP_IN
-			     || ssa_instr->op == HIR_OP_GET_PROP
-			     || ssa_instr->op == HIR_OP_SUBLIST_FROM
-			     || ssa_instr->op == HIR_OP_LIST_APPEND
-			     || ssa_instr->op == HIR_OP_LIST_ADD_TAIL
-			     || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE
-			     || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
-			     || ssa_instr->op == HIR_OP_ADD || ssa_instr->op == HIR_OP_SUB
-			     || ssa_instr->op == HIR_OP_MUL || ssa_instr->op == HIR_OP_DIV
-			     || ssa_instr->op == HIR_OP_MOD || ssa_instr->op == HIR_OP_EXP
-			     || ssa_instr->op == HIR_OP_INDEX_BF
-			     || ssa_instr->op == HIR_OP_RINDEX_BF
-			     || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_BITOR
-			     || ssa_instr->op == HIR_OP_BITXOR || ssa_instr->op == HIR_OP_SHL
-			     || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
-			     || ssa_instr->op == HIR_OP_INDEX)))
+	    if (uses_tagged && !jit_tagged_consumer_is_supported(ssa_instr)
 		&& (ssa_instr->kind == HIR_TAC_UNARY
 		    || ssa_instr->kind == HIR_TAC_BINARY
 		    || ssa_instr->kind == HIR_TAC_RETURN
