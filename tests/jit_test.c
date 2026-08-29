@@ -4,6 +4,7 @@
 #include "my-stdio.h"
 #include "my-string.h"
 
+#include "execute.h"
 #include "integer_arithmetic.h"
 #include "list.h"
 #include "storage.h"
@@ -3828,6 +3829,8 @@ main(void)
 	free_var(deopt_stack[0]);
 	{
 	    JITContinuationFrame *continuation = 0;
+	    activation owner = { 0 };
+	    Var shadow_stack[3];
 	    Var returned;
 
 	    ticks = 10;
@@ -3838,6 +3841,12 @@ main(void)
 		  "compact call_verb did not request a VM call");
 	    check(continuation && !deopt.materialized && deopt.stack_depth == 3,
 		  "call_verb did not capture a compact continuation");
+	    owner.base_rt_stack = shadow_stack;
+	    owner.top_rt_stack = shadow_stack + 3;
+	    jit_continuation_attach(continuation, &owner);
+	    jit_continuation_mark_dispatched(continuation);
+	    check(owner.top_rt_stack == owner.base_rt_stack,
+		  "dispatched continuation left compact operands live");
 	    free_var(deopt_stack[1]);
 	    free_var(deopt_stack[2]);
 	    returned.type = TYPE_STR;

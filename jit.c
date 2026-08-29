@@ -5052,8 +5052,11 @@ jit_continuation_relocate(JITContinuationFrame *frame, activation *owner)
 void
 jit_continuation_mark_dispatched(JITContinuationFrame *frame)
 {
-    if (frame)
+    if (frame) {
 	frame->dispatched = 1;
+	if (frame->owner)
+	    frame->owner->top_rt_stack = frame->owner->base_rt_stack;
+    }
 }
 
 void

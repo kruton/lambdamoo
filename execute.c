@@ -1023,6 +1023,7 @@ do {								\
 		    return outcome;
 		}
 		LOAD_STATE_VARIABLES();
+		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_ABORT_TICKS) {
 		bv = bc.vector + source_location.bytecode_pc;
 		error_bv = bc.vector + source_location.error_pc;
