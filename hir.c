@@ -4301,6 +4301,26 @@ jit_instr_defines_value(JITInstruction *instr)
 }
 
 static int
+jit_instr_can_materialize(JITInstruction *instr)
+{
+    switch (instr->kind) {
+    case HIR_TAC_DEOPT:
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_UNARY:
+    case HIR_TAC_BINARY:
+    case HIR_TAC_CALL:
+    case HIR_TAC_CALL_VERB:
+    case HIR_TAC_PUT_PROP:
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+    case HIR_TAC_UNSUPPORTED:
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static int
 jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			 Program *bytecode_program)
 {
@@ -4444,7 +4464,8 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	uses[instr->src1] = 1;
     if (instr->src2 > 0 && instr->src2 < program->num_values)
 	uses[instr->src2] = 1;
-    if (instr->deopt_map <= 0 || instr->deopt_map >= program->num_deopt_maps)
+    if (!jit_instr_can_materialize(instr) || instr->deopt_map <= 0
+	|| instr->deopt_map >= program->num_deopt_maps)
 	return;
     map = &program->deopt_maps[instr->deopt_map];
     for (i = 0; i < map->num_locals; i++)
@@ -5356,9 +5377,11 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			instr->kind = HIR_TAC_DEOPT;
 		}
 	    }
-	    instr->deopt_map = jit_add_deopt_map(program, ssa_instr,
-					  &bytecode_program->main_vector,
-					  value_types, value_is_tagged);
+	    instr->deopt_map = jit_instr_can_materialize(instr)
+		? jit_add_deopt_map(program, ssa_instr,
+				    &bytecode_program->main_vector,
+				    value_types, value_is_tagged)
+		: 0;
 	    if (instr->deopt_map < 0) {
 		myfree(instr, M_PROGRAM);
 		myfree(value_types_conflicted, M_PROGRAM);
