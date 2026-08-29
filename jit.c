@@ -1503,6 +1503,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
     memset(resume_continuations, 0,
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
+
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, ticks, 0, 1)));
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
@@ -1632,22 +1636,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
 			    -1, instr->bytecode_pc, instr->source_lineno);
 		    }
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context,
-								 tick_result),
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 0, ticks, 0, 1)));
 		    append(build, MIR_new_insn(build->context, MIR_SUB,
 						  MIR_new_reg_op(build->context,
 								 tick_result),
 						  MIR_new_reg_op(build->context,
 								 tick_result),
 						  MIR_new_int_op(build->context, 1)));
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 0, ticks, 0, 1),
-						  MIR_new_reg_op(build->context,
-								 tick_result)));
 		    if (instr->op == HIR_OP_CHARGE_TICK)
 			break;
 		    append(build, MIR_new_insn(build->context, MIR_BLE,
@@ -1922,8 +1916,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 					  MIR_new_reg_op(build->context,
 							 values[instr->value]),
-					  MIR_new_mem_op(build->context, MIR_T_I32,
-							 0, ticks, 0, 1)));
+					  MIR_new_reg_op(build->context,
+							 tick_result)));
 		    } else if (instr->op == HIR_OP_SECONDS_LEFT) {
 			append(build, MIR_new_call_insn(build->context, 3,
 				MIR_new_ref_op(build->context,
@@ -4446,6 +4440,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			deopt_map_out, deopt_values, error_out, status,
 			common_return);
     append(build, common_return);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, ticks, 0, 1),
+	MIR_new_reg_op(build->context, tick_result)));
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
