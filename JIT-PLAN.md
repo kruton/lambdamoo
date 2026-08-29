@@ -625,10 +625,24 @@ the broader ownership-map and synthesized-anchor validation described below.
    locals for the complete native invocation and releases them only after a
    return, deopt materialization, or continuation capture. This prevents an
    indexed local update from freeing a list or string still borrowed by an SSA
-   register. The remaining work is per-value ownership metadata for native
-   producers, alias-root propagation through copies and joins, and last-use
-   release on every native exit. Keep the conservative local roots until those
-   proofs are verified on Codepoint.
+   register. Per-value provenance now distinguishes scalars, borrowed locals,
+   owned values, stable owned values, and immortal constants, and propagates
+   alias roots through SSA copies. Continuations may capture retained local
+   borrows, constants, property reads, and freshly produced list values whose
+   ownership has not been consumed. A SHA-1 invocation now captures and resumes
+   all ten of its VM/scheduler crossings, performs no interpreter
+   materialization, and completes natively.
+
+   Codepoint testing showed that capturing generic scalar liveness or older
+   owned temporaries can expose stale out-of-SSA values, so both remain
+   prohibited. Add compact owner slots for longer-lived native producers and
+   path-sensitive value availability before broadening those cases. Then add
+   last-use release on every native exit. Keep the conservative local roots
+   until those proofs are verified on Codepoint. The initial ownership-safe
+   capture reduced the warmed 30,000-call SHA-1 benchmark from 7 seconds to 5
+   seconds; the 100,000-call sample moved from roughly 23 seconds to 22 seconds,
+   making the ten continuation crossings per invocation the next measured
+   bottleneck.
 
 6. **Lower the hottest remaining range and caught-error paths.**
    The current sample reaches range operations after earlier string/list work.
