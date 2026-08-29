@@ -1170,6 +1170,24 @@ do {								\
 	    } else if (jit_result == JIT_RUN_FALLBACK
 		       || jit_result == JIT_RUN_CALL_VERB) {
 		if (jit_result == JIT_RUN_CALL_VERB && continuation
+		    && deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO) {
+		    activation *caller = &RUN_ACTIV;
+		    int seconds = 0;
+		    enum error e;
+
+		    jit_continuation_attach(continuation, caller);
+		    jit_continuation_mark_dispatched(continuation);
+		    STORE_STATE_VARIABLES();
+		    jit_profile_record_vm_call(caller->prog->jit);
+		    e = suspend_task(make_suspend_pack(enqueue_suspended_task,
+			&seconds));
+		    if (e == E_NONE)
+			return OUTCOME_BLOCKED;
+		    LOAD_STATE_VARIABLES();
+		    PUSH_ERROR(e);
+		    goto next_opcode;
+		}
+		if (jit_result == JIT_RUN_CALL_VERB && continuation
 		    && deopt.boundary == JIT_BOUNDARY_BUILTIN) {
 		    activation *caller = &RUN_ACTIV;
 		    Var args = RUN_ACTIV.base_rt_stack[0];

@@ -5152,6 +5152,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	stats->continuation_resumes = program->usage->continuation_resumes;
 	stats->continuation_materializations
 	    = program->usage->continuation_materializations;
+	stats->continuation_fast_suspends
+	    = program->usage->continuation_fast_suspends;
     }
     stats->compile_attempts = program->compile_attempts;
     stats->compile_successes = program->compile_successes;
@@ -5813,6 +5815,38 @@ jit_runtime_type_is_valid(var_type type)
     }
 }
 
+static int
+jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
+			       Num *deopt_values)
+{
+    int slot;
+    int value;
+    var_type type;
+
+    if (!jit_deopt_map_bridges_builtin(map)
+	|| strcmp(name_func_by_num(map->builtin_func), "suspend")
+	|| map->stack_depth == 0)
+	return 0;
+    slot = map->stack_depth - 1;
+    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+	return 0;
+    value = map->stack_values[slot];
+    if (value <= 0 || value >= program->num_values)
+	return 0;
+    type = jit_deopt_map_stack_type(program, map, slot);
+    if (type == TYPE_ANY)
+	type = (var_type) deopt_values[jit_tag_index(program, value)];
+    if (map->builtin_args == 1)
+	return type == TYPE_INT && deopt_values[value] == 0;
+    if (map->builtin_args < 0 && type == TYPE_LIST) {
+	Var *args = (Var *) (intptr_t) deopt_values[value];
+
+	return args && args[0].v.num == 1 && args[1].type == TYPE_INT
+	    && args[1].v.num == 0;
+    }
+    return 0;
+}
+
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 		      Num *deopt_values, int operand)
@@ -5971,6 +6005,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	unsigned materialized_depth;
 	unsigned stack_start = 0;
 	int compact_boundary = 0;
+	int suspend_zero_boundary = 0;
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
@@ -6008,6 +6043,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		materialized_depth = operands;
 	    }
 	}
+	if (compact_boundary
+	    && jit_deopt_map_is_suspend_zero(program, map, deopt_values)) {
+	    suspend_zero_boundary = 1;
+	    if (program->usage)
+		program->usage->continuation_fast_suspends++;
+	    stack_start = map->stack_depth;
+	    materialized_depth = 0;
+	}
 	for (i = 0; !compact_boundary && i < map->num_locals; i++) {
 	    int local_value = jit_deopt_map_local_value(program, map, i);
 
@@ -6023,7 +6066,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		env[i] = value;
 	    }
 	}
-	if (deopt_stack && (map->stack_depth
+	if (!suspend_zero_boundary && deopt_stack && (map->stack_depth
 			    || (jit_deopt_map_is_specialized_builtin(map)
 				&& map->builtin_args == 0)))
 	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
@@ -6080,7 +6123,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 						      env, deopt_values, i);
 	    deopt->reason = map->reason;
 	    if (native_result == JIT_RUN_CALL_VERB) {
-		if (map->reason == JIT_DEOPT_VERB_CALL)
+		if (suspend_zero_boundary)
+		    deopt->boundary = JIT_BOUNDARY_SUSPEND_ZERO;
+		else if (map->reason == JIT_DEOPT_VERB_CALL)
 		    deopt->boundary = JIT_BOUNDARY_VERB;
 		else if (jit_deopt_map_bridges_builtin(map))
 		    deopt->boundary = JIT_BOUNDARY_BUILTIN;

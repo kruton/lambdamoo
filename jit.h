@@ -46,7 +46,8 @@ typedef enum {
 typedef enum {
     JIT_BOUNDARY_NONE,
     JIT_BOUNDARY_BUILTIN,
-    JIT_BOUNDARY_VERB
+    JIT_BOUNDARY_VERB,
+    JIT_BOUNDARY_SUSPEND_ZERO
 } JITBoundaryKind;
 
 typedef uint16_t JITTypeMask;
@@ -93,6 +94,7 @@ typedef struct {
     uint64_t continuation_captures;
     uint64_t continuation_resumes;
     uint64_t continuation_materializations;
+    uint64_t continuation_fast_suspends;
     uint64_t active_continuations;
     size_t continuation_bytes;
     size_t metadata_bytes;

@@ -179,6 +179,7 @@ struct JITProgramUsage {
     uint64_t continuation_captures;
     uint64_t continuation_resumes;
     uint64_t continuation_materializations;
+    uint64_t continuation_fast_suspends;
 };
 
 struct JITProgram {

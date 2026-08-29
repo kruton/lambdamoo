@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(30);
+    Var metadata = new_list(31);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -376,6 +376,8 @@ jit_metadata(JITProgram *program)
 					       stats.active_continuations);
     metadata.v.list[30] = jit_metadata_num_pair("continuation_bytes",
 					       stats.continuation_bytes);
+    metadata.v.list[31] = jit_metadata_num_pair("continuation_fast_suspends",
+					       stats.continuation_fast_suspends);
     return metadata;
 }
 #endif
