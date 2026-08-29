@@ -4316,6 +4316,30 @@ main(void)
 	jit_program_free(tagged);
     }
 
+    /* A tagged object operand can execute valid() natively. */
+    {
+	JITProgram *tagged = tagged_unary_program(HIR_OP_VALID);
+	Var env[1];
+
+	env[0].type = TYPE_OBJ;
+	env[0].v.obj = 1;
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged valid object did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "tagged valid returned the wrong result");
+	free_var(result);
+
+	env[0].type = TYPE_INT;
+	env[0].v.num = 1;
+	ticks = 10;
+	check(jit_program_execute(tagged, env, &result, &ticks, &timed_out,
+				  &error, 0, &deopt, 0) == JIT_RUN_FALLBACK,
+	      "tagged valid non-object did not fallback");
+	jit_program_free(tagged);
+    }
+
     /* Tagged list bases and indexes are guarded before native indexing. */
     {
 	JITProgram *tagged = list_index_tagged_base_program();

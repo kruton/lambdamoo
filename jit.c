@@ -1903,8 +1903,33 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context,
 					       values[instr->value])));
 		    } else if (instr->op == HIR_OP_VALID) {
-			if (program->value_types
-			    && program->value_types[instr->src1] == TYPE_OBJ) {
+			int operand_is_obj = program->value_types
+			    && program->value_types[instr->src1] == TYPE_OBJ;
+			int operand_tagged = program->value_is_tagged
+			    && program->value_is_tagged[instr->src1];
+
+			if (operand_is_obj || operand_tagged) {
+			    if (operand_tagged) {
+				char name[32];
+				MIR_reg_t operand_type;
+				MIR_label_t operand_ok = MIR_new_label(build->context);
+
+				sprintf(name, "valid_type%d", copy_serial++);
+				operand_type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, operand_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->src1) * sizeof(Num),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BEQ,
+				    MIR_new_label_op(build->context, operand_ok),
+				    MIR_new_reg_op(build->context, operand_type),
+				    MIR_new_int_op(build->context, TYPE_OBJ)));
+				append_deopt_exit(build, program, instr->deopt_map,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				append(build, operand_ok);
+			    }
 			    append(build, MIR_new_call_insn(build->context, 4,
 				MIR_new_ref_op(build->context, build->proto_valid),
 				MIR_new_ref_op(build->context, build->import_valid),

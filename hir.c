@@ -3965,7 +3965,7 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	case HIR_OP_PARENT:
 	case HIR_OP_VALID:
 	    contract.operands[0] = JIT_TYPE_MASK(TYPE_OBJ);
-	    contract.tagged_dispatch = instr->op == HIR_OP_PARENT;
+	    contract.tagged_dispatch = 1;
 	    break;
 	case HIR_OP_NOT:
 	case HIR_OP_TYPEOF:
