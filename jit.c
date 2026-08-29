@@ -5750,7 +5750,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 			 + program->num_owned_slots);
     deopt_values = mymalloc(deopt_bytes ? deopt_bytes : sizeof(Num),
 			    M_PROGRAM);
-    memset(deopt_values, 0, deopt_bytes);
+    /* Float lowering uses raw slot zero as its native 0.0 constant. */
+    deopt_values[0] = 0;
     {
 	int i;
 	int tag_slots = program->value_tag_slots
