@@ -12,6 +12,8 @@ typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 typedef struct JITResumeValue JITResumeValue;
+typedef struct JITNativeResume JITNativeResume;
+typedef struct JITLocalValue JITLocalValue;
 typedef struct JITProgramUsage JITProgramUsage;
 
 typedef enum {
@@ -29,6 +31,17 @@ struct JITResumeValue {
     var_type literal_type;
 };
 
+struct JITNativeResume {
+    int num_values;
+    JITResumeValue *values;
+    int valid;
+};
+
+struct JITLocalValue {
+    int slot;
+    int value;
+};
+
 struct JITDeoptMap {
     ResumeKey resume_key;
     unsigned bytecode_pc;
@@ -37,14 +50,13 @@ struct JITDeoptMap {
     unsigned stack_depth;
     int ticks_charged;
     int num_locals;
-    int *local_values;
-    var_type *local_types;
+    int num_local_values;
+    int local_base;
+    JITLocalValue *local_values;
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
-    int num_resume_values;
-    JITResumeValue *resume_values;
-    int native_resume_valid;
+    JITNativeResume *native_resume;
     int builtin_func;
     int builtin_args;
     int operation;
@@ -144,6 +156,8 @@ struct JITProgram {
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;
+    JITInstruction *retained_constants;
+    Program *bytecode_program;
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
@@ -162,6 +176,60 @@ struct JITProgram {
     Objid diagnostic_object;
     unsigned diagnostic_verb;
 };
+
+static inline __attribute__((always_inline)) int
+jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    while (map) {
+	int i;
+
+	for (i = 0; i < map->num_local_values; i++)
+	    if (map->local_values[i].slot == slot)
+		return map->local_values[i].value;
+	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
+	    break;
+	map = &program->deopt_maps[map->local_base - 1];
+    }
+    return 0;
+}
+
+static inline __attribute__((always_inline)) var_type
+jit_deopt_map_local_type(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    while (map) {
+	int i;
+
+	for (i = 0; i < map->num_local_values; i++)
+	    if (map->local_values[i].slot == slot) {
+		int value = map->local_values[i].value;
+
+		if (value <= 0)
+		    return TYPE_INT;
+		return program->value_is_tagged
+		    && program->value_is_tagged[value] ? TYPE_ANY
+		    : program->value_types ? program->value_types[value] : TYPE_INT;
+	    }
+	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
+	    break;
+	map = &program->deopt_maps[map->local_base - 1];
+    }
+    return TYPE_INT;
+}
+
+static inline var_type
+jit_deopt_map_stack_type(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    int value;
+
+    if (map->stack_types)
+	return map->stack_types[slot];
+    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+	return map->stack_slots[slot].kind == RSS_CATCH ? TYPE_CATCH
+	    : map->stack_slots[slot].kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+    value = map->stack_values[slot];
+    return program->value_is_tagged && program->value_is_tagged[value]
+	? TYPE_ANY : program->value_types ? program->value_types[value] : TYPE_INT;
+}
 
 extern int jit_rt_is_true(int64_t, int);
 extern int jit_rt_equality(int64_t, int, int64_t, int, int);

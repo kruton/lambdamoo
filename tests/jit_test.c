@@ -93,6 +93,25 @@ new_jit_program(void)
     return program;
 }
 
+static void
+allocate_map_locals(JITDeoptMap *map, int count)
+{
+    int i;
+
+    map->num_local_values = count;
+    map->local_values = allocate(sizeof(JITLocalValue) * count);
+    for (i = 0; i < count; i++)
+	map->local_values[i].slot = i;
+}
+
+static void
+set_program_value_type(JITProgram *program, int value, var_type type)
+{
+    if (!program->value_types)
+	program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_types[value] = type;
+}
+
 static JITProgram *
 arithmetic_program(void)
 {
@@ -453,8 +472,8 @@ call_boundary_program(void)
     map->builtin_func = 17;
     map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int) * 1);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int));
     map->stack_values[0] = 1;
     program->blocks = program->last_block = block;
@@ -502,18 +521,18 @@ builtin_call_program(unsigned func)
     map->resume_key.site = 2;
     map->reason = JIT_DEOPT_BUILTIN_CALL;
     map->builtin_func = func;
-    map->native_resume_valid = 1;
-    map->num_resume_values = 1;
-    map->resume_values = allocate(sizeof(JITResumeValue));
-    map->resume_values[0].value = 2;
-    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->native_resume = allocate(sizeof(JITNativeResume));
+    map->native_resume->valid = 1;
+    map->native_resume->num_values = 1;
+    map->native_resume->values = allocate(sizeof(JITResumeValue));
+    map->native_resume->values[0].value = 2;
+    map->native_resume->values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 25;
     map->stack_depth = 1;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int));
-    map->local_types = allocate(sizeof(var_type));
-    map->local_values[0] = 1;
-    map->local_types[0] = TYPE_LIST;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
+    set_program_value_type(program, 1, TYPE_LIST);
     map->stack_values = allocate(sizeof(int));
     map->stack_types = allocate(sizeof(var_type));
     map->stack_values[0] = 1;
@@ -561,8 +580,8 @@ get_prop_program(void)
     map->stack_depth = 2;
     map->ticks_charged = 0;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int) * 1);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int) * 2);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
@@ -614,8 +633,8 @@ deep_guard_program(void)
     map->stack_depth = 1;
     map->ticks_charged = 1;
     map->num_locals = 2;
-    map->local_values = allocate(sizeof(int) * 2);
-    map->local_values[0] = 1;
+    allocate_map_locals(map, 2);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int));
     map->stack_values[0] = 1;
     program->blocks = program->last_block = block;
@@ -696,12 +715,10 @@ in_program(void)
     map->stack_depth = 2;
     map->ticks_charged = 1;
     map->num_locals = 2;
-    map->local_values = allocate(sizeof(int) * 2);
-    map->local_values[0] = 1;
-    map->local_values[1] = 2;
-    map->local_types = allocate(sizeof(var_type) * 2);
-    map->local_types[0] = TYPE_INT;
-    map->local_types[1] = TYPE_LIST;
+    allocate_map_locals(map, 2);
+    map->local_values[0].value = 1;
+    map->local_values[1].value = 2;
+    set_program_value_type(program, 2, TYPE_LIST);
     map->stack_values = allocate(sizeof(int) * 2);
     map->stack_values[0] = 1;
     map->stack_values[1] = 2;
@@ -866,23 +883,23 @@ call_verb_program(void)
     map->resume_key.code_unit = 0;
     map->resume_key.site = 1;
     map->reason = JIT_DEOPT_VERB_CALL;
-    map->native_resume_valid = 1;
-    map->num_resume_values = 1;
-    map->resume_values = allocate(sizeof(JITResumeValue));
-    map->resume_values[0].value = 4;
-    map->resume_values[0].source = JIT_RESUME_RESULT;
+    map->native_resume = allocate(sizeof(JITNativeResume));
+    map->native_resume->valid = 1;
+    map->native_resume->num_values = 1;
+    map->native_resume->values = allocate(sizeof(JITResumeValue));
+    map->native_resume->values[0].value = 4;
+    map->native_resume->values[0].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
     map->num_locals = 3;
-    map->local_values = allocate(sizeof(int) * 3);
-    map->local_types = allocate(sizeof(var_type) * 3);
-    map->local_values[0] = 1;
-    map->local_values[1] = 2;
-    map->local_values[2] = 3;
-    map->local_types[0] = TYPE_OBJ;
-    map->local_types[1] = TYPE_STR;
-    map->local_types[2] = TYPE_LIST;
+    allocate_map_locals(map, 3);
+    map->local_values[0].value = 1;
+    map->local_values[1].value = 2;
+    map->local_values[2].value = 3;
+    set_program_value_type(program, 1, TYPE_OBJ);
+    set_program_value_type(program, 2, TYPE_STR);
+    set_program_value_type(program, 3, TYPE_LIST);
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
     map->stack_slots = allocate(sizeof(ResumeStackSlot) * 3);
@@ -1797,10 +1814,9 @@ range_ref_test_program(var_type base_type)
     map->stack_depth = 3;
     map->ticks_charged = 1;
     map->num_locals = 1;
-    map->local_values = allocate(sizeof(int));
-    map->local_types = allocate(sizeof(var_type));
-    map->local_values[0] = 1;
-    map->local_types[0] = base_type;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
+    set_program_value_type(program, 1, base_type);
     map->stack_values = allocate(sizeof(int) * 3);
     map->stack_types = allocate(sizeof(var_type) * 3);
     map->stack_values[0] = 1;
@@ -3052,9 +3068,11 @@ do_fallback:
 	JITDeoptMap *map = &program->deopt_maps[deopt_map_index];
 	int i;
 	for (i = 0; env && i < map->num_locals; i++) {
-	    if (map->local_values[i] > 0) {
-		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
-		Var val = materialize_deopt_value(type, values[map->local_values[i]]);
+	    int value = jit_deopt_map_local_value(program, map, i);
+
+	    if (value > 0) {
+		var_type type = jit_deopt_map_local_type(program, map, i);
+		Var val = materialize_deopt_value(type, values[value]);
 		free_var(env[i]);
 		env[i] = val;
 	    }
@@ -3642,7 +3660,7 @@ main(void)
 	jit_program_free(pass_prog);
 
 	pass_prog = builtin_call_program(9);
-	pass_prog->deopt_maps[1].native_resume_valid = 0;
+	pass_prog->deopt_maps[1].native_resume->valid = 0;
 	pass_args = new_list(0).v.list;
 	pass_env[0].type = TYPE_LIST;
 	pass_env[0].v.list = pass_args;
@@ -3767,7 +3785,7 @@ main(void)
 	    extra->literal_type = TYPE_OBJ;
 	    extra->next = call->next;
 	    call->next = extra;
-	    non_tail->deopt_maps[1].native_resume_valid = 0;
+	    non_tail->deopt_maps[1].native_resume->valid = 0;
 	    check(jit_program_resume_map(non_tail, call_key) == -1,
 		  "non-tail verb call exposed an unsafe continuation");
 	    jit_program_free(non_tail);
@@ -5108,10 +5126,9 @@ main(void)
 	map->stack_depth = 0;
 	map->ticks_charged = 1;
 	map->num_locals = 1;
-	map->local_values = allocate(sizeof(int) * 1);
-	map->local_values[0] = 1;
-	map->local_types = allocate(sizeof(var_type) * 1);
-	map->local_types[0] = TYPE_STR;
+	allocate_map_locals(map, 1);
+	map->local_values[0].value = 1;
+	set_program_value_type(program, 1, TYPE_STR);
 	map->operation = HIR_OP_INDEX;
 	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
 
@@ -5408,6 +5425,43 @@ main(void)
 	jit_shutdown();
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");
+    }
+    {
+	JITProgram *program = new_jit_program();
+	JITDeoptMap *base;
+	JITDeoptMap *change;
+	JITDeoptMap *remove;
+
+	program->num_deopt_maps = 3;
+	program->num_values = 4;
+	program->deopt_maps = allocate(sizeof(JITDeoptMap) * 3);
+	base = &program->deopt_maps[0];
+	change = &program->deopt_maps[1];
+	remove = &program->deopt_maps[2];
+	base->num_locals = change->num_locals = remove->num_locals = 2;
+	allocate_map_locals(base, 2);
+	base->local_values[0].value = 1;
+	base->local_values[1].value = 2;
+	set_program_value_type(program, 2, TYPE_STR);
+	change->local_base = 1;
+	allocate_map_locals(change, 1);
+	change->local_values[0].value = 3;
+	set_program_value_type(program, 3, TYPE_OBJ);
+	remove->local_base = 2;
+	allocate_map_locals(remove, 1);
+	remove->local_values[0].slot = 1;
+	remove->local_values[0].value = 0;
+
+	check(jit_deopt_map_local_value(program, change, 0) == 3
+	      && jit_deopt_map_local_value(program, change, 1) == 2,
+	      "deopt local base did not inherit unchanged value");
+	check(jit_deopt_map_local_type(program, change, 0) == TYPE_OBJ
+	      && jit_deopt_map_local_type(program, change, 1) == TYPE_STR,
+	      "deopt local base did not inherit unchanged type");
+	check(jit_deopt_map_local_value(program, remove, 0) == 3
+	      && jit_deopt_map_local_value(program, remove, 1) == 0,
+	      "deopt local tombstone did not mask base value");
+	jit_program_free(program);
     }
 
     return failures != 0;

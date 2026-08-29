@@ -24,5 +24,8 @@
 #include "version.h"
 
 extern Program *compile_ast_to_program(Stmt *, Names *, DB_Version);
+#ifdef ENABLE_JIT
+extern JITProgram *compile_program_to_jit(Program *);
+#endif
 
 #endif		/* !Compiler_H */

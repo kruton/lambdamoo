@@ -1,3 +1,4 @@
+#include "compiler.h"
 #include "db.h"
 #include "execute.h"
 #include "functions.h"
@@ -17,6 +18,13 @@
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
+
+JITProgram *
+compile_program_to_jit(Program *program)
+{
+    (void) program;
+    return 0;
+}
 
 void hir_test_set_length_protected(int);
 #ifdef WAIF_CORE
