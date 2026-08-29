@@ -567,6 +567,14 @@ the broader ownership-map and synthesized-anchor validation described below.
    Tail-call activation replacement should wait until normal and exceptional
    continuation paths have sustained database-scale validation.
 
+   Native callers now resume by the continuation frame's exact deopt-map ID;
+   they do not repeat a linear `ResumeKey` lookup. Specialized built-in exits
+   also use an explicit boundary kind rather than overloading the profiling
+   reason. Do not enable arbitrary `JIT_RESUME_CAPTURED` values yet: database
+   testing showed that SSA definition liveness alone can capture a stale or
+   wrongly represented complex value. Captured values require both the
+   ownership proof in priority 5 and a trustworthy runtime tag.
+
 3. **Use effect metadata to select direct native built-in lowering.**
    Record argument prototypes and effects such as pure, allocation, possible
    errors, permission checks, calls, suspension, abort, continuation state, and
@@ -611,6 +619,16 @@ the broader ownership-map and synthesized-anchor validation described below.
    borrowed/owned/immortal states so native temporaries are released on normal,
    error, and deopt exits. Include repeated-execution leak tests for strings,
    lists, properties, and call results.
+
+   As the first ownership step, each compiled program records the compact set
+   of interpreter locals read by its HIR. `jit_program_execute()` retains those
+   locals for the complete native invocation and releases them only after a
+   return, deopt materialization, or continuation capture. This prevents an
+   indexed local update from freeing a list or string still borrowed by an SSA
+   register. The remaining work is per-value ownership metadata for native
+   producers, alias-root propagation through copies and joins, and last-use
+   release on every native exit. Keep the conservative local roots until those
+   proofs are verified on Codepoint.
 
 6. **Lower the hottest remaining range and caught-error paths.**
    The current sample reaches range operations after earlier string/list work.
