@@ -4300,6 +4300,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			MIR_reg_t raw_value;
 			MIR_reg_t value_type;
 			MIR_reg_t list_len;
+			int direct_int_list = instr->direct_int_list_index_set;
 			int tagged_base = program->value_is_tagged
 			    && program->value_is_tagged[instr->src1];
 			int tagged_index = program->value_is_tagged
@@ -4382,6 +4383,46 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    program->value_types[instr->src3])));
 			raw_value = append_raw_value(build, program, values,
 			    instr->src3, deopt_values, &copy_serial);
+			if (direct_int_list) {
+			    MIR_label_t shared = MIR_new_label(build->context);
+			    MIR_reg_t refcount_reg;
+			    MIR_reg_t elem_offset;
+			    MIR_reg_t elem_addr;
+
+			    sprintf(name, "set_refcount%d", copy_serial++);
+			    refcount_reg = new_reg(build, name);
+			    sprintf(name, "set_elem_offset%d", copy_serial++);
+			    elem_offset = new_reg(build, name);
+			    sprintf(name, "set_elem_addr%d", copy_serial++);
+			    elem_addr = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, refcount_reg),
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    -(int) sizeof(int), base, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, shared),
+				MIR_new_reg_op(build->context, refcount_reg),
+				MIR_new_int_op(build->context, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context, elem_offset),
+				MIR_new_reg_op(build->context, index),
+				MIR_new_int_op(build->context, sizeof(Var))));
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, elem_addr),
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, elem_offset)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), elem_addr, 0, 1),
+				MIR_new_reg_op(build->context, raw_value)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, base)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, shared);
+			}
 			append(build, MIR_new_call_insn(build->context, 10,
 			    MIR_new_ref_op(build->context,
 				build->proto_list_index_set),
