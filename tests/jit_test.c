@@ -3864,6 +3864,64 @@ main(void)
 	    free_var(result);
 	}
 	{
+	    JITProgram *sparse = call_verb_program();
+	    JITDeoptMap *sparse_map = &sparse->deopt_maps[1];
+	    JITContinuationFrame *continuation = 0;
+	    activation owner = { 0 };
+	    Var owner_env[3];
+	    Var owner_stack[4];
+
+	    sparse_map->num_local_values = 2;
+	    sparse_map->local_values[1].slot = 2;
+	    sparse_map->local_values[1].value = 3;
+	    myfree(sparse_map->native_resume->values, M_PROGRAM);
+	    sparse_map->native_resume->num_values = 4;
+	    sparse_map->native_resume->values =
+		allocate(sizeof(JITResumeValue) * 4);
+	    sparse_map->native_resume->values[0].value = 1;
+	    sparse_map->native_resume->values[0].source = JIT_RESUME_LOCAL;
+	    sparse_map->native_resume->values[0].index = 0;
+	    sparse_map->native_resume->values[1].value = 2;
+	    sparse_map->native_resume->values[1].source = JIT_RESUME_STACK;
+	    sparse_map->native_resume->values[1].index = 1;
+	    sparse_map->native_resume->values[2].value = 3;
+	    sparse_map->native_resume->values[2].source = JIT_RESUME_LOCAL;
+	    sparse_map->native_resume->values[2].index = 2;
+	    sparse_map->native_resume->values[3].value = 4;
+	    sparse_map->native_resume->values[3].source = JIT_RESUME_RESULT;
+	    owner_env[0].type = TYPE_OBJ;
+	    owner_env[0].v.obj = 99;
+	    owner_env[1].type = TYPE_STR;
+	    owner_env[1].v.str = str_dup("resident local");
+	    owner_env[2] = new_list(0);
+	    owner.rt_env = owner_env;
+	    owner.base_rt_stack = owner_stack;
+	    owner.top_rt_stack = owner_stack;
+	    ticks = 10;
+	    check((jit_program_execute)(sparse, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "sparse continuation did not request a VM call");
+	    check(continuation != 0, "sparse continuation was not captured");
+	    if (continuation) {
+		jit_continuation_attach(continuation, &owner);
+		check(jit_continuation_materialize(&owner),
+		      "sparse continuation did not materialize");
+	    }
+	    check(owner_env[1].type == TYPE_STR
+		  && !strcmp(owner_env[1].v.str, "resident local"),
+		  "sparse continuation replaced an environment local");
+	    if (owner.jit_continuation)
+		jit_continuation_free(owner.jit_continuation);
+	    while (owner.top_rt_stack > owner.base_rt_stack)
+		free_var(*--owner.top_rt_stack);
+	    free_var(owner_env[0]);
+	    free_var(owner_env[1]);
+	    free_var(owner_env[2]);
+	    jit_program_free(sparse);
+	}
+	{
 	    JITProgram *fallthrough = call_verb_program();
 	    JITInstruction *call = fallthrough->blocks->first;
 	    JITInstruction *terminal = instruction(HIR_TAC_LABEL);

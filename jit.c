@@ -5146,8 +5146,10 @@ jit_continuation_materialize(activation *a)
 	int value = jit_deopt_map_local_value(program, map, i);
 	Var *saved = value > 0 ? jit_continuation_value(frame, value) : 0;
 
-	free_var(a->rt_env[i]);
-	a->rt_env[i] = saved ? var_ref(*saved) : zero;
+	if (saved) {
+	    free_var(a->rt_env[i]);
+	    a->rt_env[i] = var_ref(*saved);
+	}
     }
     while (a->top_rt_stack > a->base_rt_stack)
 	free_var(*--a->top_rt_stack);
