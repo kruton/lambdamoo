@@ -3614,6 +3614,33 @@ main(void)
 	free_var(deopt_stack[0]);
 	free_var(pass_env[0]);
 	jit_program_free(pass_prog);
+
+	/* A statically typed float result is bitcast from the VM Var payload. */
+	pass_prog = builtin_call_program(17);
+	pass_prog->value_types[2] = TYPE_FLOAT;
+	pass_prog->value_is_tagged[2] = 0;
+	pass_prog->blocks->last->literal_type = TYPE_FLOAT;
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	ticks = 10;
+	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "float built-in did not request a VM call");
+	free_var(deopt_stack[0]);
+	deopt_stack[0].type = TYPE_FLOAT;
+	deopt_stack[0].v.fnum = box_fl(1.5);
+	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+				    &timed_out, &error, 0, &deopt,
+				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+	      "float built-in continuation did not return");
+	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 1.5,
+	      "float built-in continuation returned the wrong value");
+	free_var(result);
+	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
     }
 
     /* Specialized built-in fallback reconstructs the bytecode argument list. */

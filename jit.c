@@ -1288,11 +1288,17 @@ append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
 	MIR_new_ref_op(build->context, build->import_var_raw),
 	MIR_new_reg_op(build->context, raw),
 	MIR_new_reg_op(build->context, address)));
-    if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+    if (program->value_types && program->value_types[value] == TYPE_FLOAT) {
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context,
+		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		    value * sizeof(Num), deopt_values, 0, 1),
+	    MIR_new_reg_op(build->context, raw)));
 	append(build, MIR_new_insn(build->context, MIR_DMOV,
-				  MIR_new_reg_op(build->context, values[value]),
-				  MIR_new_reg_op(build->context, raw)));
-    else
+	    MIR_new_reg_op(build->context, values[value]),
+	    MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+			   deopt_values, 0, 1)));
+    } else
 	append(build, MIR_new_insn(build->context, MIR_MOV,
 				  MIR_new_reg_op(build->context, values[value]),
 				  MIR_new_reg_op(build->context, raw)));
