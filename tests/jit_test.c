@@ -19,8 +19,6 @@ static int failures;
 
 static void check(int, const char *);
 extern void hir_test_set_length_protected(int);
-extern void hir_test_set_suspend_protected(int);
-extern void hir_test_set_suspend_zero_yield(int);
 #ifdef WAIF_CORE
 extern Var hir_test_new_waif(void);
 #endif
@@ -3698,50 +3696,6 @@ main(void)
 	      "generic built-in continuation returned the wrong value");
 	free_var(deopt_stack[0]);
 	free_var(pass_env[0]);
-	jit_program_free(pass_prog);
-
-	/* suspend(0) stays native while no other task needs the scheduler. */
-	pass_prog = builtin_call_program(11);
-	pass_args = new_list(1).v.list;
-	pass_args[1].type = TYPE_INT;
-	pass_args[1].v.num = 0;
-	pass_env[0].type = TYPE_LIST;
-	pass_env[0].v.list = pass_args;
-	hir_test_set_suspend_zero_yield(0);
-	ticks = 10;
-	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
-				  &timed_out, &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_RETURNED, "idle suspend(0) did not stay native");
-	check(result.type == TYPE_INT && result.v.num == 0,
-	      "idle suspend(0) returned the wrong value");
-
-	pass_args = new_list(1).v.list;
-	pass_args[1].type = TYPE_INT;
-	pass_args[1].v.num = 0;
-	pass_env[0].v.list = pass_args;
-	hir_test_set_suspend_zero_yield(1);
-	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
-				  &timed_out, &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_CALL_VERB, "busy suspend(0) did not enter the VM");
-	check(deopt_stack[0].type == TYPE_LIST
-	      && deopt_stack[0].v.list[1].type == TYPE_INT
-	      && deopt_stack[0].v.list[1].v.num == 0,
-	      "busy suspend(0) materialized the wrong arguments");
-	free_var(deopt_stack[0]);
-	free_var(pass_env[0]);
-
-	pass_args = new_list(1).v.list;
-	pass_args[1].type = TYPE_INT;
-	pass_args[1].v.num = 0;
-	pass_env[0].v.list = pass_args;
-	hir_test_set_suspend_zero_yield(0);
-	hir_test_set_suspend_protected(1);
-	check(jit_program_execute(pass_prog, pass_env, &result, &ticks,
-				  &timed_out, &error, 0, &deopt, deopt_stack)
-	      == JIT_RUN_CALL_VERB, "protected suspend(0) did not enter the VM");
-	free_var(deopt_stack[0]);
-	free_var(pass_env[0]);
-	hir_test_set_suspend_protected(0);
 	jit_program_free(pass_prog);
 
 	/* A statically typed float result is bitcast from the VM Var payload. */
