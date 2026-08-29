@@ -30,6 +30,30 @@ jit_list_tail_owner_slot(int source_slot, unsigned int source_uses,
 }
 
 static int
+jit_int_list_result(HIROp op, int left_is_int_list, int right_is_int_list,
+		    var_type right_type)
+{
+    if (op == HIR_OP_LIST_ADD_TAIL)
+	return left_is_int_list && right_type == TYPE_INT;
+    if (op == HIR_OP_LIST_APPEND)
+	return left_is_int_list && right_is_int_list;
+    return 0;
+}
+
+static int
+jit_all_copy_sources_are_int_lists(unsigned int sources,
+				   unsigned int proven_sources)
+{
+    return sources > 0 && proven_sources == sources;
+}
+
+static int
+jit_int_list_has_exclusive_local(unsigned int matching_locals)
+{
+    return matching_locals == 1;
+}
+
+static int
 infer_string_add_operand(HIROp op, int other_known, var_type other_type,
 			 var_type *inferred_type)
 {
@@ -5018,6 +5042,261 @@ jit_build_value_ownership(JITProgram *program)
 }
 
 static int
+jit_literal_is_int_list(JITInstruction *instr)
+{
+    Var *list;
+    int i;
+
+    if (instr->kind != HIR_TAC_CONST || instr->literal_type != TYPE_LIST
+	|| !instr->literal)
+	return 0;
+    list = (Var *) (intptr_t) instr->literal;
+    for (i = 1; i <= list[0].v.num; i++)
+	if (list[i].type != TYPE_INT)
+	    return 0;
+    return 1;
+}
+
+static void
+jit_build_int_list_values(JITProgram *program)
+{
+    unsigned int *copy_sources;
+    unsigned int *proven_sources;
+    unsigned char *instruction_definitions;
+    unsigned char *valid_definitions;
+    JITBlock *block;
+    int changed;
+    int value;
+
+    program->value_is_int_list = mymalloc(program->num_values, M_PROGRAM);
+    copy_sources = mymalloc(sizeof(unsigned int) * program->num_values,
+			    M_PROGRAM);
+    proven_sources = mymalloc(sizeof(unsigned int) * program->num_values,
+			      M_PROGRAM);
+    instruction_definitions = mymalloc(program->num_values, M_PROGRAM);
+    valid_definitions = mymalloc(program->num_values, M_PROGRAM);
+    memset(program->value_is_int_list, 0, program->num_values);
+    memset(copy_sources, 0, sizeof(unsigned int) * program->num_values);
+    memset(instruction_definitions, 0, program->num_values);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->value > 0 && instr->value < program->num_values
+		&& jit_instr_defines_value(instr)) {
+		instruction_definitions[instr->value] = 1;
+		if (jit_literal_is_int_list(instr))
+		    program->value_is_int_list[instr->value] = 1;
+	    }
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values)
+		    copy_sources[copy->dst]++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    do {
+	changed = 0;
+	memset(proven_sources, 0,
+	       sizeof(unsigned int) * program->num_values);
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+		int result_is_int_list = 0;
+
+		if (instr->value > 0 && instr->value < program->num_values) {
+		    if (instr->kind == HIR_TAC_UNARY
+			&& instr->op == HIR_OP_MAKE_SINGLETON_LIST
+			&& instr->src1 > 0 && instr->src1 < program->num_values
+			&& !program->value_is_tagged[instr->src1]
+			&& program->value_types[instr->src1] == TYPE_INT)
+			result_is_int_list = 1;
+		    else if (instr->kind == HIR_TAC_BINARY)
+			result_is_int_list = jit_int_list_result(instr->op,
+			    instr->src1 > 0 && instr->src1 < program->num_values
+				&& program->value_is_int_list[instr->src1],
+			    instr->src2 > 0 && instr->src2 < program->num_values
+				&& program->value_is_int_list[instr->src2],
+			    instr->src2 > 0 && instr->src2 < program->num_values
+				? program->value_types[instr->src2] : TYPE_ANY);
+		    else if (instr->kind == HIR_TAC_INDEX_SET
+			&& instr->src1 > 0 && instr->src1 < program->num_values
+			&& program->value_is_int_list[instr->src1]
+			&& instr->src3 > 0 && instr->src3 < program->num_values
+			&& !program->value_is_tagged[instr->src3]
+			&& program->value_types[instr->src3] == TYPE_INT)
+			result_is_int_list = 1;
+		    if (result_is_int_list
+			&& !program->value_is_int_list[instr->value]) {
+			program->value_is_int_list[instr->value] = 1;
+			changed = 1;
+		    }
+		}
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_is_int_list[copy->src])
+			proven_sources[copy->dst]++;
+		if (instr == block->last)
+		    break;
+	    }
+	}
+	for (value = 1; value < program->num_values; value++)
+	    if (proven_sources[value] > 0
+		&& !program->value_is_int_list[value]) {
+		program->value_is_int_list[value] = 1;
+		changed = 1;
+	    }
+    } while (changed);
+
+    do {
+	changed = 0;
+	memset(proven_sources, 0,
+	       sizeof(unsigned int) * program->num_values);
+	memset(valid_definitions, 0, program->num_values);
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+		int definition_is_valid = jit_literal_is_int_list(instr);
+
+		if (instr->kind == HIR_TAC_UNARY
+		    && instr->op == HIR_OP_MAKE_SINGLETON_LIST
+		    && instr->src1 > 0 && instr->src1 < program->num_values
+		    && !program->value_is_tagged[instr->src1]
+		    && program->value_types[instr->src1] == TYPE_INT)
+		    definition_is_valid = 1;
+		else if (instr->kind == HIR_TAC_BINARY)
+		    definition_is_valid = jit_int_list_result(instr->op,
+			instr->src1 > 0 && instr->src1 < program->num_values
+			    && program->value_is_int_list[instr->src1],
+			instr->src2 > 0 && instr->src2 < program->num_values
+			    && program->value_is_int_list[instr->src2],
+			instr->src2 > 0 && instr->src2 < program->num_values
+			    ? program->value_types[instr->src2] : TYPE_ANY);
+		else if (instr->kind == HIR_TAC_INDEX_SET)
+		    definition_is_valid = instr->src1 > 0
+			&& instr->src1 < program->num_values
+			&& program->value_is_int_list[instr->src1]
+			&& instr->src3 > 0
+			&& instr->src3 < program->num_values
+			&& !program->value_is_tagged[instr->src3]
+			&& program->value_types[instr->src3] == TYPE_INT;
+		if (instr->value > 0 && instr->value < program->num_values
+		    && definition_is_valid)
+		    valid_definitions[instr->value] = 1;
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_is_int_list[copy->src])
+			proven_sources[copy->dst]++;
+		if (instr == block->last)
+		    break;
+	    }
+	}
+	for (value = 1; value < program->num_values; value++)
+	    if (program->value_is_int_list[value]
+		&& ((instruction_definitions[value]
+		     && !valid_definitions[value])
+		    || (copy_sources[value] > 0
+			&& !jit_all_copy_sources_are_int_lists(
+			    copy_sources[value], proven_sources[value]))
+		    || (!instruction_definitions[value]
+			&& copy_sources[value] == 0))) {
+		program->value_is_int_list[value] = 0;
+		changed = 1;
+	    }
+    } while (changed);
+    myfree(valid_definitions, M_PROGRAM);
+    myfree(instruction_definitions, M_PROGRAM);
+    myfree(proven_sources, M_PROGRAM);
+    myfree(copy_sources, M_PROGRAM);
+}
+
+static int
+jit_int_list_alias_root(int *roots, int value)
+{
+    while (roots[value] != value) {
+	roots[value] = roots[roots[value]];
+	value = roots[value];
+    }
+    return value;
+}
+
+static void
+jit_join_int_list_aliases(int *roots, int left, int right)
+{
+    left = jit_int_list_alias_root(roots, left);
+    right = jit_int_list_alias_root(roots, right);
+    if (left != right)
+	roots[right] = left;
+}
+
+static void
+jit_build_direct_int_list_updates(JITProgram *program)
+{
+    JITBlock *block;
+    int *roots;
+    int value;
+
+    roots = mymalloc(sizeof(int) * program->num_values, M_PROGRAM);
+    for (value = 0; value < program->num_values; value++)
+	roots[value] = value;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values)
+		    jit_join_int_list_aliases(roots, copy->src, copy->dst);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_INDEX_SET
+		&& instr->src1 > 0 && instr->src1 < program->num_values
+		&& instr->src3 > 0 && instr->src3 < program->num_values
+		&& program->value_is_int_list[instr->src1]
+		&& !program->value_is_tagged[instr->src3]
+		&& program->value_types[instr->src3] == TYPE_INT
+		&& instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		unsigned int matching_locals = 0;
+		int base_root = jit_int_list_alias_root(roots, instr->src1);
+		int slot;
+
+		for (slot = 0; slot < map->num_locals; slot++) {
+		    int local = jit_deopt_map_local_value(program, map, slot);
+
+		    if (local > 0 && local < program->num_values
+			&& jit_int_list_alias_root(roots, local) == base_root)
+			matching_locals++;
+		}
+		instr->direct_int_list_index_set =
+		    jit_int_list_has_exclusive_local(matching_locals);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    myfree(roots, M_PROGRAM);
+}
+
+static int
 jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		  JITInstruction *call, int value, JITResumeValue *resume)
 {
@@ -6105,6 +6384,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->value_is_tagged = value_is_tagged;
     jit_build_tag_slots(program);
     jit_build_value_ownership(program);
+    jit_build_int_list_values(program);
+    jit_build_direct_int_list_updates(program);
     jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
 	const char *diag = hir_context_error_message(ctx);
@@ -9593,6 +9874,27 @@ hir_test_list_tail_owner_slot(int source_slot, unsigned int source_uses,
 			      int next_slot)
 {
     return jit_list_tail_owner_slot(source_slot, source_uses, next_slot);
+}
+
+int
+hir_test_int_list_result(HIROp op, int left_is_int_list,
+			 int right_is_int_list, var_type right_type)
+{
+    return jit_int_list_result(op, left_is_int_list, right_is_int_list,
+			       right_type);
+}
+
+int
+hir_test_all_copy_sources_are_int_lists(unsigned int sources,
+					unsigned int proven_sources)
+{
+    return jit_all_copy_sources_are_int_lists(sources, proven_sources);
+}
+
+int
+hir_test_int_list_has_exclusive_local(unsigned int matching_locals)
+{
+    return jit_int_list_has_exclusive_local(matching_locals);
 }
 
 int

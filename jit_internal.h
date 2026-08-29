@@ -147,6 +147,7 @@ struct JITInstruction {
     var_type literal_type;
     int deopt_map;
     JITCopy *copies;
+    unsigned char direct_int_list_index_set;
     JITInstruction *next;
 };
 
@@ -203,6 +204,7 @@ struct JITProgram {
     int *value_owner_root;
     int num_owned_slots;
     int *value_owned_slots;
+    unsigned char *value_is_int_list;
     int num_borrowed_locals;
     int *borrowed_local_slots;
     size_t active_runtime_bytes;

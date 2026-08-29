@@ -4977,6 +4977,8 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_owner_root, M_PROGRAM);
     if (program->value_owned_slots)
 	myfree(program->value_owned_slots, M_PROGRAM);
+    if (program->value_is_int_list)
+	myfree(program->value_is_int_list, M_PROGRAM);
     if (program->borrowed_local_slots)
 	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
@@ -5017,6 +5019,8 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(int) * program->num_values;
     if (program->value_owned_slots)
 	bytes += sizeof(int) * program->num_values;
+    if (program->value_is_int_list)
+	bytes += sizeof(unsigned char) * program->num_values;
     if (program->borrowed_local_slots)
 	bytes += sizeof(int) * program->num_borrowed_locals;
     if (program->usage)
@@ -5944,11 +5948,13 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 	     program->num_deopt_maps);
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
-	snprintf(line, sizeof(line), "v%d type=%d tagged=%d ownership=%d root=%d", i,
-		 program->value_types ? program->value_types[i] : TYPE_ANY,
-		 program->value_is_tagged ? program->value_is_tagged[i] : 0,
-		 program->value_ownership ? program->value_ownership[i] : 0,
-		 program->value_owner_root ? program->value_owner_root[i] : -1);
+	snprintf(line, sizeof(line),
+	    "v%d type=%d tagged=%d ownership=%d root=%d int-list=%d", i,
+	    program->value_types ? program->value_types[i] : TYPE_ANY,
+	    program->value_is_tagged ? program->value_is_tagged[i] : 0,
+	    program->value_ownership ? program->value_ownership[i] : 0,
+	    program->value_owner_root ? program->value_owner_root[i] : -1,
+	    program->value_is_int_list ? program->value_is_int_list[i] : 0);
 	add_line(line, data);
     }
     for (block = program->blocks; block; block = block->next) {
@@ -5966,7 +5972,7 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		? name_func_by_num(instr->func) : "-";
 
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d direct-int-list=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->func, func_name, instr->value,
 		     instr->src1, instr->src2,
@@ -5978,7 +5984,7 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     instr->deopt_map > 0
 		     && program->deopt_maps[instr->deopt_map].native_resume
 		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
-		     : -1);
+		     : -1, instr->direct_int_list_index_set);
 	    add_line(line, data);
 	    if (instr->deopt_map > 0
 		&& program->deopt_maps[instr->deopt_map].native_resume) {

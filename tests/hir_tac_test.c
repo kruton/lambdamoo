@@ -122,6 +122,30 @@ test_list_tail_ownership_slots(void)
 	      hir_test_list_tail_owner_slot(3, 2, 7), 7);
     check_int("unowned list tail gets new ownership slot",
 	      hir_test_list_tail_owner_slot(-1, 1, 7), 7);
+    check_int("integer tail preserves integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_ADD_TAIL, 1, 0,
+				       TYPE_INT), 1);
+    check_int("mixed tail rejects integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_ADD_TAIL, 1, 0,
+				       TYPE_STR), 0);
+    check_int("integer-list append preserves proof",
+	      hir_test_int_list_result(HIR_OP_LIST_APPEND, 1, 1,
+				       TYPE_LIST), 1);
+    check_int("unknown append rejects integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_APPEND, 1, 0,
+				       TYPE_LIST), 0);
+    check_int("all integer-list phi inputs preserve proof",
+	      hir_test_all_copy_sources_are_int_lists(2, 2), 1);
+    check_int("mixed phi inputs reject integer-list proof",
+	      hir_test_all_copy_sources_are_int_lists(2, 1), 0);
+    check_int("missing phi inputs reject integer-list proof",
+	      hir_test_all_copy_sources_are_int_lists(0, 0), 0);
+    check_int("one local permits direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(1), 1);
+    check_int("no local rejects direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(0), 0);
+    check_int("aliased locals reject direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(2), 0);
 }
 
 static void
