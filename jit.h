@@ -135,6 +135,7 @@ extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *
 extern void jit_continuation_set_result(JITContinuationFrame *, Var);
 extern void jit_continuation_mark_dispatched(JITContinuationFrame *);
 extern void jit_continuation_attach(JITContinuationFrame *, struct activation *);
+extern void jit_continuation_relocate(JITContinuationFrame *, struct activation *);
 extern int jit_continuation_materialize(struct activation *);
 extern void jit_continuation_free(JITContinuationFrame *);
 extern void jit_continuation_materialize_all(void);

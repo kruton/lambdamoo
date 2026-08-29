@@ -239,23 +239,30 @@ suspend_task(package p)
     unsigned i;
     enum error e;
 
-#ifdef ENABLE_JIT
-    for (i = 0; i <= top_activ_stack; i++)
-	if (activ_stack[i].jit_continuation
-	    && !jit_continuation_materialize(&activ_stack[i]))
-	    panic("JIT continuation suspension materialization failed");
-#endif
     the_vm = new_vm(current_task_id, top_activ_stack + 1);
     the_vm->max_stack_size = max_stack_size;
     the_vm->top_activ_stack = top_activ_stack;
     the_vm->root_activ_vector = root_activ_vector;
     the_vm->func_id = 0;	/* shouldn't need func_id; */
-    for (i = 0; i <= top_activ_stack; i++)
+    for (i = 0; i <= top_activ_stack; i++) {
 	the_vm->activ_stack[i] = activ_stack[i];
+#ifdef ENABLE_JIT
+	if (activ_stack[i].jit_continuation)
+	    jit_continuation_relocate(activ_stack[i].jit_continuation,
+				      &the_vm->activ_stack[i]);
+#endif
+    }
 
     e = (*p.u.susp.proc) (the_vm, p.u.susp.data);
-    if (e != E_NONE)
+    if (e != E_NONE) {
+#ifdef ENABLE_JIT
+	for (i = 0; i <= top_activ_stack; i++)
+	    if (the_vm->activ_stack[i].jit_continuation)
+		jit_continuation_relocate(
+		    the_vm->activ_stack[i].jit_continuation, &activ_stack[i]);
+#endif
 	free_vm(the_vm, 0);
+    }
     return e;
 }
 
@@ -486,6 +493,12 @@ make_stack_list(activation * stack, int start, int end, int include_end,
     Var r;
     int count = 0, i, j;
 
+#ifdef ENABLE_JIT
+    for (i = start; i <= end; i++)
+	if (stack[i].jit_continuation
+	    && !jit_continuation_materialize(&stack[i]))
+	    panic("JIT continuation stack introspection materialization failed");
+#endif
     for (i = end; i >= start; i--) {
 	if (include_end || i != end)
 	    count++;
@@ -2850,14 +2863,33 @@ resume_from_previous_vm(vm the_vm, Var v)
     check_activ_stack_size(the_vm->max_stack_size);
     top_activ_stack = the_vm->top_activ_stack;
     root_activ_vector = the_vm->root_activ_vector;
-    for (i = 0; i <= top_activ_stack; i++)
+    for (i = 0; i <= top_activ_stack; i++) {
 	activ_stack[i] = the_vm->activ_stack[i];
+#ifdef ENABLE_JIT
+	if (activ_stack[i].jit_continuation)
+	    jit_continuation_relocate(activ_stack[i].jit_continuation,
+				      &activ_stack[i]);
+#endif
+    }
 
     free_vm(the_vm, 0);
 
-    if (v.type == TYPE_ERR)
+    if (v.type == TYPE_ERR) {
+#ifdef ENABLE_JIT
+	for (i = 0; i <= top_activ_stack; i++)
+	    if (activ_stack[i].jit_continuation
+		&& !jit_continuation_materialize(&activ_stack[i]))
+		panic("JIT continuation error resumption materialization failed");
+#endif
 	return run_interpreter(1, v.v.err, 0, 0/*bg*/, 1/*traceback*/);
+	}
     else {
+#ifdef ENABLE_JIT
+	if (RUN_ACTIV.jit_continuation) {
+	    jit_continuation_set_result(RUN_ACTIV.jit_continuation, var_ref(v));
+	    return run_interpreter(0, E_NONE, 0, 0/*bg*/, 1/*traceback*/);
+	}
+#endif
 	/* PUSH_REF(v) */
 	*(RUN_ACTIV.top_rt_stack++) = var_ref(v);
 

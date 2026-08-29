@@ -5016,6 +5016,17 @@ jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
 }
 
 void
+jit_continuation_relocate(JITContinuationFrame *frame, activation *owner)
+{
+    if (!frame || !owner)
+	return;
+    if (frame->owner && frame->owner->jit_continuation == frame)
+	frame->owner->jit_continuation = 0;
+    frame->owner = owner;
+    owner->jit_continuation = frame;
+}
+
+void
 jit_continuation_mark_dispatched(JITContinuationFrame *frame)
 {
     if (frame)
