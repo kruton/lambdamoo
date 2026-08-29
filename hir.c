@@ -1929,6 +1929,145 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
     }
 }
 
+static int
+hir_kind_can_materialize(HIRTacKind kind)
+{
+    switch (kind) {
+    case HIR_TAC_DEOPT:
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_UNARY:
+    case HIR_TAC_BINARY:
+    case HIR_TAC_CALL:
+    case HIR_TAC_CALL_VERB:
+    case HIR_TAC_PUT_PROP:
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+    case HIR_TAC_UNSUPPORTED:
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static unsigned char *
+compute_local_live_in(HIRContext *ctx, HIRCFG *cfg, HIRBlockList **preds,
+		      int max_block_id, int num_locals)
+{
+    size_t state_size = ((size_t) max_block_id + 1) * num_locals;
+    unsigned char *defs = hir_calloc(ctx, state_size, sizeof(unsigned char));
+    unsigned char *uses = hir_calloc(ctx, state_size, sizeof(unsigned char));
+    unsigned char *dirty_in = hir_calloc(ctx, state_size,
+					 sizeof(unsigned char));
+    unsigned char *dirty_out = hir_calloc(ctx, state_size,
+					  sizeof(unsigned char));
+    unsigned char *live_in = hir_calloc(ctx, state_size,
+					sizeof(unsigned char));
+    unsigned char *live_out = hir_calloc(ctx, state_size,
+					 sizeof(unsigned char));
+    unsigned char *seen_def = hir_calloc(ctx, num_locals,
+					 sizeof(unsigned char));
+    HIRBasicBlock *block;
+    int changed;
+    int i;
+
+    if (num_locals <= 0)
+	return live_in;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	HIRTacInstr *instr;
+	unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_STORE_LOCAL
+		&& instr->local_id >= 0 && instr->local_id < num_locals)
+		block_defs[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    do {
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    unsigned char *in = dirty_in + (size_t) block->id * num_locals;
+	    unsigned char *out = dirty_out + (size_t) block->id * num_locals;
+	    unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+	    HIRBlockList *pred;
+
+	    for (i = 0; i < num_locals; i++) {
+		int new_in = 0;
+		int new_out;
+
+		for (pred = preds[block->id]; pred; pred = pred->next)
+		    if (dirty_out[(size_t) pred->block->id * num_locals + i]) {
+			new_in = 1;
+			break;
+		    }
+		new_out = new_in || block_defs[i];
+		if (in[i] != new_in || out[i] != new_out) {
+		    in[i] = new_in;
+		    out[i] = new_out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    for (block = cfg->blocks; block; block = block->next) {
+	HIRTacInstr *instr;
+	unsigned char *block_uses = uses + (size_t) block->id * num_locals;
+	unsigned char *in = dirty_in + (size_t) block->id * num_locals;
+
+	memset(seen_def, 0, num_locals);
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL
+		&& instr->local_id >= 0 && instr->local_id < num_locals
+		&& !seen_def[instr->local_id])
+		block_uses[instr->local_id] = 1;
+	    if (hir_kind_can_materialize(instr->kind))
+		for (i = 0; i < num_locals; i++)
+		    if (in[i] && !seen_def[i])
+			block_uses[i] = 1;
+	    if (instr->kind == HIR_TAC_STORE_LOCAL
+		&& instr->local_id >= 0 && instr->local_id < num_locals)
+		seen_def[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    do {
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    unsigned char *in = live_in + (size_t) block->id * num_locals;
+	    unsigned char *out = live_out + (size_t) block->id * num_locals;
+	    unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+	    unsigned char *block_uses = uses + (size_t) block->id * num_locals;
+
+	    for (i = 0; i < num_locals; i++) {
+		int new_out = 0;
+		int new_in;
+		int succ;
+
+		for (succ = 0; succ < block->num_successors; succ++)
+		    if (live_in[(size_t) block->successors[succ]->id
+				* num_locals + i]) {
+			new_out = 1;
+			break;
+		    }
+		new_in = block_uses[i] || (new_out && !block_defs[i]);
+		if (in[i] != new_in || out[i] != new_out) {
+		    in[i] = new_in;
+		    out[i] = new_out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    return live_in;
+}
+
 HIRSSAProgram *
 hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 {
@@ -1942,6 +2081,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
     HIRSSAInstr **placed_phis;
     HIRSSABlock **ssa_blocks;
     unsigned char *is_def;
+    unsigned char *live_in;
     int *stacks;
     int *stack_tops;
     int max_depth;
@@ -1971,6 +2111,9 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	    preds[succ->id] = node;
 	}
     }
+
+    live_in = compute_local_live_in(ctx, cfg, preds, max_block_id,
+				    num_locals);
 
     /* Find all defs for each local variable */
     defs = hir_calloc(ctx, num_locals, sizeof(HIRBlockList *));
@@ -2029,7 +2172,8 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 
 		for (df_node = dom->df[n->id]; df_node; df_node = df_node->next) {
 		    HIRBasicBlock *y = df_node->block;
-		    if (!added[y->id]) {
+		    if (!added[y->id]
+			&& live_in[(size_t) y->id * num_locals + i]) {
 			/* Insert Phi node at y for variable i */
 			HIRSSAInstr *phi = hir_alloc(ctx, sizeof(HIRSSAInstr));
 			phi->kind = HIR_TAC_PHI;
@@ -4322,21 +4466,7 @@ jit_instr_defines_value(JITInstruction *instr)
 static int
 jit_instr_can_materialize(JITInstruction *instr)
 {
-    switch (instr->kind) {
-    case HIR_TAC_DEOPT:
-    case HIR_TAC_LOAD_LOCAL:
-    case HIR_TAC_UNARY:
-    case HIR_TAC_BINARY:
-    case HIR_TAC_CALL:
-    case HIR_TAC_CALL_VERB:
-    case HIR_TAC_PUT_PROP:
-    case HIR_TAC_RANGE_REF:
-    case HIR_TAC_RANGE_SET:
-    case HIR_TAC_UNSUPPORTED:
-	return 1;
-    default:
-	return 0;
-    }
+    return hir_kind_can_materialize(instr->kind);
 }
 
 static int

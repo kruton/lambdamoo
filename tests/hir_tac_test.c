@@ -1159,6 +1159,104 @@ test_if_then_phi_uses_entry_local_ssa(void)
 }
 
 static void
+test_dead_if_else_local_has_no_phi(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Cond_Arm arm;
+    Expr one = int_expr(1, 90);
+    Expr two = int_expr(2, 90);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+    Expr then_value = int_expr(3, 91);
+    Expr then_lhs = id_expr(16, 91);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+    Expr else_value = int_expr(4, 92);
+    Expr else_lhs = id_expr(16, 92);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+    Expr ret_expr = int_expr(5, 93);
+    Stmt ret = return_stmt(&ret_expr);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 90;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    (void) lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("dead ifelse local phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("dead ifelse local entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("dead ifelse local verify errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_deopt_live_if_else_local_keeps_phi(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Cond_Arm arm;
+    Expr one = int_expr(1, 100);
+    Expr two = int_expr(2, 100);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+    Expr then_value = int_expr(3, 101);
+    Expr then_lhs = id_expr(16, 101);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+    Expr else_value = int_expr(4, 102);
+    Expr else_lhs = id_expr(16, 102);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+    Expr numerator = int_expr(6, 103);
+    Expr denominator = int_expr(2, 103);
+    Expr divide = binary_expr(EXPR_DIVIDE, &numerator, &denominator);
+    Stmt ret = return_stmt(&divide);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 100;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    (void) lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("deopt-live ifelse local phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("deopt-live ifelse local verify errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_guarded_environment_local_tac_ssa(void)
 {
     Names names;
@@ -3594,6 +3692,8 @@ main(void)
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
+    test_dead_if_else_local_has_no_phi();
+    test_deopt_live_if_else_local_keeps_phi();
     test_guarded_environment_local_tac_ssa();
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
