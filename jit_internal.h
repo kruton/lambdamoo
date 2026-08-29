@@ -24,6 +24,15 @@ typedef enum {
     JIT_RESUME_CAPTURED
 } JITResumeSource;
 
+typedef enum {
+    JIT_OWNERSHIP_UNKNOWN,
+    JIT_OWNERSHIP_SCALAR,
+    JIT_OWNERSHIP_BORROWED_LOCAL,
+    JIT_OWNERSHIP_OWNED,
+    JIT_OWNERSHIP_STABLE_OWNED,
+    JIT_OWNERSHIP_IMMORTAL
+} JITValueOwnership;
+
 struct JITResumeValue {
     int value;
     JITResumeSource source;
@@ -186,6 +195,8 @@ struct JITProgram {
     JITProgram *pool_next;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    unsigned char *value_ownership;
+    int *value_owner_root;
     int num_borrowed_locals;
     int *borrowed_local_slots;
     size_t active_runtime_bytes;

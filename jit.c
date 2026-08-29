@@ -4904,6 +4904,10 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->value_ownership)
+	myfree(program->value_ownership, M_PROGRAM);
+    if (program->value_owner_root)
+	myfree(program->value_owner_root, M_PROGRAM);
     if (program->borrowed_local_slots)
 	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
@@ -4936,6 +4940,10 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_ownership)
+	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_owner_root)
+	bytes += sizeof(int) * program->num_values;
     if (program->borrowed_local_slots)
 	bytes += sizeof(int) * program->num_borrowed_locals;
     if (program->usage)
@@ -5859,9 +5867,11 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 	     program->num_values, program->num_blocks, program->num_deopt_maps);
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
-	snprintf(line, sizeof(line), "v%d type=%d tagged=%d", i,
+	snprintf(line, sizeof(line), "v%d type=%d tagged=%d ownership=%d root=%d", i,
 		 program->value_types ? program->value_types[i] : TYPE_ANY,
-		 program->value_is_tagged ? program->value_is_tagged[i] : 0);
+		 program->value_is_tagged ? program->value_is_tagged[i] : 0,
+		 program->value_ownership ? program->value_ownership[i] : 0,
+		 program->value_owner_root ? program->value_owner_root[i] : -1);
 	add_line(line, data);
     }
     for (block = program->blocks; block; block = block->next) {

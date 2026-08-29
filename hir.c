@@ -4822,6 +4822,93 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 }
 
 static int
+jit_value_type_is_scalar(JITProgram *program, int value)
+{
+    var_type type;
+
+    if (!program->value_types || !program->value_is_tagged
+	|| program->value_is_tagged[value])
+	return 0;
+    type = program->value_types[value];
+    return type != TYPE_ANY && type != TYPE_STR && type != TYPE_LIST
+	&& type != TYPE_WAIF;
+}
+
+static void
+jit_build_value_ownership(JITProgram *program)
+{
+    JITBlock *block;
+    int changed;
+    int i;
+
+    program->value_ownership = mymalloc(program->num_values, M_PROGRAM);
+    program->value_owner_root = mymalloc(sizeof(int) * program->num_values,
+					 M_PROGRAM);
+    memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
+	   program->num_values);
+    for (i = 0; i < program->num_values; i++) {
+	program->value_owner_root[i] = -1;
+	if (jit_value_type_is_scalar(program, i))
+	    program->value_ownership[i] = JIT_OWNERSHIP_SCALAR;
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value > 0 && instr->value < program->num_values) {
+		if (instr->kind == HIR_TAC_LOAD_LOCAL) {
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_BORROWED_LOCAL;
+		    program->value_owner_root[instr->value] = instr->local_id;
+		} else if (instr->kind == HIR_TAC_CONST
+			   && !jit_value_type_is_scalar(program, instr->value))
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_IMMORTAL;
+		else if ((instr->kind == HIR_TAC_UNARY
+			  && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+			 || (instr->kind == HIR_TAC_BINARY
+			     && (instr->op == HIR_OP_LIST_ADD_TAIL
+				 || instr->op == HIR_OP_LIST_APPEND
+				 || instr->op == HIR_OP_SUBLIST_FROM)))
+		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
+		else if (instr->kind == HIR_TAC_BINARY
+			 && instr->op == HIR_OP_GET_PROP)
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_STABLE_OWNED;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_ownership[copy->src]
+			   != JIT_OWNERSHIP_UNKNOWN
+			&& program->value_ownership[copy->dst]
+			   == JIT_OWNERSHIP_UNKNOWN) {
+			program->value_ownership[copy->dst] =
+			    program->value_ownership[copy->src];
+			program->value_owner_root[copy->dst] =
+			    program->value_owner_root[copy->src];
+			changed = 1;
+		    }
+		if (instr == block->last)
+		    break;
+	    }
+	}
+    } while (changed);
+}
+
+static int
 jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		  JITInstruction *call, int value, JITResumeValue *resume)
 {
@@ -5854,6 +5941,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_build_value_ownership(program);
     jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
 	const char *diag = hir_context_error_message(ctx);
