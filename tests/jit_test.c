@@ -19,6 +19,9 @@ static int failures;
 
 static void check(int, const char *);
 extern void hir_test_set_length_protected(int);
+#ifdef WAIF_CORE
+extern Var hir_test_new_waif(void);
+#endif
 
 struct machine_dump {
     int lines;
@@ -2263,6 +2266,11 @@ tagged_test_value(var_type type)
     case TYPE_FLOAT:
 	value.v.fnum = box_fl(17.5);
 	break;
+#ifdef WAIF_CORE
+    case TYPE_WAIF:
+	value = hir_test_new_waif();
+	break;
+#endif
     default:
 	panic("unsupported tagged test value type");
     }
@@ -4540,7 +4548,10 @@ main(void)
 	JITProgram *tagged_append = tagged_binary_result_program(
 	    HIR_OP_LIST_ADD_TAIL, TYPE_LIST);
 	const var_type types[] = {
-	    TYPE_INT, TYPE_OBJ, TYPE_STR, TYPE_ERR, TYPE_LIST, TYPE_FLOAT
+	    TYPE_INT, TYPE_OBJ, TYPE_STR, TYPE_ERR, TYPE_LIST, TYPE_FLOAT,
+#ifdef WAIF_CORE
+	    TYPE_WAIF,
+#endif
 	};
 	unsigned i;
 
@@ -4599,7 +4610,7 @@ main(void)
 		  "tagged singleton did not preserve its element");
 	    free_var(result);
 
-	    tagged_env[1] = var_ref(tagged_env[0]);
+	    tagged_env[1] = tagged_env[0];
 	    tagged_env[0] = new_list(0);
 	    ticks = 10;
 	    check(jit_program_execute(tagged_append, tagged_env, &result, &ticks,

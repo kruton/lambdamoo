@@ -48,23 +48,33 @@ double_to_raw(double d)
     return raw;
 }
 
+static Var
+raw_to_var(int64_t raw, int type)
+{
+    Var value;
+
+    value.type = (var_type) type;
+    if (type == TYPE_FLOAT)
+	value.v.fnum = box_fl((FlNum) raw_to_double(raw));
+    else if (type == TYPE_STR)
+	value.v.str = (const char *) (intptr_t) raw;
+    else if (type == TYPE_LIST)
+	value.v.list = (Var *) (intptr_t) raw;
+#ifdef WAIF_CORE
+    else if (type == TYPE_WAIF)
+	value.v.waif = (Waif *) (intptr_t) raw;
+#endif
+    else
+	value.v.num = (Num) raw;
+    return value;
+}
+
 /* JIT Runtime Helpers for Complex Values and Properties */
 
 int
 jit_rt_is_true(int64_t raw_val, int val_type)
 {
-    Var v;
-
-    v.type = (var_type) val_type;
-    if (val_type == TYPE_FLOAT)
-	v.v.fnum = box_fl((FlNum) raw_to_double(raw_val));
-    else if (val_type == TYPE_STR)
-	v.v.str = (const char *) (intptr_t) raw_val;
-    else if (val_type == TYPE_LIST)
-	v.v.list = (Var *) (intptr_t) raw_val;
-    else
-	v.v.num = (Num) raw_val;
-    return is_true(v);
+    return is_true(raw_to_var(raw_val, val_type));
 }
 
 int
@@ -72,25 +82,8 @@ jit_rt_equality(int64_t raw1, int type1, int64_t raw2, int type2, int case_matte
 {
     Var v1, v2;
 
-    v1.type = (var_type) type1;
-    if (type1 == TYPE_FLOAT)
-	v1.v.fnum = box_fl((FlNum) raw_to_double(raw1));
-    else if (type1 == TYPE_STR)
-	v1.v.str = (const char *) (intptr_t) raw1;
-    else if (type1 == TYPE_LIST)
-	v1.v.list = (Var *) (intptr_t) raw1;
-    else
-	v1.v.num = (Num) raw1;
-
-    v2.type = (var_type) type2;
-    if (type2 == TYPE_FLOAT)
-	v2.v.fnum = box_fl((FlNum) raw_to_double(raw2));
-    else if (type2 == TYPE_STR)
-	v2.v.str = (const char *) (intptr_t) raw2;
-    else if (type2 == TYPE_LIST)
-	v2.v.list = (Var *) (intptr_t) raw2;
-    else
-	v2.v.num = (Num) raw2;
+    v1 = raw_to_var(raw1, type1);
+    v2 = raw_to_var(raw2, type2);
 
     return equality(v1, v2, case_matters);
 }
@@ -235,16 +228,7 @@ jit_rt_make_singleton_list(int64_t elem_raw, int elem_type)
     Var list = new_list(1);
     Var elem;
 
-    elem.type = (var_type) elem_type;
-    if (elem_type == TYPE_FLOAT)
-	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
-    else if (elem_type == TYPE_STR)
-	elem.v.str = str_ref((const char *) (intptr_t) elem_raw);
-    else if (elem_type == TYPE_LIST) {
-	elem.v.list = (Var *) (intptr_t) elem_raw;
-	elem = var_ref(elem);
-    } else
-	elem.v.num = (Num) elem_raw;
+    elem = var_ref(raw_to_var(elem_raw, elem_type));
 
     list.v.list[1] = elem;
     return list.v.list;
@@ -258,16 +242,7 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
     l.type = TYPE_LIST;
     l.v.list = list;
 
-    elem.type = (var_type) elem_type;
-    if (elem_type == TYPE_FLOAT)
-	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
-    else if (elem_type == TYPE_STR)
-	elem.v.str = str_ref((const char *) (intptr_t) elem_raw);
-    else if (elem_type == TYPE_LIST) {
-	elem.v.list = (Var *) (intptr_t) elem_raw;
-	elem = var_ref(elem);
-    } else
-	elem.v.num = (Num) elem_raw;
+    elem = var_ref(raw_to_var(elem_raw, elem_type));
 
     res = listappend(var_ref(l), elem);
     return res.v.list;
@@ -301,15 +276,7 @@ jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
     l.type = TYPE_LIST;
     l.v.list = list;
 
-    elem.type = (var_type) elem_type;
-    if (elem_type == TYPE_FLOAT)
-	elem.v.fnum = box_fl((FlNum) raw_to_double(elem_raw));
-    else if (elem_type == TYPE_STR)
-	elem.v.str = (const char *) (intptr_t) elem_raw;
-    else if (elem_type == TYPE_LIST)
-	elem.v.list = (Var *) (intptr_t) elem_raw;
-    else
-	elem.v.num = (Num) elem_raw;
+    elem = raw_to_var(elem_raw, elem_type);
 
     return ismember(elem, l, 0);
 }

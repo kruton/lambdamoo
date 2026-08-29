@@ -7,6 +7,7 @@
 #include "server.h"
 #include "storage.h"
 #include "utils.h"
+#include "waif.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -18,6 +19,29 @@ static int test_length_protected;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
 
 void hir_test_set_length_protected(int);
+#ifdef WAIF_CORE
+Var hir_test_new_waif(void);
+#endif
+
+#ifdef WAIF_CORE
+Var
+hir_test_new_waif(void)
+{
+    Var value;
+    Waif *waif = mymalloc(sizeof(Waif), M_WAIF);
+    WaifPropdefs *propdefs = mymalloc(sizeof(WaifPropdefs), M_WAIF_XTRA);
+
+    memset(waif, 0, sizeof(Waif));
+    propdefs->refcount = 1;
+    propdefs->length = 0;
+    waif->class = 0;
+    waif->owner = 0;
+    waif->propdefs = propdefs;
+    value.type = TYPE_WAIF;
+    value.v.waif = waif;
+    return value;
+}
+#endif
 
 unsigned
 builtin_protection_generation(void)
@@ -54,6 +78,10 @@ refcount_overhead(Memory_Type type)
 #endif
     case M_LIST:
 	return sizeof(Var *) > sizeof(int) ? sizeof(Var *) : sizeof(int);
+#ifdef WAIF_CORE
+    case M_WAIF:
+	return sizeof(void *) > sizeof(int) ? sizeof(void *) : sizeof(int);
+#endif
     default:
 	return 0;
     }
@@ -131,6 +159,12 @@ complex_free_var(Var value)
 	    myfree(value.v.list, M_LIST);
 	}
     }
+#ifdef WAIF_CORE
+    else if (value.type == TYPE_WAIF && delref(value.v.waif) == 0) {
+	myfree(value.v.waif->propdefs, M_WAIF_XTRA);
+	myfree(value.v.waif, M_WAIF);
+    }
+#endif
 }
 
 Var
@@ -140,6 +174,10 @@ complex_var_ref(Var value)
 	addref(value.v.str);
     else if (value.type == TYPE_LIST)
 	addref(value.v.list);
+#ifdef WAIF_CORE
+    else if (value.type == TYPE_WAIF)
+	addref(value.v.waif);
+#endif
     return value;
 }
 
@@ -150,6 +188,10 @@ var_refcount(Var v)
 	return refcount(v.v.str);
     if (v.type == TYPE_LIST)
 	return refcount(v.v.list);
+#ifdef WAIF_CORE
+    if (v.type == TYPE_WAIF)
+	return refcount(v.v.waif);
+#endif
     return 1;
 }
 
@@ -318,6 +360,10 @@ equality(Var lhs, Var rhs, int case_matters)
 		return 0;
 	}
 	return 1;
+#ifdef WAIF_CORE
+    case TYPE_WAIF:
+	return lhs.v.waif == rhs.v.waif;
+#endif
     default:
 	return 0;
     }
@@ -347,7 +393,8 @@ listappend(Var list, Var value)
 
     for (i = 1; i <= len; i++)
 	result.v.list[i] = var_ref(list.v.list[i]);
-    result.v.list[len + 1] = var_ref(value);
+    result.v.list[len + 1] = value;
+    free_var(list);
     return result;
 }
 
