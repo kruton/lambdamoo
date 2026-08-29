@@ -1535,6 +1535,8 @@ test_scatter_destructuring_tac_ssa(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("scatter tac deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("scatter boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, 2, 1), 0);
     check_int("scatter tac binary add count",
 	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 1);
     check_int("scatter verify errors", hir_context_error_count(ctx), 0);
@@ -1594,6 +1596,8 @@ test_optional_rest_scatter_deopt(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional rest scatter deopt stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 2), 1);
+    check_int("optional rest boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, 2, 1), 0);
     check_int("optional rest scatter default lowered",
 	      hir_tac_count_bytecode_pc(tac, default_value.bytecode_pc) > 0, 1);
     check_int("optional rest scatter sublist op",
@@ -1668,6 +1672,8 @@ test_optional_scatter_default_lowering(void)
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
     check_int("optional scatter invalid deopt preserves rhs",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, assign.bytecode_pc), 1);
+    check_int("optional scatter boundaries preserve canonical stack",
+	      hir_tac_stack_depth_mismatch_count(tac, assign.bytecode_pc, 1), 0);
     check_int("optional scatter ssa valid", hir_verify_ssa(ctx, ssa), 1);
     check_int("optional scatter destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     check_int("optional scatter out-of-ssa valid",

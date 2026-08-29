@@ -197,6 +197,7 @@ extern int hir_tac_instruction_count(HIRTacProgram *);
 extern int hir_tac_count_lineno(HIRTacProgram *, unsigned);
 extern int hir_tac_count_bytecode_pc(HIRTacProgram *, unsigned);
 extern int hir_tac_stack_depth_at_bytecode_pc(HIRTacProgram *, unsigned);
+extern int hir_tac_stack_depth_mismatch_count(HIRTacProgram *, unsigned, int);
 extern int hir_cfg_block_count(HIRCFG *);
 extern int hir_cfg_edge_count(HIRCFG *);
 extern int hir_cfg_unsupported_block_count(HIRCFG *);
