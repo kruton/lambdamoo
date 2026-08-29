@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(25);
+    Var metadata = new_list(30);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -366,6 +366,16 @@ jit_metadata(JITProgram *program)
 					       stats.native_allocated_bytes);
     metadata.v.list[25] = jit_metadata_num_pair("accounted_bytes",
 					       stats.accounted_bytes);
+    metadata.v.list[26] = jit_metadata_num_pair("continuation_captures",
+					       stats.continuation_captures);
+    metadata.v.list[27] = jit_metadata_num_pair("continuation_resumes",
+					       stats.continuation_resumes);
+    metadata.v.list[28] = jit_metadata_num_pair("continuation_materializations",
+					       stats.continuation_materializations);
+    metadata.v.list[29] = jit_metadata_num_pair("active_continuations",
+					       stats.active_continuations);
+    metadata.v.list[30] = jit_metadata_num_pair("continuation_bytes",
+					       stats.continuation_bytes);
     return metadata;
 }
 #endif

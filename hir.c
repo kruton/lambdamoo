@@ -23,6 +23,37 @@
 #include <string.h>
 
 static int
+jit_list_tail_owner_slot(int source_slot, unsigned int source_uses,
+			 int next_slot)
+{
+    return source_slot >= 0 && source_uses == 1 ? source_slot : next_slot;
+}
+
+static int
+jit_int_list_result(HIROp op, int left_is_int_list, int right_is_int_list,
+		    var_type right_type)
+{
+    if (op == HIR_OP_LIST_ADD_TAIL)
+	return left_is_int_list && right_type == TYPE_INT;
+    if (op == HIR_OP_LIST_APPEND)
+	return left_is_int_list && right_is_int_list;
+    return 0;
+}
+
+static int
+jit_all_copy_sources_are_int_lists(unsigned int sources,
+				   unsigned int proven_sources)
+{
+    return sources > 0 && proven_sources == sources;
+}
+
+static int
+jit_int_list_has_exclusive_local(unsigned int matching_locals)
+{
+    return matching_locals == 1;
+}
+
+static int
 infer_string_add_operand(HIROp op, int other_known, var_type other_type,
 			 var_type *inferred_type)
 {
@@ -427,6 +458,7 @@ struct HIRTacInstr {
     int dst;
     int src1;
     int src2;
+    int src3;
     int label;
     int local_id;
     HIROp op;
@@ -509,6 +541,7 @@ struct HIRSSAInstr {
     int value;
     int src1;
     int src2;
+    int src3;
     int label;
     int local_id;
     HIROp op;
@@ -575,6 +608,7 @@ struct HIRContext {
     int next_temp;
     int next_label;
     int next_local;
+    int first_user_local;
     unsigned current_code_unit;
     int lower_stack_depth;
     int lower_stack_capacity;
@@ -615,6 +649,7 @@ hir_context_new(Names *var_names)
     ctx->next_temp = 1;
     ctx->next_label = 1;
     ctx->next_local = var_names ? (int) var_names->size : 0;
+    ctx->first_user_local = ctx->next_local;
     ctx->current_code_unit = 0;
     ctx->lower_stack_depth = 0;
     ctx->lower_stack_capacity = 0;
@@ -626,6 +661,18 @@ hir_context_new(Names *var_names)
     ctx->current_length_base = 0;
 
     return ctx;
+}
+
+void
+hir_context_set_first_user_local(HIRContext *ctx, int first_user_local)
+{
+    if (!ctx)
+	return;
+    if (first_user_local < 0)
+	first_user_local = 0;
+    if (first_user_local > ctx->next_local)
+	first_user_local = ctx->next_local;
+    ctx->first_user_local = first_user_local;
 }
 
 void
@@ -800,6 +847,13 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_RANGE_SET:
 	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
 	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
+	    break;
+	case HIR_TAC_INDEX_SET:
+	    verify_local(ctx, instr->local_id);
+	    verify_temp_use(ctx, instr->src1, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src2, defined_temps, max_temp);
+	    verify_temp_use(ctx, instr->src3, defined_temps, max_temp);
 	    verify_temp_def(ctx, instr->dst, defined_temps, max_temp);
 	    break;
 	case HIR_TAC_LABEL:
@@ -1237,20 +1291,17 @@ new_cfg_split_jump(HIRContext *ctx, HIRBasicBlock *from, HIRBasicBlock *to)
 {
     HIRTacInstr *jump = hir_alloc(ctx, sizeof(HIRTacInstr));
 
+    memset(jump, 0, sizeof(HIRTacInstr));
     jump->kind = HIR_TAC_JUMP;
     jump->source_lineno = from && from->last ? from->last->source_lineno : 0;
     jump->bytecode_pc = NO_BYTECODE_PC;
     if (jump->source_lineno == 0 && to)
 	jump->source_lineno = to->first_lineno;
-    jump->dst = 0;
-    jump->src1 = 0;
-    jump->src2 = 0;
     jump->label = to && to->first && to->first->kind == HIR_TAC_LABEL
 	? to->first->label : 0;
     jump->local_id = -1;
     jump->op = HIR_OP_ADD;
     jump->literal.type = TYPE_NONE;
-    jump->next = 0;
 
     return jump;
 }
@@ -1616,6 +1667,7 @@ ssa_defines_value(HIRSSAInstr *instr)
 	    || instr->kind == HIR_TAC_CALL
 	    || instr->kind == HIR_TAC_CALL_VERB
 	    || instr->kind == HIR_TAC_PUT_PROP
+	    || instr->kind == HIR_TAC_INDEX_SET
 	    || instr->kind == HIR_TAC_RANGE_REF
 	    || instr->kind == HIR_TAC_RANGE_SET
 	    || instr->kind == HIR_TAC_UNSUPPORTED
@@ -1659,6 +1711,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->value = tac->dst;
     instr->src1 = tac->src1;
     instr->src2 = tac->src2;
+    instr->src3 = tac->src3;
     instr->label = tac->label;
     instr->local_id = tac->local_id;
     instr->op = tac->op;
@@ -1697,7 +1750,8 @@ ssa_stack_depth(HIRContext *ctx, HIRCFG *cfg, HIRSSAInstr **placed_phis,
 	HIRTacInstr *tac;
 
 	for (tac = block->first; tac; tac = tac->next) {
-	    if (tac->kind == HIR_TAC_STORE_LOCAL
+	    if ((tac->kind == HIR_TAC_STORE_LOCAL
+		 || tac->kind == HIR_TAC_INDEX_SET)
 		&& tac->local_id >= 0 && tac->local_id < num_locals)
 		counts[tac->local_id]++;
 	    if (tac == block->last)
@@ -1738,16 +1792,22 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	HIRSSAInstr *load = hir_alloc(ctx, sizeof(HIRSSAInstr));
 	int internal_local = ctx->var_names
 	    && v >= (int) ctx->var_names->size;
-	load->kind = internal_local ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
+	int uninitialized_local = !internal_local
+	    && v >= ctx->first_user_local;
+
+	memset(load, 0, sizeof(HIRSSAInstr));
+	load->kind = internal_local || uninitialized_local
+	    ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
 	load->bytecode_pc = NO_BYTECODE_PC;
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
+	load->src3 = 0;
 	load->label = 0;
-	load->local_id = internal_local ? -1 : v;
+	load->local_id = internal_local || uninitialized_local ? -1 : v;
 	load->op = HIR_OP_ADD;
-	load->literal.type = TYPE_INT;
+	load->literal.type = uninitialized_local ? TYPE_NONE : TYPE_INT;
 	load->literal.v.num = 0;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
@@ -1784,6 +1844,8 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
     }
     return stacks[v * max_depth + stack_tops[v] - 1];
 }
+
+static int hir_kind_can_materialize(HIRTacKind);
 
 static void
 rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
@@ -1829,6 +1891,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
     for (tac = b->first; tac; tac = tac->next) {
 	int src1_renamed = (tac->src1 > 0 && tac->src1 < temp_map_size) ? temp_map[tac->src1] : tac->src1;
 	int src2_renamed = (tac->src2 > 0 && tac->src2 < temp_map_size) ? temp_map[tac->src2] : tac->src2;
+	int src3_renamed = (tac->src3 > 0 && tac->src3 < temp_map_size) ? temp_map[tac->src3] : tac->src3;
 
 	if (tac->kind == HIR_TAC_LOAD_LOCAL) {
 	    int t_val = current_version(ctx, tac->local_id, num_locals,
@@ -1848,6 +1911,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 
 	    ssa_inst->src1 = src1_renamed;
 	    ssa_inst->src2 = src2_renamed;
+	    ssa_inst->src3 = src3_renamed;
 	    if (tac->num_stack_values) {
 		ssa_inst->stack_values = hir_alloc(ctx,
 				 sizeof(int) * tac->num_stack_values);
@@ -1863,6 +1927,7 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 		}
 	    }
 	    ssa_inst->num_local_values = ctx->var_names
+		&& hir_kind_can_materialize(ssa_inst->kind)
 		? ctx->var_names->size : 0;
 	    if (ssa_inst->num_local_values) {
 		ssa_inst->local_values = hir_alloc(ctx,
@@ -1874,6 +1939,13 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 	    if (tac->dst > 0 && tac->dst < temp_map_size)
 		temp_map[tac->dst] = tac->dst;
 	    emit_ssa_instr(ssa, ssa_block, ssa_inst);
+	    if (tac->kind == HIR_TAC_INDEX_SET) {
+		if (tac->local_id >= 0 && tac->local_id < num_locals)
+		    stacks[tac->local_id * max_depth
+			   + stack_tops[tac->local_id]++] = ssa_inst->value;
+		else
+		    record_unsupported_fmt(ctx, "ssa-build: invalid index-set local id %d", tac->local_id);
+	    }
 	}
 
 	if (tac == b->last)
@@ -1921,12 +1993,155 @@ rename_block_recurse(HIRContext *ctx, HIRBasicBlock *b, HIRDominatorTree *dom,
 
     /* 6. Pop store_local definitions from version stacks */
     for (tac = b->first; tac; tac = tac->next) {
-	if (tac->kind == HIR_TAC_STORE_LOCAL
+	if ((tac->kind == HIR_TAC_STORE_LOCAL
+	     || tac->kind == HIR_TAC_INDEX_SET)
 	    && tac->local_id >= 0 && tac->local_id < num_locals)
 	    stack_tops[tac->local_id]--;
 	if (tac == b->last)
 	    break;
     }
+}
+
+static int
+hir_kind_can_materialize(HIRTacKind kind)
+{
+    switch (kind) {
+    case HIR_TAC_DEOPT:
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_UNARY:
+    case HIR_TAC_BINARY:
+    case HIR_TAC_CALL:
+    case HIR_TAC_CALL_VERB:
+    case HIR_TAC_PUT_PROP:
+    case HIR_TAC_INDEX_SET:
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+    case HIR_TAC_UNSUPPORTED:
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static unsigned char *
+compute_local_live_in(HIRContext *ctx, HIRCFG *cfg, HIRBlockList **preds,
+		      int max_block_id, int num_locals)
+{
+    size_t state_size = ((size_t) max_block_id + 1) * num_locals;
+    unsigned char *defs = hir_calloc(ctx, state_size, sizeof(unsigned char));
+    unsigned char *uses = hir_calloc(ctx, state_size, sizeof(unsigned char));
+    unsigned char *dirty_in = hir_calloc(ctx, state_size,
+					 sizeof(unsigned char));
+    unsigned char *dirty_out = hir_calloc(ctx, state_size,
+					  sizeof(unsigned char));
+    unsigned char *live_in = hir_calloc(ctx, state_size,
+					sizeof(unsigned char));
+    unsigned char *live_out = hir_calloc(ctx, state_size,
+					 sizeof(unsigned char));
+    unsigned char *seen_def = hir_calloc(ctx, num_locals,
+					 sizeof(unsigned char));
+    HIRBasicBlock *block;
+    int changed;
+    int i;
+
+    if (num_locals <= 0)
+	return live_in;
+
+    for (block = cfg->blocks; block; block = block->next) {
+	HIRTacInstr *instr;
+	unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if ((instr->kind == HIR_TAC_STORE_LOCAL
+		 || instr->kind == HIR_TAC_INDEX_SET)
+		&& instr->local_id >= 0 && instr->local_id < num_locals)
+		block_defs[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    do {
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    unsigned char *in = dirty_in + (size_t) block->id * num_locals;
+	    unsigned char *out = dirty_out + (size_t) block->id * num_locals;
+	    unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+	    HIRBlockList *pred;
+
+	    for (i = 0; i < num_locals; i++) {
+		int new_in = 0;
+		int new_out;
+
+		for (pred = preds[block->id]; pred; pred = pred->next)
+		    if (dirty_out[(size_t) pred->block->id * num_locals + i]) {
+			new_in = 1;
+			break;
+		    }
+		new_out = new_in || block_defs[i];
+		if (in[i] != new_in || out[i] != new_out) {
+		    in[i] = new_in;
+		    out[i] = new_out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    for (block = cfg->blocks; block; block = block->next) {
+	HIRTacInstr *instr;
+	unsigned char *block_uses = uses + (size_t) block->id * num_locals;
+	unsigned char *in = dirty_in + (size_t) block->id * num_locals;
+
+	memset(seen_def, 0, num_locals);
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL
+		&& instr->local_id >= 0 && instr->local_id < num_locals
+		&& !seen_def[instr->local_id])
+		block_uses[instr->local_id] = 1;
+	    if (hir_kind_can_materialize(instr->kind))
+		for (i = 0; i < num_locals; i++)
+		    if (in[i] && !seen_def[i])
+			block_uses[i] = 1;
+	    if ((instr->kind == HIR_TAC_STORE_LOCAL
+		 || instr->kind == HIR_TAC_INDEX_SET)
+		&& instr->local_id >= 0 && instr->local_id < num_locals)
+		seen_def[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    do {
+	changed = 0;
+	for (block = cfg->blocks; block; block = block->next) {
+	    unsigned char *in = live_in + (size_t) block->id * num_locals;
+	    unsigned char *out = live_out + (size_t) block->id * num_locals;
+	    unsigned char *block_defs = defs + (size_t) block->id * num_locals;
+	    unsigned char *block_uses = uses + (size_t) block->id * num_locals;
+
+	    for (i = 0; i < num_locals; i++) {
+		int new_out = 0;
+		int new_in;
+		int succ;
+
+		for (succ = 0; succ < block->num_successors; succ++)
+		    if (live_in[(size_t) block->successors[succ]->id
+				* num_locals + i]) {
+			new_out = 1;
+			break;
+		    }
+		new_in = block_uses[i] || (new_out && !block_defs[i]);
+		if (in[i] != new_in || out[i] != new_out) {
+		    in[i] = new_in;
+		    out[i] = new_out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    return live_in;
 }
 
 HIRSSAProgram *
@@ -1942,6 +2157,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
     HIRSSAInstr **placed_phis;
     HIRSSABlock **ssa_blocks;
     unsigned char *is_def;
+    unsigned char *live_in;
     int *stacks;
     int *stack_tops;
     int max_depth;
@@ -1972,12 +2188,16 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	}
     }
 
+    live_in = compute_local_live_in(ctx, cfg, preds, max_block_id,
+				    num_locals);
+
     /* Find all defs for each local variable */
     defs = hir_calloc(ctx, num_locals, sizeof(HIRBlockList *));
     for (cfg_block = cfg->blocks; cfg_block; cfg_block = cfg_block->next) {
 	HIRTacInstr *tac;
 	for (tac = cfg_block->first; tac; tac = tac->next) {
-	    if (tac->kind == HIR_TAC_STORE_LOCAL) {
+	    if (tac->kind == HIR_TAC_STORE_LOCAL
+		|| tac->kind == HIR_TAC_INDEX_SET) {
 		int v = tac->local_id;
 		if (v >= 0 && v < num_locals) {
 		    /* Check if block is already in defs[v] */
@@ -2029,9 +2249,12 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 
 		for (df_node = dom->df[n->id]; df_node; df_node = df_node->next) {
 		    HIRBasicBlock *y = df_node->block;
-		    if (!added[y->id]) {
+		    if (!added[y->id]
+			&& live_in[(size_t) y->id * num_locals + i]) {
 			/* Insert Phi node at y for variable i */
 			HIRSSAInstr *phi = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+			memset(phi, 0, sizeof(HIRSSAInstr));
 			phi->kind = HIR_TAC_PHI;
 			phi->source_lineno = y->first_lineno;
 			phi->bytecode_pc = NO_BYTECODE_PC;
@@ -2043,6 +2266,7 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 			phi->local_values = 0;
 			phi->src1 = 0;
 			phi->src2 = 0;
+			phi->src3 = 0;
 			phi->label = 0;
 			phi->local_id = i;
 			phi->op = HIR_OP_ADD;
@@ -2126,24 +2350,13 @@ hir_build_ssa(HIRContext *ctx, HIRCFG *cfg)
 	HIRSSABlock *ssa_block = ssa_blocks[cfg_block->id];
 	if (ssa_block && !ssa_block->first) {
 	    HIRSSAInstr *label = hir_alloc(ctx, sizeof(HIRSSAInstr));
+
+	    memset(label, 0, sizeof(HIRSSAInstr));
 	    label->kind = HIR_TAC_LABEL;
 	    label->source_lineno = cfg_block->first_lineno;
 	    label->bytecode_pc = NO_BYTECODE_PC;
-	    label->value = 0;
-	    label->src1 = 0;
-	    label->src2 = 0;
-	    label->label = 0;
-	    label->local_id = 0;
 	    label->op = HIR_OP_ADD;
 	    label->literal.type = TYPE_NONE;
-	    label->num_stack_values = 0;
-	    label->stack_values = 0;
-	    label->stack_slots = 0;
-	    label->num_local_values = 0;
-	    label->local_values = 0;
-	    label->phi_args = 0;
-	    label->copies = 0;
-	    label->next = 0;
 	    emit_ssa_instr(ssa, ssa_block, label);
 	}
     }
@@ -2358,6 +2571,17 @@ verify_ssa_dominance(HIRContext *ctx, HIRSSAProgram *ssa, int max_value)
 					   order, 0, max_value,
 					   def_block, def_order);
 		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_ssa_dominating_use(ctx, dom, instr->src1, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		verify_ssa_dominating_use(ctx, dom, instr->src2, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		verify_ssa_dominating_use(ctx, dom, instr->src3, block->id,
+					   order, 0, max_value,
+					   def_block, def_order);
+		break;
 	    case HIR_TAC_PHI:
 		{
 		    HIRPhiArg *arg;
@@ -2441,6 +2665,14 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_RANGE_SET:
 		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
 		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_def(ctx, instr->value, defined, max_value);
+		value_count++;
+		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_local(ctx, instr->local_id);
+		verify_ssa_value_use(ctx, instr->src1, defined, max_value);
+		verify_ssa_value_use(ctx, instr->src2, defined, max_value);
+		verify_ssa_value_use(ctx, instr->src3, defined, max_value);
 		verify_ssa_value_def(ctx, instr->value, defined, max_value);
 		value_count++;
 		break;
@@ -2770,6 +3002,7 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		case HIR_TAC_CALL:
 		case HIR_TAC_CALL_VERB:
 		case HIR_TAC_PUT_PROP:
+		case HIR_TAC_INDEX_SET:
 		case HIR_TAC_RANGE_REF:
 		case HIR_TAC_RANGE_SET:
 		case HIR_TAC_UNSUPPORTED:
@@ -3017,7 +3250,7 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 		instr->literal.type = TYPE_INT;
 		instr->literal.v.num = hir_value_constant(analysis,
 							  instr->value);
-		instr->src1 = instr->src2 = 0;
+		instr->src1 = instr->src2 = instr->src3 = 0;
 		instr->phi_args = 0;
 		changes++;
 	    }
@@ -3236,12 +3469,14 @@ ensure_parallel_copy(HIRContext *ctx, HIRSSAProgram *ssa, HIRSSABlock *block,
     }
 
     copy = hir_alloc(ctx, sizeof(HIRSSAInstr));
+    memset(copy, 0, sizeof(HIRSSAInstr));
     copy->kind = HIR_TAC_PARALLEL_COPY;
     copy->source_lineno = source_lineno;
     copy->bytecode_pc = NO_BYTECODE_PC;
     copy->value = 0;
     copy->src1 = 0;
     copy->src2 = 0;
+    copy->src3 = 0;
     copy->label = 0;
     copy->local_id = -1;
     copy->op = HIR_OP_ADD;
@@ -3427,6 +3662,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_INDEX_SET:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 		mark_out_ssa_def(instr->value, defined, max_value);
@@ -3485,6 +3721,11 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_RANGE_SET:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
 		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
+		break;
+	    case HIR_TAC_INDEX_SET:
+		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
+		verify_out_ssa_use(ctx, instr->src2, defined, max_value);
+		verify_out_ssa_use(ctx, instr->src3, defined, max_value);
 		break;
 	    case HIR_TAC_BRANCH_FALSE:
 		verify_out_ssa_use(ctx, instr->src1, defined, max_value);
@@ -3566,7 +3807,7 @@ jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 	return kind == HIR_TAC_UNARY || kind == HIR_TAC_BINARY
 	    || kind == HIR_TAC_BRANCH_FALSE || kind == HIR_TAC_CALL_VERB
 	    || kind == HIR_TAC_PUT_PROP || kind == HIR_TAC_RANGE_REF
-	    || kind == HIR_TAC_RANGE_SET
+	    || kind == HIR_TAC_RANGE_SET || kind == HIR_TAC_INDEX_SET
 	    || (kind == HIR_TAC_DEOPT && op == HIR_OP_SCATTER);
 }
 
@@ -3653,6 +3894,7 @@ tac_kind_name(HIRTacKind kind)
     case HIR_TAC_CALL: return "call";
     case HIR_TAC_CALL_VERB: return "call-verb";
     case HIR_TAC_PUT_PROP: return "put-prop";
+    case HIR_TAC_INDEX_SET: return "index-set";
     case HIR_TAC_RANGE_REF: return "range-ref";
     case HIR_TAC_RANGE_SET: return "range-set";
     case HIR_TAC_LABEL: return "label";
@@ -3689,6 +3931,7 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
 	    case HIR_TAC_PUT_PROP:
+	    case HIR_TAC_INDEX_SET:
 	    case HIR_TAC_RANGE_REF:
 	    case HIR_TAC_RANGE_SET:
 	    case HIR_TAC_LABEL:
@@ -3975,6 +4218,18 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		    return 0;
 		}
 		break;
+	    case HIR_TAC_INDEX_SET:
+		if (instr->bytecode_pc == NO_BYTECODE_PC
+		    || instr->bytecode_pc + 1 >= bc->size
+		    || bc->vector[instr->bytecode_pc] != OP_PUT_TEMP
+		    || bc->vector[instr->bytecode_pc + 1] != OP_INDEXSET) {
+		    record_unsupported_fmt(ctx, "anchor: pc %u index_set expected OP_PUT_TEMP/OP_INDEXSET (got opcode %u)",
+					   instr->bytecode_pc,
+					   instr->bytecode_pc < bc->size
+					   ? (unsigned) bc->vector[instr->bytecode_pc] : 0);
+		    return 0;
+		}
+		break;
 	    case HIR_TAC_RANGE_REF:
 		if (instr->bytecode_pc == NO_BYTECODE_PC || instr->bytecode_pc >= bc->size
 		    || bc->vector[instr->bytecode_pc] != OP_RANGE_REF) {
@@ -4250,6 +4505,9 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     case HIR_TAC_PUT_PROP:
 	map->reason = JIT_DEOPT_PROPERTY_WRITE;
 	break;
+    case HIR_TAC_INDEX_SET:
+	map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+	break;
     case HIR_TAC_RANGE_REF:
     case HIR_TAC_RANGE_SET:
 	map->reason = JIT_DEOPT_RANGE_OP;
@@ -4315,28 +4573,15 @@ jit_instr_defines_value(JITInstruction *instr)
 	|| instr->kind == HIR_TAC_LOAD_ERROR
 	|| instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB
-	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_RANGE_REF
+	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_INDEX_SET
+	|| instr->kind == HIR_TAC_RANGE_REF
 	|| instr->kind == HIR_TAC_RANGE_SET || instr->kind == HIR_TAC_UNSUPPORTED;
 }
 
 static int
 jit_instr_can_materialize(JITInstruction *instr)
 {
-    switch (instr->kind) {
-    case HIR_TAC_DEOPT:
-    case HIR_TAC_LOAD_LOCAL:
-    case HIR_TAC_UNARY:
-    case HIR_TAC_BINARY:
-    case HIR_TAC_CALL:
-    case HIR_TAC_CALL_VERB:
-    case HIR_TAC_PUT_PROP:
-    case HIR_TAC_RANGE_REF:
-    case HIR_TAC_RANGE_SET:
-    case HIR_TAC_UNSUPPORTED:
-	return 1;
-    default:
-	return 0;
-    }
+    return hir_kind_can_materialize(instr->kind);
 }
 
 static int
@@ -4556,6 +4801,69 @@ jit_coalesce_deopt_locals(JITProgram *program)
 }
 
 static void
+jit_build_tag_slots(JITProgram *program)
+{
+    int value;
+
+    if (!program || program->num_values <= 0)
+	return;
+    program->value_tag_slots = mymalloc(sizeof(int) * program->num_values,
+					M_PROGRAM);
+    for (value = 0; value < program->num_values; value++) {
+	program->value_tag_slots[value] = -1;
+	if (program->value_is_tagged[value])
+	    program->value_tag_slots[value] = program->num_tag_slots++;
+    }
+}
+
+static void
+jit_build_deopt_tag_values(JITProgram *program)
+{
+    unsigned char *seen;
+    int map_id;
+
+    if (!program || program->num_values <= 0)
+	return;
+    seen = mymalloc(program->num_values, M_PROGRAM);
+    for (map_id = 0; map_id < program->num_deopt_maps; map_id++) {
+	JITDeoptMap *map = &program->deopt_maps[map_id];
+	int count = 0;
+	int slot;
+
+	memset(seen, 0, program->num_values);
+	for (slot = 0; slot < map->num_locals; slot++) {
+	    int value = jit_deopt_map_local_value(program, map, slot);
+
+	    if (value > 0 && value < program->num_values
+		&& program->value_is_tagged[value] && !seen[value]) {
+		seen[value] = 1;
+		count++;
+	    }
+	}
+	for (slot = 0; slot < (int) map->stack_depth; slot++) {
+	    int value;
+
+	    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+		continue;
+	    value = map->stack_values[slot];
+	    if (value > 0 && value < program->num_values
+		&& program->value_is_tagged[value] && !seen[value]) {
+		seen[value] = 1;
+		count++;
+	    }
+	}
+	map->num_tagged_values = count;
+	map->tagged_values = count
+	    ? mymalloc(sizeof(int) * count, M_PROGRAM) : 0;
+	count = 0;
+	for (slot = 1; slot < program->num_values; slot++)
+	    if (seen[slot])
+		map->tagged_values[count++] = slot;
+    }
+    myfree(seen, M_PROGRAM);
+}
+
+static void
 jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 		   unsigned char *uses, unsigned char *defs)
 {
@@ -4577,6 +4885,8 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	uses[instr->src1] = 1;
     if (instr->src2 > 0 && instr->src2 < program->num_values)
 	uses[instr->src2] = 1;
+    if (instr->src3 > 0 && instr->src3 < program->num_values)
+	uses[instr->src3] = 1;
     if (!jit_instr_can_materialize(instr) || instr->deopt_map <= 0
 	|| instr->deopt_map >= program->num_deopt_maps)
 	return;
@@ -4592,6 +4902,398 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	    && map->stack_values[i] < program->num_values
 	    && !defs[map->stack_values[i]])
 	    uses[map->stack_values[i]] = 1;
+}
+
+static int
+jit_value_type_is_scalar(JITProgram *program, int value)
+{
+    var_type type;
+
+    if (!program->value_types || !program->value_is_tagged
+	|| program->value_is_tagged[value])
+	return 0;
+    type = program->value_types[value];
+    return type != TYPE_ANY && type != TYPE_STR && type != TYPE_LIST
+	&& type != TYPE_WAIF;
+}
+
+static void
+jit_build_value_ownership(JITProgram *program)
+{
+    unsigned int *uses;
+    JITBlock *block;
+    int changed;
+    int i;
+
+    program->value_ownership = mymalloc(program->num_values, M_PROGRAM);
+    program->value_owner_root = mymalloc(sizeof(int) * program->num_values,
+					 M_PROGRAM);
+    program->value_owned_slots = mymalloc(sizeof(int) * program->num_values,
+					  M_PROGRAM);
+    uses = mymalloc(sizeof(unsigned int) * program->num_values, M_PROGRAM);
+    memset(uses, 0, sizeof(unsigned int) * program->num_values);
+    memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
+	   program->num_values);
+    for (i = 0; i < program->num_values; i++) {
+	program->value_owner_root[i] = -1;
+	program->value_owned_slots[i] = -1;
+	if (jit_value_type_is_scalar(program, i))
+	    program->value_ownership[i] = JIT_OWNERSHIP_SCALAR;
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value > 0 && instr->value < program->num_values) {
+		if (instr->kind == HIR_TAC_LOAD_LOCAL) {
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_BORROWED_LOCAL;
+		    program->value_owner_root[instr->value] = instr->local_id;
+		} else if (instr->kind == HIR_TAC_CONST
+			   && !jit_value_type_is_scalar(program, instr->value))
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_IMMORTAL;
+		else if ((instr->kind == HIR_TAC_UNARY
+			  && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+			 || (instr->kind == HIR_TAC_BINARY
+			     && (instr->op == HIR_OP_LIST_ADD_TAIL
+				 || instr->op == HIR_OP_LIST_APPEND
+				 || instr->op == HIR_OP_SUBLIST_FROM)))
+		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
+		else if (instr->kind == HIR_TAC_BINARY
+			 && instr->op == HIR_OP_GET_PROP)
+		    program->value_ownership[instr->value] =
+			JIT_OWNERSHIP_STABLE_OWNED;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->src1 > 0 && instr->src1 < program->num_values)
+		uses[instr->src1]++;
+	    if (instr->src2 > 0 && instr->src2 < program->num_values)
+		uses[instr->src2]++;
+	    if (instr->src3 > 0 && instr->src3 < program->num_values)
+		uses[instr->src3]++;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values)
+		    uses[copy->src]++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value > 0 && instr->value < program->num_values
+		&& instr->kind == HIR_TAC_BINARY
+		&& instr->op == HIR_OP_LIST_ADD_TAIL
+		&& program->value_owned_slots[instr->value] < 0) {
+		if (instr->src1 > 0 && instr->src1 < program->num_values
+		    && program->value_owned_slots[instr->src1] >= 0
+		    && uses[instr->src1] == 1) {
+		    program->value_owned_slots[instr->value] =
+			jit_list_tail_owner_slot(
+			    program->value_owned_slots[instr->src1],
+			    uses[instr->src1], program->num_owned_slots);
+		} else
+		    program->value_owned_slots[instr->value] =
+			jit_list_tail_owner_slot(-1, 0,
+			    program->num_owned_slots++);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    myfree(uses, M_PROGRAM);
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_ownership[copy->src]
+			   != JIT_OWNERSHIP_UNKNOWN
+			&& program->value_ownership[copy->dst]
+			   == JIT_OWNERSHIP_UNKNOWN) {
+			program->value_ownership[copy->dst] =
+			    program->value_ownership[copy->src];
+			program->value_owner_root[copy->dst] =
+			    program->value_owner_root[copy->src];
+			changed = 1;
+		    }
+		if (instr == block->last)
+		    break;
+	    }
+	}
+    } while (changed);
+}
+
+static int
+jit_literal_is_int_list(JITInstruction *instr)
+{
+    Var *list;
+    int i;
+
+    if (instr->kind != HIR_TAC_CONST || instr->literal_type != TYPE_LIST
+	|| !instr->literal)
+	return 0;
+    list = (Var *) (intptr_t) instr->literal;
+    for (i = 1; i <= list[0].v.num; i++)
+	if (list[i].type != TYPE_INT)
+	    return 0;
+    return 1;
+}
+
+static void
+jit_build_int_list_values(JITProgram *program)
+{
+    unsigned int *copy_sources;
+    unsigned int *proven_sources;
+    unsigned char *instruction_definitions;
+    unsigned char *valid_definitions;
+    JITBlock *block;
+    int changed;
+    int value;
+
+    program->value_is_int_list = mymalloc(program->num_values, M_PROGRAM);
+    copy_sources = mymalloc(sizeof(unsigned int) * program->num_values,
+			    M_PROGRAM);
+    proven_sources = mymalloc(sizeof(unsigned int) * program->num_values,
+			      M_PROGRAM);
+    instruction_definitions = mymalloc(program->num_values, M_PROGRAM);
+    valid_definitions = mymalloc(program->num_values, M_PROGRAM);
+    memset(program->value_is_int_list, 0, program->num_values);
+    memset(copy_sources, 0, sizeof(unsigned int) * program->num_values);
+    memset(instruction_definitions, 0, program->num_values);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->value > 0 && instr->value < program->num_values
+		&& jit_instr_defines_value(instr)) {
+		instruction_definitions[instr->value] = 1;
+		if (jit_literal_is_int_list(instr))
+		    program->value_is_int_list[instr->value] = 1;
+	    }
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values)
+		    copy_sources[copy->dst]++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    do {
+	changed = 0;
+	memset(proven_sources, 0,
+	       sizeof(unsigned int) * program->num_values);
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+		int result_is_int_list = 0;
+
+		if (instr->value > 0 && instr->value < program->num_values) {
+		    if (instr->kind == HIR_TAC_UNARY
+			&& instr->op == HIR_OP_MAKE_SINGLETON_LIST
+			&& instr->src1 > 0 && instr->src1 < program->num_values
+			&& !program->value_is_tagged[instr->src1]
+			&& program->value_types[instr->src1] == TYPE_INT)
+			result_is_int_list = 1;
+		    else if (instr->kind == HIR_TAC_BINARY)
+			result_is_int_list = jit_int_list_result(instr->op,
+			    instr->src1 > 0 && instr->src1 < program->num_values
+				&& program->value_is_int_list[instr->src1],
+			    instr->src2 > 0 && instr->src2 < program->num_values
+				&& program->value_is_int_list[instr->src2],
+			    instr->src2 > 0 && instr->src2 < program->num_values
+				? program->value_types[instr->src2] : TYPE_ANY);
+		    else if (instr->kind == HIR_TAC_INDEX_SET
+			&& instr->src1 > 0 && instr->src1 < program->num_values
+			&& program->value_is_int_list[instr->src1]
+			&& instr->src3 > 0 && instr->src3 < program->num_values
+			&& !program->value_is_tagged[instr->src3]
+			&& program->value_types[instr->src3] == TYPE_INT)
+			result_is_int_list = 1;
+		    if (result_is_int_list
+			&& !program->value_is_int_list[instr->value]) {
+			program->value_is_int_list[instr->value] = 1;
+			changed = 1;
+		    }
+		}
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_is_int_list[copy->src])
+			proven_sources[copy->dst]++;
+		if (instr == block->last)
+		    break;
+	    }
+	}
+	for (value = 1; value < program->num_values; value++)
+	    if (proven_sources[value] > 0
+		&& !program->value_is_int_list[value]) {
+		program->value_is_int_list[value] = 1;
+		changed = 1;
+	    }
+    } while (changed);
+
+    do {
+	changed = 0;
+	memset(proven_sources, 0,
+	       sizeof(unsigned int) * program->num_values);
+	memset(valid_definitions, 0, program->num_values);
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction *instr;
+
+	    for (instr = block->first; instr; instr = instr->next) {
+		JITCopy *copy;
+		int definition_is_valid = jit_literal_is_int_list(instr);
+
+		if (instr->kind == HIR_TAC_UNARY
+		    && instr->op == HIR_OP_MAKE_SINGLETON_LIST
+		    && instr->src1 > 0 && instr->src1 < program->num_values
+		    && !program->value_is_tagged[instr->src1]
+		    && program->value_types[instr->src1] == TYPE_INT)
+		    definition_is_valid = 1;
+		else if (instr->kind == HIR_TAC_BINARY)
+		    definition_is_valid = jit_int_list_result(instr->op,
+			instr->src1 > 0 && instr->src1 < program->num_values
+			    && program->value_is_int_list[instr->src1],
+			instr->src2 > 0 && instr->src2 < program->num_values
+			    && program->value_is_int_list[instr->src2],
+			instr->src2 > 0 && instr->src2 < program->num_values
+			    ? program->value_types[instr->src2] : TYPE_ANY);
+		else if (instr->kind == HIR_TAC_INDEX_SET)
+		    definition_is_valid = instr->src1 > 0
+			&& instr->src1 < program->num_values
+			&& program->value_is_int_list[instr->src1]
+			&& instr->src3 > 0
+			&& instr->src3 < program->num_values
+			&& !program->value_is_tagged[instr->src3]
+			&& program->value_types[instr->src3] == TYPE_INT;
+		if (instr->value > 0 && instr->value < program->num_values
+		    && definition_is_valid)
+		    valid_definitions[instr->value] = 1;
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src > 0 && copy->src < program->num_values
+			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_is_int_list[copy->src])
+			proven_sources[copy->dst]++;
+		if (instr == block->last)
+		    break;
+	    }
+	}
+	for (value = 1; value < program->num_values; value++)
+	    if (program->value_is_int_list[value]
+		&& ((instruction_definitions[value]
+		     && !valid_definitions[value])
+		    || (copy_sources[value] > 0
+			&& !jit_all_copy_sources_are_int_lists(
+			    copy_sources[value], proven_sources[value]))
+		    || (!instruction_definitions[value]
+			&& copy_sources[value] == 0))) {
+		program->value_is_int_list[value] = 0;
+		changed = 1;
+	    }
+    } while (changed);
+    myfree(valid_definitions, M_PROGRAM);
+    myfree(instruction_definitions, M_PROGRAM);
+    myfree(proven_sources, M_PROGRAM);
+    myfree(copy_sources, M_PROGRAM);
+}
+
+static int
+jit_int_list_alias_root(int *roots, int value)
+{
+    while (roots[value] != value) {
+	roots[value] = roots[roots[value]];
+	value = roots[value];
+    }
+    return value;
+}
+
+static void
+jit_join_int_list_aliases(int *roots, int left, int right)
+{
+    left = jit_int_list_alias_root(roots, left);
+    right = jit_int_list_alias_root(roots, right);
+    if (left != right)
+	roots[right] = left;
+}
+
+static void
+jit_build_direct_int_list_updates(JITProgram *program)
+{
+    JITBlock *block;
+    int *roots;
+    int value;
+
+    roots = mymalloc(sizeof(int) * program->num_values, M_PROGRAM);
+    for (value = 0; value < program->num_values; value++)
+	roots[value] = value;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values)
+		    jit_join_int_list_aliases(roots, copy->src, copy->dst);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_INDEX_SET
+		&& instr->src1 > 0 && instr->src1 < program->num_values
+		&& instr->src3 > 0 && instr->src3 < program->num_values
+		&& program->value_is_int_list[instr->src1]
+		&& !program->value_is_tagged[instr->src3]
+		&& program->value_types[instr->src3] == TYPE_INT
+		&& instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		unsigned int matching_locals = 0;
+		int base_root = jit_int_list_alias_root(roots, instr->src1);
+		int slot;
+
+		for (slot = 0; slot < map->num_locals; slot++) {
+		    int local = jit_deopt_map_local_value(program, map, slot);
+
+		    if (local > 0 && local < program->num_values
+			&& jit_int_list_alias_root(roots, local) == base_root)
+			matching_locals++;
+		}
+		instr->direct_int_list_index_set =
+		    jit_int_list_has_exclusive_local(matching_locals);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    myfree(roots, M_PROGRAM);
 }
 
 static int
@@ -4634,6 +5336,56 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	}
     }
     return 0;
+}
+
+static int
+jit_owned_value_is_fresh(JITProgram *program, JITInstruction *call, int value)
+{
+    JITBlock *block;
+
+    if (program->value_ownership[value] != JIT_OWNERSHIP_OWNED
+	&& program->value_ownership[value] != JIT_OWNERSHIP_STABLE_OWNED)
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	int found = 0;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr == call)
+		return found;
+	    if (found) {
+		JITCopy *copy;
+
+		if (instr->src1 == value || instr->src2 == value
+		    || instr->src3 == value || instr->kind == HIR_TAC_CALL
+		    || instr->kind == HIR_TAC_CALL_VERB
+		    || instr->kind == HIR_TAC_PUT_PROP
+		    || instr->kind == HIR_TAC_INDEX_SET
+		    || instr->kind == HIR_TAC_RANGE_SET)
+		    return 0;
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->src == value || copy->dst == value)
+			return 0;
+	    }
+	    if (instr->value == value && jit_instr_defines_value(instr))
+		found = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static int
+jit_resume_value_can_capture(JITProgram *program, JITInstruction *call,
+			     int value)
+{
+    if (value <= 0 || value >= program->num_values
+	|| !program->value_ownership)
+	return 0;
+    return program->value_ownership[value] == JIT_OWNERSHIP_BORROWED_LOCAL
+	|| program->value_ownership[value] == JIT_OWNERSHIP_IMMORTAL
+	|| jit_owned_value_is_fresh(program, call, value);
 }
 
 static void
@@ -4747,23 +5499,58 @@ jit_build_resume_liveness(JITProgram *program)
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
 		JITNativeResume *resume = mymalloc(sizeof(JITNativeResume),
 						   M_PROGRAM);
+		unsigned char *needed = mymalloc(program->num_values, M_PROGRAM);
 		int call_operands = jit_call_stack_operands(map);
+		const char *call_name = instr->kind == HIR_TAC_CALL
+		    ? name_func_by_num(instr->func) : 0;
+		int saved_stack_depth = map->stack_depth;
+		int slot;
+
+		if (call_name && !strcmp(call_name, "suspend"))
+		    saved_stack_depth -= call_operands;
+
+		memcpy(needed, live, program->num_values);
+		for (slot = 0; slot < map->num_locals; slot++) {
+		    value = jit_deopt_map_local_value(program, map, slot);
+		    if (value > 0 && value < program->num_values)
+			needed[value] = 1;
+		}
+		for (slot = 0; slot < saved_stack_depth; slot++)
+		    if ((!map->stack_slots
+			 || map->stack_slots[slot].kind == RSS_VALUE)
+			&& map->stack_values[slot] > 0
+			&& map->stack_values[slot] < program->num_values)
+			needed[map->stack_values[slot]] = 1;
 		for (value = 1; value < program->num_values; value++)
-		    if (live[value])
+		    if (needed[value])
 			live_count++;
 		memset(resume, 0, sizeof(JITNativeResume));
 		map->native_resume = resume;
 		resume->values = live_count
 		    ? mymalloc(sizeof(JITResumeValue) * live_count, M_PROGRAM) : 0;
 		resume->num_values = live_count;
-		resume->valid = jit_resume_stack_is_safe(map,
-							      call_operands);
+		resume->valid = 1;
+		resume->rehydratable = jit_resume_stack_is_safe(map,
+							    call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
-		    if (live[value]
+		    if (needed[value]
 			&& !jit_resume_source(program, map, instr, value,
-					      &resume->values[live_count++]))
-			resume->valid = 0;
+					      &resume->values[live_count++])) {
+			const char *func_name = instr->kind == HIR_TAC_CALL
+			    ? name_func_by_num(instr->func) : 0;
+
+			if ((func_name && !strcmp(func_name, "suspend"))
+			    || jit_resume_value_can_capture(program, instr, value)) {
+			    resume->values[live_count - 1].source =
+				JIT_RESUME_CAPTURED;
+			    resume->rehydratable = 0;
+			} else {
+			    resume->valid = 0;
+			    resume->values[live_count - 1].index = -1;
+			}
+		    }
+		myfree(needed, M_PROGRAM);
 	    }
 	    memset(uses, 0, program->num_values);
 	    memset(defs, 0, program->num_values);
@@ -4908,6 +5695,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->value] = TYPE_INT;
 			value_types_known[si->value] = 1;
 		    }
+		} else if (si->kind == HIR_TAC_INDEX_SET) {
+		    value_types[si->value] = TYPE_LIST;
+		    value_types_known[si->value] = 1;
 		}
 	    }
 	    if (si == ssa_block->last)
@@ -5094,6 +5884,13 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    value_types_known[from] = 1;
 		    types_changed = 1;
 		}
+	    }
+	    if (si->kind == HIR_TAC_INDEX_SET
+		&& si->src2 > 0 && si->src2 < program->num_values
+		&& !value_types_known[si->src2]) {
+		value_types[si->src2] = TYPE_INT;
+		value_types_known[si->src2] = 1;
+		types_changed = 1;
 	    }
 	    if (si->kind == HIR_TAC_PUT_PROP) {
 		int rhs = si->num_stack_values >= 1
@@ -5349,13 +6146,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
 		    && value_types_conflicted[ssa_instr->src2]
-		    && !value_is_tagged[ssa_instr->src2]);
+		    && !value_is_tagged[ssa_instr->src2])
+		|| (ssa_instr->src3 > 0
+		    && ssa_instr->src3 < program->num_values
+		    && value_types_conflicted[ssa_instr->src3]
+		    && !value_is_tagged[ssa_instr->src3]);
 	    int uses_tagged = (ssa_instr->src1 > 0
 			       && ssa_instr->src1 < program->num_values
 			       && value_is_tagged[ssa_instr->src1])
 		|| (ssa_instr->src2 > 0
 		    && ssa_instr->src2 < program->num_values
-		    && value_is_tagged[ssa_instr->src2]);
+		    && value_is_tagged[ssa_instr->src2])
+		|| (ssa_instr->src3 > 0
+		    && ssa_instr->src3 < program->num_values
+		    && value_is_tagged[ssa_instr->src3]);
 
 	    memset(instr, 0, sizeof(JITInstruction));
 	    instr->kind = ssa_instr->kind;
@@ -5371,6 +6175,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->value = ssa_instr->value;
 	    instr->src1 = ssa_instr->src1;
 	    instr->src2 = ssa_instr->src2;
+	    instr->src3 = ssa_instr->src3;
 	    instr->local_id = ssa_instr->local_id;
 	    instr->func = ssa_instr->func;
 	    instr->op = ssa_instr->op;
@@ -5577,6 +6382,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_build_tag_slots(program);
+    jit_build_value_ownership(program);
+    jit_build_int_list_values(program);
+    jit_build_direct_int_list_updates(program);
     jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
 	const char *diag = hir_context_error_message(ctx);
@@ -5587,6 +6396,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	jit_program_free(program);
 	return unsupported;
     }
+    jit_build_deopt_tag_values(program);
     jit_build_resume_liveness(program);
     return program;
 }
@@ -5627,6 +6437,11 @@ hir_dump_tac(HIRTacProgram *program)
 	    break;
 	case HIR_TAC_STORE_LOCAL:
 	    fprintf(stderr, " local[%d] = t%d", instr->local_id, instr->src1);
+	    break;
+	case HIR_TAC_INDEX_SET:
+	    fprintf(stderr, " t%d = local[%d] = index_set(t%d, t%d, t%d)",
+		    instr->dst, instr->local_id, instr->src1, instr->src2,
+		    instr->src3);
 	    break;
 	case HIR_TAC_UNARY:
 	    fprintf(stderr, " t%d = %s t%d", instr->dst,
@@ -5814,6 +6629,11 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " local[%d] = t%d", instr->local_id,
 			instr->src1);
 		break;
+	    case HIR_TAC_INDEX_SET:
+		fprintf(file, " t%d = local[%d] = index_set(t%d, t%d, t%d)",
+			instr->value, instr->local_id, instr->src1, instr->src2,
+			instr->src3);
+		break;
 	    case HIR_TAC_UNARY:
 		fprintf(file, " t%d = %s t%d", instr->value,
 			op_name(instr->op), instr->src1);
@@ -5915,6 +6735,8 @@ tac_kind_name(HIRTacKind kind)
 	return "load_local";
     case HIR_TAC_STORE_LOCAL:
 	return "store_local";
+    case HIR_TAC_INDEX_SET:
+	return "index_set";
     case HIR_TAC_UNARY:
 	return "unary";
     case HIR_TAC_BINARY:
@@ -6300,6 +7122,25 @@ hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *program,
 	}
     }
     return -1;
+}
+
+int
+hir_ssa_local_snapshot_count(HIRSSAProgram *program)
+{
+    HIRSSABlock *block;
+    int count = 0;
+
+    for (block = program ? program->blocks : 0; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->num_local_values > 0)
+		count++;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return count;
 }
 
 int
@@ -7355,20 +8196,14 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
 {
     HIRTacInstr *instr = hir_alloc(ctx, sizeof(HIRTacInstr));
 
+    memset(instr, 0, sizeof(HIRTacInstr));
     instr->kind = kind;
     instr->source_lineno = source_lineno;
     instr->bytecode_pc = NO_BYTECODE_PC;
     instr->error_label = ctx->current_error_label;
-    instr->dst = 0;
-    instr->src1 = 0;
-    instr->src2 = 0;
-    instr->label = 0;
     instr->local_id = -1;
     instr->op = HIR_OP_ADD;
     instr->func = FUNC_NOT_FOUND;
-    instr->num_stack_values = 0;
-    instr->stack_values = 0;
-    instr->stack_slots = 0;
     return instr;
 }
 
@@ -8160,10 +8995,22 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    ctx->current_length_base = prev_base;
 	    rhs_temp = lower_expr(ctx, program, expr->u.index_store.rhs);
 
-	    (void) base_temp;
-	    (void) index_temp;
-	    append_index_store_deopt(ctx, program, expr->source_lineno,
-				     expr->bytecode_pc);
+	    if (expr->u.index_store.base->kind == HIR_EXPR_LOCAL_LOAD) {
+		append_tick(ctx, program, expr->source_lineno,
+			    expr->bytecode_pc);
+		instr = new_tac(ctx, HIR_TAC_INDEX_SET, expr->source_lineno);
+		instr->bytecode_pc = expr->bytecode_pc;
+		instr->dst = new_temp(ctx);
+		instr->src1 = base_temp;
+		instr->src2 = index_temp;
+		instr->src3 = rhs_temp;
+		instr->local_id = expr->u.index_store.base->u.local_id;
+		snapshot_lower_stack(ctx, instr);
+		append_tac(program, instr);
+	    } else {
+		append_index_store_deopt(ctx, program, expr->source_lineno,
+					 expr->bytecode_pc);
+	    }
 	    ctx->lower_stack_depth = saved_depth;
 	    push_lower_stack(ctx, rhs_temp);
 	    return rhs_temp;
@@ -9020,6 +9867,34 @@ int
 hir_test_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 {
 	return jit_boundary_ticks_charged(kind, op);
+}
+
+int
+hir_test_list_tail_owner_slot(int source_slot, unsigned int source_uses,
+			      int next_slot)
+{
+    return jit_list_tail_owner_slot(source_slot, source_uses, next_slot);
+}
+
+int
+hir_test_int_list_result(HIROp op, int left_is_int_list,
+			 int right_is_int_list, var_type right_type)
+{
+    return jit_int_list_result(op, left_is_int_list, right_is_int_list,
+			       right_type);
+}
+
+int
+hir_test_all_copy_sources_are_int_lists(unsigned int sources,
+					unsigned int proven_sources)
+{
+    return jit_all_copy_sources_are_int_lists(sources, proven_sources);
+}
+
+int
+hir_test_int_list_has_exclusive_local(unsigned int matching_locals)
+{
+    return jit_int_list_has_exclusive_local(matching_locals);
 }
 
 int

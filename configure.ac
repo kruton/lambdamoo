@@ -48,7 +48,6 @@ MOO_PROG_GPERF
 AS_VAR_IF([[ac_cv_prog_GPERF]],[],
   [AC_MSG_ERROR([[We need gperf]])])
 
-: ${CFLAGS="-std=c99"}
 AC_PROG_CC
 dnl  prior to 2.70 only tests for C89
 dnl    and AC_PROG_CC_C99 is needed to test for C99

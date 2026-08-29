@@ -9,6 +9,8 @@
 #include "structures.h"
 
 typedef struct JITProgram JITProgram;
+typedef struct JITContinuationFrame JITContinuationFrame;
+struct activation;
 
 typedef enum {
     JIT_STATE_PENDING,
@@ -41,6 +43,12 @@ typedef enum {
     JIT_DEOPT_NUM_REASONS
 } JITDeoptReason;
 
+typedef enum {
+    JIT_BOUNDARY_NONE,
+    JIT_BOUNDARY_BUILTIN,
+    JIT_BOUNDARY_VERB
+} JITBoundaryKind;
+
 typedef uint16_t JITTypeMask;
 
 #define JIT_MAX_GUARD_OPERANDS 2
@@ -61,6 +69,7 @@ typedef struct {
     JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     var_type guard_actual[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
+    JITBoundaryKind boundary;
 } JITDeoptState;
 
 typedef struct {
@@ -81,6 +90,11 @@ typedef struct {
     uint64_t compile_successes;
     uint64_t compile_failures;
     uint64_t compile_time_us;
+    uint64_t continuation_captures;
+    uint64_t continuation_resumes;
+    uint64_t continuation_materializations;
+    uint64_t active_continuations;
+    size_t continuation_bytes;
     size_t metadata_bytes;
     size_t runtime_bytes;
     size_t machine_code_bytes;
@@ -94,6 +108,8 @@ typedef struct {
     size_t total_machine_code_bytes;
     size_t total_native_allocated_bytes;
     size_t total_mir_heap_bytes;
+    uint64_t active_continuations;
+    size_t continuation_bytes;
 } JITPoolStats;
 
 extern const char *jit_deopt_reason_name(JITDeoptReason);
@@ -119,6 +135,7 @@ extern const char *jit_program_reason(JITProgram *);
 extern const char *jit_program_diagnostic(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
+extern int jit_program_is_direct_leaf(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern void jit_program_stats(JITProgram *, JITProgramStats *);
@@ -128,7 +145,15 @@ extern void jit_program_note_location(JITProgram *, Objid, unsigned);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 				enum error *, JITSourceLocation *,
-				JITDeoptState *, Var *, Objid, int);
+				JITDeoptState *, Var *, Objid, int,
+				JITContinuationFrame *, JITContinuationFrame **);
+extern void jit_continuation_set_result(JITContinuationFrame *, Var);
+extern void jit_continuation_mark_dispatched(JITContinuationFrame *);
+extern void jit_continuation_attach(JITContinuationFrame *, struct activation *);
+extern void jit_continuation_relocate(JITContinuationFrame *, struct activation *);
+extern int jit_continuation_materialize(struct activation *);
+extern void jit_continuation_free(JITContinuationFrame *);
+extern void jit_continuation_materialize_all(void);
 extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),
 				void *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),

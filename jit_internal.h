@@ -20,8 +20,18 @@ typedef enum {
     JIT_RESUME_LOCAL,
     JIT_RESUME_STACK,
     JIT_RESUME_RESULT,
-    JIT_RESUME_CONSTANT
+    JIT_RESUME_CONSTANT,
+    JIT_RESUME_CAPTURED
 } JITResumeSource;
+
+typedef enum {
+    JIT_OWNERSHIP_UNKNOWN,
+    JIT_OWNERSHIP_SCALAR,
+    JIT_OWNERSHIP_BORROWED_LOCAL,
+    JIT_OWNERSHIP_OWNED,
+    JIT_OWNERSHIP_STABLE_OWNED,
+    JIT_OWNERSHIP_IMMORTAL
+} JITValueOwnership;
 
 struct JITResumeValue {
     int value;
@@ -35,6 +45,28 @@ struct JITNativeResume {
     int num_values;
     JITResumeValue *values;
     int valid;
+    int rehydratable;
+};
+
+struct JITContinuationFrame {
+    JITProgram *program;
+    struct activation *owner;
+    int map_id;
+    int num_values;
+    Var *values;
+    int values_capacity;
+    Var *spare_values;
+    int spare_values_capacity;
+    void *runtime_storage;
+    Num *deopt_values;
+    Var *borrowed_locals;
+    Var *owned_values;
+    size_t runtime_bytes;
+    Var result;
+    int has_result;
+    int dispatched;
+    JITContinuationFrame *previous;
+    JITContinuationFrame *next;
 };
 
 struct JITLocalValue {
@@ -53,6 +85,8 @@ struct JITDeoptMap {
     int num_local_values;
     int local_base;
     JITLocalValue *local_values;
+    int num_tagged_values;
+    int *tagged_values;
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
@@ -113,6 +147,7 @@ struct JITInstruction {
     int value;
     int src1;
     int src2;
+    int src3;
     int local_id;
     unsigned func;
     HIROp op;
@@ -120,6 +155,7 @@ struct JITInstruction {
     var_type literal_type;
     int deopt_map;
     JITCopy *copies;
+    unsigned char direct_int_list_index_set;
     JITInstruction *next;
 };
 
@@ -140,6 +176,9 @@ struct JITProgramUsage {
     uint32_t deopts_by_reason[JIT_DEOPT_NUM_REASONS];
     uint64_t last_used_generation;
     time_t last_used_time;
+    uint64_t continuation_captures;
+    uint64_t continuation_resumes;
+    uint64_t continuation_materializations;
 };
 
 struct JITProgram {
@@ -148,6 +187,7 @@ struct JITProgram {
     const char *diagnostic;
     int eligible;
     int may_error;
+    signed char direct_leaf;
     int num_values;
     int num_vars;
     int num_blocks;
@@ -164,9 +204,18 @@ struct JITProgram {
     uint64_t pool_generation;
     JITProgram *pool_prev;
     JITProgram *pool_next;
-    Num *deopt_values;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    int num_tag_slots;
+    int *value_tag_slots;
+    unsigned char *value_ownership;
+    int *value_owner_root;
+    int num_owned_slots;
+    int *value_owned_slots;
+    unsigned char *value_is_int_list;
+    int num_borrowed_locals;
+    int *borrowed_local_slots;
+    size_t active_runtime_bytes;
     unsigned protection_generation;
     JITProgramUsage *usage;
     uint32_t compile_attempts;
@@ -241,6 +290,9 @@ extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern void jit_rt_owned_replace(Var *, int, int64_t, int);
+extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
+				  int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);

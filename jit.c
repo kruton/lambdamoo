@@ -10,6 +10,7 @@
 #include "compiler.h"
 #include "db.h"
 #include "exceptions.h"
+#include "execute.h"
 #include "functions.h"
 #include "jit_internal.h"
 #include "list.h"
@@ -247,6 +248,38 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
 
     res = listappend(var_ref(l), elem);
     return res.v.list;
+}
+
+void
+jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
+{
+    free_var(owned_values[value]);
+    owned_values[value] = raw_to_var(raw, type);
+}
+
+Var *
+jit_rt_list_index_set(Var *env, int local_id, Var *list, int64_t index,
+		      int64_t value_raw, int value_type, int32_t *err_out)
+{
+    Var base, value, result;
+
+    if (!env || local_id < 0 || !list) {
+	*err_out = E_TYPE;
+	return 0;
+    }
+    if (index < 1 || index > list[0].v.num) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+
+    base.type = TYPE_LIST;
+    base.v.list = list;
+    value = var_ref(raw_to_var(value_raw, value_type));
+    result = listset(var_dup(base), value, (int) index);
+    free_var(env[local_id]);
+    env[local_id] = result;
+    *err_out = E_NONE;
+    return result.v.list;
 }
 
 Var *
@@ -488,7 +521,7 @@ jit_rt_var_raw(const Var *value)
 
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *, Objid,
-				   int, Var *);
+				   int, Var *, Var *, Var *);
 
 typedef union JITMIRAllocationHeader JITMIRAllocationHeader;
 
@@ -659,6 +692,7 @@ typedef struct JITPool {
 
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 static uint64_t next_module_serial = 0;
+static JITContinuationFrame *continuation_frames;
 
 static void
 jit_load_externals(MIR_context_t context)
@@ -673,6 +707,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
+    MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
     MIR_load_external(context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
@@ -684,6 +720,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
     MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
+    MIR_load_external(context, "execute_jit_direct_verb_call",
+		      (void *) execute_jit_direct_verb_call);
 }
 
 static int
@@ -756,16 +794,14 @@ jit_pool_reset(void)
 {
     JITProgram *current = jit_shared_pool.active_head;
 
+    jit_continuation_materialize_all();
+
     while (current) {
 	JITProgram *next = current->pool_next;
 	current->state = JIT_STATE_PENDING;
 	current->native_function = 0;
 	current->machine_code = 0;
 	current->machine_code_len = 0;
-	if (current->deopt_values) {
-	    myfree(current->deopt_values, M_PROGRAM);
-	    current->deopt_values = 0;
-	}
 	current->pool_generation = 0;
 	current->pool_prev = 0;
 	current->pool_next = 0;
@@ -797,6 +833,8 @@ jit_shutdown(void)
 void
 jit_pool_stats(JITPoolStats *stats)
 {
+    JITContinuationFrame *frame;
+
     if (!stats)
 	return;
     memset(stats, 0, sizeof(*stats));
@@ -808,6 +846,12 @@ jit_pool_stats(JITPoolStats *stats)
 	    = _MIR_code_allocated_size(jit_shared_pool.context);
     if (jit_shared_pool.allocator)
 	stats->total_mir_heap_bytes = jit_shared_pool.allocator->live_bytes;
+    for (frame = continuation_frames; frame; frame = frame->next) {
+	stats->active_continuations++;
+	stats->continuation_bytes += sizeof(*frame)
+	    + sizeof(Var) * (frame->values_capacity
+		+ frame->spare_values_capacity);
+    }
 }
 
 typedef struct {
@@ -834,6 +878,10 @@ typedef struct {
     MIR_item_t import_singleton_list;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
+    MIR_item_t proto_owned_replace;
+    MIR_item_t import_owned_replace;
+    MIR_item_t proto_list_index_set;
+    MIR_item_t import_list_index_set;
     MIR_item_t proto_sublist_from;
     MIR_item_t import_sublist_from;
     MIR_item_t proto_list_in;
@@ -856,6 +904,8 @@ typedef struct {
     MIR_item_t import_parent;
     MIR_item_t proto_var_raw;
     MIR_item_t import_var_raw;
+    MIR_item_t proto_direct_verb_call;
+    MIR_item_t import_direct_verb_call;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -1046,6 +1096,27 @@ new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
     return exit->label;
 }
 
+static int
+jit_tag_index(JITProgram *program, int value)
+{
+    if (!program->value_tag_slots)
+	return program->num_values + value;
+    return program->num_values + program->value_tag_slots[value];
+}
+
+static size_t
+jit_tag_offset(JITProgram *program, int value)
+{
+    return (size_t) jit_tag_index(program, value) * sizeof(Num);
+}
+
+static int
+jit_runtime_value_slots(JITProgram *program)
+{
+    return program->num_values + (program->value_tag_slots
+	? program->num_tag_slots : program->num_values);
+}
+
 static void
 append_float_result_check(MIRBuild *build, JITInstruction *instr,
 			  MIR_reg_t *values, MIR_reg_t deopt_values,
@@ -1214,6 +1285,25 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 	    }
 	}
     }
+    for (i = 0; map->native_resume
+	 && i < map->native_resume->num_values; i++) {
+	int value = map->native_resume->values[i].value;
+
+	if (map->native_resume->values[i].source == JIT_RESUME_RESULT
+	    || value <= 0 || value >= program->num_values)
+	    continue;
+	if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+	    append(build, MIR_new_insn(build->context, MIR_DMOV,
+		MIR_new_mem_op(build->context, MIR_T_D,
+			       value * sizeof(Num), deopt_values, 0, 1),
+		MIR_new_reg_op(build->context, values[value])));
+	else
+	    append(build, MIR_new_insn(build->context, MIR_MOV,
+		MIR_new_mem_op(build->context,
+			       sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+			       value * sizeof(Num), deopt_values, 0, 1),
+		MIR_new_reg_op(build->context, values[value])));
+    }
     append(build, MIR_new_insn(build->context, MIR_MOV,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
 					     0, deopt_map_out, 0, 1),
@@ -1274,11 +1364,31 @@ append_resume_value(MIRBuild *build, JITProgram *program, MIR_reg_t *values,
 	append(build, MIR_new_insn(build->context, MIR_MOV,
 	    MIR_new_mem_op(build->context,
 		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-		    (program->num_values + value) * sizeof(Num),
+		    jit_tag_offset(program, value),
 		    deopt_values, 0, 1),
 	    MIR_new_mem_op(build->context, MIR_T_I32,
 		    stack_index * sizeof(Var) + offsetof(Var, type),
 		    stack, 0, 1)));
+}
+
+static void
+append_stored_resume_value(MIRBuild *build, JITProgram *program,
+			   MIR_reg_t *values, int value,
+			   MIR_reg_t deopt_values)
+{
+    if (value <= 0 || value >= program->num_values)
+	return;
+    if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+	append(build, MIR_new_insn(build->context, MIR_DMOV,
+	    MIR_new_reg_op(build->context, values[value]),
+	    MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+		deopt_values, 0, 1)));
+    else
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_reg_op(build->context, values[value]),
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		value * sizeof(Num), deopt_values, 0, 1)));
 }
 
 static int
@@ -1295,6 +1405,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     MIR_type_t result_type = MIR_T_I64;
     MIR_reg_t env, result, ticks, timed_out, error_out, deopt_map_out;
     MIR_reg_t source_location, deopt_values, progr, resume_map, resume_stack;
+    MIR_reg_t continuation_values, owned_values;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
     MIR_label_t *labels;
@@ -1363,6 +1474,18 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
 
+    build->proto_owned_replace = MIR_new_proto(build->context,
+	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
+	MIR_T_I32, "value", MIR_T_I64, "raw", MIR_T_I32, "type");
+    build->import_owned_replace = MIR_new_import(build->context,
+	"jit_rt_owned_replace");
+
+    build->proto_list_index_set = MIR_new_proto(build->context, "proto_list_index_set", 1, &res_p, 7,
+						MIR_T_P, "env", MIR_T_I32, "local", MIR_T_P, "list",
+						MIR_T_I64, "index", MIR_T_I64, "value_raw",
+						MIR_T_I32, "value_type", MIR_T_P, "err");
+    build->import_list_index_set = MIR_new_import(build->context, "jit_rt_list_index_set");
+
     build->proto_sublist_from = MIR_new_proto(build->context, "proto_sublist_from", 1, &res_p, 2,
 					     MIR_T_P, "list", MIR_T_I64, "start");
     build->import_sublist_from = MIR_new_import(build->context, "jit_rt_sublist_from");
@@ -1407,6 +1530,16 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
 
+    build->proto_direct_verb_call = MIR_new_proto(build->context,
+	"proto_direct_verb_call", 1, &res_i32, 11,
+	MIR_T_I64, "obj_raw", MIR_T_I32, "obj_type",
+	MIR_T_I64, "verb_raw", MIR_T_I32, "verb_type",
+	MIR_T_I64, "args_raw", MIR_T_I32, "args_type",
+	MIR_T_P, "ticks", MIR_T_P, "timed_out", MIR_T_P, "error",
+	MIR_T_P, "result_raw", MIR_T_P, "result_type");
+    build->import_direct_verb_call = MIR_new_import(build->context,
+	"execute_jit_direct_verb_call");
+
     if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
 	snprintf(func_name, sizeof(func_name), "jit_o%" PRIdN "_v%u_%" PRIu64,
 		 program->diagnostic_object, program->diagnostic_verb,
@@ -1415,13 +1548,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64,
 		 next_module_serial);
     build->function = MIR_new_func(build->context, func_name, 1,
-				   &result_type, 11,
+				   &result_type, 13,
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
 				   MIR_T_P, "error_out", MIR_T_P, "source_location",
 				   MIR_T_P, "deopt_map_out", MIR_T_P, "deopt_values",
 				   MIR_T_I64, "progr", MIR_T_I32, "resume_map",
-				   MIR_T_P, "resume_stack");
+				   MIR_T_P, "resume_stack",
+				   MIR_T_P, "continuation_values",
+				   MIR_T_P, "owned_values");
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
@@ -1436,6 +1571,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     progr = MIR_reg(build->context, "progr", build->function->u.func);
     resume_map = MIR_reg(build->context, "resume_map", build->function->u.func);
     resume_stack = MIR_reg(build->context, "resume_stack", build->function->u.func);
+    continuation_values = MIR_reg(build->context, "continuation_values",
+				  build->function->u.func);
+    owned_values = MIR_reg(build->context, "owned_values",
+			  build->function->u.func);
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -1469,6 +1608,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
     memset(resume_continuations, 0,
 	   sizeof(MIR_label_t) * program->num_deopt_maps);
+
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, ticks, 0, 1)));
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
@@ -1505,12 +1648,20 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     for (i = 1; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map;
 	int j, outer_depth;
+	MIR_label_t compact, values_loaded;
 
 	if (!resume_entries[i])
 	    continue;
 	map = &program->deopt_maps[i];
 	outer_depth = map->stack_depth - jit_call_stack_operands(map);
+	compact = MIR_new_label(build->context);
+	values_loaded = MIR_new_label(build->context);
 	append(build, resume_entries[i]);
+	append(build, MIR_new_insn(build->context, MIR_BNE,
+				  MIR_new_label_op(build->context, compact),
+				  MIR_new_reg_op(build->context,
+						 continuation_values),
+				  MIR_new_int_op(build->context, 0)));
 	for (j = 0; map->native_resume
 	     && j < map->native_resume->num_values; j++) {
 	    JITResumeValue *resume = &map->native_resume->values[j];
@@ -1526,7 +1677,28 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		append_resume_value(build, program, values, resume->value,
 				    resume_stack, outer_depth, deopt_values,
 				    &copy_serial);
-	    else if (resume->source == JIT_RESUME_CONSTANT) {
+	}
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+				  MIR_new_label_op(build->context, values_loaded)));
+	append(build, compact);
+	for (j = 0; map->native_resume
+	     && j < map->native_resume->num_values; j++) {
+	    JITResumeValue *resume = &map->native_resume->values[j];
+
+	    if (resume->source == JIT_RESUME_RESULT)
+		append_resume_value(build, program, values, resume->value,
+				    continuation_values, j, deopt_values,
+				    &copy_serial);
+	    else if (resume->source != JIT_RESUME_CONSTANT)
+		append_stored_resume_value(build, program, values,
+		    resume->value, deopt_values);
+	}
+	append(build, values_loaded);
+	for (j = 0; map->native_resume
+	     && j < map->native_resume->num_values; j++) {
+	    JITResumeValue *resume = &map->native_resume->values[j];
+
+	    if (resume->source == JIT_RESUME_CONSTANT) {
 		if (program->value_types[resume->value] == TYPE_FLOAT) {
 		    double d = raw_to_double(resume->literal);
 		    append(build, MIR_new_insn(build->context, MIR_DMOV,
@@ -1540,9 +1712,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 			MIR_new_mem_op(build->context,
 			    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-			    (program->num_values + resume->value) * sizeof(Num),
+			    jit_tag_offset(program, resume->value),
 			    deopt_values, 0, 1),
-			MIR_new_int_op(build->context, resume->literal_type)));
+			    MIR_new_int_op(build->context, resume->literal_type)));
 	    }
 	}
 	append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -1572,22 +1744,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
 			    -1, instr->bytecode_pc, instr->source_lineno);
 		    }
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context,
-								 tick_result),
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 0, ticks, 0, 1)));
 		    append(build, MIR_new_insn(build->context, MIR_SUB,
 						  MIR_new_reg_op(build->context,
 								 tick_result),
 						  MIR_new_reg_op(build->context,
 								 tick_result),
 						  MIR_new_int_op(build->context, 1)));
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 0, ticks, 0, 1),
-						  MIR_new_reg_op(build->context,
-								 tick_result)));
 		    if (instr->op == HIR_OP_CHARGE_TICK)
 			break;
 		    append(build, MIR_new_insn(build->context, MIR_BLE,
@@ -1643,7 +1805,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			&& program->value_is_tagged[instr->value]) {
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_mem_op(build->context, tag_t,
-				(program->num_values + instr->value) * sizeof(Num),
+				jit_tag_offset(program, instr->value),
 				deopt_values, 0, 1),
 			    MIR_new_int_op(build->context, instr->literal_type)));
 		    }
@@ -1669,7 +1831,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_reg_op(build->context, var_type)));
 			    sprintf(name, "local_addr%d", copy_serial++);
@@ -1776,7 +1938,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			} else {
 			    var_type elem_type = (program->value_types
@@ -1799,7 +1961,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -1816,7 +1978,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, tag),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -1829,7 +1991,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_LIST)));
 			    }
@@ -1848,7 +2010,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_LIST)));
 			    }
@@ -1862,8 +2024,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 					  MIR_new_reg_op(build->context,
 							 values[instr->value]),
-					  MIR_new_mem_op(build->context, MIR_T_I32,
-							 0, ticks, 0, 1)));
+					  MIR_new_reg_op(build->context,
+							 tick_result)));
 		    } else if (instr->op == HIR_OP_SECONDS_LEFT) {
 			append(build, MIR_new_call_insn(build->context, 3,
 				MIR_new_ref_op(build->context,
@@ -1895,7 +2057,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, operand_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, operand_ok),
@@ -1934,7 +2096,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, operand_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, operand_ok),
@@ -1968,7 +2130,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_OBJ)));
 			    break;
@@ -1999,7 +2161,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_AND,
 				MIR_new_reg_op(build->context, values[instr->value]),
@@ -2030,7 +2192,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -2092,7 +2254,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -2121,7 +2283,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, tag),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BEQ,
 				MIR_new_label_op(build->context, is_list),
@@ -2221,7 +2383,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			}
@@ -2267,7 +2429,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_call_insn(build->context, 5,
 				MIR_new_ref_op(build->context, build->proto_is_true),
@@ -2283,7 +2445,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    }
@@ -2391,7 +2553,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, list_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -2405,7 +2567,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			} else {
 			    var_type elem_type = (program->value_types
@@ -2429,7 +2591,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -2473,7 +2635,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, obj_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, obj_ok),
@@ -2492,7 +2654,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_ADD,
 				MIR_new_reg_op(build->context, out_type_ptr),
 				MIR_new_reg_op(build->context, deopt_values),
-				MIR_new_int_op(build->context, (program->num_values + instr->value) * sizeof(Num))));
+				MIR_new_int_op(build->context, jit_tag_offset(program, instr->value))));
 			    append(build, MIR_new_call_insn(build->context, 9,
 				MIR_new_ref_op(build->context, build->proto_get_prop),
 				MIR_new_ref_op(build->context, build->import_get_prop),
@@ -2541,7 +2703,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2556,7 +2718,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2597,7 +2759,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2611,7 +2773,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2630,7 +2792,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_LIST)));
 			}
@@ -2666,7 +2828,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, list_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -2678,7 +2840,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, in_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 			    else
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2697,7 +2859,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    if (tagged_list) {
@@ -2748,8 +2910,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, type),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->src1)
-					    * sizeof(Num), deopt_values, 0, 1)));
+					    jit_tag_offset(program, instr->src1), deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
 					MIR_new_reg_op(build->context, type),
@@ -2763,8 +2924,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, type),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->src2)
-					    * sizeof(Num), deopt_values, 0, 1)));
+					    jit_tag_offset(program, instr->src2), deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
 					MIR_new_reg_op(build->context, type),
@@ -2812,7 +2972,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type1),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2823,7 +2983,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type2),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			else
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -2859,7 +3019,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->value])
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			break;
@@ -2970,7 +3130,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -2997,7 +3157,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 			    } else {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3008,7 +3168,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 			    } else {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3046,7 +3206,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    }
@@ -3073,7 +3233,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -3277,7 +3437,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, index_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3307,7 +3467,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tagged_result)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    if (tagged_index) {
@@ -3354,7 +3514,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, index_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src2) * sizeof(Num),
+				    jit_tag_offset(program, instr->src2),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BNE,
 				MIR_new_label_op(build->context, deopt),
@@ -3369,7 +3529,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, base_type),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_insn(build->context, MIR_BEQ,
 				MIR_new_label_op(build->context, is_list),
@@ -3408,7 +3568,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tagged_result) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_STR)));
 			    }
@@ -3450,7 +3610,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			if (tagged_result)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_reg_op(build->context, elem_type)));
 			else
@@ -3526,7 +3686,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3540,7 +3700,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, t2),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src2) * sizeof(Num),
+					jit_tag_offset(program, instr->src2),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BNE,
 				    MIR_new_label_op(build->context, deopt),
@@ -3557,7 +3717,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			if (tagged_dst) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->value) * sizeof(Num),
+				    jit_tag_offset(program, instr->value),
 				    deopt_values, 0, 1),
 				MIR_new_int_op(build->context, TYPE_INT)));
 			}
@@ -3794,7 +3954,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, tag_temps[n]),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + copy->src) * sizeof(Num),
+					    jit_tag_offset(program, copy->src),
 					    deopt_values, 0, 1)));
 				else
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3859,7 +4019,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    if (tag_temps[n])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + copy->dst) * sizeof(Num),
+					jit_tag_offset(program, copy->dst),
 					deopt_values, 0, 1),
 				    MIR_new_reg_op(build->context, tag_temps[n])));
 			    n++;
@@ -3913,7 +4073,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
 				MIR_new_reg_op(build->context, type_reg),
 				MIR_new_mem_op(build->context, tag_t,
-				    (program->num_values + instr->src1) * sizeof(Num),
+				    jit_tag_offset(program, instr->src1),
 				    deopt_values, 0, 1)));
 			    append(build, MIR_new_call_insn(build->context, 5,
 				MIR_new_ref_op(build->context, build->proto_is_true),
@@ -3976,7 +4136,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_reg_op(build->context, return_type),
 			    MIR_new_mem_op(build->context, tag_t,
-				(program->num_values + instr->src1) * sizeof(Num),
+				jit_tag_offset(program, instr->src1),
 				deopt_values, 0, 1)));
 			append(build, MIR_new_insn(build->context, MIR_MOV,
 			    MIR_new_mem_op(build->context, MIR_T_I32,
@@ -4072,7 +4232,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, obj_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->src1) * sizeof(Num),
+					jit_tag_offset(program, instr->src1),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, obj_ok),
@@ -4088,7 +4248,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, rhs_type),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + rhs) * sizeof(Num),
+					jit_tag_offset(program, rhs),
 					deopt_values, 0, 1)));
 			    else
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -4129,7 +4289,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&& program->value_is_tagged[instr->value])
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + instr->value) * sizeof(Num),
+					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_reg_op(build->context, rhs_type)));
 			    append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -4149,6 +4309,168 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    append_deopt_exit(build, program, instr->deopt_map, values,
 				      deopt_map_out, deopt_values, status,
 				      common_return);
+		    break;
+		case HIR_TAC_INDEX_SET:
+		    {
+			char name[32];
+			MIR_label_t deopt = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			MIR_label_t range_error = new_status_exit(build,
+			    &status_exits, &last_status_exit, JIT_RUN_ERROR,
+			    E_RANGE, instr->deopt_map, instr->bytecode_pc,
+			    instr->source_lineno);
+			MIR_reg_t base = values[instr->src1];
+			MIR_reg_t index = values[instr->src2];
+			MIR_reg_t raw_value;
+			MIR_reg_t value_type;
+			MIR_reg_t list_len;
+			int direct_int_list = instr->direct_int_list_index_set;
+			int tagged_base = program->value_is_tagged
+			    && program->value_is_tagged[instr->src1];
+			int tagged_index = program->value_is_tagged
+			    && program->value_is_tagged[instr->src2];
+
+			if (!tagged_base
+			    && program->value_types[instr->src1] != TYPE_LIST) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return);
+			    break;
+			}
+			if (tagged_base) {
+			    MIR_reg_t base_type;
+
+			    sprintf(name, "set_base_type%d", copy_serial++);
+			    base_type = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, base_type),
+				MIR_new_mem_op(build->context, tag_t,
+				    jit_tag_offset(program, instr->src1),
+				    deopt_values, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, base_type),
+				MIR_new_int_op(build->context, TYPE_LIST)));
+			}
+			if (tagged_index) {
+			    MIR_reg_t index_type;
+
+			    sprintf(name, "set_index_type%d", copy_serial++);
+			    index_type = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, index_type),
+				MIR_new_mem_op(build->context, tag_t,
+				    jit_tag_offset(program, instr->src2),
+				    deopt_values, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, index_type),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			} else if (program->value_types[instr->src2] != TYPE_INT) {
+			    append_deopt_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return);
+			    break;
+			}
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+			    MIR_new_label_op(build->context, deopt),
+			    MIR_new_reg_op(build->context, base),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+			    MIR_new_label_op(build->context, range_error),
+			    MIR_new_reg_op(build->context, index),
+			    MIR_new_int_op(build->context, 1)));
+			sprintf(name, "set_list_len%d", copy_serial++);
+			list_len = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, list_len),
+			    MIR_new_mem_op(build->context,
+				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				offsetof(Var, v.num), base, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BGT,
+			    MIR_new_label_op(build->context, range_error),
+			    MIR_new_reg_op(build->context, index),
+			    MIR_new_reg_op(build->context, list_len)));
+
+			sprintf(name, "set_value_type%d", copy_serial++);
+			value_type = new_reg(build, name);
+			if (program->value_is_tagged[instr->src3])
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, value_type),
+				MIR_new_mem_op(build->context, tag_t,
+				    jit_tag_offset(program, instr->src3),
+				    deopt_values, 0, 1)));
+			else
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, value_type),
+				MIR_new_int_op(build->context,
+				    program->value_types[instr->src3])));
+			raw_value = append_raw_value(build, program, values,
+			    instr->src3, deopt_values, &copy_serial);
+			if (direct_int_list) {
+			    MIR_label_t shared = MIR_new_label(build->context);
+			    MIR_reg_t refcount_reg;
+			    MIR_reg_t elem_offset;
+			    MIR_reg_t elem_addr;
+
+			    sprintf(name, "set_refcount%d", copy_serial++);
+			    refcount_reg = new_reg(build, name);
+			    sprintf(name, "set_elem_offset%d", copy_serial++);
+			    elem_offset = new_reg(build, name);
+			    sprintf(name, "set_elem_addr%d", copy_serial++);
+			    elem_addr = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, refcount_reg),
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    -(int) sizeof(int), base, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BNE,
+				MIR_new_label_op(build->context, shared),
+				MIR_new_reg_op(build->context, refcount_reg),
+				MIR_new_int_op(build->context, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_MUL,
+				MIR_new_reg_op(build->context, elem_offset),
+				MIR_new_reg_op(build->context, index),
+				MIR_new_int_op(build->context, sizeof(Var))));
+			    append(build, MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, elem_addr),
+				MIR_new_reg_op(build->context, base),
+				MIR_new_reg_op(build->context, elem_offset)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), elem_addr, 0, 1),
+				MIR_new_reg_op(build->context, raw_value)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, base)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, shared);
+			}
+			append(build, MIR_new_call_insn(build->context, 10,
+			    MIR_new_ref_op(build->context,
+				build->proto_list_index_set),
+			    MIR_new_ref_op(build->context,
+				build->import_list_index_set),
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, env),
+			    MIR_new_int_op(build->context, instr->local_id),
+			    MIR_new_reg_op(build->context, base),
+			    MIR_new_reg_op(build->context, index),
+			    MIR_new_reg_op(build->context, raw_value),
+			    MIR_new_reg_op(build->context, value_type),
+			    MIR_new_reg_op(build->context, error_out)));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+			    MIR_new_label_op(build->context, deopt),
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, deopt);
+			append_deopt_exit(build, program, instr->deopt_map, values,
+			    deopt_map_out, deopt_values, status, common_return);
+			append(build, done);
+		    }
 		    break;
 		case HIR_TAC_RANGE_REF:
 		    if (instr->deopt_map >= 0
@@ -4189,7 +4511,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, ft),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + from_val) * sizeof(Num),
+					    jit_tag_offset(program, from_val),
 					    deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
@@ -4203,7 +4525,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_reg_op(build->context, tt),
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + to_val) * sizeof(Num),
+					    jit_tag_offset(program, to_val),
 					    deopt_values, 0, 1)));
 				    append(build, MIR_new_insn(build->context, MIR_BNE,
 					MIR_new_label_op(build->context, deopt),
@@ -4231,7 +4553,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_STR)));
 			    } else if (base_type == TYPE_LIST) {
@@ -4253,7 +4575,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_LIST)));
 			    } else {
@@ -4265,7 +4587,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, bt),
 				    MIR_new_mem_op(build->context, tag_t,
-					(program->num_values + base_val) * sizeof(Num),
+					jit_tag_offset(program, base_val),
 					deopt_values, 0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_BEQ,
 				    MIR_new_label_op(build->context, is_list),
@@ -4294,7 +4616,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_STR)));
 				append(build, MIR_new_insn(build->context, MIR_JMP,
@@ -4319,7 +4641,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				if (program->value_is_tagged && program->value_is_tagged[instr->value])
 				    append(build, MIR_new_insn(build->context, MIR_MOV,
 					MIR_new_mem_op(build->context, tag_t,
-					    (program->num_values + instr->value) * sizeof(Num),
+					    jit_tag_offset(program, instr->value),
 					    deopt_values, 0, 1),
 					MIR_new_int_op(build->context, TYPE_LIST)));
 				append(build, done);
@@ -4343,20 +4665,144 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      common_return);
 		    break;
 		case HIR_TAC_CALL_VERB:
-		    append_materialized_exit(build, program, instr->deopt_map,
-					     values, deopt_map_out,
-					     deopt_values, status,
-					     common_return, JIT_RUN_CALL_VERB);
-		    if (instr->deopt_map > 0
-			&& instr->deopt_map < program->num_deopt_maps
-			&& resume_continuations[instr->deopt_map])
-			append(build, resume_continuations[instr->deopt_map]);
+		    {
+			JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+			int args_value = map->stack_depth
+			    ? map->stack_values[map->stack_depth - 1] : 0;
+			int operands[3] = { instr->src1, instr->src2, args_value };
+			MIR_reg_t raw[3], type[3], call_result;
+			MIR_reg_t raw_out, type_out;
+			MIR_label_t materialize = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			int operand;
+
+			if (!program->value_types || operands[0] <= 0
+			    || operands[0] >= program->num_values
+			    || operands[1] <= 0
+			    || operands[1] >= program->num_values
+			    || operands[2] <= 0
+			    || operands[2] >= program->num_values) {
+			    append_materialized_exit(build, program,
+				instr->deopt_map, values, deopt_map_out,
+				deopt_values, status, common_return,
+				JIT_RUN_CALL_VERB);
+			    if (instr->deopt_map > 0
+				&& instr->deopt_map < program->num_deopt_maps
+				&& resume_continuations[instr->deopt_map])
+				append(build,
+				    resume_continuations[instr->deopt_map]);
+			    break;
+			}
+			for (operand = 0; operand < 3; operand++) {
+			    char name[32];
+
+			    raw[operand] = append_raw_value(build, program, values,
+				operands[operand], deopt_values, &copy_serial);
+			    sprintf(name, "verb_type%d", copy_serial++);
+			    type[operand] = new_reg(build, name);
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[operands[operand]])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type[operand]),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, operands[operand]), deopt_values, 0, 1)));
+			    else
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type[operand]),
+				    MIR_new_int_op(build->context,
+					program->value_types[operands[operand]])));
+			}
+			{
+			    char name[32];
+
+			    sprintf(name, "direct_verb_result%d", copy_serial++);
+			    call_result = new_reg(build, name);
+			    sprintf(name, "direct_verb_raw_out%d", copy_serial++);
+			    raw_out = new_reg(build, name);
+			    sprintf(name, "direct_verb_type_out%d", copy_serial++);
+			    type_out = new_reg(build, name);
+			}
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, deopt_values),
+			    MIR_new_int_op(build->context,
+				instr->value * sizeof(Num))));
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, type_out),
+			    MIR_new_reg_op(build->context, deopt_values),
+			    MIR_new_int_op(build->context,
+				jit_tag_offset(program, instr->value))));
+			append(build, MIR_new_call_insn(build->context, 14,
+			    MIR_new_ref_op(build->context,
+				build->proto_direct_verb_call),
+			    MIR_new_ref_op(build->context,
+				build->import_direct_verb_call),
+			    MIR_new_reg_op(build->context, call_result),
+			    MIR_new_reg_op(build->context, raw[0]),
+			    MIR_new_reg_op(build->context, type[0]),
+			    MIR_new_reg_op(build->context, raw[1]),
+			    MIR_new_reg_op(build->context, type[1]),
+			    MIR_new_reg_op(build->context, raw[2]),
+			    MIR_new_reg_op(build->context, type[2]),
+			    MIR_new_reg_op(build->context, ticks),
+			    MIR_new_reg_op(build->context, timed_out),
+			    MIR_new_reg_op(build->context, error_out),
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, type_out)));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+			    MIR_new_label_op(build->context, materialize),
+			    MIR_new_reg_op(build->context, call_result),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_mem_op(build->context,
+				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				instr->value * sizeof(Num), deopt_values, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, materialize);
+			append_materialized_exit(build, program, instr->deopt_map,
+			    values, deopt_map_out, deopt_values, status,
+			    common_return, JIT_RUN_CALL_VERB);
+			if (instr->deopt_map > 0
+			    && instr->deopt_map < program->num_deopt_maps
+			    && resume_continuations[instr->deopt_map])
+			    append(build,
+				resume_continuations[instr->deopt_map]);
+			append(build, done);
+		    }
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
 		case HIR_TAC_UNSUPPORTED:
 		case HIR_TAC_PHI:
 		    break;
+		}
+		if (instr->value > 0 && instr->value < program->num_values
+		    && program->value_owned_slots
+		    && instr->kind == HIR_TAC_BINARY
+		    && instr->op == HIR_OP_LIST_ADD_TAIL) {
+		    MIR_reg_t raw = append_raw_value(build, program, values,
+			instr->value, deopt_values, &copy_serial);
+		    MIR_op_t type;
+
+		    if (program->value_is_tagged
+			&& program->value_is_tagged[instr->value])
+			type = MIR_new_mem_op(build->context, tag_t,
+			    jit_tag_offset(program, instr->value),
+			    deopt_values, 0, 1);
+		    else
+			type = MIR_new_int_op(build->context,
+			    program->value_types[instr->value]);
+		    append(build, MIR_new_call_insn(build->context, 6,
+			MIR_new_ref_op(build->context,
+			    build->proto_owned_replace),
+			MIR_new_ref_op(build->context,
+			    build->import_owned_replace),
+			MIR_new_reg_op(build->context, owned_values),
+			MIR_new_int_op(build->context,
+			    program->value_owned_slots[instr->value]),
+			MIR_new_reg_op(build->context, raw), type));
 		}
 		if (instr == block->last)
 		    break;
@@ -4386,6 +4832,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			deopt_map_out, deopt_values, error_out, status,
 			common_return);
     append(build, common_return);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, ticks, 0, 1),
+	MIR_new_reg_op(build->context, tick_result)));
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
@@ -4420,10 +4869,6 @@ jit_program_release_native(JITProgram *program)
     if (!program)
 	return;
     jit_pool_unregister(program);
-    if (program->deopt_values) {
-	myfree(program->deopt_values, M_PROGRAM);
-	program->deopt_values = 0;
-    }
     program->native_function = 0;
     program->machine_code = 0;
     program->machine_code_len = 0;
@@ -4492,6 +4937,44 @@ jit_program_release_ir(JITProgram *program, int retain_constants)
     program->blocks = program->last_block = 0;
 }
 
+static void
+jit_program_find_borrowed_locals(JITProgram *program)
+{
+    unsigned char *used;
+    JITBlock *block;
+    int count = 0;
+    int i;
+
+    if (program->borrowed_local_slots || program->num_vars <= 0)
+	return;
+    used = mymalloc(program->num_vars, M_PROGRAM);
+    memset(used, 0, program->num_vars);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_LOAD_LOCAL && instr->local_id >= 0
+		&& instr->local_id < program->num_vars)
+		used[instr->local_id] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (i = 0; i < program->num_vars; i++)
+	if (used[i])
+	    count++;
+    if (count) {
+	int next = 0;
+
+	program->borrowed_local_slots = mymalloc(sizeof(int) * count, M_PROGRAM);
+	for (i = 0; i < program->num_vars; i++)
+	    if (used[i])
+		program->borrowed_local_slots[next++] = i;
+	program->num_borrowed_locals = count;
+    }
+    myfree(used, M_PROGRAM);
+}
+
 static int
 jit_program_restore_ir(JITProgram *program)
 {
@@ -4530,6 +5013,8 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
+		if (program->deopt_maps[i].tagged_values)
+		    myfree(program->deopt_maps[i].tagged_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_values)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
 		if (program->deopt_maps[i].stack_types)
@@ -4549,6 +5034,18 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->value_tag_slots)
+	myfree(program->value_tag_slots, M_PROGRAM);
+    if (program->value_ownership)
+	myfree(program->value_ownership, M_PROGRAM);
+    if (program->value_owner_root)
+	myfree(program->value_owner_root, M_PROGRAM);
+    if (program->value_owned_slots)
+	myfree(program->value_owned_slots, M_PROGRAM);
+    if (program->value_is_int_list)
+	myfree(program->value_is_int_list, M_PROGRAM);
+    if (program->borrowed_local_slots)
+	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
 	myfree(program->usage, M_PROGRAM);
     jit_program_release_ir(program, 0);
@@ -4579,6 +5076,18 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_tag_slots)
+	bytes += sizeof(int) * program->num_values;
+    if (program->value_ownership)
+	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_owner_root)
+	bytes += sizeof(int) * program->num_values;
+    if (program->value_owned_slots)
+	bytes += sizeof(int) * program->num_values;
+    if (program->value_is_int_list)
+	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->borrowed_local_slots)
+	bytes += sizeof(int) * program->num_borrowed_locals;
     if (program->usage)
 	bytes += sizeof(JITProgramUsage);
     for (i = 0; i < program->num_deopt_maps; i++) {
@@ -4586,6 +5095,8 @@ jit_program_metadata_bytes(JITProgram *program)
 
 	if (map->local_values)
 	    bytes += sizeof(JITLocalValue) * map->num_local_values;
+	if (map->tagged_values)
+	    bytes += sizeof(int) * map->num_tagged_values;
 	if (map->stack_values)
 	    bytes += sizeof(int) * map->stack_depth;
 	if (map->stack_types)
@@ -4637,14 +5148,17 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 		= program->usage->deopts_by_reason[reason];
 	stats->last_used_generation = program->usage->last_used_generation;
 	stats->last_used_time = program->usage->last_used_time;
+	stats->continuation_captures = program->usage->continuation_captures;
+	stats->continuation_resumes = program->usage->continuation_resumes;
+	stats->continuation_materializations
+	    = program->usage->continuation_materializations;
     }
     stats->compile_attempts = program->compile_attempts;
     stats->compile_successes = program->compile_successes;
     stats->compile_failures = program->compile_failures;
     stats->compile_time_us = program->compile_time_us;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
-    stats->runtime_bytes = program->deopt_values
-	? sizeof(Num) * program->num_values * 2 : 0;
+    stats->runtime_bytes = program->active_runtime_bytes;
     stats->machine_code_bytes = program->machine_code_len;
     if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
 	&& program->machine_code_len > 0) {
@@ -4656,8 +5170,18 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     } else {
 	stats->native_allocated_bytes = program->machine_code_len;
     }
+    {
+	JITContinuationFrame *frame;
+
+	for (frame = continuation_frames; frame; frame = frame->next)
+	    if (frame->program == program) {
+		stats->active_continuations++;
+		stats->continuation_bytes += sizeof(*frame)
+		    + sizeof(Var) * frame->num_values;
+	    }
+    }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes;
+	+ stats->native_allocated_bytes + stats->continuation_bytes;
 }
 
 int
@@ -4716,6 +5240,44 @@ jit_program_may_error(JITProgram *program)
 }
 
 int
+jit_program_is_direct_leaf(JITProgram *program)
+{
+    JITBlock *block;
+    int release_ir;
+    int direct_leaf = 1;
+
+    if (!program || !program->eligible)
+	return 0;
+
+    if (program->direct_leaf)
+	return program->direct_leaf > 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CALL
+		|| instr->kind == HIR_TAC_CALL_VERB
+		|| instr->kind == HIR_TAC_PUT_PROP
+		|| instr->kind == HIR_TAC_DEOPT) {
+		direct_leaf = 0;
+		break;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+	if (!direct_leaf)
+	    break;
+    }
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    program->direct_leaf = direct_leaf ? 1 : -1;
+    return direct_leaf;
+}
+
+int
 jit_program_anchor_count(JITProgram *program)
 {
     return program ? program->num_resume_anchors : 0;
@@ -4741,7 +5303,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
 	    && map->resume_key.code_unit == key.code_unit
 	    && map->resume_key.site == key.site && map->native_resume
-	    && map->native_resume->valid)
+	    && map->native_resume->valid && map->native_resume->rehydratable)
 	    return i;
     }
     return -1;
@@ -4787,6 +5349,7 @@ jit_program_compile(JITProgram *program)
 	return 1;
     if (!jit_program_restore_ir(program))
 	return 0;
+    jit_program_find_borrowed_locals(program);
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
@@ -4827,15 +5390,6 @@ jit_program_compile(JITProgram *program)
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
     MIR_gen_finish(jit_shared_pool.context);
-    program->deopt_values = mymalloc(sizeof(Num) * program->num_values * 2,
-				     M_PROGRAM);
-    memset(program->deopt_values, 0, sizeof(Num) * program->num_values * 2);
-    {
-	int i;
-
-	for (i = 0; i < program->num_values; i++)
-	    program->deopt_values[program->num_values + i] = TYPE_ANY;
-    }
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
     jit_pool_register(program);
@@ -4848,6 +5402,18 @@ jit_program_compile(JITProgram *program)
 	jit_program_release_ir(program, 1);
     }
     return 1;
+}
+
+static int jit_runtime_type_is_valid(var_type);
+
+static int
+jit_continuation_type_needs_owner(var_type type)
+{
+    return type == TYPE_STR || type == TYPE_LIST
+#ifdef WAIF_CORE
+	|| type == TYPE_WAIF
+#endif
+	;
 }
 
 static Var
@@ -4887,6 +5453,343 @@ materialize_deopt_value(var_type type, Num raw)
     return var_ref(value);
 }
 
+static JITResumeValue *
+jit_continuation_resume_value(JITContinuationFrame *frame, int value)
+{
+    JITNativeResume *resume;
+    int i;
+
+    resume = frame->program->deopt_maps[frame->map_id].native_resume;
+    for (i = 0; i < frame->num_values; i++) {
+	if (resume->values[i].value == value) {
+	    return &resume->values[i];
+	}
+    }
+    return 0;
+}
+
+static int
+jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
+				    Var *materialized)
+{
+    JITResumeValue *resume;
+    var_type type;
+
+    resume = jit_continuation_resume_value(frame, value);
+    if (!resume)
+	return 0;
+    if (resume->source == JIT_RESUME_RESULT) {
+	if (!frame->has_result)
+	    return 0;
+	*materialized = var_ref(frame->result);
+	return 1;
+    }
+    if (resume->source == JIT_RESUME_CONSTANT) {
+	*materialized = materialize_deopt_value(resume->literal_type,
+	    resume->literal);
+	return 1;
+    }
+    type = frame->program->value_is_tagged
+	&& frame->program->value_is_tagged[value]
+	? (var_type) frame->deopt_values[
+	    jit_tag_index(frame->program, value)]
+	: frame->program->value_types[value];
+    if (!jit_runtime_type_is_valid(type))
+	return 0;
+    *materialized = materialize_deopt_value(type,
+	frame->deopt_values[value]);
+    return 1;
+}
+
+static JITContinuationFrame *
+jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
+			 void *runtime_storage, Var *borrowed_locals,
+			 Var *owned_values, size_t runtime_bytes,
+			 JITContinuationFrame *frame)
+{
+    JITDeoptMap *map;
+    Var *new_values;
+    int new_values_capacity;
+    int i;
+
+    if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
+	return 0;
+    map = &program->deopt_maps[map_id];
+    if (!map->native_resume || !map->native_resume->valid)
+	return 0;
+    for (i = 0; i < map->native_resume->num_values; i++) {
+	JITResumeValue *resume = &map->native_resume->values[i];
+	var_type type;
+
+	if (resume->source == JIT_RESUME_RESULT
+	    || resume->source == JIT_RESUME_CONSTANT)
+	    continue;
+	type = program->value_is_tagged
+	    && program->value_is_tagged[resume->value]
+	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
+	    : program->value_types[resume->value];
+	if (!jit_runtime_type_is_valid(type))
+	    return 0;
+    }
+    new_values_capacity = map->native_resume->num_values;
+    if (frame) {
+	new_values = frame->spare_values;
+	new_values_capacity = frame->spare_values_capacity;
+	if (new_values_capacity < map->native_resume->num_values) {
+	    if (new_values)
+		new_values = myrealloc(new_values,
+		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
+	    else
+		new_values = mymalloc(
+		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
+	    new_values_capacity = map->native_resume->num_values;
+	}
+    } else
+	new_values = map->native_resume->num_values
+	    ? mymalloc(sizeof(Var) * map->native_resume->num_values, M_PROGRAM)
+	    : 0;
+    for (i = 0; i < map->native_resume->num_values; i++)
+	new_values[i].type = TYPE_NONE;
+    for (i = 0; i < map->native_resume->num_values; i++) {
+	JITResumeValue *resume = &map->native_resume->values[i];
+	var_type type;
+
+	if (resume->source == JIT_RESUME_RESULT)
+	    continue;
+	if (resume->source == JIT_RESUME_CONSTANT
+	    && jit_continuation_type_needs_owner(resume->literal_type)) {
+	    new_values[i] = materialize_deopt_value(
+		resume->literal_type, resume->literal);
+	    continue;
+	}
+	if (resume->source == JIT_RESUME_CONSTANT)
+	    continue;
+	type = program->value_is_tagged
+	    && program->value_is_tagged[resume->value]
+	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
+	    : program->value_types[resume->value];
+	if (jit_continuation_type_needs_owner(type))
+	    new_values[i] = materialize_deopt_value(type,
+		deopt_values[resume->value]);
+    }
+    if (!frame) {
+	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
+	memset(frame, 0, sizeof(JITContinuationFrame));
+    } else {
+	Var *old_values = frame->values;
+	int old_values_capacity = frame->values_capacity;
+
+	for (i = 0; i < frame->num_values; i++)
+	    free_var(frame->values[i]);
+	if (frame->has_result)
+	    free_var(frame->result);
+	frame->spare_values = old_values;
+	frame->spare_values_capacity = old_values_capacity;
+	frame->has_result = 0;
+	frame->dispatched = 0;
+    }
+    frame->program = program;
+    frame->map_id = map_id;
+    frame->num_values = map->native_resume->num_values;
+    frame->values = new_values;
+    frame->values_capacity = new_values_capacity;
+    frame->runtime_storage = runtime_storage;
+    frame->deopt_values = deopt_values;
+    frame->borrowed_locals = borrowed_locals;
+    frame->owned_values = owned_values;
+    frame->runtime_bytes = runtime_bytes;
+    if (program->usage)
+	program->usage->continuation_captures++;
+    return frame;
+}
+
+void
+jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
+{
+    if (!frame || !owner)
+	return;
+    if (frame->owner == owner && owner->jit_continuation == frame)
+	return;
+    frame->owner = owner;
+    owner->jit_continuation = frame;
+    frame->next = continuation_frames;
+    if (continuation_frames)
+	continuation_frames->previous = frame;
+    continuation_frames = frame;
+}
+
+void
+jit_continuation_relocate(JITContinuationFrame *frame, activation *owner)
+{
+    if (!frame || !owner)
+	return;
+    if (frame->owner && frame->owner->jit_continuation == frame)
+	frame->owner->jit_continuation = 0;
+    frame->owner = owner;
+    owner->jit_continuation = frame;
+}
+
+void
+jit_continuation_mark_dispatched(JITContinuationFrame *frame)
+{
+    if (frame) {
+	frame->dispatched = 1;
+	if (frame->owner)
+	    frame->owner->top_rt_stack = frame->owner->base_rt_stack;
+    }
+}
+
+void
+jit_continuation_set_result(JITContinuationFrame *frame, Var value)
+{
+    JITNativeResume *resume;
+    int i;
+
+    if (!frame)
+	return;
+    if (frame->has_result)
+	free_var(frame->result);
+    frame->result = value;
+    frame->has_result = 1;
+    resume = frame->program->deopt_maps[frame->map_id].native_resume;
+    for (i = 0; i < frame->num_values; i++)
+	if (resume->values[i].source == JIT_RESUME_RESULT) {
+	    free_var(frame->values[i]);
+	    frame->values[i] = var_ref(value);
+	}
+}
+
+void
+jit_continuation_free(JITContinuationFrame *frame)
+{
+    int i;
+
+    if (!frame)
+	return;
+    if (frame->owner && frame->owner->jit_continuation == frame)
+	frame->owner->jit_continuation = 0;
+    if (frame->previous)
+	frame->previous->next = frame->next;
+    else if (continuation_frames == frame)
+	continuation_frames = frame->next;
+    if (frame->next)
+	frame->next->previous = frame->previous;
+    for (i = 0; i < frame->num_values; i++)
+	free_var(frame->values[i]);
+    if (frame->values)
+	myfree(frame->values, M_PROGRAM);
+    if (frame->spare_values)
+	myfree(frame->spare_values, M_PROGRAM);
+    if (frame->has_result)
+	free_var(frame->result);
+    if (frame->runtime_storage) {
+	for (i = 0; i < frame->program->num_borrowed_locals; i++)
+	    free_var(frame->borrowed_locals[i]);
+	for (i = 0; i < frame->program->num_owned_slots; i++)
+	    free_var(frame->owned_values[i]);
+	frame->program->active_runtime_bytes -= frame->runtime_bytes;
+	myfree(frame->runtime_storage, M_PROGRAM);
+    }
+    myfree(frame, M_PROGRAM);
+}
+
+int
+jit_continuation_materialize(activation *a)
+{
+    JITContinuationFrame *frame;
+    JITProgram *program;
+    JITDeoptMap *map;
+    const ResumePoint *point;
+    unsigned depth, i;
+
+    if (!a || !(frame = a->jit_continuation))
+	return 1;
+    program = frame->program;
+    if (!program || frame->map_id <= 0
+	|| frame->map_id >= program->num_deopt_maps)
+	return 0;
+    map = &program->deopt_maps[frame->map_id];
+    if (program->usage)
+	program->usage->continuation_materializations++;
+    depth = map->stack_depth;
+    if (frame->dispatched) {
+	int operands = jit_call_stack_operands(map);
+
+	if (operands < 0 || (unsigned) operands > depth)
+	    return 0;
+	depth -= operands;
+    }
+    point = resume_point_for_key(a->prog, map->resume_key);
+    if (frame->dispatched && !point)
+	return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+
+	if (value > 0 && !jit_continuation_resume_value(frame, value))
+	    return 0;
+    }
+    for (i = 0; i < depth; i++)
+	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
+	    && !jit_continuation_resume_value(frame, map->stack_values[i]))
+	    return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+	Var saved;
+
+	if (value > 0
+	    && jit_continuation_materialized_value(frame, value, &saved)) {
+	    free_var(a->rt_env[i]);
+	    a->rt_env[i] = saved;
+	}
+    }
+    while (a->top_rt_stack > a->base_rt_stack)
+	free_var(*--a->top_rt_stack);
+    for (i = 0; i < depth; i++) {
+	ResumeStackSlot slot = map->stack_slots
+	    ? map->stack_slots[i]
+	    : (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
+	Var value;
+
+	if (slot.kind == RSS_VALUE) {
+	    if (!jit_continuation_materialized_value(frame,
+		map->stack_values[i], &value))
+		return 0;
+	} else {
+	    value.type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		: slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+	    value.v.num = slot.data;
+	}
+	*a->top_rt_stack++ = value;
+    }
+    if (frame->has_result)
+	*a->top_rt_stack++ = var_ref(frame->result);
+    if (frame->dispatched) {
+	a->pc = point->pc;
+	a->error_pc = point->error_pc;
+	a->resume_key = point->key;
+    } else {
+	a->pc = map->bytecode_pc;
+	a->error_pc = map->error_pc;
+	a->resume_key = invalid_resume_key();
+    }
+    free_var(a->temp);
+    a->temp.type = TYPE_NONE;
+    a->temp.v.num = 0;
+    jit_continuation_free(frame);
+    return 1;
+}
+
+void
+jit_continuation_materialize_all(void)
+{
+    while (continuation_frames) {
+	JITContinuationFrame *frame = continuation_frames;
+
+	if (!frame->owner || !jit_continuation_materialize(frame->owner))
+	    panic("JIT continuation materialization failed");
+    }
+}
+
 static int
 jit_runtime_type_is_valid(var_type type)
 {
@@ -4912,7 +5815,7 @@ jit_runtime_type_is_valid(var_type type)
 
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
-		      int operand)
+		      Num *deopt_values, int operand)
 {
     int value = map->guard_value[operand];
     int local = map->guard_local[operand];
@@ -4923,7 +5826,7 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 	return env[local].type;
     if (value > 0 && value < program->num_values) {
 	if (program->value_is_tagged && program->value_is_tagged[value])
-	    return (var_type) program->deopt_values[program->num_values + value];
+	    return (var_type) deopt_values[jit_tag_index(program, value)];
 	if (program->value_types)
 	    return program->value_types[value];
     }
@@ -4931,32 +5834,18 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 }
 
 static void
-jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
+jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
+			       Num *deopt_values)
 {
     int i;
 
-    for (i = 0; i < map->num_locals; i++) {
-	int value = jit_deopt_map_local_value(program, map, i);
+    for (i = 0; i < map->num_tagged_values; i++) {
+	int value = map->tagged_values[i];
 
-	if (value > 0 && value < program->num_values
-	    && program->value_is_tagged && program->value_is_tagged[value]
-	    && !jit_runtime_type_is_valid((var_type)
-		program->deopt_values[program->num_values + value])) {
-	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
-		   value, i, map->bytecode_pc);
-	    panic("JIT runtime tag invariant violated");
-	}
-    }
-    for (i = 0; i < (int) map->stack_depth; i++) {
-	int value = map->stack_values[i];
-
-	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
-	    && value > 0 && value < program->num_values
-	    && program->value_is_tagged && program->value_is_tagged[value]
-	    && !jit_runtime_type_is_valid((var_type)
-		program->deopt_values[program->num_values + value])) {
-	    errlog("JIT: missing runtime tag for value %d in stack slot %d at pc %u\n",
-		   value, i, map->bytecode_pc);
+	if (!jit_runtime_type_is_valid((var_type)
+	    deopt_values[jit_tag_index(program, value)])) {
+	    errlog("JIT: missing runtime tag for value %d at pc %u\n",
+		   value, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
 	}
     }
@@ -4966,12 +5855,38 @@ JITRunResult
 jit_program_execute(JITProgram *program, Var *env, Var *result,
 		    int *ticks, int *timed_out, enum error *error,
 		    JITSourceLocation *source_location, JITDeoptState *deopt,
-		    Var *deopt_stack, Objid progr, int resume_map)
+		    Var *deopt_stack, Objid progr, int resume_map,
+		    JITContinuationFrame *continuation_in,
+		    JITContinuationFrame **continuation_out)
 {
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
+    Num *deopt_values;
+    Var *borrowed_locals = 0;
+    Var *owned_values = 0;
+    void *runtime_storage;
+    size_t deopt_bytes;
+    size_t deopt_storage_bytes;
+    size_t runtime_bytes;
     JITSourceLocation ignored_location;
+    int runtime_from_continuation = continuation_in != 0;
+    int runtime_transferred = 0;
+
+    (void) continuation_in;
+    if (continuation_out)
+	*continuation_out = 0;
+    if (continuation_in) {
+	if (continuation_in->program != program
+	    || continuation_in->map_id <= 0
+	    || continuation_in->map_id >= program->num_deopt_maps
+	    || !program->deopt_maps[continuation_in->map_id].native_resume
+	    || !program->deopt_maps[continuation_in->map_id].native_resume->valid)
+	    return JIT_RUN_FALLBACK;
+	resume_map = continuation_in->map_id;
+	if (program->usage)
+	    program->usage->continuation_resumes++;
+    }
 
     if (!source_location)
 	source_location = &ignored_location;
@@ -5002,34 +5917,107 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     }
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
+    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
+    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    runtime_bytes = deopt_storage_bytes
+	+ sizeof(Var) * (program->num_borrowed_locals
+			 + program->num_owned_slots);
+    if (runtime_from_continuation) {
+	runtime_storage = continuation_in->runtime_storage;
+	deopt_values = continuation_in->deopt_values;
+	borrowed_locals = continuation_in->borrowed_locals;
+	owned_values = continuation_in->owned_values;
+    } else {
+	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
+				   M_PROGRAM);
+	deopt_values = runtime_storage;
+	/* Float lowering uses raw slot zero as its native 0.0 constant. */
+	deopt_values[0] = 0;
+	{
+	    int i;
+	    int tag_slots = program->value_tag_slots
+		? program->num_tag_slots : program->num_values;
+
+	    for (i = 0; i < tag_slots; i++)
+		deopt_values[program->num_values + i] = TYPE_ANY;
+	    if (program->num_borrowed_locals) {
+		borrowed_locals = (Var *) ((char *) runtime_storage
+		    + deopt_storage_bytes);
+		for (i = 0; i < program->num_borrowed_locals; i++)
+		    borrowed_locals[i] = var_ref(
+			env[program->borrowed_local_slots[i]]);
+	    }
+	    owned_values = program->num_owned_slots
+		? (Var *) ((char *) runtime_storage + deopt_storage_bytes
+		    + sizeof(Var) * program->num_borrowed_locals) : 0;
+	    for (i = 0; i < program->num_owned_slots; i++)
+		owned_values[i].type = TYPE_NONE;
+	}
+	program->active_runtime_bytes += runtime_bytes;
+    }
     function = (NativeFunction) program->native_function;
     native_result = function(env, result, ticks, timed_out, error,
 			     source_location, &deopt_map,
-			     program->deopt_values, progr, resume_map,
-			     deopt_stack);
+			     deopt_values, progr, resume_map,
+			     deopt_stack,
+			     continuation_in ? continuation_in->values : 0,
+			     owned_values);
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
 	JITDeoptMap *map;
 	Var *new_stack = 0;
 	unsigned materialized_depth;
+	unsigned stack_start = 0;
+	int compact_boundary = 0;
 	int i;
 
-	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps)
+	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
+	    if (!runtime_from_continuation) {
+		int i;
+
+		for (i = 0; i < program->num_borrowed_locals; i++)
+		    free_var(borrowed_locals[i]);
+		for (i = 0; i < program->num_owned_slots; i++)
+		    free_var(owned_values[i]);
+		program->active_runtime_bytes -= runtime_bytes;
+		myfree(runtime_storage, M_PROGRAM);
+	    }
 	    return JIT_RUN_FALLBACK;
+	}
 	map = &program->deopt_maps[deopt_map];
-	jit_validate_materialized_tags(program, map);
+	jit_validate_materialized_tags(program, map, deopt_values);
 	materialized_depth = map->stack_depth;
-	for (i = 0; i < map->num_locals; i++) {
+	if (native_result == JIT_RUN_CALL_VERB && continuation_out
+	    && (map->reason == JIT_DEOPT_VERB_CALL
+		|| jit_deopt_map_bridges_builtin(map))) {
+	    int operands = jit_call_stack_operands(map);
+	    JITContinuationFrame *frame = 0;
+
+	    if (operands >= 0 && (unsigned) operands <= map->stack_depth)
+		frame = jit_continuation_capture(program, deopt_map,
+		    deopt_values, runtime_storage, borrowed_locals,
+		    owned_values, runtime_bytes, continuation_in);
+
+	    if (frame) {
+		*continuation_out = frame;
+		runtime_transferred = 1;
+		compact_boundary = 1;
+		stack_start = map->stack_depth - operands;
+		materialized_depth = operands;
+	    }
+	}
+	for (i = 0; !compact_boundary && i < map->num_locals; i++) {
 	    int local_value = jit_deopt_map_local_value(program, map, i);
 
 	    if (local_value > 0) {
 		var_type type = jit_deopt_map_local_type(program, map, i);
 		if (type == TYPE_ANY)
-		    type = (var_type) program->deopt_values[program->num_values
-			+ local_value];
+		    type = (var_type) deopt_values[jit_tag_index(program,
+			local_value)];
 		Var value = materialize_deopt_value(type,
-			program->deopt_values[local_value]);
+		    deopt_values[local_value]);
 
 		free_var(env[i]);
 		env[i] = value;
@@ -5039,27 +6027,28 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 			    || (jit_deopt_map_is_specialized_builtin(map)
 				&& map->builtin_args == 0)))
 	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
-	for (i = 0; new_stack && i < (int) map->stack_depth; i++) {
+	for (i = stack_start; new_stack && i < (int) map->stack_depth; i++) {
 	    ResumeStackSlot slot = map->stack_slots
 		? map->stack_slots[i]
 		: (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
 	    var_type type = jit_deopt_map_stack_type(program, map, i);
 
 	    if (slot.kind != RSS_VALUE) {
-		new_stack[i].type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		new_stack[i - stack_start].type = slot.kind == RSS_CATCH ? TYPE_CATCH
 		    : slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
-		new_stack[i].v.num = slot.data;
+		new_stack[i - stack_start].v.num = slot.data;
 		continue;
 	    }
 	    if (type == TYPE_ANY)
-		type = (var_type) program->deopt_values[program->num_values
-		    + map->stack_values[i]];
+		type = (var_type) deopt_values[jit_tag_index(program,
+		    map->stack_values[i])];
 
-	    new_stack[i] = materialize_deopt_value(type,
-		program->deopt_values[map->stack_values[i]]);
+	    new_stack[i - stack_start] = materialize_deopt_value(type,
+		deopt_values[map->stack_values[i]]);
 	}
 	if (new_stack && jit_deopt_map_is_specialized_builtin(map)) {
-	    int outer_depth = map->stack_depth - map->builtin_args;
+	    int outer_depth = compact_boundary ? 0
+		: map->stack_depth - map->builtin_args;
 	    Var args = new_list(map->builtin_args);
 
 	    for (i = 0; i < map->builtin_args; i++)
@@ -5076,7 +6065,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->error_pc = map->error_pc;
 	    deopt->source_lineno = map->source_lineno;
 	    deopt->stack_depth = materialized_depth;
-	    deopt->materialized = 1;
+	    deopt->materialized = !compact_boundary;
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
 	    deopt->operation = map->operation;
@@ -5088,13 +6077,29 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		   sizeof(deopt->guard_expected));
 	    for (i = 0; i < JIT_MAX_GUARD_OPERANDS; i++)
 		deopt->guard_actual[i] = jit_guard_actual_type(program, map,
-							      env, i);
+						      env, deopt_values, i);
 	    deopt->reason = map->reason;
+	    if (native_result == JIT_RUN_CALL_VERB) {
+		if (map->reason == JIT_DEOPT_VERB_CALL)
+		    deopt->boundary = JIT_BOUNDARY_VERB;
+		else if (jit_deopt_map_bridges_builtin(map))
+		    deopt->boundary = JIT_BOUNDARY_BUILTIN;
+	    }
 	}
     }
     if (native_result == JIT_RUN_RETURNED) {
 	if (result)
 	    *result = var_ref(*result);
+    }
+    if (!runtime_from_continuation && !runtime_transferred) {
+	int i;
+
+	for (i = 0; i < program->num_borrowed_locals; i++)
+	    free_var(borrowed_locals[i]);
+	for (i = 0; i < program->num_owned_slots; i++)
+	    free_var(owned_values[i]);
+	program->active_runtime_bytes -= runtime_bytes;
+	myfree(runtime_storage, M_PROGRAM);
     }
     return native_result;
 }
@@ -5114,13 +6119,20 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     release_ir = !program->blocks;
     if (release_ir && !jit_program_restore_ir(program))
 	return 0;
-    snprintf(line, sizeof(line), "HIR values=%d blocks=%d deopt-maps=%d",
-	     program->num_values, program->num_blocks, program->num_deopt_maps);
+    snprintf(line, sizeof(line),
+	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d",
+	     program->num_values, program->num_tag_slots,
+	     jit_runtime_value_slots(program), program->num_blocks,
+	     program->num_deopt_maps);
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
-	snprintf(line, sizeof(line), "v%d type=%d tagged=%d", i,
-		 program->value_types ? program->value_types[i] : TYPE_ANY,
-		 program->value_is_tagged ? program->value_is_tagged[i] : 0);
+	snprintf(line, sizeof(line),
+	    "v%d type=%d tagged=%d ownership=%d root=%d int-list=%d", i,
+	    program->value_types ? program->value_types[i] : TYPE_ANY,
+	    program->value_is_tagged ? program->value_is_tagged[i] : 0,
+	    program->value_ownership ? program->value_ownership[i] : 0,
+	    program->value_owner_root ? program->value_owner_root[i] : -1,
+	    program->value_is_int_list ? program->value_is_int_list[i] : 0);
 	add_line(line, data);
     }
     for (block = program->blocks; block; block = block->next) {
@@ -5133,13 +6145,42 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		&& program->value_is_tagged[instr->value];
 	    int type = instr->value > 0 && program->value_types
 		? program->value_types[instr->value] : TYPE_ANY;
+	    const char *func_name = (instr->kind == HIR_TAC_CALL
+				     && instr->func < FUNC_NOT_FOUND)
+		? name_func_by_num(instr->func) : "-";
 
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d v%d <- v%d,v%d type=%d tagged=%d local=%d deopt=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d direct-int-list=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
-		     instr->op, instr->value, instr->src1, instr->src2,
-		     type, tagged, instr->local_id, instr->deopt_map);
+		     instr->op, instr->func, func_name, instr->value,
+		     instr->src1, instr->src2,
+		     instr->src3,
+		     type, tagged, instr->local_id, instr->deopt_map,
+		     instr->deopt_map > 0
+		     && program->deopt_maps[instr->deopt_map].native_resume
+		     ? program->deopt_maps[instr->deopt_map].native_resume->valid : -1,
+		     instr->deopt_map > 0
+		     && program->deopt_maps[instr->deopt_map].native_resume
+		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
+		     : -1, instr->direct_int_list_index_set);
 	    add_line(line, data);
+	    if (instr->deopt_map > 0
+		&& program->deopt_maps[instr->deopt_map].native_resume) {
+		JITNativeResume *resume =
+		    program->deopt_maps[instr->deopt_map].native_resume;
+		int j;
+
+		for (j = 0; j < resume->num_values; j++) {
+		    JITResumeValue *value = &resume->values[j];
+
+		    snprintf(line, sizeof(line),
+			     "    resume v%d source=%d index=%d type=%d tagged=%d",
+			     value->value, value->source, value->index,
+			     program->value_types[value->value],
+			     program->value_is_tagged[value->value]);
+		    add_line(line, data);
+		}
+	    }
 	    if (instr->kind == HIR_TAC_PARALLEL_COPY) {
 		JITCopy *copy;
 

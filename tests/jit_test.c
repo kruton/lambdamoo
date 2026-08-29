@@ -4,6 +4,7 @@
 #include "my-stdio.h"
 #include "my-string.h"
 
+#include "execute.h"
 #include "integer_arithmetic.h"
 #include "list.h"
 #include "storage.h"
@@ -13,7 +14,7 @@
 #include <limits.h>
 
 #define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
-    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1)
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1, 0, 0)
 
 static int failures;
 
@@ -110,6 +111,19 @@ set_program_value_type(JITProgram *program, int value, var_type type)
     if (!program->value_types)
 	program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_types[value] = type;
+}
+
+static void
+use_compact_tag_slots(JITProgram *program)
+{
+    int value;
+
+    program->value_tag_slots = allocate(sizeof(int) * program->num_values);
+    for (value = 0; value < program->num_values; value++) {
+	program->value_tag_slots[value] = -1;
+	if (program->value_is_tagged[value])
+	    program->value_tag_slots[value] = program->num_tag_slots++;
+    }
 }
 
 static JITProgram *
@@ -523,6 +537,7 @@ builtin_call_program(unsigned func)
     map->builtin_func = func;
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
+    map->native_resume->rehydratable = 1;
     map->native_resume->num_values = 1;
     map->native_resume->values = allocate(sizeof(JITResumeValue));
     map->native_resume->values[0].value = 2;
@@ -554,6 +569,7 @@ builtin_call_program(unsigned func)
     return_instr->literal_type = TYPE_ANY;
     block->first = load_args;
     block->last = return_instr;
+    use_compact_tag_slots(program);
     return program;
 }
 
@@ -885,6 +901,7 @@ call_verb_program(void)
     map->reason = JIT_DEOPT_VERB_CALL;
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
+    map->native_resume->rehydratable = 1;
     map->native_resume->num_values = 1;
     map->native_resume->values = allocate(sizeof(JITResumeValue));
     map->native_resume->values[0].value = 4;
@@ -2377,6 +2394,15 @@ tagged_binary_result_program(HIROp op, var_type result_type)
     JITInstruction *ret = binary->next;
 
     program->value_types[3] = result_type;
+    if (op == HIR_OP_LIST_ADD_TAIL) {
+	int i;
+
+	program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+	for (i = 0; i < program->num_values; i++)
+	    program->value_owned_slots[i] = -1;
+	program->value_owned_slots[3] = 0;
+	program->num_owned_slots = 1;
+    }
     ret->literal_type = result_type;
     return program;
 }
@@ -3298,7 +3324,7 @@ main(void)
 	      && stats.compile_failures == 0,
 	      "JIT compilation statistics are wrong");
 	check(stats.metadata_bytes > sizeof(JITProgram)
-	      && stats.runtime_bytes == sizeof(Num) * program->num_values * 2
+	      && stats.runtime_bytes == 0
 	      && stats.machine_code_bytes == program->machine_code_len
 	      && stats.native_allocated_bytes >= stats.machine_code_bytes,
 	      "JIT memory statistics are wrong");
@@ -3650,7 +3676,7 @@ main(void)
 	deopt_stack[0].v.str = str_dup("passed");
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "pass continuation did not return");
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "passed"),
 	      "pass continuation returned the wrong value");
@@ -3690,11 +3716,46 @@ main(void)
 	deopt_stack[0].v.num = 41;
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "generic built-in continuation did not return");
 	check(result.type == TYPE_INT && result.v.num == 41,
 	      "generic built-in continuation returned the wrong value");
 	free_var(deopt_stack[0]);
+	free_var(pass_env[0]);
+	jit_program_free(pass_prog);
+
+	/* Native-only continuations need not promise bytecode rehydration. */
+	pass_prog = builtin_call_program(17);
+	pass_prog->deopt_maps[1].native_resume->rehydratable = 0;
+	pass_args = new_list(0).v.list;
+	pass_env[0].type = TYPE_LIST;
+	pass_env[0].v.list = pass_args;
+	{
+	    JITContinuationFrame *continuation = 0;
+	    Var returned;
+
+	    check(jit_program_resume_map(pass_prog, pass_key) == -1,
+		  "native-only built-in exposed a bytecode resume map");
+	    check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "native-only built-in did not request a VM call");
+	    check(continuation != 0,
+		  "native-only built-in did not capture its continuation");
+	    free_var(deopt_stack[0]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 42;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, continuation,
+					0) == JIT_RUN_RETURNED,
+		  "native-only built-in continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 42,
+		  "native-only built-in continuation returned the wrong value");
+	    jit_continuation_free(continuation);
+	}
 	free_var(pass_env[0]);
 	jit_program_free(pass_prog);
 
@@ -3716,7 +3777,7 @@ main(void)
 	deopt_stack[0].v.fnum = box_fl(1.5);
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "float built-in continuation did not return");
 	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 1.5,
 	      "float built-in continuation returned the wrong value");
@@ -3820,12 +3881,106 @@ main(void)
 	deopt_stack[0].v.str = str_dup("returned");
 	check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "call_verb continuation did not return");
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "returned"),
 	      "call_verb continuation returned the wrong value");
 	free_var(result);
 	free_var(deopt_stack[0]);
+	{
+	    JITContinuationFrame *continuation = 0;
+	    activation owner = { 0 };
+	    Var shadow_stack[3];
+	    Var returned;
+
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "compact call_verb did not request a VM call");
+	    check(continuation && !deopt.materialized && deopt.stack_depth == 3,
+		  "call_verb did not capture a compact continuation");
+	    owner.base_rt_stack = shadow_stack;
+	    owner.top_rt_stack = shadow_stack + 3;
+	    jit_continuation_attach(continuation, &owner);
+	    jit_continuation_mark_dispatched(continuation);
+	    check(owner.top_rt_stack == owner.base_rt_stack,
+		  "dispatched continuation left compact operands live");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    returned.type = TYPE_STR;
+	    returned.v.str = str_dup("compact returned");
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, continuation,
+					0) == JIT_RUN_RETURNED,
+		  "compact call_verb continuation did not return");
+	    jit_continuation_free(continuation);
+	    check(result.type == TYPE_STR
+		  && !strcmp(result.v.str, "compact returned"),
+		  "compact call_verb continuation returned the wrong value");
+	    free_var(result);
+	}
+	{
+	    JITProgram *sparse = call_verb_program();
+	    JITDeoptMap *sparse_map = &sparse->deopt_maps[1];
+	    JITContinuationFrame *continuation = 0;
+	    activation owner = { 0 };
+	    Var owner_env[3];
+	    Var owner_stack[4];
+
+	    sparse_map->num_local_values = 2;
+	    sparse_map->local_values[1].slot = 2;
+	    sparse_map->local_values[1].value = 3;
+	    myfree(sparse_map->native_resume->values, M_PROGRAM);
+	    sparse_map->native_resume->num_values = 4;
+	    sparse_map->native_resume->values =
+		allocate(sizeof(JITResumeValue) * 4);
+	    sparse_map->native_resume->values[0].value = 1;
+	    sparse_map->native_resume->values[0].source = JIT_RESUME_LOCAL;
+	    sparse_map->native_resume->values[0].index = 0;
+	    sparse_map->native_resume->values[1].value = 2;
+	    sparse_map->native_resume->values[1].source = JIT_RESUME_STACK;
+	    sparse_map->native_resume->values[1].index = 1;
+	    sparse_map->native_resume->values[2].value = 3;
+	    sparse_map->native_resume->values[2].source = JIT_RESUME_LOCAL;
+	    sparse_map->native_resume->values[2].index = 2;
+	    sparse_map->native_resume->values[3].value = 4;
+	    sparse_map->native_resume->values[3].source = JIT_RESUME_RESULT;
+	    owner_env[0].type = TYPE_OBJ;
+	    owner_env[0].v.obj = 99;
+	    owner_env[1].type = TYPE_STR;
+	    owner_env[1].v.str = str_dup("resident local");
+	    owner_env[2] = new_list(0);
+	    owner.rt_env = owner_env;
+	    owner.base_rt_stack = owner_stack;
+	    owner.top_rt_stack = owner_stack;
+	    ticks = 10;
+	    check((jit_program_execute)(sparse, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "sparse continuation did not request a VM call");
+	    check(continuation != 0, "sparse continuation was not captured");
+	    if (continuation) {
+		jit_continuation_attach(continuation, &owner);
+		check(jit_continuation_materialize(&owner),
+		      "sparse continuation did not materialize");
+	    }
+	    check(owner_env[1].type == TYPE_STR
+		  && !strcmp(owner_env[1].v.str, "resident local"),
+		  "sparse continuation replaced an environment local");
+	    if (owner.jit_continuation)
+		jit_continuation_free(owner.jit_continuation);
+	    while (owner.top_rt_stack > owner.base_rt_stack)
+		free_var(*--owner.top_rt_stack);
+	    free_var(owner_env[0]);
+	    free_var(owner_env[1]);
+	    free_var(owner_env[2]);
+	    jit_program_free(sparse);
+	}
 	{
 	    JITProgram *fallthrough = call_verb_program();
 	    JITInstruction *call = fallthrough->blocks->first;
@@ -3839,7 +3994,7 @@ main(void)
 	    deopt_stack[0].v.num = 17;
 	    check((jit_program_execute)(fallthrough, deep_env, &result, &ticks,
 					&timed_out, &error, 0, &deopt,
-					deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+					deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 		  "fallthrough continuation did not return");
 	    check(result.type == TYPE_INT && result.v.num == 0,
 		  "fallthrough continuation did not return zero");
@@ -4209,18 +4364,48 @@ main(void)
 	{
 	    JITDeoptState protected_deopt;
 	    Var protected_stack[1];
+	    JITContinuationFrame *continuation = 0;
+	    JITDeoptMap *map = &str_length->deopt_maps[1];
+	    Var returned;
+
+	    map->resume_key.code_unit = 0;
+	    map->resume_key.site = 1;
+	    map->native_resume = allocate(sizeof(JITNativeResume));
+	    map->native_resume->valid = 1;
+	    map->native_resume->rehydratable = 1;
+	    map->native_resume->num_values = 1;
+	    map->native_resume->values = allocate(sizeof(JITResumeValue));
+	    map->native_resume->values[0].value = 2;
+	    map->native_resume->values[0].source = JIT_RESUME_RESULT;
 
 	    ticks = 10;
-	    check(jit_program_execute(str_length, 0, &result, &ticks,
-				      &timed_out, &error, 0, &protected_deopt,
-				      protected_stack)
+	    check((jit_program_execute)(str_length, 0, &result, &ticks,
+				       &timed_out, &error, 0, &protected_deopt,
+				       protected_stack, 2, -1, 0,
+				       &continuation)
 		  == JIT_RUN_CALL_VERB, "protected length did not enter VM");
+	    check(protected_deopt.reason == JIT_DEOPT_ARITHMETIC_TYPE
+		  && protected_deopt.boundary == JIT_BOUNDARY_BUILTIN,
+		  "protected length lost its boundary classification");
+	    check(continuation != 0,
+		  "protected length did not capture a native continuation");
 	    check(protected_deopt.stack_depth == 1
 		  && protected_stack[0].type == TYPE_LIST
 		  && protected_stack[0].v.list[0].v.num == 1
 		  && protected_stack[0].v.list[1].type == TYPE_STR,
 		  "protected length did not materialize its arguments");
 	    free_var(protected_stack[0]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 5;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(str_length, 0, &result, &ticks,
+				       &timed_out, &error, 0, &protected_deopt,
+				       protected_stack, 2, -1,
+				       continuation, 0) == JIT_RUN_RETURNED,
+		  "protected length continuation did not return");
+	    check(result.type == TYPE_INT && result.v.num == 5,
+		  "protected length continuation returned the wrong value");
+	    jit_continuation_free(continuation);
 	}
 	hir_test_set_length_protected(0);
 	ticks = 10;
@@ -5275,6 +5460,40 @@ main(void)
 	lapp_var.type = TYPE_LIST;
 	lapp_var.v.list = lapp;
 	free_var(lapp_var);
+
+	/* Indexed local updates preserve shared lists and acquire the RHS. */
+	{
+	    Var env[1];
+	    Var shared;
+	    Var *updated;
+	    const char *replacement = str_dup("replacement");
+
+	    env[0] = new_list(2);
+	    env[0].v.list[1].type = TYPE_INT;
+	    env[0].v.list[1].v.num = 10;
+	    env[0].v.list[2].type = TYPE_INT;
+	    env[0].v.list[2].v.num = 20;
+	    shared = var_ref(env[0]);
+	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 2,
+		(int64_t) (intptr_t) replacement, TYPE_STR, &rt_err);
+	    check(rt_err == E_NONE && updated == env[0].v.list,
+		  "jit_rt_list_index_set updates local");
+	    check(env[0].v.list != shared.v.list
+		  && shared.v.list[2].type == TYPE_INT
+		  && shared.v.list[2].v.num == 20,
+		  "jit_rt_list_index_set preserves shared list");
+	    check(env[0].v.list[2].type == TYPE_STR
+		  && !strcmp(env[0].v.list[2].v.str, "replacement"),
+		  "jit_rt_list_index_set stores complex value");
+	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 0,
+		42, TYPE_INT, &rt_err);
+	    check(!updated && rt_err == E_RANGE
+		  && env[0].v.list[2].type == TYPE_STR,
+		  "jit_rt_list_index_set rejects range without mutation");
+	    free_str(replacement);
+	    free_var(shared);
+	    free_var(env[0]);
+	}
 
 	/* 6. list_in test */
 	check(jit_rt_list_in(111, TYPE_INT, l1.v.list) == 1, "jit_rt_list_in found");

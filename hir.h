@@ -133,6 +133,7 @@ typedef enum {
     HIR_TAC_CALL,
     HIR_TAC_CALL_VERB,
     HIR_TAC_PUT_PROP,
+    HIR_TAC_INDEX_SET,
     HIR_TAC_RANGE_REF,
     HIR_TAC_RANGE_SET,
     HIR_TAC_UNSUPPORTED,
@@ -153,6 +154,7 @@ typedef enum {
 } HIRValueKind;
 
 extern HIRContext *hir_context_new(Names *);
+extern void hir_context_set_first_user_local(HIRContext *, int);
 extern void hir_context_free(HIRContext *);
 extern int hir_context_error_count(HIRContext *);
 extern const char *hir_context_error_message(HIRContext *);
@@ -219,6 +221,7 @@ extern int hir_ssa_stack_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
 extern int hir_ssa_binary_value_at_bytecode_pc(HIRSSAProgram *, unsigned,
 					       HIROp);
 extern int hir_ssa_local_value_at_bytecode_pc(HIRSSAProgram *, unsigned, int);
+extern int hir_ssa_local_snapshot_count(HIRSSAProgram *);
 extern int hir_ssa_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_zero_phi_arg_count(HIRSSAProgram *);
 extern int hir_ssa_return_uses_phi_count(HIRSSAProgram *);
@@ -237,6 +240,11 @@ extern unsigned short hir_test_binary_operand_type_mask(HIROp, int, int,
 						 var_type);
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
+extern int hir_test_list_tail_owner_slot(int, unsigned int, int);
+extern int hir_test_int_list_result(HIROp, int, int, var_type);
+extern int hir_test_all_copy_sources_are_int_lists(unsigned int,
+					    unsigned int);
+extern int hir_test_int_list_has_exclusive_local(unsigned int);
 extern int hir_test_infer_min_max_result(HIROp, var_type, var_type,
 					 var_type *);
 extern int hir_test_infer_builtin_result_type(const char *, var_type *);

@@ -18,6 +18,21 @@
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
+Var zero = { .type = TYPE_INT, .v.num = 0 };
+
+ResumeKey
+invalid_resume_key(void)
+{
+    return (ResumeKey){ 0, 0 };
+}
+
+const ResumePoint *
+resume_point_for_key(Program *program, ResumeKey key)
+{
+    (void) program;
+    (void) key;
+    return 0;
+}
 
 JITProgram *
 compile_program_to_jit(Program *program)
@@ -55,6 +70,27 @@ unsigned
 builtin_protection_generation(void)
 {
     return test_protection_generation;
+}
+
+int
+execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
+			     int64_t verb_raw, int verb_type,
+			     int64_t args_raw, int args_type,
+			     int *ticks, int *timed_out, enum error *error,
+			     int64_t *result_raw, int *result_type)
+{
+    (void) obj_raw;
+    (void) obj_type;
+    (void) verb_raw;
+    (void) verb_type;
+    (void) args_raw;
+    (void) args_type;
+    (void) ticks;
+    (void) timed_out;
+    (void) error;
+    (void) result_raw;
+    (void) result_type;
+    return 0;
 }
 
 int
@@ -186,6 +222,21 @@ complex_var_ref(Var value)
     else if (value.type == TYPE_WAIF)
 	addref(value.v.waif);
 #endif
+    return value;
+}
+
+Var
+complex_var_dup(Var value)
+{
+    if (value.type == TYPE_LIST) {
+	Var copy = new_list(value.v.list[0].v.num);
+	int i;
+
+	for (i = 1; i <= value.v.list[0].v.num; i++)
+	    copy.v.list[i] = var_ref(value.v.list[i]);
+	value = copy;
+    } else
+	value = var_ref(value);
     return value;
 }
 
@@ -404,6 +455,14 @@ listappend(Var list, Var value)
     result.v.list[len + 1] = value;
     free_var(list);
     return result;
+}
+
+Var
+listset(Var list, Var value, int pos)
+{
+    free_var(list.v.list[pos]);
+    list.v.list[pos] = value;
+    return list;
 }
 
 Var

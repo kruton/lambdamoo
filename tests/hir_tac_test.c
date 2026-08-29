@@ -102,12 +102,50 @@ test_boundary_tick_refunds(void)
 	check_int("range boundary refunds tick",
 		  hir_test_boundary_ticks_charged(HIR_TAC_RANGE_SET,
 					  HIR_OP_INDEX), 1);
+	check_int("native index-store boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_INDEX_SET,
+					  HIR_OP_INDEX), 1);
 	check_int("scatter boundary refunds tick",
 		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
 					  HIR_OP_SCATTER), 1);
 	check_int("index-store boundary has no tick to refund",
 		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
 					  HIR_OP_INDEX), 0);
+}
+
+static void
+test_list_tail_ownership_slots(void)
+{
+    check_int("last-use list tail reuses ownership slot",
+	      hir_test_list_tail_owner_slot(3, 1, 7), 3);
+    check_int("shared list tail gets new ownership slot",
+	      hir_test_list_tail_owner_slot(3, 2, 7), 7);
+    check_int("unowned list tail gets new ownership slot",
+	      hir_test_list_tail_owner_slot(-1, 1, 7), 7);
+    check_int("integer tail preserves integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_ADD_TAIL, 1, 0,
+				       TYPE_INT), 1);
+    check_int("mixed tail rejects integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_ADD_TAIL, 1, 0,
+				       TYPE_STR), 0);
+    check_int("integer-list append preserves proof",
+	      hir_test_int_list_result(HIR_OP_LIST_APPEND, 1, 1,
+				       TYPE_LIST), 1);
+    check_int("unknown append rejects integer-list proof",
+	      hir_test_int_list_result(HIR_OP_LIST_APPEND, 1, 0,
+				       TYPE_LIST), 0);
+    check_int("all integer-list phi inputs preserve proof",
+	      hir_test_all_copy_sources_are_int_lists(2, 2), 1);
+    check_int("mixed phi inputs reject integer-list proof",
+	      hir_test_all_copy_sources_are_int_lists(2, 1), 0);
+    check_int("missing phi inputs reject integer-list proof",
+	      hir_test_all_copy_sources_are_int_lists(0, 0), 0);
+    check_int("one local permits direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(1), 1);
+    check_int("no local rejects direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(0), 0);
+    check_int("aliased locals reject direct integer-list update",
+	      hir_test_int_list_has_exclusive_local(2), 0);
 }
 
 static void
@@ -1159,6 +1197,136 @@ test_if_then_phi_uses_entry_local_ssa(void)
 }
 
 static void
+test_dead_if_else_local_has_no_phi(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Cond_Arm arm;
+    Expr one = int_expr(1, 90);
+    Expr two = int_expr(2, 90);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+    Expr then_value = int_expr(3, 91);
+    Expr then_lhs = id_expr(16, 91);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+    Expr else_value = int_expr(4, 92);
+    Expr else_lhs = id_expr(16, 92);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+    Expr ret_expr = int_expr(5, 93);
+    Stmt ret = return_stmt(&ret_expr);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 90;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    (void) lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("dead ifelse local phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 0);
+    check_int("dead ifelse local entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("dead ifelse local verify errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_uninitialized_user_local_is_none_constant(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRProgram *program;
+    HIRTacProgram *tac;
+    HIRCFG *cfg;
+    HIRSSAProgram *ssa;
+    Expr local = id_expr(18, 95);
+    Stmt ret = return_stmt(&local);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 19;
+    ctx = hir_context_new(&names);
+    hir_context_set_first_user_local(ctx, 18);
+    program = hir_lift_ast(ctx, &ret);
+    tac = hir_lower_to_tac(ctx, program);
+    cfg = hir_build_cfg(ctx, tac);
+    ssa = hir_build_ssa(ctx, cfg);
+
+    check_int("uninitialized local entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("uninitialized local none constants",
+	      hir_ssa_count_kind(ssa, HIR_TAC_CONST), 1);
+    check_int("uninitialized local verify", hir_verify_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
+test_deopt_live_if_else_local_keeps_phi(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    Cond_Arm arm;
+    Expr one = int_expr(1, 100);
+    Expr two = int_expr(2, 100);
+    Expr cond = binary_expr(EXPR_LT, &one, &two);
+    Expr then_value = int_expr(3, 101);
+    Expr then_lhs = id_expr(16, 101);
+    Expr then_assign = binary_expr(EXPR_ASGN, &then_lhs, &then_value);
+    Stmt then_stmt = expr_stmt(&then_assign);
+    Expr else_value = int_expr(4, 102);
+    Expr else_lhs = id_expr(16, 102);
+    Expr else_assign = binary_expr(EXPR_ASGN, &else_lhs, &else_value);
+    Stmt else_stmt = expr_stmt(&else_assign);
+    Expr numerator = int_expr(6, 103);
+    Expr denominator = int_expr(2, 103);
+    Expr divide = binary_expr(EXPR_DIVIDE, &numerator, &denominator);
+    Stmt ret = return_stmt(&divide);
+    Stmt if_stmt_node;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&arm, 0, sizeof(arm));
+    arm.condition = &cond;
+    arm.stmt = &then_stmt;
+
+    memset(&if_stmt_node, 0, sizeof(if_stmt_node));
+    if_stmt_node.kind = STMT_COND;
+    if_stmt_node.lineno = 100;
+    if_stmt_node.s.cond.arms = &arm;
+    if_stmt_node.s.cond.otherwise = &else_stmt;
+    if_stmt_node.next = &ret;
+
+    (void) lower_stmt(&names, &if_stmt_node, &ctx, &cfg, &dom, &ssa);
+
+    check_int("deopt-live ifelse local phi count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
+    check_int("deopt-live ifelse materialization snapshots",
+	      hir_ssa_local_snapshot_count(ssa), 2);
+    check_int("deopt-live ifelse local verify errors",
+	      hir_context_error_count(ctx), 0);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_guarded_environment_local_tac_ssa(void)
 {
     Names names;
@@ -1360,7 +1528,7 @@ test_list_index_tac_ssa(void)
 }
 
 static void
-test_direct_index_assignment_deopt(void)
+test_direct_index_assignment_native(void)
 {
     Names names;
     HIRContext *ctx;
@@ -1386,11 +1554,15 @@ test_direct_index_assignment_deopt(void)
     tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
 
     check_int("index assignment accepted", hir_context_error_count(ctx), 0);
+	check_int("index assignment native count",
+	      hir_tac_count_kind(tac, HIR_TAC_INDEX_SET), 1);
     check_int("index assignment deopt count",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
-    check_int("index assignment deopt stack",
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
+    check_int("index assignment resume stack",
 	      hir_tac_stack_depth_at_bytecode_pc(tac, 4), 3);
     check_int("index assignment ssa valid", hir_verify_ssa(ctx, ssa), 1);
+    check_int("index assignment ssa count",
+	      hir_ssa_count_kind(ssa, HIR_TAC_INDEX_SET), 1);
     check_int("index assignment destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
@@ -2968,6 +3140,8 @@ test_repeated_local_assignment_ssa(void)
 	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
     check_int("repeat assign ssa stores",
 	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
+    check_int("repeat assign materialization snapshots",
+	      hir_ssa_local_snapshot_count(ssa), 0);
     check_int("repeat assign verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);
@@ -3484,8 +3658,10 @@ test_length_expr_in_stores_and_negatives(void)
     stmt_idx = expr_stmt(&assign_idx);
     tac = lower_stmt(&names, &stmt_idx, &ctx, &cfg, &dom, &ssa);
     check_int("length in index store verify errors", hir_context_error_count(ctx), 0);
+    check_int("length in index store native count",
+	      hir_tac_count_kind(tac, HIR_TAC_INDEX_SET), 1);
     check_int("length in index store deopt count",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
     hir_context_free(ctx);
 
     /* 2. local[1..$] = 42 */
@@ -3576,6 +3752,7 @@ main(void)
     test_resume_stack_safety();
     test_resume_stack_shape();
     test_boundary_tick_refunds();
+    test_list_tail_ownership_slots();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_binary_type_pair_contracts();
@@ -3594,11 +3771,14 @@ main(void)
     test_while_loop_phi_ssa();
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
+    test_dead_if_else_local_has_no_phi();
+    test_uninitialized_user_local_is_none_constant();
+    test_deopt_live_if_else_local_keeps_phi();
     test_guarded_environment_local_tac_ssa();
     test_multiple_guarded_environment_locals_ssa();
     test_conditional_local_assignment_with_entry_local_analysis();
     test_list_index_tac_ssa();
-    test_direct_index_assignment_deopt();
+    test_direct_index_assignment_native();
     test_nested_index_assignment_deopt();
     test_property_index_assignment_deopt();
     test_list_index_in_arithmetic_tac_ssa();

@@ -29,7 +29,9 @@
 
 #define ANY_RESUME_VECTOR (-2)
 
-typedef struct {
+struct JITContinuationFrame;
+
+typedef struct activation {
     Program *prog;
     Var *rt_env;		/* same length as prog.var_names */
     Var *base_rt_stack;
@@ -64,8 +66,9 @@ typedef struct {
     const char *verb;
     const char *verbname;
     int debug;
+    struct JITContinuationFrame *jit_continuation;
 } activation;
-#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (17 * V) + X(WAIF_CORE, B(Var)))
+#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (18 * V) + X(WAIF_CORE, B(Var)))
 
 extern void free_activation(activation *, char data_too);
 
@@ -98,6 +101,11 @@ extern enum error call_verb(Objid obj, const char *vname, Var args,
 extern enum error call_verb2(Objid obj, const char *vname
 			     WAIF_COMMA_ARG(Var THIS),
 			     Var args, int do_pass);
+#ifdef ENABLE_JIT
+extern int execute_jit_direct_verb_call(int64_t, int, int64_t, int, int64_t,
+					int, int *, int *, enum error *,
+					int64_t *, int *);
+#endif
 
 extern int setup_activ_for_eval(Program * prog);
 

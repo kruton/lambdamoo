@@ -23,6 +23,9 @@
 #include "db_io.h"
 #include "decompile.h"
 #include "execute.h"
+#ifdef ENABLE_JIT
+#include "jit.h"
+#endif
 #include "log.h"
 #include "storage.h"
 #include "structures.h"
@@ -84,6 +87,12 @@ write_vm(vm the_vm)
 {
     unsigned i;
 
+#ifdef ENABLE_JIT
+    for (i = 0; i <= the_vm->top_activ_stack; i++)
+	if (the_vm->activ_stack[i].jit_continuation
+	    && !jit_continuation_materialize(&the_vm->activ_stack[i]))
+	    panic("JIT continuation database materialization failed");
+#endif
     dbio_printf("portable vm 1 %u %u\n", the_vm->top_activ_stack,
 		the_vm->max_stack_size);
 
