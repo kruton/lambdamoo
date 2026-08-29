@@ -48,6 +48,7 @@ struct JITDeoptMap {
     int builtin_args;
     int operation;
     JITDeoptReason reason;
+    int native_error_block;
 };
 
 static inline int
@@ -91,6 +92,8 @@ struct JITInstruction {
     ResumeKey resume_key;
     unsigned source_lineno;
     unsigned bytecode_pc;
+    int error_block;
+    int label;
     int value;
     int src1;
     int src2;

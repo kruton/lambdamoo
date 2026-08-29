@@ -2896,12 +2896,14 @@ test_catch_expr_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr catch_expr, try_expr, handler_expr;
+    Expr catch_expr, try_expr, lhs_expr, rhs_expr, handler_expr;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
-    try_expr = id_expr(0, 30);
+    lhs_expr = int_expr(1, 30);
+    rhs_expr = int_expr(0, 30);
+    try_expr = binary_expr(EXPR_DIVIDE, &lhs_expr, &rhs_expr);
     handler_expr = int_expr(42, 30);
     memset(&catch_expr, 0, sizeof(catch_expr));
     catch_expr.kind = EXPR_CATCH;
@@ -2933,14 +2935,16 @@ test_try_except_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr val_expr, handler_val;
+    Expr val_expr, divisor_expr, try_expr, handler_val;
     Stmt body_stmt, handler_stmt, try_stmt;
     Except_Arm except_arm;
 
     memset(&names, 0, sizeof(names));
     names.size = 32;
     val_expr = int_expr(10, 40);
-    body_stmt = return_stmt(&val_expr);
+    divisor_expr = int_expr(0, 40);
+    try_expr = binary_expr(EXPR_DIVIDE, &val_expr, &divisor_expr);
+    body_stmt = expr_stmt(&try_expr);
     handler_val = int_expr(20, 42);
     handler_stmt = return_stmt(&handler_val);
 
@@ -2958,11 +2962,11 @@ test_try_except_tac_ssa(void)
     tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
 
     check_int("try except tac returns",
-	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 2);
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
     check_int("try except deopt boundary",
 	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
-    check_int("try except cfg blocks", hir_cfg_block_count(cfg), 1);
-    check_int("try except ssa blocks", hir_ssa_block_count(ssa), 1);
+    check_int("try except cfg blocks", hir_cfg_block_count(cfg) > 1, 1);
+    check_int("try except ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("try except verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);

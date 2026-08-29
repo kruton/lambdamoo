@@ -361,6 +361,7 @@ struct HIRTacInstr {
     HIRTacKind kind;
     unsigned source_lineno;
     unsigned bytecode_pc;
+    int error_label;
     int dst;
     int src1;
     int src2;
@@ -441,6 +442,7 @@ struct HIRSSAInstr {
     HIRTacKind kind;
     unsigned source_lineno;
     unsigned bytecode_pc;
+    int error_label;
     int value;
     int src1;
     int src2;
@@ -515,6 +517,7 @@ struct HIRContext {
     int *lower_stack;
     HIRLoopContext *current_loop;
     HIRFinallyContext *current_finally;
+    int current_error_label;
     int current_length_base;
 };
 
@@ -553,6 +556,7 @@ hir_context_new(Names *var_names)
     ctx->lower_stack = 0;
     ctx->current_loop = 0;
     ctx->current_finally = 0;
+    ctx->current_error_label = 0;
     ctx->current_length_base = 0;
 
     return ctx;
@@ -700,6 +704,7 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_DEOPT:
 	    break;
 	case HIR_TAC_CONST:
+	case HIR_TAC_LOAD_ERROR:
 	case HIR_TAC_LOAD_LOCAL:
 	    if (instr->kind == HIR_TAC_LOAD_LOCAL)
 		verify_local(ctx, instr->local_id);
@@ -769,13 +774,24 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 }
 
 static int
+tac_can_raise_natively(HIRTacInstr *instr)
+{
+    return instr && (instr->kind == HIR_TAC_UNARY
+		     || instr->kind == HIR_TAC_BINARY
+		     || instr->kind == HIR_TAC_PUT_PROP
+		     || instr->kind == HIR_TAC_RANGE_REF
+		     || instr->kind == HIR_TAC_RANGE_SET);
+}
+
+static int
 tac_is_terminator(HIRTacInstr *instr)
 {
     return instr
 	&& (instr->kind == HIR_TAC_JUMP
 	    || instr->kind == HIR_TAC_BRANCH_FALSE
 	    || instr->kind == HIR_TAC_RETURN
-	    || instr->kind == HIR_TAC_RETURN0);
+	    || instr->kind == HIR_TAC_RETURN0
+	    || (instr->error_label > 0 && tac_can_raise_natively(instr)));
 }
 
 static HIRBasicBlock *
@@ -1048,6 +1064,9 @@ hir_build_cfg(HIRContext *ctx, HIRTacProgram *program)
 	case HIR_TAC_RETURN0:
 	    break;
 	default:
+	    if (last->error_label > 0 && tac_can_raise_natively(last))
+		add_edge(cfg, block, block_for_label(ctx, label_blocks,
+						       max_label, last->error_label));
 	    add_edge(cfg, block, block->next);
 	    break;
 	}
@@ -1114,7 +1133,7 @@ cfg_expected_successors(HIRTacInstr *last)
     case HIR_TAC_RETURN0:
 	return 0;
     default:
-	return -1;
+	return last->error_label > 0 && tac_can_raise_natively(last) ? 2 : -1;
     }
 }
 
@@ -1524,6 +1543,7 @@ ssa_defines_value(HIRSSAInstr *instr)
 {
     return instr
 	&& (instr->kind == HIR_TAC_CONST
+	    || instr->kind == HIR_TAC_LOAD_ERROR
 	    || instr->kind == HIR_TAC_LOAD_LOCAL
 	    || instr->kind == HIR_TAC_UNARY
 	    || instr->kind == HIR_TAC_BINARY
@@ -1569,6 +1589,7 @@ new_ssa_instr(HIRContext *ctx, HIRTacInstr *tac)
     instr->kind = tac->kind;
     instr->source_lineno = tac->source_lineno;
     instr->bytecode_pc = tac->bytecode_pc;
+    instr->error_label = tac->error_label;
     instr->value = tac->dst;
     instr->src1 = tac->src1;
     instr->src2 = tac->src2;
@@ -2322,6 +2343,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_DEOPT:
 		break;
 	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_ERROR:
 	    case HIR_TAC_LOAD_LOCAL:
 		if (instr->kind == HIR_TAC_LOAD_LOCAL)
 		    verify_local(ctx, instr->local_id);
@@ -3323,6 +3345,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    case HIR_TAC_DEOPT:
 		break;
 	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_ERROR:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
@@ -3500,6 +3523,7 @@ tac_kind_name(HIRTacKind kind)
     case HIR_TAC_TICK: return "tick";
     case HIR_TAC_DEOPT: return "deopt";
     case HIR_TAC_CONST: return "const";
+    case HIR_TAC_LOAD_ERROR: return "load-error";
     case HIR_TAC_LOAD_LOCAL: return "load-local";
     case HIR_TAC_STORE_LOCAL: return "store-local";
     case HIR_TAC_UNARY: return "unary";
@@ -3538,6 +3562,7 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_LOAD_ERROR:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
 	    case HIR_TAC_CALL_VERB:
@@ -3783,6 +3808,7 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 		}
 		break;
 	    case HIR_TAC_CONST:
+	    case HIR_TAC_LOAD_ERROR:
 	    case HIR_TAC_LOAD_LOCAL:
 		if (instr->bytecode_pc != NO_BYTECODE_PC
 		    && instr->bytecode_pc >= bc->size) {
@@ -3981,6 +4007,7 @@ static int
 jit_instr_defines_value(JITInstruction *instr)
 {
     return instr->kind == HIR_TAC_CONST || instr->kind == HIR_TAC_LOAD_LOCAL
+	|| instr->kind == HIR_TAC_LOAD_ERROR
 	|| instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB
 	|| instr->kind == HIR_TAC_PUT_PROP || instr->kind == HIR_TAC_RANGE_REF
@@ -4296,6 +4323,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 
 		if (si->kind == HIR_TAC_CONST) {
 		    value_types[si->value] = si->literal.type;
+		    value_types_known[si->value] = 1;
+		} else if (si->kind == HIR_TAC_LOAD_ERROR) {
+		    value_types[si->value] = TYPE_ERR;
 		    value_types_known[si->value] = 1;
 		} else if (builtin_entry_type(si->kind, si->bytecode_pc,
 					   si->local_id,
@@ -4858,6 +4888,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->resume_key = ssa_instr->resume_key;
 	    instr->source_lineno = ssa_instr->source_lineno;
 	    instr->bytecode_pc = ssa_instr->bytecode_pc;
+	    instr->error_block = ssa_instr->error_label > 0 && cfg_block
+		&& cfg_block->num_successors > 0
+		? cfg_block->successors[0]->id : 0;
+	    instr->label = ssa_instr->label;
 	    if (ssa_instr->bytecode_pc != NO_BYTECODE_PC)
 		program->num_resume_anchors++;
 	    instr->value = ssa_instr->value;
@@ -5025,6 +5059,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		return jit_program_unsupported_with_diagnostic("invalid-deopt-map",
 							       "deopt-map: map allocation or stack value failed");
 	    }
+	    if (instr->deopt_map > 0 && instr->error_block > 0)
+		program->deopt_maps[instr->deopt_map].native_error_block
+		    = instr->error_block;
 	    if (ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_DIV || ssa_instr->op == HIR_OP_MOD
 		    || ssa_instr->op == HIR_OP_EXP || ssa_instr->op == HIR_OP_SHL
@@ -5317,6 +5354,9 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 		fprintf(file, " t%d = ", instr->value);
 		dump_var(file, instr->literal);
 		break;
+	    case HIR_TAC_LOAD_ERROR:
+		fprintf(file, " t%d = current_error", instr->value);
+		break;
 	    case HIR_TAC_LOAD_LOCAL:
 		fprintf(file, " t%d = local[%d]", instr->value,
 			instr->local_id);
@@ -5420,6 +5460,8 @@ tac_kind_name(HIRTacKind kind)
 	return "deopt";
     case HIR_TAC_CONST:
 	return "const";
+    case HIR_TAC_LOAD_ERROR:
+	return "load_error";
     case HIR_TAC_LOAD_LOCAL:
 	return "load_local";
     case HIR_TAC_STORE_LOCAL:
@@ -6853,6 +6895,7 @@ new_tac(HIRContext *ctx, HIRTacKind kind, unsigned source_lineno)
     instr->kind = kind;
     instr->source_lineno = source_lineno;
     instr->bytecode_pc = NO_BYTECODE_PC;
+    instr->error_label = ctx->current_error_label;
     instr->dst = 0;
     instr->src1 = 0;
     instr->src2 = 0;
@@ -7333,6 +7376,7 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     int try_val;
     int handler_val;
     int result_temp;
+    int saved_error_label = ctx->current_error_label;
 
     codes_val = lower_codes(ctx, program, expr->u.catch_expr.codes,
 			    expr->source_lineno, expr->bytecode_pc);
@@ -7356,7 +7400,10 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     append_tac(program, catch_marker_tac);
     push_lower_stack(ctx, catch_marker_val);
 
+    if (!expr->u.catch_expr.codes)
+	ctx->current_error_label = handler_label;
     try_val = lower_expr(ctx, program, expr->u.catch_expr.body);
+    ctx->current_error_label = saved_error_label;
     append_internal_store(ctx, program, result_local, try_val,
 			  expr->source_lineno);
 
@@ -7366,8 +7413,16 @@ lower_catch_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
     append_label(ctx, program, handler_label, expr->source_lineno);
     if (expr->u.catch_expr.handler)
 	handler_val = lower_expr(ctx, program, expr->u.catch_expr.handler);
-    else
-	handler_val = try_val;
+    else {
+	HIRTacInstr *load_error = new_tac(ctx, HIR_TAC_LOAD_ERROR,
+					 expr->source_lineno);
+
+	load_error->dst = new_temp(ctx);
+	load_error->literal.type = TYPE_ERR;
+	append_tac(program, load_error);
+	push_lower_stack(ctx, load_error->dst);
+	handler_val = load_error->dst;
+    }
 
     append_internal_store(ctx, program, result_local, handler_val,
 			  expr->source_lineno);
@@ -8246,6 +8301,7 @@ static void
 lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 {
     int base_depth = ctx->lower_stack_depth;
+    int saved_error_label = ctx->current_error_label;
     HIRExceptArm *ex;
     int arm_count = 0;
     int done_label = new_label(ctx);
@@ -8284,7 +8340,11 @@ lower_try_except(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
     append_tac(program, catch_marker);
     push_lower_stack(ctx, catch_marker_val);
 
+    if (arm_count == 1 && !stmt->u.try_except.excepts->codes
+	&& stmt->u.try_except.excepts->local_id < 0)
+	ctx->current_error_label = stmt->u.try_except.excepts->label;
     lower_stmt_list(ctx, program, stmt->u.try_except.body);
+    ctx->current_error_label = saved_error_label;
 
     ctx->lower_stack_depth = base_depth;
     append_jump(ctx, program, done_label, stmt->source_lineno);

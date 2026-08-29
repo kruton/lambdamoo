@@ -1402,6 +1402,71 @@ string_length_program(const char *s)
 }
 
 static JITProgram *
+native_catch_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *body = allocate(sizeof(JITBlock));
+    JITBlock *handler = allocate(sizeof(JITBlock));
+    JITInstruction *lhs = instruction(HIR_TAC_CONST);
+    JITInstruction *rhs = instruction(HIR_TAC_CONST);
+    JITInstruction *divide = instruction(HIR_TAC_BINARY);
+    JITInstruction *load_error = instruction(HIR_TAC_LOAD_ERROR);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_blocks = 2;
+    program->value_types = allocate(sizeof(var_type) * 5);
+    program->value_types[1] = TYPE_INT;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = TYPE_ERR;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->bytecode_pc = map->error_pc = 25;
+    map->native_error_block = 2;
+
+    program->blocks = body;
+    program->last_block = handler;
+    body->id = 1;
+    body->num_successors = 2;
+    body->successors[0] = 2;
+    body->successors[1] = 2;
+    body->next = handler;
+    handler->id = 2;
+
+    lhs->value = 1;
+    lhs->literal = 1;
+    lhs->literal_type = TYPE_INT;
+    lhs->next = rhs;
+    rhs->value = 2;
+    rhs->literal = 0;
+    rhs->literal_type = TYPE_INT;
+    rhs->next = divide;
+    divide->value = 3;
+    divide->src1 = 1;
+    divide->src2 = 2;
+    divide->op = HIR_OP_DIV;
+    divide->deopt_map = 1;
+    divide->error_block = 2;
+    divide->bytecode_pc = 25;
+    body->first = lhs;
+    body->last = divide;
+
+    load_error->value = 4;
+    load_error->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_ERR;
+    handler->first = load_error;
+    handler->last = ret;
+    return program;
+}
+
+static JITProgram *
 catch_stack_marker_program(int native_error)
 {
     JITProgram *program = new_jit_program();
@@ -4402,6 +4467,17 @@ main(void)
 
     /* Exception and finally stack marker deoptimization tests */
     {
+	JITProgram *native_catch = native_catch_program();
+
+	ticks = 10;
+	check(jit_program_execute(native_catch, 0, &result, &ticks, &timed_out,
+				  &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "native catch handler did not return");
+	check(result.type == TYPE_ERR && result.v.err == E_DIV,
+	      "native catch handler received the wrong error");
+	free_var(result);
+	jit_program_free(native_catch);
+
 	JITProgram *boundary = exception_boundary_deopt_program();
 	JITDeoptState boundary_state;
 	ticks = 10;

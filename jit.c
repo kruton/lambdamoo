@@ -1128,6 +1128,7 @@ append_materialized_exit(MIRBuild *, JITProgram *, int, MIR_reg_t *,
 static void
 append_status_exits(MIRBuild *build, JITStatusExit *exit,
 		    JITProgram *program, MIR_reg_t *values,
+		    MIR_label_t *labels,
 		    MIR_reg_t source_location, MIR_reg_t deopt_map_out,
 		    MIR_reg_t deopt_values, MIR_reg_t error_out,
 		    MIR_reg_t status, MIR_label_t common_return)
@@ -1157,6 +1158,12 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 			       0, error_out, 0, 1),
 		MIR_new_int_op(build->context, exit->error)));
 	if (exit->status == JIT_RUN_ERROR && exit->deopt_map > 0
+	    && exit->deopt_map < program->num_deopt_maps
+	    && program->deopt_maps[exit->deopt_map].native_error_block > 0)
+	    append(build, MIR_new_insn(build->context, MIR_JMP,
+		MIR_new_label_op(build->context,
+		    labels[program->deopt_maps[exit->deopt_map].native_error_block])));
+	else if (exit->status == JIT_RUN_ERROR && exit->deopt_map > 0
 	    && exit->deopt_map < program->num_deopt_maps)
 	    append_materialized_exit(build, program, exit->deopt_map, values,
 		deopt_map_out, deopt_values, status, common_return,
@@ -1544,6 +1551,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	    for (instr = block->first; instr; instr = instr->next) {
 		append_source_marker(build, instr, &source_marker_serial);
 		switch (instr->kind) {
+		case HIR_TAC_LOAD_ERROR:
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_reg_op(build->context, values[instr->value]),
+			MIR_new_mem_op(build->context, MIR_T_I32,
+				       0, error_out, 0, 1)));
+		    break;
 		case HIR_TAC_TICK:
 		    if (instr->op != HIR_OP_CHARGE_TICK) {
 			tick_abort = new_status_exit(build, &status_exits,
@@ -4308,7 +4321,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, 0)));
     return_status(build, status, common_return, JIT_RUN_FALLBACK);
-    append_status_exits(build, status_exits, program, values, source_location,
+    append_status_exits(build, status_exits, program, values, labels, source_location,
 			deopt_map_out, deopt_values, error_out, status,
 			common_return);
     append(build, common_return);
