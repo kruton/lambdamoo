@@ -73,6 +73,27 @@ builtin_protection_generation(void)
 }
 
 int
+execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
+			     int64_t verb_raw, int verb_type,
+			     int64_t args_raw, int args_type,
+			     int *ticks, int *timed_out, enum error *error,
+			     int64_t *result_raw, int *result_type)
+{
+    (void) obj_raw;
+    (void) obj_type;
+    (void) verb_raw;
+    (void) verb_type;
+    (void) args_raw;
+    (void) args_type;
+    (void) ticks;
+    (void) timed_out;
+    (void) error;
+    (void) result_raw;
+    (void) result_type;
+    return 0;
+}
+
+int
 builtin_function_is_protected(unsigned n)
 {
     return n == 6 && test_length_protected;

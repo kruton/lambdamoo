@@ -98,6 +98,11 @@ extern enum error call_verb(Objid obj, const char *vname, Var args,
 extern enum error call_verb2(Objid obj, const char *vname
 			     WAIF_COMMA_ARG(Var THIS),
 			     Var args, int do_pass);
+#ifdef ENABLE_JIT
+extern int execute_jit_direct_verb_call(int64_t, int, int64_t, int, int64_t,
+					int, int *, int *, enum error *,
+					int64_t *, int *);
+#endif
 
 extern int setup_activ_for_eval(Program * prog);
 

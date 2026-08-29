@@ -128,6 +128,7 @@ extern const char *jit_program_reason(JITProgram *);
 extern const char *jit_program_diagnostic(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
+extern int jit_program_is_direct_leaf(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern void jit_program_stats(JITProgram *, JITProgramStats *);

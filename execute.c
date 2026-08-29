@@ -805,6 +805,121 @@ call_verb2(Objid this, const char *vname
     return E_NONE;
 }
 
+#ifdef ENABLE_JIT
+static Var
+jit_direct_raw_var(int64_t raw, int type)
+{
+    Var value;
+
+    value.type = (var_type) type;
+    if (type == TYPE_STR)
+	value.v.str = (const char *) (intptr_t) raw;
+    else if (type == TYPE_LIST)
+	value.v.list = (Var *) (intptr_t) raw;
+#ifdef WAIF_CORE
+    else if (type == TYPE_WAIF)
+	value.v.waif = (Waif *) (intptr_t) raw;
+#endif
+    else
+	value.v.num = (Num) raw;
+    return value;
+}
+
+static int64_t
+jit_direct_var_raw(Var value)
+{
+    if (value.type == TYPE_FLOAT) {
+	double number = fl_unbox(value.v.fnum);
+	int64_t raw;
+
+	memcpy(&raw, &number, sizeof(raw));
+	return raw;
+    }
+    if (value.type == TYPE_STR)
+	return (int64_t) (intptr_t) value.v.str;
+    if (value.type == TYPE_LIST)
+	return (int64_t) (intptr_t) value.v.list;
+#ifdef WAIF_CORE
+    if (value.type == TYPE_WAIF)
+	return (int64_t) (intptr_t) value.v.waif;
+#endif
+    return value.v.num;
+}
+
+int
+execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
+			     int64_t verb_raw, int verb_type,
+			     int64_t args_raw, int args_type,
+			     int *ticks, int *timed_out, enum error *error,
+			     int64_t *result_raw, int *result_type)
+{
+    Var obj = jit_direct_raw_var(obj_raw, obj_type);
+    Var verb = jit_direct_raw_var(verb_raw, verb_type);
+    Var args = jit_direct_raw_var(args_raw, args_type);
+    Var result = zero;
+    JITSourceLocation source_location;
+    JITDeoptState deopt;
+    JITContinuationFrame *continuation = 0;
+    JITRunResult run_result;
+    Program *callee;
+    Var call_args;
+    enum error call_error;
+    int saved_ticks = *ticks;
+    int saved_timed_out = *timed_out;
+    enum error saved_error = *error;
+
+    if (verb.type != TYPE_STR || args.type != TYPE_LIST)
+	return 0;
+#ifdef WAIF_CORE
+    if (obj.type == TYPE_WAIF) {
+	if (!valid(obj.v.waif->class))
+	    return 0;
+    } else
+#endif
+    if (obj.type != TYPE_OBJ || !valid(obj.v.obj))
+	return 0;
+
+    call_args = var_ref(args);
+    call_error = call_verb2(
+#ifdef WAIF_CORE
+	obj.type == TYPE_WAIF ? obj.v.waif->class :
+#endif
+	obj.v.obj, verb.v.str WAIF_COMMA_ARG(obj), call_args, 0);
+    if (call_error != E_NONE) {
+	free_var(call_args);
+	return 0;
+    }
+    callee = RUN_ACTIV.prog;
+    if (!callee->jit || !jit_program_is_direct_leaf(callee->jit)) {
+	free_activation(&RUN_ACTIV, 0);
+	top_activ_stack--;
+	return 0;
+    }
+
+    jit_profile_record_entry(callee->jit);
+    run_result = jit_program_execute(callee->jit, RUN_ACTIV.rt_env, &result,
+	    ticks, timed_out, error, &source_location, &deopt,
+	    RUN_ACTIV.base_rt_stack, RUN_ACTIV.progr, -1, 0, &continuation);
+    if (run_result == JIT_RUN_RETURNED) {
+	jit_profile_record_completed(callee->jit);
+	*result_raw = jit_direct_var_raw(result);
+	*result_type = result.type;
+	free_activation(&RUN_ACTIV, 0);
+	top_activ_stack--;
+	return 1;
+    }
+    if (continuation)
+	jit_continuation_free(continuation);
+    free_var(result);
+    free_activation(&RUN_ACTIV, 0);
+    top_activ_stack--;
+    *ticks = saved_ticks;
+    *timed_out = saved_timed_out;
+    *error = saved_error;
+    return 0;
+}
+#endif
+
 static inline int
 int_or_float(Var v)
 {

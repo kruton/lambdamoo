@@ -167,6 +167,7 @@ struct JITProgram {
     const char *diagnostic;
     int eligible;
     int may_error;
+    signed char direct_leaf;
     int num_values;
     int num_vars;
     int num_blocks;

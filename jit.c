@@ -712,6 +712,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
     MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
+    MIR_load_external(context, "execute_jit_direct_verb_call",
+		      (void *) execute_jit_direct_verb_call);
 }
 
 static int
@@ -891,6 +893,8 @@ typedef struct {
     MIR_item_t import_parent;
     MIR_item_t proto_var_raw;
     MIR_item_t import_var_raw;
+    MIR_item_t proto_direct_verb_call;
+    MIR_item_t import_direct_verb_call;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -1467,6 +1471,16 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_var_raw = MIR_new_proto(build->context, "proto_var_raw", 1,
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
+
+    build->proto_direct_verb_call = MIR_new_proto(build->context,
+	"proto_direct_verb_call", 1, &res_i32, 11,
+	MIR_T_I64, "obj_raw", MIR_T_I32, "obj_type",
+	MIR_T_I64, "verb_raw", MIR_T_I32, "verb_type",
+	MIR_T_I64, "args_raw", MIR_T_I32, "args_type",
+	MIR_T_P, "ticks", MIR_T_P, "timed_out", MIR_T_P, "error",
+	MIR_T_P, "result_raw", MIR_T_P, "result_type");
+    build->import_direct_verb_call = MIR_new_import(build->context,
+	"execute_jit_direct_verb_call");
 
     if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
 	snprintf(func_name, sizeof(func_name), "jit_o%" PRIdN "_v%u_%" PRIu64,
@@ -4548,14 +4562,106 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      common_return);
 		    break;
 		case HIR_TAC_CALL_VERB:
-		    append_materialized_exit(build, program, instr->deopt_map,
-					     values, deopt_map_out,
-					     deopt_values, status,
-					     common_return, JIT_RUN_CALL_VERB);
-		    if (instr->deopt_map > 0
-			&& instr->deopt_map < program->num_deopt_maps
-			&& resume_continuations[instr->deopt_map])
-			append(build, resume_continuations[instr->deopt_map]);
+		    {
+			JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+			int args_value = map->stack_depth
+			    ? map->stack_values[map->stack_depth - 1] : 0;
+			int operands[3] = { instr->src1, instr->src2, args_value };
+			MIR_reg_t raw[3], type[3], call_result;
+			MIR_reg_t raw_out, type_out;
+			MIR_label_t materialize = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			int operand;
+
+			if (!program->value_types || operands[0] <= 0
+			    || operands[0] >= program->num_values
+			    || operands[1] <= 0
+			    || operands[1] >= program->num_values
+			    || operands[2] <= 0
+			    || operands[2] >= program->num_values) {
+			    append_materialized_exit(build, program,
+				instr->deopt_map, values, deopt_map_out,
+				deopt_values, status, common_return,
+				JIT_RUN_CALL_VERB);
+			    if (instr->deopt_map > 0
+				&& instr->deopt_map < program->num_deopt_maps
+				&& resume_continuations[instr->deopt_map])
+				append(build,
+				    resume_continuations[instr->deopt_map]);
+			    break;
+			}
+			for (operand = 0; operand < 3; operand++) {
+			    char name[32];
+
+			    raw[operand] = append_raw_value(build, program, values,
+				operands[operand], deopt_values, &copy_serial);
+			    sprintf(name, "verb_type%d", copy_serial++);
+			    type[operand] = new_reg(build, name);
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[operands[operand]])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type[operand]),
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + operands[operand])
+					* sizeof(Num), deopt_values, 0, 1)));
+			    else
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, type[operand]),
+				    MIR_new_int_op(build->context,
+					program->value_types[operands[operand]])));
+			}
+			call_result = new_reg(build, "direct_verb_result");
+			raw_out = new_reg(build, "direct_verb_raw_out");
+			type_out = new_reg(build, "direct_verb_type_out");
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, deopt_values),
+			    MIR_new_int_op(build->context,
+				instr->value * sizeof(Num))));
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, type_out),
+			    MIR_new_reg_op(build->context, deopt_values),
+			    MIR_new_int_op(build->context,
+				(program->num_values + instr->value) * sizeof(Num))));
+			append(build, MIR_new_call_insn(build->context, 14,
+			    MIR_new_ref_op(build->context,
+				build->proto_direct_verb_call),
+			    MIR_new_ref_op(build->context,
+				build->import_direct_verb_call),
+			    MIR_new_reg_op(build->context, call_result),
+			    MIR_new_reg_op(build->context, raw[0]),
+			    MIR_new_reg_op(build->context, type[0]),
+			    MIR_new_reg_op(build->context, raw[1]),
+			    MIR_new_reg_op(build->context, type[1]),
+			    MIR_new_reg_op(build->context, raw[2]),
+			    MIR_new_reg_op(build->context, type[2]),
+			    MIR_new_reg_op(build->context, ticks),
+			    MIR_new_reg_op(build->context, timed_out),
+			    MIR_new_reg_op(build->context, error_out),
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, type_out)));
+			append(build, MIR_new_insn(build->context, MIR_BEQ,
+			    MIR_new_label_op(build->context, materialize),
+			    MIR_new_reg_op(build->context, call_result),
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_mem_op(build->context,
+				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				instr->value * sizeof(Num), deopt_values, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, materialize);
+			append_materialized_exit(build, program, instr->deopt_map,
+			    values, deopt_map_out, deopt_values, status,
+			    common_return, JIT_RUN_CALL_VERB);
+			if (instr->deopt_map > 0
+			    && instr->deopt_map < program->num_deopt_maps
+			    && resume_continuations[instr->deopt_map])
+			    append(build,
+				resume_continuations[instr->deopt_map]);
+			append(build, done);
+		    }
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
@@ -4930,6 +5036,44 @@ int
 jit_program_may_error(JITProgram *program)
 {
     return program && program->may_error;
+}
+
+int
+jit_program_is_direct_leaf(JITProgram *program)
+{
+    JITBlock *block;
+    int release_ir;
+    int direct_leaf = 1;
+
+    if (!program || !program->eligible)
+	return 0;
+
+    if (program->direct_leaf)
+	return program->direct_leaf > 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CALL
+		|| instr->kind == HIR_TAC_CALL_VERB
+		|| instr->kind == HIR_TAC_PUT_PROP
+		|| instr->kind == HIR_TAC_DEOPT) {
+		direct_leaf = 0;
+		break;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+	if (!direct_leaf)
+	    break;
+    }
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    program->direct_leaf = direct_leaf ? 1 : -1;
+    return direct_leaf;
 }
 
 int
