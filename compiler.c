@@ -48,6 +48,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     assign_resume_ids(ast);
     program = generate_code(ast, version);
     hir_ctx = hir_context_new(var_names);
+    hir_context_set_first_user_local(hir_ctx, first_user_slot(version));
     hir_program = hir_lift_ast(hir_ctx, ast);
     tac_program = hir_lower_to_tac(hir_ctx, hir_program);
     hir_supported = hir_context_error_count(hir_ctx) == 0;

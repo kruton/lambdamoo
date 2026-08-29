@@ -1208,6 +1208,36 @@ test_dead_if_else_local_has_no_phi(void)
 }
 
 static void
+test_uninitialized_user_local_is_none_constant(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRProgram *program;
+    HIRTacProgram *tac;
+    HIRCFG *cfg;
+    HIRSSAProgram *ssa;
+    Expr local = id_expr(18, 95);
+    Stmt ret = return_stmt(&local);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 19;
+    ctx = hir_context_new(&names);
+    hir_context_set_first_user_local(ctx, 18);
+    program = hir_lift_ast(ctx, &ret);
+    tac = hir_lower_to_tac(ctx, program);
+    cfg = hir_build_cfg(ctx, tac);
+    ssa = hir_build_ssa(ctx, cfg);
+
+    check_int("uninitialized local entry loads",
+	      hir_ssa_count_kind(ssa, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("uninitialized local none constants",
+	      hir_ssa_count_kind(ssa, HIR_TAC_CONST), 1);
+    check_int("uninitialized local verify", hir_verify_ssa(ctx, ssa), 1);
+
+    hir_context_free(ctx);
+}
+
+static void
 test_deopt_live_if_else_local_keeps_phi(void)
 {
     Names names;
@@ -3697,6 +3727,7 @@ main(void)
     test_if_else_phi_ssa();
     test_if_then_phi_uses_entry_local_ssa();
     test_dead_if_else_local_has_no_phi();
+    test_uninitialized_user_local_is_none_constant();
     test_deopt_live_if_else_local_keeps_phi();
     test_guarded_environment_local_tac_ssa();
     test_multiple_guarded_environment_locals_ssa();

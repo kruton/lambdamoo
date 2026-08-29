@@ -153,6 +153,7 @@ typedef enum {
 } HIRValueKind;
 
 extern HIRContext *hir_context_new(Names *);
+extern void hir_context_set_first_user_local(HIRContext *, int);
 extern void hir_context_free(HIRContext *);
 extern int hir_context_error_count(HIRContext *);
 extern const char *hir_context_error_message(HIRContext *);

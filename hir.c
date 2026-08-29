@@ -575,6 +575,7 @@ struct HIRContext {
     int next_temp;
     int next_label;
     int next_local;
+    int first_user_local;
     unsigned current_code_unit;
     int lower_stack_depth;
     int lower_stack_capacity;
@@ -615,6 +616,7 @@ hir_context_new(Names *var_names)
     ctx->next_temp = 1;
     ctx->next_label = 1;
     ctx->next_local = var_names ? (int) var_names->size : 0;
+    ctx->first_user_local = ctx->next_local;
     ctx->current_code_unit = 0;
     ctx->lower_stack_depth = 0;
     ctx->lower_stack_capacity = 0;
@@ -626,6 +628,18 @@ hir_context_new(Names *var_names)
     ctx->current_length_base = 0;
 
     return ctx;
+}
+
+void
+hir_context_set_first_user_local(HIRContext *ctx, int first_user_local)
+{
+    if (!ctx)
+	return;
+    if (first_user_local < 0)
+	first_user_local = 0;
+    if (first_user_local > ctx->next_local)
+	first_user_local = ctx->next_local;
+    ctx->first_user_local = first_user_local;
 }
 
 void
@@ -1738,16 +1752,19 @@ current_version(HIRContext *ctx, int v, int num_locals, int *stacks,
 	HIRSSAInstr *load = hir_alloc(ctx, sizeof(HIRSSAInstr));
 	int internal_local = ctx->var_names
 	    && v >= (int) ctx->var_names->size;
-	load->kind = internal_local ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
+	int uninitialized_local = !internal_local
+	    && v >= ctx->first_user_local;
+	load->kind = internal_local || uninitialized_local
+	    ? HIR_TAC_CONST : HIR_TAC_LOAD_LOCAL;
 	load->source_lineno = entry_block ? entry_block->first_lineno : 0;
 	load->bytecode_pc = NO_BYTECODE_PC;
 	load->value = t_init;
 	load->src1 = 0;
 	load->src2 = 0;
 	load->label = 0;
-	load->local_id = internal_local ? -1 : v;
+	load->local_id = internal_local || uninitialized_local ? -1 : v;
 	load->op = HIR_OP_ADD;
-	load->literal.type = TYPE_INT;
+	load->literal.type = uninitialized_local ? TYPE_NONE : TYPE_INT;
 	load->literal.v.num = 0;
 	load->num_stack_values = 0;
 	load->stack_values = 0;
