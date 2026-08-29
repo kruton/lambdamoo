@@ -5118,17 +5118,6 @@ jit_continuation_materialize(activation *a)
     map = &program->deopt_maps[frame->map_id];
     if (program->usage)
 	program->usage->continuation_materializations++;
-    for (i = 0; i < (unsigned) map->num_locals; i++) {
-	int value = jit_deopt_map_local_value(program, map, i);
-	Var *saved = value > 0 ? jit_continuation_value(frame, value) : 0;
-
-	if (value > 0 && !saved)
-	    return 0;
-	free_var(a->rt_env[i]);
-	a->rt_env[i] = saved ? var_ref(*saved) : zero;
-    }
-    while (a->top_rt_stack > a->base_rt_stack)
-	free_var(*--a->top_rt_stack);
     depth = map->stack_depth;
     if (frame->dispatched) {
 	int operands = jit_call_stack_operands(map);
@@ -5137,6 +5126,28 @@ jit_continuation_materialize(activation *a)
 	    return 0;
 	depth -= operands;
     }
+    point = resume_point_for_key(a->prog, map->resume_key);
+    if (frame->dispatched && !point)
+	return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+
+	if (value > 0 && !jit_continuation_value(frame, value))
+	    return 0;
+    }
+    for (i = 0; i < depth; i++)
+	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
+	    && !jit_continuation_value(frame, map->stack_values[i]))
+	    return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+	Var *saved = value > 0 ? jit_continuation_value(frame, value) : 0;
+
+	free_var(a->rt_env[i]);
+	a->rt_env[i] = saved ? var_ref(*saved) : zero;
+    }
+    while (a->top_rt_stack > a->base_rt_stack)
+	free_var(*--a->top_rt_stack);
     for (i = 0; i < depth; i++) {
 	ResumeStackSlot slot = map->stack_slots
 	    ? map->stack_slots[i]
@@ -5145,8 +5156,6 @@ jit_continuation_materialize(activation *a)
 
 	if (slot.kind == RSS_VALUE) {
 	    Var *saved = jit_continuation_value(frame, map->stack_values[i]);
-	    if (!saved)
-		return 0;
 	    value = var_ref(*saved);
 	} else {
 	    value.type = slot.kind == RSS_CATCH ? TYPE_CATCH
@@ -5157,8 +5166,7 @@ jit_continuation_materialize(activation *a)
     }
     if (frame->has_result)
 	*a->top_rt_stack++ = var_ref(frame->result);
-    point = resume_point_for_key(a->prog, map->resume_key);
-    if (frame->dispatched && point) {
+    if (frame->dispatched) {
 	a->pc = point->pc;
 	a->error_pc = point->error_pc;
 	a->resume_key = point->key;
