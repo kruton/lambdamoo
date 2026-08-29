@@ -4747,7 +4747,7 @@ jit_program_compile(JITProgram *program)
     }
     MIR_load_module(jit_shared_pool.context, build.module);
     MIR_gen_init(jit_shared_pool.context);
-    MIR_gen_set_optimize_level(jit_shared_pool.context, 0);
+    MIR_gen_set_optimize_level(jit_shared_pool.context, 1);
     MIR_link(jit_shared_pool.context, MIR_set_gen_interface, 0);
     program->native_function = MIR_gen(jit_shared_pool.context, build.function);
     if (!program->native_function) {

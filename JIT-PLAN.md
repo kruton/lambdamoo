@@ -627,9 +627,19 @@ the broader ownership-map and synthesized-anchor validation described below.
    enabling native resume.
 
 8. **Optimize only after coverage boundaries are trustworthy.**
+   MIR optimization level 1 is now the default. On Codepoint's 984-value
+   `$local.crypto:sha1` verb it reduced generated machine code from 250,864 to
+   72,080 bytes and compile time from about 303 ms to 225 ms. Level 2 reduced
+   code further to 49,872 bytes but raised compile time to about 316 ms. Compare
+   runtime with an external monotonic timer: MOO's `time()` has one-second
+   granularity, and this verb suspends three times per invocation, so its
+   in-database timing cannot distinguish close O1 and O2 results. Keep level 2
+   as a possible hot-tier policy until that comparison shows whether its extra
+   compile cost pays for hot verbs.
+
    First remove redundant guards and repeated local/tag loads. Then consider
    block-level tick batching, call-site specialization, and MIR optimization
-   levels. Deopt-aware liveness is intentionally broader than machine-operand
+   tiers. Deopt-aware liveness is intentionally broader than machine-operand
    liveness: values named by a later interpreter-state map are genuinely live
    even if no later native instruction reads them. Reduce that pressure by
    running an explicit deopt-point simplification pass after type and effect
