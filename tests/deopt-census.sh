@@ -87,6 +87,8 @@ if proc.returncode != 0:
     print(f"Error: MOO server exited with status {proc.returncode}.", file=sys.stderr)
     print(proc.stdout, file=sys.stderr)
     print(proc.stderr, file=sys.stderr)
+    if pathlib.Path(log_file).exists():
+        print(pathlib.Path(log_file).read_text(errors="replace"), file=sys.stderr)
     sys.exit(proc.returncode or 1)
 
 log_lines = pathlib.Path(log_file).read_text(errors="replace").splitlines()
