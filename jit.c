@@ -4610,9 +4610,16 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    MIR_new_int_op(build->context,
 					program->value_types[operands[operand]])));
 			}
-			call_result = new_reg(build, "direct_verb_result");
-			raw_out = new_reg(build, "direct_verb_raw_out");
-			type_out = new_reg(build, "direct_verb_type_out");
+			{
+			    char name[32];
+
+			    sprintf(name, "direct_verb_result%d", copy_serial++);
+			    call_result = new_reg(build, name);
+			    sprintf(name, "direct_verb_raw_out%d", copy_serial++);
+			    raw_out = new_reg(build, name);
+			    sprintf(name, "direct_verb_type_out%d", copy_serial++);
+			    type_out = new_reg(build, name);
+			}
 			append(build, MIR_new_insn(build->context, MIR_ADD,
 			    MIR_new_reg_op(build->context, raw_out),
 			    MIR_new_reg_op(build->context, deopt_values),
