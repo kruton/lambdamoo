@@ -56,6 +56,25 @@ test_resume_stack_safety(void)
 }
 
 static void
+test_boundary_tick_refunds(void)
+{
+	check_int("arithmetic boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_BINARY, HIR_OP_ADD), 1);
+	check_int("property write boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_PUT_PROP,
+					  HIR_OP_GET_PROP), 1);
+	check_int("range boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_RANGE_SET,
+					  HIR_OP_INDEX), 1);
+	check_int("scatter boundary refunds tick",
+		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
+					  HIR_OP_SCATTER), 1);
+	check_int("index-store boundary has no tick to refund",
+		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
+					  HIR_OP_INDEX), 0);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -3441,6 +3460,7 @@ int
 main(void)
 {
     test_resume_stack_safety();
+    test_boundary_tick_refunds();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_list_operand_inference();

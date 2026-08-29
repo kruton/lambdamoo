@@ -3464,6 +3464,16 @@ resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
     return 1;
 }
 
+static int
+jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
+{
+	return kind == HIR_TAC_UNARY || kind == HIR_TAC_BINARY
+	    || kind == HIR_TAC_BRANCH_FALSE || kind == HIR_TAC_CALL_VERB
+	    || kind == HIR_TAC_PUT_PROP || kind == HIR_TAC_RANGE_REF
+	    || kind == HIR_TAC_RANGE_SET
+	    || (kind == HIR_TAC_DEOPT && op == HIR_OP_SCATTER);
+}
+
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
 static int
 jit_op_is_supported(HIROp op)
@@ -3919,10 +3929,7 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->error_pc = instr->bytecode_pc;
     map->source_lineno = instr->source_lineno;
     map->stack_depth = instr->num_stack_values;
-    map->ticks_charged = instr->kind == HIR_TAC_UNARY
-	|| instr->kind == HIR_TAC_BINARY
-	|| instr->kind == HIR_TAC_BRANCH_FALSE
-	|| instr->kind == HIR_TAC_CALL_VERB;
+    map->ticks_charged = jit_boundary_ticks_charged(instr->kind, instr->op);
     map->num_locals = instr->num_local_values;
     map->builtin_func = -1;
     map->builtin_args = -1;
@@ -8637,6 +8644,12 @@ hir_test_resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 			      int call_operands)
 {
     return resume_stack_is_safe(stack_types, stack_depth, call_operands);
+}
+
+int
+hir_test_boundary_ticks_charged(HIRTacKind kind, HIROp op)
+{
+	return jit_boundary_ticks_charged(kind, op);
 }
 
 int
