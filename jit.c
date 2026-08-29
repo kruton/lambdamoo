@@ -5695,8 +5695,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     int deopt_map = -1;
     Num *deopt_values;
     Var *borrowed_locals = 0;
-    Var *owned_values;
+    Var *owned_values = 0;
+    void *runtime_storage;
     size_t deopt_bytes;
+    size_t deopt_storage_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
 
@@ -5745,11 +5747,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (!jit_program_compile(program))
 	return JIT_RUN_FALLBACK;
     deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
-    runtime_bytes = deopt_bytes
+    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    runtime_bytes = deopt_storage_bytes
 	+ sizeof(Var) * (program->num_borrowed_locals
 			 + program->num_owned_slots);
-    deopt_values = mymalloc(deopt_bytes ? deopt_bytes : sizeof(Num),
-			    M_PROGRAM);
+    runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
+			       M_PROGRAM);
+    deopt_values = runtime_storage;
     /* Float lowering uses raw slot zero as its native 0.0 constant. */
     deopt_values[0] = 0;
     {
@@ -5760,13 +5765,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	for (i = 0; i < tag_slots; i++)
 	    deopt_values[program->num_values + i] = TYPE_ANY;
 	if (program->num_borrowed_locals) {
-	    borrowed_locals = mymalloc(sizeof(Var)
-		* program->num_borrowed_locals, M_PROGRAM);
+	    borrowed_locals = (Var *) ((char *) runtime_storage
+		+ deopt_storage_bytes);
 	    for (i = 0; i < program->num_borrowed_locals; i++)
 		borrowed_locals[i] = var_ref(env[program->borrowed_local_slots[i]]);
 	}
 	owned_values = program->num_owned_slots
-	    ? mymalloc(sizeof(Var) * program->num_owned_slots, M_PROGRAM) : 0;
+	    ? (Var *) ((char *) runtime_storage + deopt_storage_bytes
+		+ sizeof(Var) * program->num_borrowed_locals) : 0;
 	for (i = 0; i < program->num_owned_slots; i++)
 	    owned_values[i].type = TYPE_NONE;
     }
@@ -5793,14 +5799,10 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 
 	    for (i = 0; i < program->num_borrowed_locals; i++)
 		free_var(borrowed_locals[i]);
-	    if (borrowed_locals)
-		myfree(borrowed_locals, M_PROGRAM);
 	    for (i = 0; i < program->num_owned_slots; i++)
 		free_var(owned_values[i]);
-	    if (owned_values)
-		myfree(owned_values, M_PROGRAM);
 	    program->active_runtime_bytes -= runtime_bytes;
-	    myfree(deopt_values, M_PROGRAM);
+	    myfree(runtime_storage, M_PROGRAM);
 	    return JIT_RUN_FALLBACK;
 	}
 	map = &program->deopt_maps[deopt_map];
@@ -5912,15 +5914,11 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 
 	for (i = 0; i < program->num_borrowed_locals; i++)
 	    free_var(borrowed_locals[i]);
-	if (borrowed_locals)
-	    myfree(borrowed_locals, M_PROGRAM);
 	for (i = 0; i < program->num_owned_slots; i++)
 	    free_var(owned_values[i]);
-	if (owned_values)
-	    myfree(owned_values, M_PROGRAM);
     }
     program->active_runtime_bytes -= runtime_bytes;
-    myfree(deopt_values, M_PROGRAM);
+    myfree(runtime_storage, M_PROGRAM);
     return native_result;
 }
 
