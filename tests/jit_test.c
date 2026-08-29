@@ -13,7 +13,7 @@
 #include <limits.h>
 
 #define jit_program_execute(p, e, r, t, to, err, loc, d, ds) \
-    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1)
+    jit_program_execute(p, e, r, t, to, err, loc, d, ds, 2, -1, 0, 0)
 
 static int failures;
 
@@ -3650,7 +3650,7 @@ main(void)
 	deopt_stack[0].v.str = str_dup("passed");
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "pass continuation did not return");
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "passed"),
 	      "pass continuation returned the wrong value");
@@ -3690,7 +3690,7 @@ main(void)
 	deopt_stack[0].v.num = 41;
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "generic built-in continuation did not return");
 	check(result.type == TYPE_INT && result.v.num == 41,
 	      "generic built-in continuation returned the wrong value");
@@ -3716,7 +3716,7 @@ main(void)
 	deopt_stack[0].v.fnum = box_fl(1.5);
 	check((jit_program_execute)(pass_prog, pass_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "float built-in continuation did not return");
 	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 1.5,
 	      "float built-in continuation returned the wrong value");
@@ -3820,12 +3820,40 @@ main(void)
 	deopt_stack[0].v.str = str_dup("returned");
 	check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
 				    &timed_out, &error, 0, &deopt,
-				    deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+				    deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 	      "call_verb continuation did not return");
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "returned"),
 	      "call_verb continuation returned the wrong value");
 	free_var(result);
 	free_var(deopt_stack[0]);
+	{
+	    JITContinuationFrame *continuation = 0;
+	    Var returned;
+
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "compact call_verb did not request a VM call");
+	    check(continuation && !deopt.materialized && deopt.stack_depth == 3,
+		  "call_verb did not capture a compact continuation");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    returned.type = TYPE_STR;
+	    returned.v.str = str_dup("compact returned");
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, continuation,
+					0) == JIT_RUN_RETURNED,
+		  "compact call_verb continuation did not return");
+	    jit_continuation_free(continuation);
+	    check(result.type == TYPE_STR
+		  && !strcmp(result.v.str, "compact returned"),
+		  "compact call_verb continuation returned the wrong value");
+	    free_var(result);
+	}
 	{
 	    JITProgram *fallthrough = call_verb_program();
 	    JITInstruction *call = fallthrough->blocks->first;
@@ -3839,7 +3867,7 @@ main(void)
 	    deopt_stack[0].v.num = 17;
 	    check((jit_program_execute)(fallthrough, deep_env, &result, &ticks,
 					&timed_out, &error, 0, &deopt,
-					deopt_stack, 2, 1) == JIT_RUN_RETURNED,
+					deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
 		  "fallthrough continuation did not return");
 	    check(result.type == TYPE_INT && result.v.num == 0,
 		  "fallthrough continuation did not return zero");

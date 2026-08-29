@@ -9,6 +9,8 @@
 #include "structures.h"
 
 typedef struct JITProgram JITProgram;
+typedef struct JITContinuationFrame JITContinuationFrame;
+struct activation;
 
 typedef enum {
     JIT_STATE_PENDING,
@@ -128,7 +130,14 @@ extern void jit_program_note_location(JITProgram *, Objid, unsigned);
 extern int jit_program_compile(JITProgram *);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 				enum error *, JITSourceLocation *,
-				JITDeoptState *, Var *, Objid, int);
+				JITDeoptState *, Var *, Objid, int,
+				JITContinuationFrame *, JITContinuationFrame **);
+extern void jit_continuation_set_result(JITContinuationFrame *, Var);
+extern void jit_continuation_mark_dispatched(JITContinuationFrame *);
+extern void jit_continuation_attach(JITContinuationFrame *, struct activation *);
+extern int jit_continuation_materialize(struct activation *);
+extern void jit_continuation_free(JITContinuationFrame *);
+extern void jit_continuation_materialize_all(void);
 extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),
 				void *);
 extern int jit_program_dump_mir(JITProgram *, void (*)(const char *, void *),

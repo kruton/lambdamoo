@@ -18,6 +18,21 @@
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
+Var zero = { .type = TYPE_INT, .v.num = 0 };
+
+ResumeKey
+invalid_resume_key(void)
+{
+    return (ResumeKey){ 0, 0 };
+}
+
+const ResumePoint *
+resume_point_for_key(Program *program, ResumeKey key)
+{
+    (void) program;
+    (void) key;
+    return 0;
+}
 
 JITProgram *
 compile_program_to_jit(Program *program)

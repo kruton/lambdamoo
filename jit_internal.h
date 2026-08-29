@@ -37,6 +37,19 @@ struct JITNativeResume {
     int valid;
 };
 
+struct JITContinuationFrame {
+    JITProgram *program;
+    struct activation *owner;
+    int map_id;
+    int num_values;
+    Var *values;
+    Var result;
+    int has_result;
+    int dispatched;
+    JITContinuationFrame *previous;
+    JITContinuationFrame *next;
+};
+
 struct JITLocalValue {
     int slot;
     int value;

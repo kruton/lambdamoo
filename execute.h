@@ -29,7 +29,9 @@
 
 #define ANY_RESUME_VECTOR (-2)
 
-typedef struct {
+struct JITContinuationFrame;
+
+typedef struct activation {
     Program *prog;
     Var *rt_env;		/* same length as prog.var_names */
     Var *base_rt_stack;
@@ -64,8 +66,9 @@ typedef struct {
     const char *verb;
     const char *verbname;
     int debug;
+    struct JITContinuationFrame *jit_continuation;
 } activation;
-#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (17 * V) + X(WAIF_CORE, B(Var)))
+#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (18 * V) + X(WAIF_CORE, B(Var)))
 
 extern void free_activation(activation *, char data_too);
 

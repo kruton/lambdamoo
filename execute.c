@@ -151,6 +151,7 @@ alloc_rt_stack(activation * a, Num size)
     }
     a->base_rt_stack = a->top_rt_stack = res;
     a->rt_stack_size = size;
+    a->jit_continuation = 0;
 }
 
 static void
@@ -234,10 +235,17 @@ error_backtrace_list(const char *msg)
 static enum error
 suspend_task(package p)
 {
-    vm the_vm = new_vm(current_task_id, top_activ_stack + 1);
+    vm the_vm;
     unsigned i;
     enum error e;
 
+#ifdef ENABLE_JIT
+    for (i = 0; i <= top_activ_stack; i++)
+	if (activ_stack[i].jit_continuation
+	    && !jit_continuation_materialize(&activ_stack[i]))
+	    panic("JIT continuation suspension materialization failed");
+#endif
+    the_vm = new_vm(current_task_id, top_activ_stack + 1);
     the_vm->max_stack_size = max_stack_size;
     the_vm->top_activ_stack = top_activ_stack;
     the_vm->root_activ_vector = root_activ_vector;
@@ -276,6 +284,12 @@ unwind_stack(Finally_Reason why, Var value, enum outcome *outcome)
 	int bi_func_pc;
 	unsigned bi_func_id = 0;
 	Var v, *goal = a->base_rt_stack;
+
+#ifdef ENABLE_JIT
+	if (a->jit_continuation
+	    && !jit_continuation_materialize(a))
+	    panic("JIT continuation unwind materialization failed");
+#endif
 
 	if (why == FIN_EXIT)
 	    goal += value.v.list[1].v.num;
@@ -418,6 +432,12 @@ unwind_stack(Finally_Reason why, Var value, enum outcome *outcome)
 	    }
 	} else if (why == FIN_RETURN) {		/* Push the value on the stack & go */
 	    a = &(activ_stack[top_activ_stack]);
+#ifdef ENABLE_JIT
+	    if (a->jit_continuation) {
+		jit_continuation_set_result(a->jit_continuation, value);
+		return 0;
+	    }
+#endif
 	    *(a->top_rt_stack++) = value;
 	    return 0;
 	}
@@ -436,6 +456,11 @@ find_handler_activ(Var code)
 	activation *a = &(activ_stack[frame]);
 	Var *v, *vv;
 
+#ifdef ENABLE_JIT
+	if (a->jit_continuation
+	    && !jit_continuation_materialize(a))
+	    panic("JIT continuation handler materialization failed");
+#endif
 	for (v = a->top_rt_stack - 1; v >= a->base_rt_stack; v--)
 	    if (v->type == TYPE_CATCH) {
 		for (vv = v - 2 * v->v.num; vv < v; vv += 2)
@@ -604,6 +629,13 @@ void
 free_activation(activation * ap, char data_too)
 {
     Var *i;
+
+#ifdef ENABLE_JIT
+    if (ap->jit_continuation) {
+	jit_continuation_free(ap->jit_continuation);
+	ap->jit_continuation = 0;
+    }
+#endif
 
     free_rt_env(ap->rt_env, ap->prog->num_var_names);
 
@@ -905,6 +937,7 @@ do {								\
 	{
 	    int at_entry = bv == bc.vector && rts == RUN_ACTIV.base_rt_stack;
 	    int resume_map = -1;
+	    JITContinuationFrame *continuation_in = RUN_ACTIV.jit_continuation;
 
 	    if (resume_key_is_valid(RUN_ACTIV.resume_key)) {
 		const ResumePoint *point =
@@ -920,7 +953,7 @@ do {								\
 		    RUN_ACTIV.resume_key = invalid_resume_key();
 	    }
 
-	if ((at_entry || resume_map >= 0)
+	if ((at_entry || resume_map >= 0 || continuation_in)
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
 	    && RUN_ACTIV.prog->jit
 	    && jit_program_is_eligible(RUN_ACTIV.prog->jit)
@@ -930,6 +963,7 @@ do {								\
 	    JITRunResult jit_result;
 	    JITSourceLocation source_location;
 	    JITDeoptState deopt;
+	    JITContinuationFrame *continuation = 0;
 	    enum error jit_error = E_NONE;
 
 	    if (resume_map >= 0)
@@ -954,7 +988,11 @@ do {								\
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
 					     RUN_ACTIV.base_rt_stack,
-					     RUN_ACTIV.progr, resume_map);
+					     RUN_ACTIV.progr, resume_map,
+					     continuation_in,
+					     &continuation);
+	    if (continuation_in)
+		jit_continuation_free(continuation_in);
 	    if (jit_result == JIT_RUN_RETURNED) {
 		jit_profile_record_completed(RUN_ACTIV.prog->jit);
 		STORE_STATE_VARIABLES();
@@ -989,6 +1027,63 @@ do {								\
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK
 		       || jit_result == JIT_RUN_CALL_VERB) {
+		if (jit_result == JIT_RUN_CALL_VERB && continuation
+		    && deopt.reason == JIT_DEOPT_VERB_CALL) {
+		    activation *caller = &RUN_ACTIV;
+		    enum error err = E_NONE;
+		    Var obj = RUN_ACTIV.base_rt_stack[0];
+		    Var verb = RUN_ACTIV.base_rt_stack[1];
+		    Var args = RUN_ACTIV.base_rt_stack[2];
+		    Objid class = NOTHING;
+
+		    if (args.type != TYPE_LIST || verb.type != TYPE_STR)
+			err = E_TYPE;
+#ifdef WAIF_CORE
+		    else if (obj.type == TYPE_WAIF) {
+			if (!valid(class = obj.v.waif->class))
+			    err = E_INVIND;
+			else {
+			    char *name = mymalloc(strlen(verb.v.str) + 2,
+					      M_STRING);
+
+			    name[0] = WAIF_VERB_PREFIX;
+			    strcpy(name + 1, verb.v.str);
+			    free_str(verb.v.str);
+			    verb.v.str = name;
+			}
+		    }
+#endif
+		    else if (obj.type != TYPE_OBJ)
+			err = E_TYPE;
+#ifdef WAIF_CORE
+		    else if (verb.v.str[0] == WAIF_VERB_PREFIX)
+			err = E_VERBNF;
+#endif
+		    else if (!valid(class = obj.v.obj))
+			err = E_INVIND;
+		    if (err == E_NONE) {
+			STORE_STATE_VARIABLES();
+			err = call_verb2(class, verb.v.str
+				 WAIF_COMMA_ARG(obj), args, 0);
+		    }
+		    free_var(obj);
+		    free_var(verb);
+		    if (err == E_NONE) {
+			jit_continuation_attach(continuation, caller);
+			jit_continuation_mark_dispatched(continuation);
+			jit_profile_record_vm_call(caller->prog->jit);
+			LOAD_STATE_VARIABLES();
+			goto next_opcode;
+		    }
+		    free_var(args);
+		    jit_continuation_attach(continuation, caller);
+		    if (!jit_continuation_materialize(caller))
+			panic("JIT verb-call continuation materialization failed");
+		    ticks_remaining += deopt.ticks_charged;
+		    jit_profile_record_vm_call(caller->prog->jit);
+		    LOAD_STATE_VARIABLES();
+		    goto next_opcode;
+		}
 		if (jit_result == JIT_RUN_FALLBACK)
 		    jit_profile_record_deopt(RUN_ACTIV.prog->jit, RUN_ACTIV.vloc,
 					     RUN_ACTIV.verbname, &deopt);
