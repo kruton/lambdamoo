@@ -226,6 +226,10 @@ guard_program(void)
     program->num_vars = 1;
     program->num_blocks = 1;
     add_entry_deopt_map(program);
+    program->deopt_maps[0].guard_value[0] = 1;
+    program->deopt_maps[0].guard_local[0] = 0;
+    program->deopt_maps[0].guard_local[1] = -1;
+    program->deopt_maps[0].guard_expected[0] = JIT_TYPE_MASK(TYPE_INT);
     program->blocks = program->last_block = block;
     block->id = 1;
     load->value = 1;
@@ -3348,6 +3352,11 @@ main(void)
 	  && deopt.stack_depth == 0, "entry guard returned the wrong deopt map");
     check(deopt.reason == JIT_DEOPT_TYPE_GUARD,
 	  "entry guard returned the wrong deopt reason");
+    check(deopt.guard_value[0] == 1 && deopt.guard_local[0] == 0,
+	  "entry guard returned the wrong guarded value");
+    check(deopt.guard_expected[0] == JIT_TYPE_MASK(TYPE_INT)
+	  && deopt.guard_actual[0] == TYPE_STR,
+	  "entry guard returned the wrong expected or actual type");
     check_differential(guard, env, 10, 0,
 		       "guard fallback differed from reference execution");
     free_var(env[0]);

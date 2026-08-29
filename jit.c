@@ -4774,6 +4774,26 @@ jit_runtime_type_is_valid(var_type type)
     }
 }
 
+static var_type
+jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
+		      int operand)
+{
+    int value = map->guard_value[operand];
+    int local = map->guard_local[operand];
+
+    if (!map->guard_expected[operand])
+	return TYPE_NONE;
+    if (local >= 0 && local < program->num_vars && env)
+	return env[local].type;
+    if (value > 0 && value < program->num_values) {
+	if (program->value_is_tagged && program->value_is_tagged[value])
+	    return (var_type) program->deopt_values[program->num_values + value];
+	if (program->value_types)
+	    return program->value_types[value];
+    }
+    return TYPE_NONE;
+}
+
 static void
 jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
 {
@@ -4826,6 +4846,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	memset(deopt, 0, sizeof(*deopt));
 	deopt->builtin_func = -1;
 	deopt->operation = -1;
+	deopt->guard_local[0] = deopt->guard_local[1] = -1;
 	if (program && program->num_deopt_maps > 0) {
 	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
 	    deopt->error_pc = program->deopt_maps[0].error_pc;
@@ -4834,6 +4855,12 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
 	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
 	    deopt->operation = program->deopt_maps[0].operation;
+	    memcpy(deopt->guard_value, program->deopt_maps[0].guard_value,
+		   sizeof(deopt->guard_value));
+	    memcpy(deopt->guard_local, program->deopt_maps[0].guard_local,
+		   sizeof(deopt->guard_local));
+	    memcpy(deopt->guard_expected, program->deopt_maps[0].guard_expected,
+		   sizeof(deopt->guard_expected));
 	    deopt->reason = program->deopt_maps[0].reason;
 	}
     }
@@ -4914,6 +4941,15 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
 	    deopt->operation = map->operation;
+	    memcpy(deopt->guard_value, map->guard_value,
+		   sizeof(deopt->guard_value));
+	    memcpy(deopt->guard_local, map->guard_local,
+		   sizeof(deopt->guard_local));
+	    memcpy(deopt->guard_expected, map->guard_expected,
+		   sizeof(deopt->guard_expected));
+	    for (i = 0; i < JIT_MAX_GUARD_OPERANDS; i++)
+		deopt->guard_actual[i] = jit_guard_actual_type(program, map,
+							      env, i);
 	    deopt->reason = map->reason;
 	}
     }
@@ -5058,6 +5094,10 @@ typedef struct JITDeoptSite {
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITDeoptReason reason;
+    int guard_value[JIT_MAX_GUARD_OPERANDS];
+    int guard_local[JIT_MAX_GUARD_OPERANDS];
+    JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
+    var_type guard_actual[JIT_MAX_GUARD_OPERANDS];
     uint64_t count;
     struct JITDeoptSite *next;
 } JITDeoptSite;
@@ -5072,6 +5112,69 @@ static uint64_t total_deopts = 0;
 static uint64_t deopt_reason_counts[JIT_DEOPT_NUM_REASONS];
 static uint64_t unsupported_operation_counts[HIR_OP_FORK + 1];
 static time_t last_deopt_report_time = 0;
+
+static const char *
+jit_profile_type_name(var_type type)
+{
+    switch ((unsigned) type & TYPE_DB_MASK) {
+    case TYPE_INT: return "int";
+    case TYPE_OBJ: return "obj";
+    case _TYPE_STR: return "str";
+    case TYPE_ERR: return "err";
+    case _TYPE_LIST: return "list";
+    case TYPE_CLEAR: return "clear";
+    case TYPE_NONE: return "none";
+    case TYPE_CATCH: return "catch";
+    case TYPE_FINALLY: return "finally";
+    case _TYPE_FLOAT: return "float";
+    case _TYPE_WAIF: return "waif";
+    default: return "invalid";
+    }
+}
+
+static void
+jit_format_guard(char *buffer, size_t size, const int *values,
+		 const int *locals, const JITTypeMask *expected,
+		 const var_type *actual)
+{
+    int i;
+    size_t used = 0;
+
+    buffer[0] = '\0';
+    for (i = 0; i < JIT_MAX_GUARD_OPERANDS; i++) {
+	int type;
+	int first = 1;
+	int n;
+
+	if (!expected[i])
+	    continue;
+	n = snprintf(buffer + used, size - used, "%s[v%d%s%d expected=",
+		     used ? " " : " [guard ", values[i],
+		     locals[i] >= 0 ? " local=" : " operand=",
+		     locals[i] >= 0 ? locals[i] : i);
+	if (n < 0 || (size_t) n >= size - used)
+	    break;
+	used += n;
+	for (type = TYPE_INT; type <= _TYPE_WAIF; type++)
+	    if (expected[i] & JIT_TYPE_MASK(type)) {
+		n = snprintf(buffer + used, size - used, "%s%s",
+			     first ? "" : "|", jit_profile_type_name((var_type) type));
+		if (n < 0 || (size_t) n >= size - used)
+		    break;
+		used += n;
+		first = 0;
+	    }
+	n = snprintf(buffer + used, size - used, " actual=%s]",
+		     jit_profile_type_name(actual[i]));
+	if (n < 0 || (size_t) n >= size - used)
+	    break;
+	used += n;
+    }
+    if (used && used + 1 < size) {
+	buffer[used++] = ']';
+	buffer[used] = '\0';
+    }
+}
 
 const char *
 jit_deopt_reason_name(JITDeoptReason reason)
@@ -5148,6 +5251,7 @@ jit_profile_record_deopt(JITProgram *program, Objid vloc, const char *verbname,
     const char *builtin_name = builtin_func >= 0
 	? name_func_by_num((unsigned) builtin_func) : 0;
     char operation_label[32];
+    char guard_label[256];
     const char *operation_name = 0;
     unsigned h;
     JITDeoptSite *site;
@@ -5165,17 +5269,22 @@ jit_profile_record_deopt(JITProgram *program, Objid vloc, const char *verbname,
     }
     if (reason == JIT_DEOPT_UNSUPPORTED_OP && operation_name)
 	unsupported_operation_counts[operation]++;
+    guard_label[0] = '\0';
+    if (deopt)
+	jit_format_guard(guard_label, sizeof(guard_label), deopt->guard_value,
+			 deopt->guard_local, deopt->guard_expected,
+			 deopt->guard_actual);
 
     log_mode = server_int_option("jit_deopt_log_mode", 0);
     if (log_mode == 1) {
-	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s\n",
+	oklog("JIT_DEOPT: #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s%s\n",
 	      vloc, verbname ? verbname : "?",
 	      deopt ? deopt->source_lineno : 0,
 	      deopt ? deopt->bytecode_pc : 0,
 	      jit_deopt_reason_name(reason), builtin_name ? " [" : "",
 	      builtin_name ? builtin_name : "", builtin_name ? "]" : "",
 	      operation_name ? " [" : "", operation_name ? operation_name : "",
-	      operation_name ? "]" : "");
+	      operation_name ? "]" : "", guard_label);
     }
 
     h = ((unsigned) vloc * 31 + (deopt ? deopt->bytecode_pc : 0) * 17
@@ -5191,6 +5300,9 @@ jit_profile_record_deopt(JITProgram *program, Objid vloc, const char *verbname,
 	    && ((!site->verbname && !verbname)
 		|| (site->verbname && verbname && strcmp(site->verbname, verbname) == 0))) {
 	    site->count++;
+	    if (deopt)
+		memcpy(site->guard_actual, deopt->guard_actual,
+		       sizeof(site->guard_actual));
 	    return;
 	}
     }
@@ -5202,6 +5314,16 @@ jit_profile_record_deopt(JITProgram *program, Objid vloc, const char *verbname,
     site->bytecode_pc = deopt ? deopt->bytecode_pc : 0;
     site->source_lineno = deopt ? deopt->source_lineno : 0;
     site->reason = reason;
+    if (deopt) {
+	memcpy(site->guard_value, deopt->guard_value,
+	       sizeof(site->guard_value));
+	memcpy(site->guard_local, deopt->guard_local,
+	       sizeof(site->guard_local));
+	memcpy(site->guard_expected, deopt->guard_expected,
+	       sizeof(site->guard_expected));
+	memcpy(site->guard_actual, deopt->guard_actual,
+	       sizeof(site->guard_actual));
+    }
     site->count = 1;
     site->next = deopt_sites_hash[h];
     deopt_sites_hash[h] = site;
@@ -5266,12 +5388,16 @@ jit_profile_report(void)
 		? name_func_by_num((unsigned) s->builtin_func) : 0;
 	    char operation_label[32];
 	    const char *operation_name = 0;
+	    char guard_label[256];
 	    if (s->operation >= 0 && s->operation <= HIR_OP_FORK) {
 		snprintf(operation_label, sizeof(operation_label), "op=%d",
 			 s->operation);
 		operation_name = operation_label;
 	    }
-	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s (count: %"PRIu64")\n",
+	    jit_format_guard(guard_label, sizeof(guard_label), s->guard_value,
+			     s->guard_local, s->guard_expected,
+			     s->guard_actual);
+	    oklog("JIT:   #%"PRIdN":%s line %u (pc %u): %s%s%s%s%s%s%s%s (count: %"PRIu64")\n",
 		  s->vloc, s->verbname ? s->verbname : "?",
 		  s->source_lineno, s->bytecode_pc,
 		  jit_deopt_reason_name(s->reason),
@@ -5279,7 +5405,7 @@ jit_profile_report(void)
 		  builtin_name ? "]" : "",
 		  operation_name ? " [" : "",
 		  operation_name ? operation_name : "",
-		  operation_name ? "]" : "",
+		  operation_name ? "]" : "", guard_label,
 		  s->count);
 	}
     }

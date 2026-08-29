@@ -3929,6 +3929,93 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 }
 
 static int
+jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
+		   unsigned char *value_is_tagged, int num_values,
+		   int *values, int *locals, JITTypeMask *expected)
+{
+    JITTypeMask numeric = JIT_TYPE_MASK(TYPE_INT) | JIT_TYPE_MASK(TYPE_FLOAT);
+
+    values[0] = values[1] = 0;
+    locals[0] = locals[1] = -1;
+    expected[0] = expected[1] = 0;
+    if (instr->kind == HIR_TAC_LOAD_LOCAL && instr->value > 0
+	&& instr->value < num_values && !value_is_tagged[instr->value]
+	&& value_types[instr->value] != TYPE_ANY) {
+	values[0] = instr->value;
+	locals[0] = instr->local_id;
+	expected[0] = JIT_TYPE_MASK(value_types[instr->value]);
+	return 1;
+    }
+    if (instr->kind == HIR_TAC_UNARY) {
+	values[0] = instr->src1;
+	switch (instr->op) {
+	case HIR_OP_COMPLEMENT:
+	case HIR_OP_TOINT:
+	    expected[0] = JIT_TYPE_MASK(TYPE_INT);
+	    break;
+	case HIR_OP_NEGATE:
+	case HIR_OP_ABS:
+	    expected[0] = numeric;
+	    break;
+	case HIR_OP_LENGTH:
+	    expected[0] = JIT_TYPE_MASK(TYPE_STR) | JIT_TYPE_MASK(TYPE_LIST);
+	    break;
+	case HIR_OP_CHECK_LIST_FOR_SPLICE:
+	    expected[0] = JIT_TYPE_MASK(TYPE_LIST);
+	    break;
+	case HIR_OP_PARENT:
+	case HIR_OP_VALID:
+	    expected[0] = JIT_TYPE_MASK(TYPE_OBJ);
+	    break;
+	default:
+	    values[0] = 0;
+	    break;
+	}
+	return expected[0] != 0;
+    }
+    if (instr->kind != HIR_TAC_BINARY)
+	return 0;
+    values[0] = instr->src1;
+    values[1] = instr->src2;
+    switch (instr->op) {
+    case HIR_OP_ADD:
+	expected[0] = expected[1] = numeric | JIT_TYPE_MASK(TYPE_STR);
+	break;
+    case HIR_OP_SUB:
+    case HIR_OP_MUL:
+    case HIR_OP_DIV:
+	expected[0] = expected[1] = numeric;
+	break;
+    case HIR_OP_MOD:
+    case HIR_OP_EXP:
+    case HIR_OP_BITOR:
+    case HIR_OP_BITXOR:
+    case HIR_OP_BITAND:
+    case HIR_OP_SHL:
+    case HIR_OP_SHR:
+    case HIR_OP_LSHR:
+	expected[0] = expected[1] = JIT_TYPE_MASK(TYPE_INT);
+	break;
+    case HIR_OP_INDEX:
+	expected[0] = JIT_TYPE_MASK(TYPE_LIST) | JIT_TYPE_MASK(TYPE_STR);
+	expected[1] = JIT_TYPE_MASK(TYPE_INT);
+	break;
+    case HIR_OP_INDEX_BF:
+    case HIR_OP_RINDEX_BF:
+	expected[0] = expected[1] = JIT_TYPE_MASK(TYPE_STR);
+	break;
+    case HIR_OP_GET_PROP:
+	expected[0] = JIT_TYPE_MASK(TYPE_OBJ) | JIT_TYPE_MASK(TYPE_WAIF);
+	expected[1] = JIT_TYPE_MASK(TYPE_STR);
+	break;
+    default:
+	values[0] = values[1] = 0;
+	break;
+    }
+    return expected[0] != 0 || expected[1] != 0;
+}
+
+static int
 jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 		  Bytecodes *bytecodes, var_type *value_types,
 		  unsigned char *value_is_tagged)
@@ -3966,6 +4053,10 @@ jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
     map->builtin_func = -1;
     map->builtin_args = -1;
     map->operation = -1;
+    map->guard_local[0] = map->guard_local[1] = -1;
+    (void) jit_guard_contract(instr, value_types, value_is_tagged,
+			      program->num_values, map->guard_value,
+			      map->guard_local, map->guard_expected);
     if (instr->kind == HIR_TAC_UNARY || instr->kind == HIR_TAC_BINARY
 	|| instr->kind == HIR_TAC_DEOPT)
 	map->operation = instr->op;

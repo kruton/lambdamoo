@@ -48,6 +48,9 @@ struct JITDeoptMap {
     int builtin_func;
     int builtin_args;
     int operation;
+    int guard_value[JIT_MAX_GUARD_OPERANDS];
+    int guard_local[JIT_MAX_GUARD_OPERANDS];
+    JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
     int native_error_block;
 };
