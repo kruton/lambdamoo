@@ -4385,6 +4385,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			}
 			if (map->num_locals != program->num_vars
 			    || map->stack_depth > bytecode_program->main_vector.max_stack
+			    || map->local_base < 0
+			    || map->local_base > instr->deopt_map
 			    || map->num_local_values < 0
 			    || map->num_local_values > map->num_locals
 			    || (map->num_local_values && (!map->local_slots
@@ -4398,16 +4400,36 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 				    instr->deopt_map, map->bytecode_pc);
 				goto invalid;
 			}
+			if (map->local_base > 0
+			    && program->deopt_maps[map->local_base - 1].num_locals
+			       != map->num_locals) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: map %d has incompatible local base %d",
+				    instr->deopt_map, map->local_base - 1);
+				goto invalid;
+			}
 			for (i = 0; i < map->num_local_values; i++)
 				if (map->local_slots[i] < 0
 				    || map->local_slots[i] >= map->num_locals
-				    || map->local_values[i] <= 0
+				    || (i > 0 && map->local_slots[i]
+					<= map->local_slots[i - 1])
+				    || map->local_values[i] < 0
 				    || map->local_values[i] >= program->num_values) {
 					record_unsupported_fmt(ctx,
 					    "deopt-map: map %d local %d has invalid value %d",
 					    instr->deopt_map, i, map->local_values[i]);
 					goto invalid;
 				}
+			for (i = 0; i < map->num_locals; i++) {
+				int value = jit_deopt_map_local_value(program, map, i);
+
+				if (value < 0 || value >= program->num_values) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d resolves local %d to invalid value %d",
+					    instr->deopt_map, i, value);
+					goto invalid;
+				}
+			}
 			for (i = 0; i < (int) map->stack_depth; i++)
 				if (map->stack_slots[i].kind > RSS_FINALLY
 				    || map->stack_values[i] <= 0
@@ -4461,6 +4483,91 @@ invalid:
 	return 0;
 }
 
+#define JIT_LOCAL_BASE_WINDOW 32
+#define JIT_LOCAL_BASE_DEPTH 8
+
+static void
+jit_coalesce_deopt_locals(JITProgram *program)
+{
+    unsigned char *depth;
+    int map_id;
+
+    if (!program || program->num_deopt_maps <= 1 || program->num_vars <= 0)
+	return;
+    depth = mymalloc(program->num_deopt_maps, M_PROGRAM);
+    memset(depth, 0, program->num_deopt_maps);
+    for (map_id = 1; map_id < program->num_deopt_maps; map_id++) {
+	JITDeoptMap *map = &program->deopt_maps[map_id];
+	int first = map_id > JIT_LOCAL_BASE_WINDOW
+	    ? map_id - JIT_LOCAL_BASE_WINDOW : 0;
+	int best = -1;
+	int best_count = map->num_local_values;
+	int candidate;
+
+	for (candidate = map_id - 1; candidate >= first; candidate--) {
+	    JITDeoptMap *base = &program->deopt_maps[candidate];
+	    int count = 0;
+	    int slot;
+
+	    if (depth[candidate] >= JIT_LOCAL_BASE_DEPTH
+		|| base->num_locals != map->num_locals)
+		continue;
+	    for (slot = 0; slot < map->num_locals; slot++) {
+		int value = jit_deopt_map_local_value(program, map, slot);
+		int base_value = jit_deopt_map_local_value(program, base, slot);
+
+		if (value != base_value
+		    || (value > 0 && jit_deopt_map_local_type(program, map, slot)
+			!= jit_deopt_map_local_type(program, base, slot)))
+		    count++;
+	    }
+	    if (count < best_count) {
+		best = candidate;
+		best_count = count;
+	    }
+	}
+	if (best >= 0) {
+	    JITDeoptMap *base = &program->deopt_maps[best];
+	    int *slots = best_count
+		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
+	    int *values = best_count
+		? mymalloc(sizeof(int) * best_count, M_PROGRAM) : 0;
+	    var_type *types = best_count
+		? mymalloc(sizeof(var_type) * best_count, M_PROGRAM) : 0;
+	    int entry = 0;
+	    int slot;
+
+	    for (slot = 0; slot < map->num_locals; slot++) {
+		int value = jit_deopt_map_local_value(program, map, slot);
+		int base_value = jit_deopt_map_local_value(program, base, slot);
+		var_type type = jit_deopt_map_local_type(program, map, slot);
+
+		if (value == base_value
+		    && (value <= 0 || type
+			== jit_deopt_map_local_type(program, base, slot)))
+		    continue;
+		slots[entry] = slot;
+		values[entry] = value;
+		types[entry] = type;
+		entry++;
+	    }
+	    if (map->local_slots)
+		myfree(map->local_slots, M_PROGRAM);
+	    if (map->local_values)
+		myfree(map->local_values, M_PROGRAM);
+	    if (map->local_types)
+		myfree(map->local_types, M_PROGRAM);
+	    map->local_slots = slots;
+	    map->local_values = values;
+	    map->local_types = types;
+	    map->num_local_values = best_count;
+	    map->local_base = best + 1;
+	    depth[map_id] = depth[best] + 1;
+	}
+    }
+    myfree(depth, M_PROGRAM);
+}
+
 static void
 jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 		   unsigned char *uses, unsigned char *defs)
@@ -4487,11 +4594,12 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	|| instr->deopt_map >= program->num_deopt_maps)
 	return;
     map = &program->deopt_maps[instr->deopt_map];
-    for (i = 0; i < jit_deopt_map_local_count(map); i++)
-	if (map->local_values[i] > 0
-	    && map->local_values[i] < program->num_values
-	    && !defs[map->local_values[i]])
-	    uses[map->local_values[i]] = 1;
+    for (i = 0; i < map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+
+	if (value > 0 && value < program->num_values && !defs[value])
+	    uses[value] = 1;
+    }
     for (i = 0; i < (int) map->stack_depth; i++)
 	if (map->stack_values[i] > 0
 	    && map->stack_values[i] < program->num_values
@@ -4512,10 +4620,10 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	resume->source = JIT_RESUME_RESULT;
 	return 1;
     }
-    for (i = 0; i < jit_deopt_map_local_count(map); i++)
-	if (map->local_values[i] == value) {
+    for (i = 0; i < map->num_locals; i++)
+	if (jit_deopt_map_local_value(program, map, i) == value) {
 	    resume->source = JIT_RESUME_LOCAL;
-	    resume->index = jit_deopt_map_local_slot(map, i);
+	    resume->index = i;
 	    return 1;
 	}
     for (i = 0; i + call_operands < (int) map->stack_depth; i++)
@@ -5480,6 +5588,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
+    jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
 	const char *diag = hir_context_error_message(ctx);
 	JITProgram *unsupported;

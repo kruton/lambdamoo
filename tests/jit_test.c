@@ -3052,9 +3052,11 @@ do_fallback:
 	JITDeoptMap *map = &program->deopt_maps[deopt_map_index];
 	int i;
 	for (i = 0; env && i < map->num_locals; i++) {
-	    if (map->local_values[i] > 0) {
-		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
-		Var val = materialize_deopt_value(type, values[map->local_values[i]]);
+	    int value = jit_deopt_map_local_value(program, map, i);
+
+	    if (value > 0) {
+		var_type type = jit_deopt_map_local_type(program, map, i);
+		Var val = materialize_deopt_value(type, values[value]);
 		free_var(env[i]);
 		env[i] = val;
 	    }
@@ -5408,6 +5410,58 @@ main(void)
 	jit_shutdown();
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");
+    }
+    {
+	JITProgram *program = new_jit_program();
+	JITDeoptMap *base;
+	JITDeoptMap *change;
+	JITDeoptMap *remove;
+
+	program->num_deopt_maps = 3;
+	program->deopt_maps = allocate(sizeof(JITDeoptMap) * 3);
+	base = &program->deopt_maps[0];
+	change = &program->deopt_maps[1];
+	remove = &program->deopt_maps[2];
+	base->num_locals = change->num_locals = remove->num_locals = 2;
+	base->locals_are_sparse = change->locals_are_sparse
+	    = remove->locals_are_sparse = 1;
+	base->num_local_values = 2;
+	base->local_slots = allocate(sizeof(int) * 2);
+	base->local_values = allocate(sizeof(int) * 2);
+	base->local_types = allocate(sizeof(var_type) * 2);
+	base->local_slots[0] = 0;
+	base->local_slots[1] = 1;
+	base->local_values[0] = 1;
+	base->local_values[1] = 2;
+	base->local_types[0] = TYPE_INT;
+	base->local_types[1] = TYPE_STR;
+	change->local_base = 1;
+	change->num_local_values = 1;
+	change->local_slots = allocate(sizeof(int));
+	change->local_values = allocate(sizeof(int));
+	change->local_types = allocate(sizeof(var_type));
+	change->local_slots[0] = 0;
+	change->local_values[0] = 3;
+	change->local_types[0] = TYPE_OBJ;
+	remove->local_base = 2;
+	remove->num_local_values = 1;
+	remove->local_slots = allocate(sizeof(int));
+	remove->local_values = allocate(sizeof(int));
+	remove->local_types = allocate(sizeof(var_type));
+	remove->local_slots[0] = 1;
+	remove->local_values[0] = 0;
+	remove->local_types[0] = TYPE_INT;
+
+	check(jit_deopt_map_local_value(program, change, 0) == 3
+	      && jit_deopt_map_local_value(program, change, 1) == 2,
+	      "deopt local base did not inherit unchanged value");
+	check(jit_deopt_map_local_type(program, change, 0) == TYPE_OBJ
+	      && jit_deopt_map_local_type(program, change, 1) == TYPE_STR,
+	      "deopt local base did not inherit unchanged type");
+	check(jit_deopt_map_local_value(program, remove, 0) == 3
+	      && jit_deopt_map_local_value(program, remove, 1) == 0,
+	      "deopt local tombstone did not mask base value");
+	jit_program_free(program);
     }
 
     return failures != 0;

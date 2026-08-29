@@ -1175,8 +1175,8 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
     JITDeoptMap *map = &program->deopt_maps[map_id];
     int i;
 
-    for (i = 0; i < jit_deopt_map_local_count(map); i++) {
-	int val = map->local_values[i];
+    for (i = 0; i < map->num_locals; i++) {
+	int val = jit_deopt_map_local_value(program, map, i);
 	if (val > 0) {
 	    if (program->value_types && program->value_types[val] == TYPE_FLOAT) {
 		append(build, MIR_new_insn(build->context, MIR_DMOV,
@@ -4933,16 +4933,15 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map)
 {
     int i;
 
-    for (i = 0; i < jit_deopt_map_local_count(map); i++) {
-	int value = map->local_values[i];
-	int slot = jit_deopt_map_local_slot(map, i);
+    for (i = 0; i < map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
 
 	if (value > 0 && value < program->num_values
 	    && program->value_is_tagged && program->value_is_tagged[value]
 	    && !jit_runtime_type_is_valid((var_type)
 		program->deopt_values[program->num_values + value])) {
 	    errlog("JIT: missing runtime tag for value %d in local %d at pc %u\n",
-		   value, slot, map->bytecode_pc);
+		   value, i, map->bytecode_pc);
 	    panic("JIT runtime tag invariant violated");
 	}
     }
@@ -5019,19 +5018,21 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	map = &program->deopt_maps[deopt_map];
 	jit_validate_materialized_tags(program, map);
 	materialized_depth = map->stack_depth;
-	for (i = 0; i < jit_deopt_map_local_count(map); i++)
-	    if (map->local_values[i] > 0) {
-		int slot = jit_deopt_map_local_slot(map, i);
-		var_type type = map->local_types ? map->local_types[i] : TYPE_INT;
+	for (i = 0; i < map->num_locals; i++) {
+	    int local_value = jit_deopt_map_local_value(program, map, i);
+
+	    if (local_value > 0) {
+		var_type type = jit_deopt_map_local_type(program, map, i);
 		if (type == TYPE_ANY)
 		    type = (var_type) program->deopt_values[program->num_values
-			+ map->local_values[i]];
+			+ local_value];
 		Var value = materialize_deopt_value(type,
-			program->deopt_values[map->local_values[i]]);
+			program->deopt_values[local_value]);
 
-		free_var(env[slot]);
-		env[slot] = value;
+		free_var(env[i]);
+		env[i] = value;
 	    }
+	}
 	if (deopt_stack && (map->stack_depth
 			    || (jit_deopt_map_is_specialized_builtin(map)
 				&& map->builtin_args == 0)))

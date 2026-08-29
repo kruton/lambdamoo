@@ -39,6 +39,7 @@ struct JITDeoptMap {
     int num_locals;
     int num_local_values;
     int locals_are_sparse;
+    int local_base;
     int *local_slots;
     int *local_values;
     var_type *local_types;
@@ -179,6 +180,46 @@ struct JITProgram {
     Objid diagnostic_object;
     unsigned diagnostic_verb;
 };
+
+static inline int
+jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    while (map) {
+	int i;
+
+	if (map->locals_are_sparse) {
+	    for (i = 0; i < map->num_local_values; i++)
+		if (map->local_slots[i] == slot)
+		    return map->local_values[i];
+	} else if (slot >= 0 && slot < map->num_locals && map->local_values)
+	    return map->local_values[slot];
+	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
+	    break;
+	map = &program->deopt_maps[map->local_base - 1];
+    }
+    return 0;
+}
+
+static inline var_type
+jit_deopt_map_local_type(JITProgram *program, JITDeoptMap *map, int slot)
+{
+    while (map) {
+	int i;
+
+	if (map->locals_are_sparse) {
+	    for (i = 0; i < map->num_local_values; i++)
+		if (map->local_slots[i] == slot)
+		    return map->local_values[i] > 0 && map->local_types
+			? map->local_types[i] : TYPE_INT;
+	} else if (slot >= 0 && slot < map->num_locals && map->local_values
+		 && map->local_values[slot] > 0)
+	    return map->local_types ? map->local_types[slot] : TYPE_INT;
+	if (map->local_base <= 0 || map->local_base > program->num_deopt_maps)
+	    break;
+	map = &program->deopt_maps[map->local_base - 1];
+    }
+    return TYPE_INT;
+}
 
 extern int jit_rt_is_true(int64_t, int);
 extern int jit_rt_equality(int64_t, int, int64_t, int, int);
