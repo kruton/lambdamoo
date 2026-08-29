@@ -862,6 +862,8 @@ execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
     JITContinuationFrame *continuation = 0;
     JITRunResult run_result;
     Program *callee;
+    db_verb_handle handle;
+    Objid receiver;
     Var call_args;
     enum error call_error;
     int saved_ticks = *ticks;
@@ -874,25 +876,27 @@ execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
     if (obj.type == TYPE_WAIF) {
 	if (!valid(obj.v.waif->class))
 	    return 0;
+	receiver = obj.v.waif->class;
     } else
 #endif
-    if (obj.type != TYPE_OBJ || !valid(obj.v.obj))
+    {
+	if (obj.type != TYPE_OBJ || !valid(obj.v.obj))
+	    return 0;
+	receiver = obj.v.obj;
+    }
+
+    handle = db_find_callable_verb(receiver, verb.v.str);
+    if (!handle.ptr)
+	return 0;
+    callee = db_verb_program(handle);
+    if (!callee->jit || !jit_program_is_direct_leaf(callee->jit))
 	return 0;
 
     call_args = var_ref(args);
-    call_error = call_verb2(
-#ifdef WAIF_CORE
-	obj.type == TYPE_WAIF ? obj.v.waif->class :
-#endif
-	obj.v.obj, verb.v.str WAIF_COMMA_ARG(obj), call_args, 0);
+    call_error = call_verb2(receiver, verb.v.str WAIF_COMMA_ARG(obj),
+	call_args, 0);
     if (call_error != E_NONE) {
 	free_var(call_args);
-	return 0;
-    }
-    callee = RUN_ACTIV.prog;
-    if (!callee->jit || !jit_program_is_direct_leaf(callee->jit)) {
-	free_activation(&RUN_ACTIV, 0);
-	top_activ_stack--;
 	return 0;
     }
 
