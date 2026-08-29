@@ -700,6 +700,18 @@ Implement pool efficiency in this order:
    potentially exiting instruction still has exactly one valid reconstruction
    state.
 
+   Local reconstruction snapshots now use bounded base-plus-delta chains, with
+   a maximum depth of eight and tombstones for locals absent from a derived
+   frame. Compiler IR is released after native compilation and rebuilt from
+   bytecode for later HIR/MIR dumps or recompilation. Static snapshot types are
+   derived from SSA metadata, native-resume state is allocated only for call
+   boundaries, and local deltas use one slot/value entry array. For
+   `#463:sha1`, these changes reduced retained metadata from 661,450 to 95,550
+   bytes while preserving 70,848 bytes of machine code and roughly 200--240 ms
+   compilation time. The next representation work is stack base/delta
+   coalescing followed by compact map scalar fields; metadata must fall below
+   machine-code bytes without dropping reconstruction liveness dependencies.
+
 6. **Benchmark policy rather than assuming it.** Run stable interpreter/JIT
    workloads at several pool budgets. Record peak and steady-state bytes,
    compilation and recompilation time, eviction churn, native completion, and
