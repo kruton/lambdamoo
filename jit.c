@@ -5297,7 +5297,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	jit_validate_materialized_tags(program, map);
 	materialized_depth = map->stack_depth;
 	if (native_result == JIT_RUN_CALL_VERB && continuation_out
-	    && map->reason == JIT_DEOPT_VERB_CALL) {
+	    && (map->reason == JIT_DEOPT_VERB_CALL
+		|| map->reason == JIT_DEOPT_BUILTIN_CALL)) {
 	    JITContinuationFrame *frame =
 		jit_continuation_capture(program, deopt_map);
 

@@ -4747,9 +4747,24 @@ jit_build_resume_liveness(JITProgram *program)
 		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
 		JITNativeResume *resume = mymalloc(sizeof(JITNativeResume),
 						   M_PROGRAM);
+		unsigned char *needed = mymalloc(program->num_values, M_PROGRAM);
 		int call_operands = jit_call_stack_operands(map);
+		int slot;
+
+		memcpy(needed, live, program->num_values);
+		for (slot = 0; slot < map->num_locals; slot++) {
+		    value = jit_deopt_map_local_value(program, map, slot);
+		    if (value > 0 && value < program->num_values)
+			needed[value] = 1;
+		}
+		for (slot = 0; slot < (int) map->stack_depth; slot++)
+		    if ((!map->stack_slots
+			 || map->stack_slots[slot].kind == RSS_VALUE)
+			&& map->stack_values[slot] > 0
+			&& map->stack_values[slot] < program->num_values)
+			needed[map->stack_values[slot]] = 1;
 		for (value = 1; value < program->num_values; value++)
-		    if (live[value])
+		    if (needed[value])
 			live_count++;
 		memset(resume, 0, sizeof(JITNativeResume));
 		map->native_resume = resume;
@@ -4760,10 +4775,11 @@ jit_build_resume_liveness(JITProgram *program)
 							      call_operands);
 		live_count = 0;
 		for (value = 1; value < program->num_values; value++)
-		    if (live[value]
+		    if (needed[value]
 			&& !jit_resume_source(program, map, instr, value,
 					      &resume->values[live_count++]))
 			resume->valid = 0;
+		myfree(needed, M_PROGRAM);
 	    }
 	    memset(uses, 0, program->num_values);
 	    memset(defs, 0, program->num_values);

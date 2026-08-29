@@ -360,6 +360,12 @@ unwind_stack(Finally_Reason why, Var value, enum outcome *outcome)
 				 bi_func_data);
 		switch (p.kind) {
 		case BI_RETURN:
+#ifdef ENABLE_JIT
+		    if (a->jit_continuation) {
+			jit_continuation_set_result(a->jit_continuation, p.u.ret);
+			return 0;
+		    }
+#endif
 		    *(a->top_rt_stack++) = p.u.ret;
 		    return 0;
 		case BI_RAISE:
@@ -1027,6 +1033,71 @@ do {								\
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK
 		       || jit_result == JIT_RUN_CALL_VERB) {
+		if (jit_result == JIT_RUN_CALL_VERB && continuation
+		    && deopt.reason == JIT_DEOPT_BUILTIN_CALL) {
+		    activation *caller = &RUN_ACTIV;
+		    Var args = RUN_ACTIV.base_rt_stack[0];
+		    package p;
+
+		    jit_continuation_attach(continuation, caller);
+		    jit_continuation_mark_dispatched(continuation);
+		    STORE_STATE_VARIABLES();
+		    p = call_bi_func(deopt.builtin_func, args, 1,
+				     caller->progr, 0);
+		    jit_profile_record_vm_call(caller->prog->jit);
+		    switch (p.kind) {
+		    case BI_RETURN:
+			if (caller->jit_continuation)
+			    jit_continuation_set_result(caller->jit_continuation,
+						p.u.ret);
+			else {
+			    LOAD_STATE_VARIABLES();
+			    PUSH(p.u.ret);
+			    goto next_opcode;
+			}
+			LOAD_STATE_VARIABLES();
+			goto next_opcode;
+		    case BI_CALL:
+			RUN_ACTIV.bi_func_id = deopt.builtin_func;
+			RUN_ACTIV.bi_func_data = p.u.call.data;
+			RUN_ACTIV.bi_func_pc = p.u.call.pc;
+			LOAD_STATE_VARIABLES();
+			goto next_opcode;
+		    case BI_SUSPEND:
+			{
+			    enum error e = suspend_task(p);
+
+			    if (e == E_NONE)
+				return OUTCOME_BLOCKED;
+			    LOAD_STATE_VARIABLES();
+			    PUSH_ERROR(e);
+			    goto next_opcode;
+			}
+		    case BI_RAISE:
+			if (caller->jit_continuation
+			    && !jit_continuation_materialize(caller))
+			    panic("JIT built-in continuation materialization failed");
+			LOAD_STATE_VARIABLES();
+			if (RUN_ACTIV.debug) {
+			    if (raise_error(p, 0))
+				return OUTCOME_ABORTED;
+			    LOAD_STATE_VARIABLES();
+			} else {
+			    PUSH(p.u.raise.code);
+			    free_str(p.u.raise.msg);
+			    free_var(p.u.raise.value);
+			}
+			goto next_opcode;
+		    case BI_ABORT:
+			if (caller->jit_continuation
+			    && !jit_continuation_materialize(caller))
+			    panic("JIT built-in continuation materialization failed");
+			LOAD_STATE_VARIABLES();
+			STORE_STATE_VARIABLES();
+			abort_task(p.u.why);
+			return OUTCOME_ABORTED;
+		    }
+		}
 		if (jit_result == JIT_RUN_CALL_VERB && continuation
 		    && deopt.reason == JIT_DEOPT_VERB_CALL) {
 		    activation *caller = &RUN_ACTIV;
