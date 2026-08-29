@@ -1077,7 +1077,7 @@ do {								\
 	    int resume_map = -1;
 	    JITContinuationFrame *continuation_in = RUN_ACTIV.jit_continuation;
 
-	    if (resume_key_is_valid(RUN_ACTIV.resume_key)) {
+	    if (!continuation_in && resume_key_is_valid(RUN_ACTIV.resume_key)) {
 		const ResumePoint *point =
 		    resume_point_for_key(RUN_ACTIV.prog, RUN_ACTIV.resume_key);
 

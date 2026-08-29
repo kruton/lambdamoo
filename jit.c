@@ -5592,7 +5592,11 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     if (continuation_out)
 	*continuation_out = 0;
     if (continuation_in) {
-	if (continuation_in->program != program)
+	if (continuation_in->program != program
+	    || continuation_in->map_id <= 0
+	    || continuation_in->map_id >= program->num_deopt_maps
+	    || !program->deopt_maps[continuation_in->map_id].native_resume
+	    || !program->deopt_maps[continuation_in->map_id].native_resume->valid)
 	    return JIT_RUN_FALLBACK;
 	resume_map = continuation_in->map_id;
 	if (program->usage)
