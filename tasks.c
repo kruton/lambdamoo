@@ -1210,6 +1210,21 @@ next_task_start(void)
     return -1;
 }
 
+int
+tasks_suspend_zero_should_yield(Objid progr)
+{
+    /* Even an otherwise idle server must periodically return to the main
+     * loop so that network input can become queued work. */
+    static unsigned skipped_yields;
+
+    if (!check_user_task_limit(progr)
+	|| next_task_start() == 0 || ++skipped_yields >= 64) {
+	skipped_yields = 0;
+	return 1;
+    }
+    return 0;
+}
+
 void
 run_ready_tasks(void)
 {

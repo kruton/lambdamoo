@@ -7,6 +7,7 @@
 #include "ref_count.h"
 #include "server.h"
 #include "storage.h"
+#include "tasks.h"
 #include "utils.h"
 #include "waif.h"
 
@@ -17,6 +18,8 @@
 
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
+static int test_suspend_protected;
+static int test_suspend_zero_yield;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
 
 JITProgram *
@@ -27,6 +30,8 @@ compile_program_to_jit(Program *program)
 }
 
 void hir_test_set_length_protected(int);
+void hir_test_set_suspend_protected(int);
+void hir_test_set_suspend_zero_yield(int);
 #ifdef WAIF_CORE
 Var hir_test_new_waif(void);
 #endif
@@ -60,7 +65,8 @@ builtin_protection_generation(void)
 int
 builtin_function_is_protected(unsigned n)
 {
-    return n == 6 && test_length_protected;
+    return (n == 6 && test_length_protected)
+	|| (n == 11 && test_suspend_protected);
 }
 
 void
@@ -70,6 +76,28 @@ hir_test_set_length_protected(int protected)
 	test_length_protected = protected;
 	test_protection_generation++;
     }
+}
+
+void
+hir_test_set_suspend_protected(int protected)
+{
+    if (test_suspend_protected != protected) {
+	test_suspend_protected = protected;
+	test_protection_generation++;
+    }
+}
+
+void
+hir_test_set_suspend_zero_yield(int yield)
+{
+    test_suspend_zero_yield = yield;
+}
+
+int
+tasks_suspend_zero_should_yield(Objid progr)
+{
+    (void) progr;
+    return test_suspend_zero_yield;
 }
 
 static inline int
@@ -217,6 +245,7 @@ name_func_by_num(unsigned id)
     case 8: return "rindex";
     case 9: return "pass";
     case 10: return "time";
+    case 11: return "suspend";
     default: return "unknown_func";
     }
 }

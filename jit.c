@@ -16,6 +16,7 @@
 #include "log.h"
 #include "server.h"
 #include "storage.h"
+#include "tasks.h"
 #include "utf.h"
 #include "utils.h"
 
@@ -486,6 +487,22 @@ jit_rt_var_raw(const Var *value)
     return value->v.num;
 }
 
+static int
+jit_rt_suspend_zero(Var *args, unsigned func, int64_t progr)
+{
+    Var arglist;
+
+    if (builtin_function_is_protected(func)
+	|| !args || args[0].v.num != 1
+	|| args[1].type != TYPE_INT || args[1].v.num != 0
+	|| tasks_suspend_zero_should_yield((Objid) progr))
+	return 0;
+    arglist.type = TYPE_LIST;
+    arglist.v.list = args;
+    free_var(arglist);
+    return 1;
+}
+
 typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *, Objid,
 				   int, Var *);
@@ -684,6 +701,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
     MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
+    MIR_load_external(context, "jit_rt_suspend_zero",
+		      (void *) jit_rt_suspend_zero);
 }
 
 static int
@@ -856,6 +875,8 @@ typedef struct {
     MIR_item_t import_parent;
     MIR_item_t proto_var_raw;
     MIR_item_t import_var_raw;
+    MIR_item_t proto_suspend_zero;
+    MIR_item_t import_suspend_zero;
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -1406,6 +1427,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_var_raw = MIR_new_proto(build->context, "proto_var_raw", 1,
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
+
+    build->proto_suspend_zero = MIR_new_proto(build->context,
+	"proto_suspend_zero", 1, &res_i32, 3,
+	MIR_T_P, "args", MIR_T_I32, "func", MIR_T_I64, "progr");
+    build->import_suspend_zero = MIR_new_import(build->context,
+						"jit_rt_suspend_zero");
 
     if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
 	snprintf(func_name, sizeof(func_name), "jit_o%" PRIdN "_v%u_%" PRIu64,
@@ -4027,10 +4054,51 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    if (instr->deopt_map > 0
 			&& instr->deopt_map < program->num_deopt_maps
 			&& jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])) {
-			append_materialized_exit(build, program, instr->deopt_map,
-					 values,
-					 deopt_map_out, deopt_values, status,
-					 common_return, JIT_RUN_CALL_VERB);
+			JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+			const char *builtin_name = name_func_by_num(map->builtin_func);
+
+			if (builtin_name && !strcmp(builtin_name, "suspend")) {
+			    char name[32];
+			    MIR_reg_t can_continue;
+			    MIR_label_t yield = MIR_new_label(build->context);
+			    MIR_label_t done = MIR_new_label(build->context);
+
+			    sprintf(name, "suspend_continue%d", copy_serial++);
+			    can_continue = new_reg(build, name);
+			    append(build, MIR_new_call_insn(build->context, 6,
+				MIR_new_ref_op(build->context,
+					       build->proto_suspend_zero),
+				MIR_new_ref_op(build->context,
+					       build->import_suspend_zero),
+				MIR_new_reg_op(build->context, can_continue),
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_int_op(build->context, map->builtin_func),
+				MIR_new_reg_op(build->context, progr)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, yield),
+				MIR_new_reg_op(build->context, can_continue),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			    if (program->value_is_tagged
+				&& program->value_is_tagged[instr->value])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_mem_op(build->context, tag_t,
+					(program->num_values + instr->value)
+					* sizeof(Num), deopt_values, 0, 1),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, yield);
+			    append_materialized_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return, JIT_RUN_CALL_VERB);
+			    append(build, done);
+			} else
+			    append_materialized_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return, JIT_RUN_CALL_VERB);
 			if (resume_continuations[instr->deopt_map])
 			    append(build, resume_continuations[instr->deopt_map]);
 		    } else

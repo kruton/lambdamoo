@@ -81,6 +81,7 @@ extern void register_task_queue(task_enumerator);
 extern Var read_input_now(Objid connection);
 
 extern int next_task_start(void);
+extern int tasks_suspend_zero_should_yield(Objid);
 extern void run_ready_tasks(void);
 extern enum outcome run_server_task(Objid player, Objid what,
 				    const char *verb, Var args,
