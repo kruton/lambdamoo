@@ -233,23 +233,22 @@ The current tier deoptimizes before general built-in calls, but directly lowers
 a reviewed set of continuation-free built-ins and runtime operations.
 These include `abs()`, `min()`, `max()`, `toint()`, `typeof()`, `length()`,
 `index()`, `rindex()`, `ticks_left()`, `seconds_left()`, `time()`, `valid()`, and
-`parent()`. Verb calls and general fixed-ID built-in calls can now leave a
-compact native continuation on the caller activation. The frame owns every live
-SSA value plus the canonical locals and stack values required to reconstruct
-the pre-call state. Normal verb and built-in returns inject their tagged `Var`
-result into that frame and resume machine code without first expanding `rt_env`
-and the operand stack. `BI_CALL` chains retain the native caller while the
-interpreter owns activation creation and built-in continuation data.
-`BI_SUSPEND` moves the frame with the queued VM and resumes it from the
-scheduler-provided value.
+`parent()`. The existing VM-call bridge can leave a compact continuation on a
+canonical caller activation for verb and fixed-ID built-in calls. That bridge
+is not the general native verb-frame ABI specified below: it relies on the
+interpreter to own activation creation and has supported experiments in which
+`BI_CALL` and `BI_SUSPEND` retained a native caller.
 
-Errors, aborts, traceback or task-stack introspection, pool invalidation, and
-database writes materialize the frame in place before using canonical VM
-machinery. Database persistence therefore remains bytecode-based and contains
-no native pointers. Continuation maps preserve catch/finally markers and the
-complete canonical stack prefix for these recovery paths. Specialized built-in
-guard exits still use their existing canonical bridge and can adopt compact
-frames after their raw operands are packaged with identical ownership rules.
+The native verb-frame sections below are normative for the broader
+JIT-to-JIT-call milestone. Normal eligible verb calls keep a compact task-local
+chain. Built-ins whose effects require canonical state promote before entry;
+other built-ins may return normally or retain a modeled `BI_CALL` continuation
+without promotion. Suspension, unmodeled errors or aborts, traceback or
+task-stack introspection, pool invalidation, and database writes promote the
+complete chain before using canonical VM machinery. Database persistence
+therefore remains bytecode-based and contains no native pointers. Existing
+continuation code may be reused only where it satisfies the frame, ownership,
+ABI, and promotion invariants below.
 
 Built-in inlining must be opt-in and metadata-driven. A built-in may be inlined
 only if its registered contract declares it continuation-free:
@@ -261,6 +260,685 @@ only if its registered contract declares it continuation-free:
 * its error behavior and ownership behavior are fully modeled by the JIT.
 
 Continuation-capable built-ins must remain runtime call boundaries.
+
+### 9.2.1 Native Verb Frame Model
+
+The general JIT-to-JIT call path must not be implemented as a recursive C call
+whose failure restarts the callee.  It is an incremental execution stack.  Each
+committed general verb dispatch creates one semantic frame, just as
+`call_verb2()` would create one activation, but the frame remains in compact
+runtime form until it returns or the chain is promoted.  The separately
+classified rollback-safe leaf optimization may return without committing such
+a frame.
+
+There are two distinct records which must not be conflated:
+
+* A **native verb frame** describes one invoked verb and retains the generated
+  code and `Program` needed to execute it.  A younger compact callee owns its
+  runtime environment, native storage, value homes, referenced receiver or waif
+  identity, called and canonical verb names, and other invocation metadata.
+  The root frame is an overlay anchored to an existing canonical activation: it
+  borrows all activation-owned environment and invocation metadata and owns
+  only its additional native storage and value homes.  The overlay and
+  activation must not both claim ownership of the same stored reference.
+* A **caller resume record** describes the suspended call expression in the
+  immediately preceding frame.  It identifies an exact deoptimization-map ID
+  and owns the values needed to reconstruct or resume the caller after the
+  call operands have been consumed.  It has exactly one result hole.  It does
+  not own the callee environment or describe the callee's current PC.
+
+Native execution entered from `run()` begins with a root frame overlay anchored
+to the current interpreter activation.  Younger frames form a chain ordered
+from that root to the currently executing leaf.  Every non-root native frame
+has exactly one incoming caller resume record.  A frame may have an outgoing
+resume record only while its callee exists.  Links are task-local; a
+process-global pending list cannot represent nested tasks, reentrant execution,
+or independent VMs safely.
+
+Conceptually the task stack is:
+
+```text
+canonical activation A
+  native root frame A             (borrows A's canonical environment)
+    caller resume: A after calling B
+      native verb frame B         (owns B's compact environment)
+        caller resume: B after calling C
+          native verb frame C     <- current frame
+```
+
+This is a semantic stack, not necessarily the C stack.  Dispatch and return
+should run through a C trampoline so recursion consumes the ordinary MOO
+activation-depth budget without consuming unbounded C stack.
+
+#### Dispatch
+
+Native dispatch must share verb lookup and environment construction with
+`call_verb2()`.  Lookup validates the object or waif receiver, finds the
+callable verb, and determines the verb owner and definer.  Environment
+construction establishes `this`, `caller`, `player`, `verb`, `args`, command
+variables, and permissions with the same reference-transfer rules as an
+interpreter activation.
+
+After lookup, dispatch has only three valid outcomes:
+
+1. A strict rollback-safe leaf may use the existing direct-call optimization.
+   It either returns normally or proves that no language-visible work occurred
+   before falling back.
+2. An eligible general callee consumes the call operands, freezes the caller's
+   resume record, allocates its native verb frame, and becomes the current
+   frame.  From this point the caller cannot be restarted.
+3. An ineligible or unavailable callee causes promotion before `call_verb2()`
+   is invoked.  Verb-not-found and receiver errors are delivered at the
+   caller's exact call site after promotion; they are not treated as permission
+   to replay the caller.
+
+A frame becomes visible in the chain only after all references and storage
+needed to destroy or promote it have been acquired.  Allocation or validation
+failure before that commit point leaves the frozen caller and call request
+intact so they can be promoted at the call boundary; it does not authorize
+restarting earlier caller instructions.  Failure after the commit point must
+promote or abort; it must never restore saved ticks, timeout state, errors, or
+native storage and re-execute completed instructions.
+
+#### Normal return
+
+On normal return, the trampoline removes only the completed leaf frame.  The
+returned `Var` is moved into the unique result hole in its caller resume record,
+then the callee environment and all remaining callee-owned values are
+destroyed.  The caller resumes by the recorded map ID.  No bytecode-PC search,
+source-line search, or speculative re-entry is permitted.
+
+The result transfer is a move, not a borrowed raw payload.  For complex values,
+the result hole is the sole owner after transfer.  Generated code may load the
+raw payload and runtime tag from that hole, but the hole remains authoritative
+until the value is moved to another owned slot or the resume record is
+destroyed.  An SSA register containing a copied pointer is never an ownership
+root and must not be used to recover a value after another call.
+
+#### Values retained across a call
+
+Every value named by a caller resume map must have one stable source:
+
+* canonical local or stack slot, whose owning `Var` remains live;
+* constant or immediate scalar encoded in the map;
+* the result hole; or
+* a dedicated owned slot in the caller frame.
+
+An owned slot stores the complete `Var`, including its runtime type tag.  Resume
+loads both payload and tag from that slot.  Raw SSA payload slots and separately
+cached tags are not stable sources for strings, lists, floats, waifs, maps, or
+anonymous values across a call.
+
+The compiler must perform forward must-availability analysis for every resume
+map.  A value may be captured only if its definition dominates the call on all
+incoming paths and the selected owner is initialized on all of those paths.
+Phi liveness or the existence of an SSA definition is insufficient.  If
+availability, the runtime tag, or unique ownership cannot be proved, the call
+site is not natively resumable and dispatch promotes before executing the
+callee.
+
+The verifier must reject a resume record when a referenced value is
+uninitialized, already consumed, owned by two slots, represented only by a raw
+complex payload, or destroyed before every resume/promotion edge.  Runtime
+debug assertions should poison consumed owner slots and check that each live
+complex `Var` has exactly one designated owner within the frame.
+
+#### Canonical promotion
+
+Promotion converts the whole native suffix into ordinary activations before
+using VM behavior that expects a canonical stack.  It is required for built-ins
+classified as requiring canonical entry, unrepresentable built-in continuation
+states, suspension, unmodeled errors or aborts, ordinary deoptimization,
+traceback or task-stack introspection, JIT invalidation, and database dumps.  A
+modeled `BI_CALL` is not intrinsically a promotion boundary.
+
+Promotion is prepared before it mutates the VM stack:
+
+1. Reserve activation capacity for the complete native suffix and verify the
+   ordinary interpreter-plus-native depth limit.
+2. Validate every program reference, current-location map, caller resume map,
+   and value source.
+3. Allocate any reconstruction storage and acquire any additional references
+   needed by canonical activations.
+4. Commit bottom-up: materialize the root overlay back into its anchored
+   activation in place, then push an activation for each younger frame, ending
+   with the active leaf.
+5. Materialize each suspended caller at its after-dispatch continuation.  Its
+   stack excludes the consumed object, verb name, and argument list and has no
+   synthetic return value yet.
+6. Materialize the leaf at its exact current `pc` and `error_pc`, with its
+   locals, operand stack, `temp`, handler markers, and built-in continuation
+   state.
+7. Transfer ownership to the activations, detach the native chain, and only
+   then release the compact frame containers.
+
+If preparation fails, no partial canonical chain is published.  Once commit
+begins it must be infallible.  The resulting activation order must be identical
+to repeated successful `call_verb2()` calls, so the existing interpreter
+unwinder can return from an interpreted leaf into a materialized caller.  A
+caller may later enter native code through its ordinary resume anchor, but
+promotion itself never leaves native pointers in an activation or database.
+
+#### Required invariants
+
+At every trampoline iteration and materialization boundary:
+
+* canonical activation depth plus compact frames younger than the root overlay
+  is within the normal activation limit; the overlay represents its anchored
+  activation and is not counted twice;
+* each environment, frame, resume record, result hole, and owned value has one
+  owner and one destruction path;
+* a dispatched call's operands have been consumed exactly once;
+* completed ticks, timeout state, errors, and side effects are never rolled
+  back or replayed;
+* the current frame has one exact canonical location, including `error_pc`;
+* every suspended caller has one exact after-call map and cannot execute until
+  its result hole is filled or an exception is delivered;
+* task switching, serialization, introspection, and invalidation observe only
+  canonical activations; and
+* normal return, exceptional unwind, abort, and promotion release the same
+  references exactly once along mutually exclusive paths.
+
+The implementation should begin with a standalone frame verifier and tests for
+construction, return, and bottom-up promotion.  The general trampoline should
+not be enabled for database workloads until those tests cover complex values,
+recursive chains, caught errors at every depth, and promotion after an earlier
+side effect.  The persisted `player:test(300000)` SHA1 loop is a hard regression
+and performance gate: inability to log in, complete the loop, or keep resident
+memory stable rejects the change.
+
+### 9.2.2 JIT Execution ABI
+
+Every native entry point receives a hidden execution-context pointer in
+addition to the current native verb frame.  This is the stable semantic JIT
+ABI.  Generated code must not discover task state through process globals or
+assume that an interpreter activation remains at a fixed address.
+
+Conceptually, the entry point and context are:
+
+```c
+JITRunResult jit_entry(JITExecutionContext *context,
+                       JITNativeVerbFrame *frame,
+                       int entry_map);
+
+struct JITExecutionContext {
+    vm task_vm;
+    JITNativeVerbFrame *current_frame;
+    int *ticks_remaining;
+    int *task_timed_out;
+    enum error *pending_error;
+    unsigned native_depth;
+    unsigned activation_limit;
+    const JITRuntimeServices *services;
+};
+```
+
+This is an illustrative interface rather than a declaration to copy directly:
+the concrete structure must follow the project's C layout and dependency
+rules.  Its responsibilities and ownership are normative.
+
+The context is allocated for, and associated with, one running task.  It
+survives every native call in that task and identifies the VM which owns the
+canonical activation stack.  `current_frame` identifies the currently
+executing native verb and changes on call and return.  The context does not own
+language `Var` values; native frames, resume records, and canonical activations
+remain their only ownership roots.
+
+`native_depth` counts compact frames younger than the root overlay.  It does not
+count the anchored activation a second time.  At every native entry,
+`frame == context->current_frame` is an ABI invariant.
+
+The two ABI operands have different lifetimes:
+
+* `context` is stable across the complete native execution interval for a task;
+* `frame` changes at each verb call and return and owns the callee-specific
+  environment, runtime storage, resume location, and values.
+
+`entry_map` selects either initial verb entry or one exact continuation map.  A
+compiled verb does not search by source line or bytecode PC to resume after a
+call.  Its caller resume record supplies the map ID directly.
+
+Every native exit reports one of a small set of semantic outcomes to the
+trampoline:
+
+* **return** moves a complete result `Var` out of the current frame;
+* **call** supplies a complete call request and freezes an exact caller resume
+  record; the trampoline performs dynamic receiver and verb validation;
+* **promote** identifies a canonical boundary and the current deoptimization
+  map;
+* **raise** supplies an error and the exact error location; and
+* **abort** supplies the task-abort reason and exact current location.
+
+The concrete `JITRunResult` may carry these details through out-parameters, but
+the distinction is part of the ABI.  Generated code reports the outcome; it
+does not recursively manipulate the interpreter activation stack or decide
+whether VM policy permits a boundary to remain native.
+
+#### Frame-to-frame calling convention
+
+Native verb calls still require ownership and liveness information.  A machine
+calling convention can specify where values travel, but it cannot determine
+which reference-counted values remain live, who frees them, or how to rebuild
+canonical locals and stacks during deoptimization.  The compiler therefore
+uses liveness to construct the frame layout and ownership maps; the runtime
+uses the resulting fixed layout rather than trying to rediscover SSA state.
+
+At every natively resumable verb-call site, generated code spills every value
+live across the call to a stable home in the caller's explicit native frame.
+This storage is a JIT-managed semantic stack, not the platform C stack and not
+the movable interpreter operand stack.  It remains valid across C helpers,
+activation-stack growth, recursive MOO calls, and register allocation changes.
+
+The initial calling convention is deliberately conservative:
+
+* `context` and `frame` are the only values preserved as ABI inputs;
+* ordinary machine registers containing language values are caller-clobbered;
+* every live complex value is homed as a complete owning `Var`, with payload
+  and runtime tag in the same slot;
+* every live scalar has a typed or tagged frame slot when deoptimization or
+  native resumption can observe it;
+* constants remain encoded in immutable resume metadata when they need no
+  runtime owner; and
+* the result is moved into one designated caller result slot before the caller
+  resumes.
+
+Consequently, a call does not need to preserve an arbitrary set of SSA
+registers.  Before publishing a call outcome, the caller completes all required
+stores to its home slots and changes their state from uninitialized or borrowed
+to the ownership state described by the call-site map.  Only then are the call
+operands consumed and the caller suspended.  After return, the caller reloads
+values from their homes and may place them back into registers.
+
+The link between a callee frame and its caller must identify at least:
+
+* the caller frame, including the root overlay when the caller is canonical;
+* the exact after-call resume-map ID;
+* the caller's canonical call-site `pc` and `error_pc`;
+* the result-slot index and whether that slot is empty or initialized;
+* the live-home layout or call-site map describing reconstructible values; and
+* the lifecycle state: preparing, dispatched, returned, or promoted.
+
+Arguments are transferred according to the shared verb-environment
+constructor.  The call request owns the receiver, verb name, and argument list
+while dispatch is being prepared.  On successful dispatch their ownership is
+moved into the callee environment and metadata.  On pre-commit failure the
+request remains their authoritative owner until promotion transfers them to the
+canonical call boundary or the interpreter-compatible lookup-error path
+consumes them.  It must not reconstruct them by replaying the caller.  After
+the dispatch commit point, no frame may retain a second owning copy of those
+call operands.
+
+Normal return produces a complete result `Var`.  The trampoline verifies that
+the caller result slot is empty, moves the result into it, marks it initialized,
+and only then destroys the callee frame.  An error or abort does not initialize
+the result slot; promotion reconstructs the caller as suspended after dispatch
+so the interpreter unwinder can deliver the exceptional outcome normally.
+
+This convention reduces the amount of runtime continuation data, but it does
+not eliminate compiler analysis.  Forward must-availability proves that each
+home slot is initialized on every path reaching the call.  Backward liveness
+determines which values require homes.  Ownership analysis selects move,
+reference, or scalar storage and verifies exactly one cleanup path.  The deopt
+map relates those homes to canonical locals, operand-stack entries, `temp`, and
+handler markers.
+
+The first implementation should spill all cross-call values, even when a
+platform callee-saved register could retain one.  Later register allocation may
+keep scalar values in callee-saved registers only if every promotion and
+runtime-helper safepoint has an exact recovery rule.  Complex owning `Var`
+values should continue to have authoritative frame homes; a register may cache
+their payload but never replace their ownership slot.
+
+Using the platform machine stack for these homes is intentionally excluded from
+the portable ABI.  C and MIR stack-frame layouts are target-specific, unwind
+through C is not the MOO activation model, and suspended or promoted state must
+outlive the native call stack.  A backend may address JIT frame homes relative
+to a pinned frame register, giving generated code stack-like access without
+making correctness depend on the host ABI.
+
+#### Built-in continuation links and `BI_CALL`
+
+`BI_CALL` is not intrinsically a canonical-stack operation.  The interpreter
+represents it with a built-in function ID, continuation PC, and opaque
+`bi_func_data`, attaches that state to the nested callee activation, and invokes
+the built-in continuation when the callee unwinds.  The native ABI can retain
+the same semantics with an explicit built-in continuation link, but the package
+alone is insufficient: under the current API the built-in has already called
+`call_verb()` or `call_verb2()` and pushed the nested interpreter activation
+before returning `BI_CALL`.
+
+Compact `BI_CALL` therefore requires shared verb dispatch to have a task-local
+capture mode.  While `call_bi_func()` is entered from a compact native frame,
+the execution context enables that mode.  A successful `call_verb2()` performs
+the usual lookup and environment construction but commits a complete pending
+call request to the execution context instead of pushing an activation.  The
+built-in then returns `BI_CALL`, and the trampoline consumes both the package
+and the pending request atomically.  This state belongs to
+`JITExecutionContext`; it must not be a process-global pending call.
+
+The dispatch refactoring should separate three operations currently combined
+by `call_verb2()`:
+
+1. resolve and validate the receiver and callable verb;
+2. construct an ownership-complete verb environment and semantic call
+   descriptor; and
+3. commit that descriptor either as an interpreter activation or as a native
+   verb frame.
+
+Interpreter callers use the activation commit unchanged.  A built-in running
+under native capture uses the frame commit after it returns `BI_CALL`.  Lookup
+errors create no pending request and retain the existing `call_verb2()` error
+contract.  Capture mode is enabled only around the one `call_bi_func()` entry
+and is cleared on every package outcome, including C-level failure paths.
+
+The link is distinct from an ordinary verb caller resume record and owns:
+
+* the built-in function ID and continuation PC;
+* the opaque `bi_func_data` and its cleanup responsibility;
+* the programmer identity used for the continuation call;
+* the native caller frame and exact result resume map; and
+* the nested callee frame currently producing the continuation input.
+
+When a built-in that is safe to enter with a compact chain returns `BI_CALL`,
+the trampoline requires exactly one pending call request, freezes the native
+caller, creates this link, and commits the request as a native callee when
+eligible.  Zero or multiple pending requests is an ABI violation rejected by a
+verifier or runtime assertion; replaying the built-in is not a safe fallback.  A
+non-`BI_CALL` package must leave no pending request.  A normal nested return is
+moved into `call_bi_func()` as the continuation argument under a fresh capture
+scope.  Its outcome is then handled as follows:
+
+* `BI_RETURN` destroys the built-in link and moves the value into the original
+  caller's result slot;
+* another `BI_CALL` updates or replaces the link and dispatches the next nested
+  verb without growing the native caller chain unnecessarily;
+* `BI_SUSPEND` promotes before queuing the task until native suspension state is
+  separately modeled;
+* `BI_RAISE` promotes before delivering the error through the interpreter; and
+* `BI_ABORT` promotes the locations needed by the ordinary abort machinery.
+
+If the nested verb exits exceptionally, the initial implementation promotes
+and lets `unwind_stack()` apply the legacy rule: invoke the built-in
+continuation with zero, short-circuit further calls, and suppress continuation
+errors as the interpreter currently does.  That path may remain native only
+after the trampoline implements and tests the same unusual semantics exactly.
+
+Promotion transfers the link into the nested callee activation's `bi_func_id`,
+`bi_func_pc`, and `bi_func_data` fields without copying ownership of the opaque
+data, exactly where `unwind_stack()` expects it.  The emptied native link must
+no longer free the data; the activation cleanup path becomes its sole owner.  A
+built-in continuation which cannot be represented by those canonical fields is
+not eligible for compact capture and promotes before the built-in is entered.
+
+Effect metadata decides whether a built-in may be entered while callers remain
+compact.  A built-in which can inspect the task stack, suspend internally
+without returning a package, invalidate executing code, or otherwise require
+canonical activations promotes before `call_bi_func()`.  For a safe compact
+entry, side effects completed before a later `BI_CALL`, raise, abort, or suspend
+outcome are retained; outcome handling never replays the built-in.
+
+Compact capture additionally requires an audited built-in contract: every
+successful captured `call_verb2()` is followed by exactly one `BI_CALL` return,
+and the built-in does not inspect or depend on the newly pushed activation
+before returning.  Built-ins without that contract promote before entry even
+when their registered effects merely say that they may call a verb.
+
+Thus minimal promotion is the target: retain a `BI_CALL` when both the built-in
+continuation and nested verb call are representable, and promote only for an
+effect or outcome whose semantics require canonical VM state.  A conservative
+implementation may initially promote all `BI_CALL` outcomes while the link and
+its verifier are being developed, but that is a bring-up restriction rather
+than the final ABI.
+
+Native dispatch passes the same context to the callee, installs the callee as
+`current_frame`, and enters its compiled program.  Normal return restores the
+caller frame before resuming its exact map ID.  Promotion follows
+`current_frame` and its task-local links to find the native suffix; it never
+consults a process-global pending-frame list.
+
+The context must provide or reach all mutable execution state whose identity is
+shared across verbs, including tick accounting, timeout and kill state, native
+depth, the activation limit, and the owning VM.  Runtime operations should be
+accessed through an explicit, versioned service table or ABI helpers rather
+than embedding arbitrary C addresses and structure offsets throughout generated
+code.  Changes to the context layout, service table, value representation, or
+calling convention invalidate compiled programs.
+
+The portable ABI treats `context` and `frame` as hidden function arguments.
+Correctness must not depend on a particular physical register.  A backend may
+pin `context` in a dedicated callee-saved register and keep `frame` in another
+register when the target architecture, platform ABI, and MIR integration can
+reserve them reliably.  Such pinning is an optimization of the same semantic
+ABI, not a separate source of VM state.
+
+When a pinned register is used:
+
+* every JIT entry stub initializes it before entering generated code;
+* every JIT-to-JIT edge preserves it according to the platform calling
+  convention;
+* calls into C either preserve it as callee-saved or spill and restore it;
+* signal, error, deoptimization, and promotion stubs can recover the same
+  context without relying on transient C locals; and
+* architecture-specific tests verify the register contract around every
+  runtime helper category.
+
+Generated code must not retain pointers to `RUN_ACTIV` or activation-stack
+elements across operations that can grow or relocate that stack.  If the
+context caches a canonical activation, it uses a stable index or refreshes the
+pointer after every relocating operation.  Similarly, suspension stores the
+task only after promoting the chain to canonical activations.  The execution
+context becomes inactive before the task is queued, and neither it nor its
+physical register assignment is database state.  A later task resumption
+creates or reinitializes a context before entering native code again.
+
+ABI verification should exercise native recursion, calls through C helpers,
+activation-stack growth, task switching, suspension, promotion, and error
+unwind with assertions that `context`, `current_frame`, tick pointers, and the
+owning VM remain consistent.  Register pinning should be enabled only after the
+argument-based ABI passes the full database regression suite, so backend
+optimization cannot obscure frame-model correctness.
+
+### 9.2.3 Interpreter Run-Loop Integration and Deoptimization
+
+The interpreter `run()` loop remains the authority for canonical activations,
+exception delivery, built-ins, suspension, aborts, and task completion.  The
+native trampoline is entered from `run()` only when the current activation has
+a compiled initial entry or an exact compiled resume map.  Entry constructs or
+reinitializes a task-local `JITExecutionContext`, identifies the canonical root
+activation, and creates a native view of that activation without transferring
+its language values to a second owner.
+
+While execution remains native, the trampoline repeatedly performs this state
+machine:
+
+```text
+execute current frame at entry_map
+  return   -> move result to caller, pop frame, resume caller map
+  call     -> resolve target, push native callee or request promotion
+  promote  -> materialize complete native suffix and return to run()
+  raise    -> materialize complete native suffix and deliver the error
+  abort    -> materialize locations needed for traceback, then abort the task
+```
+
+The trampoline, rather than generated code or recursive C calls, changes
+`current_frame`.  It charges each compact frame younger than the root overlay
+against the ordinary activation limit, retains code and program references, and
+is the single cleanup authority for normal native call and return.  The C stack
+therefore remains bounded for MOO recursion.
+
+The canonical activation from which `run()` entered native code remains the
+root of the task stack and owns its canonical environment.  Its native root
+frame is an overlay which borrows that environment and owns only native homes
+and metadata not already owned by the activation.  If the root calls a native
+callee, its after-call resume record links the overlay to the younger native
+frame.  `run()` must not interpret the root activation while its overlay or any
+younger frame remains active.  It regains control either after the root verb
+returns normally or after the complete native chain has been promoted.
+
+Before entering the trampoline, `run()` stores any cached interpreter state
+such as the bytecode pointer, error pointer, and runtime-stack pointer into its
+activation or execution context.  After a native outcome returns control,
+`run()` reloads those caches from the now-authoritative activation.  No pointer
+to `RUN_ACTIV`, its runtime stack, or the activation vector may remain live
+across a push, relocation, promotion, or other VM operation that can invalidate
+it.
+
+#### Deoptimization protocol
+
+For this milestone, every ordinary deoptimization is a full native-suffix
+promotion.  It is not enough to reconstruct only the leaf while leaving its
+callers in private native storage: interpreter error handling, introspection,
+suspension, and activation return all assume one canonical activation stack.
+
+Each native safepoint therefore identifies a deoptimization map containing:
+
+* the active frame's exact bytecode `pc` and `error_pc`;
+* whether the boundary instruction has or has not executed;
+* the operand-stack depth and complete stack reconstruction recipe;
+* canonical locals, `temp`, catch/finally markers, and built-in continuation
+  state;
+* ownership sources and runtime tags for every reconstructed `Var`;
+* ticks already charged at the safepoint; and
+* the boundary kind and any operands which the interpreter must consume.
+
+Deoptimization proceeds in four phases:
+
+1. **Freeze.** Generated code stops at the safepoint and publishes its outcome,
+   current map ID, and authoritative owner slots.  It performs no more language
+   operations and releases no value needed by promotion.
+2. **Prepare.** The runtime validates every frame and resume map, reserves the
+   complete activation suffix, allocates reconstruction storage, and acquires
+   any references required for transfer.  Failure here aborts safely without
+   publishing a partial interpreter stack; it never restarts completed native
+   work.
+3. **Commit.** The runtime writes the root overlay into its anchored activation,
+   materializes younger suspended callers bottom-up and the active leaf last,
+   transfers each value to exactly one canonical owner, clears native links,
+   and releases only the emptied compact containers.  This phase is
+   allocation-free and cannot fail.
+4. **Resume.** Control returns to `run()`, which reloads its cached state and
+   dispatches according to the boundary kind at the reconstructed `pc` and
+   `error_pc`.
+
+The safepoint's executed/not-executed flag determines where interpretation
+continues.  A guard before an operation reconstructs its operands and resumes
+at that operation.  A boundary after an operation resumes after it and must not
+repeat its side effects or tick charge.  Tick reimbursement is permitted only
+when the map proves the corresponding interpreter operation has not executed;
+saved task counters are never restored wholesale.
+
+Boundary handling after promotion is deliberately ordinary VM behavior:
+
+* an unavailable or ineligible verb target promotes through the canonical
+  caller call site, then uses shared verb resolution and `call_verb2()`;
+* a built-in requiring canonical entry promotes before `call_bi_func()`;
+  otherwise `BI_RETURN` and a representable `BI_CALL` remain in the trampoline,
+  while `BI_SUSPEND`, `BI_RAISE`, `BI_ABORT`, or an unrepresentable continuation
+  state request promotion and are completed by the existing run loop;
+* a native error promotes first, then pushes or raises the error at the leaf's
+  exact `error_pc`, allowing catches in the leaf or any caller to unwind in the
+  normal order;
+* timeout, tick exhaustion, and `kill_task()` preserve the exact current
+  location and enter the existing abort machinery without rolling back task
+  state; and
+* introspection, invalidation, and database persistence promote first and see
+  no native-only frames or pointers.
+
+An interpreted callee created after promotion may return through the existing
+activation unwinder.  Its caller is already a canonical activation at the
+after-dispatch continuation.  If that continuation has a valid native resume
+map, the next `run()` iteration may construct a fresh execution context and
+re-enter compiled code; correctness never requires retaining the old native
+context across promotion.
+
+The first implementation tests should drive the trampoline with synthetic
+outcomes and compare the promoted activation stack field-for-field with the
+semantic stack created by ordinary interpreter calls, including value tags and
+reference ownership.  Only after call, return, deopt, error, abort, and built-in
+boundary transitions pass those comparisons should generated JIT-to-JIT call
+instructions be enabled.
+
+### 9.2.4 Experimental Code Disposition
+
+The native-frame ABI is a replacement design, not a requirement to preserve
+every earlier continuation experiment.  Experimental code which cannot be
+adapted without retaining global chains, speculative replay, raw SSA ownership,
+or activation-attached native state should be deleted.  Tests of language
+semantics should be retained and redirected through the new trampoline; tests
+which assert only an obsolete internal mechanism should be replaced.
+
+The following known experiments do not fit the target model and are explicit
+delete-or-replace candidates:
+
+* In `execute.c`, `JITNativeCallFrame`, `jit_pending_native_calls`,
+  `jit_native_call_depth`, `jit_retain_native_call()`, and
+  `jit_promote_native_calls()` implement a process-global pending chain and
+  recursive C execution.  Replace them with the task-local
+  `JITExecutionContext`, root overlay, and iterative trampoline.
+* `JIT_DIRECT_VERB_PROMOTED` and the `run()` branch which recognizes
+  `jit_pending_native_calls` expose that global promotion protocol.  Remove
+  them when explicit call and promote outcomes drive the trampoline.
+* `execute_jit_direct_verb_call()` currently saves and restores ticks, timeout,
+  and error state after a failed speculative callee.  Preserve a separately
+  audited rollback-safe leaf helper if it remains useful, but delete this
+  rollback behavior from every committed general call path.  The general ABI
+  never restores task state or replays the caller.
+* `jit_program_is_direct_call_safe()` currently admits transitive speculative
+  verb calls, and `jit_program_note_direct_call_failure()` disables a callee
+  after a failed attempt.  Restrict the classifier to the strict leaf contract;
+  do not reuse dynamic failure-and-restart as general chain control flow.
+* The current `JITContinuationFrame` representation in `jit_internal.h` stores
+  an activation `owner`, duplicated `values` and `spare_values`, raw
+  `deopt_values`, and pointers into one native runtime allocation.  Replace
+  this shape with the root overlay, fixed authoritative frame homes, caller
+  resume records, and built-in continuation links.  Reuse its verified
+  deoptimization-map concepts, not its ambiguous ownership graph.
+* The process-global `continuation_frames` list and
+  `jit_continuation_attach()`, `jit_continuation_relocate()`,
+  `jit_continuation_mark_dispatched()`, and
+  `jit_continuation_materialize_all()` treat activation-attached continuations
+  as the native-chain registry.  Replace chain ownership with task-local
+  contexts.  Invalidation and database dumps must enumerate tasks and request
+  promotion through their contexts rather than walking native frames owned by
+  unrelated activations.
+* `JIT_RESUME_CAPTURED` and the fallback capture path in `hir.c` retain values
+  from raw SSA/deoptimization slots when no canonical source is available.
+  Delete or disable that source.  Replace it with an explicit frame-home source
+  admitted only by must-availability, runtime-tag, and unique-ownership proofs.
+* `JIT_BOUNDARY_SUSPEND_ZERO`, `continuation_fast_suspends`, and the compact
+  suspend branch in `run()` preserve native continuation state across scheduler
+  suspension.  Suspension promotes in this milestone.  Remove this special
+  path unless a later, separately specified native-suspension ABI supersedes
+  the canonical-only persistence rule.
+* `JIT_RUN_CALL_VERB` is currently overloaded for ordinary verb calls,
+  built-in bridges, and zero-second suspension.  Replace the overload with the
+  explicit call, promote, raise, abort, and return outcomes in Section 9.2.2.
+* Tests in `tests/jit_test.c` which directly attach an activation-owned
+  continuation, force `jit_program_note_direct_call_failure()`, or assert the
+  compact-suspend mechanism should be rewritten against frame construction,
+  trampoline outcomes, and canonical promotion.  Their value, tag, reference
+  count, error-location, and no-replay assertions remain required.
+
+The following foundations fit the target design and should be retained or
+adapted rather than removed:
+
+* bytecode resume points, exact deoptimization-map IDs, canonical stack-marker
+  recipes, and source/error locations;
+* shared verb lookup, environment construction, and activation initialization;
+* the strict rollback-safe leaf optimization, provided its proof excludes all
+  visible effects and post-commit fallback;
+* built-in continuation import, export, and cleanup support, which canonical
+  promotion uses when transferring `bi_func_data` ownership;
+* native-chain and continuation profiling counters, updated to count the new
+  task-local frames and their retained bytes; and
+* semantic database tests, especially complex values across repeated calls,
+  caught errors at each depth, side effects before later promotion, and the
+  persisted `player:test(300000)` SHA1 gate.
+
+This list should be rechecked during implementation.  A symbol being listed as
+reusable does not exempt it from the new verifier and ownership rules, and an
+experimental commit need not remain in history merely because some tests or
+metadata from it are worth preserving.
 
 ### 9.3 Exceptions and Finally
 
@@ -279,11 +957,13 @@ Native landing pads may be added later as an optimization, but they must still
 materialize the same activation and stack-marker state expected by
 `unwind_stack()`.
 
-The same requirement applies to native return continuations after VM calls.
-Before enabling them across protected regions, continuation maps must preserve
-and reconstruct the complete caller stack prefix, including catch/finally
-markers and any enclosing loop state, rather than only call operands and live
-SSA values.
+The existing compact VM-call continuation paths must satisfy the same
+requirement.  Calls inside protected regions remain promotion boundaries in
+this milestone unless their complete handler state is represented by the new
+frame ABI.  Before any native return across such a protected call is enabled,
+continuation maps must preserve and reconstruct the complete caller stack
+prefix, including catch/finally markers and any enclosing loop state, rather
+than only call operands and live SSA values.
 
 ## 10. Phase 7: Resume, Deoptimization, and Persistence
 
@@ -312,14 +992,12 @@ continues in the interpreter.
 ### 10.2 Deep Deoptimization
 
 When JIT code must suspend, call unsupported runtime behavior, hit a guard
-failure, or abort:
-
-1. Trap to a C deoptimization runtime.
-2. Use the JIT deopt map for the current native location.
-3. Materialize each native frame into a normal `activation`.
-4. Populate `pc`, `error_pc`, resume metadata, `rt_env`, runtime stack, `temp`,
-   and ownership-correct `Var` values.
-5. Continue in the interpreter or serialize the VM if the operation suspended.
+failure, or abort, it follows the freeze, prepare, commit, and resume protocol
+in Section 9.2.3.  The runtime uses the current deoptimization map, writes the
+root frame overlay back into its anchored activation, and materializes each
+younger native frame as a normal `activation`.  It populates `pc`, `error_pc`,
+resume metadata, `rt_env`, runtime stack, `temp`, and ownership-correct `Var`
+values before returning control to `run()` or serializing a suspended VM.
 
 Serialized activations preserve language state, not JIT state. JIT state is
 disposable and must be reconstructable from the canonical activation.
@@ -331,7 +1009,8 @@ On database load, a future JIT may resume natively only if:
 * the relevant program/vector is compiled;
 * the compiled code advertises support for the activation's resume anchor;
 * the compiler has a native resume stub for that anchor;
-* the canonical activation can be converted into the native frame layout.
+* the canonical activation can be represented by a verified root-frame overlay
+  without duplicating ownership.
 
 If any condition fails, resume in the interpreter.
 
@@ -549,31 +1228,32 @@ the broader ownership-map and synthesized-anchor validation described below.
    and controls paths. Do not implement an operation until its resume stack,
    error behavior, tick charge, and ownership contract are known.
 
-2. **Harden and extend native continuations across stateful VM calls.**
-   Compact frames now cover ordinary verb calls, general fixed-ID built-ins,
-   `BI_CALL`, and `BI_SUSPEND`; normal returns and scheduler resumptions re-enter
-   machine code directly. Canonical locals, the full stack prefix, handler
-   markers, and live SSA values are retained with owned `Var` references.
-   `BI_RAISE`, `BI_ABORT`, introspection, invalidation, and database writes
-   materialize before entering existing VM behavior. `verb_info(..., 1)` reports
-   continuation captures, resumes, materializations, active frames, and bytes.
+2. **Replace experimental continuations with the verified native-frame ABI.**
+   The existing bridge has exercised compact continuations across ordinary verb
+   calls, fixed-ID built-ins, `BI_CALL`, and `BI_SUSPEND`. Those experiments are
+   evidence for resume-map coverage, not the target frame model: database
+   testing showed that SSA definition liveness alone can retain a stale or
+   wrongly represented complex value.
 
-   Next add focused nested catch/finally, loop-around-call, `BI_CALL`,
-   suspension/resumption, task-stack, checkpoint, and protection-invalidation
-   regressions. Extend compact dispatch to specialized built-in guard exits,
-   then use the counters to identify unexpected materialization sites. A task
-   loaded from a database still resumes canonically and may enter JIT at its
-   bytecode anchor; serializing native frames is intentionally out of scope.
-   Tail-call activation replacement should wait until normal and exceptional
-   continuation paths have sustained database-scale validation.
+   Implement Sections 9.2.1 through 9.2.3 in order: the task-local context and
+   root overlay, explicit frame homes, the frame verifier, synthetic trampoline
+   transitions, bottom-up promotion, and only then general native verb dispatch.
+   Normal eligible verb calls are the first compact boundary. Then add verified
+   built-in continuation links so safe built-ins can return `BI_CALL` without
+   promotion. Built-ins requiring canonical entry, suspension, unmodeled errors
+   or aborts, introspection, invalidation, and database writes still promote
+   before entering existing VM behavior. `verb_info(..., 1)` should report
+   continuation and native-chain captures, returns, promotions, active frames,
+   maximum depth, and retained bytes.
 
-   Native callers now resume by the continuation frame's exact deopt-map ID;
-   they do not repeat a linear `ResumeKey` lookup. Specialized built-in exits
-   also use an explicit boundary kind rather than overloading the profiling
-   reason. Do not enable arbitrary `JIT_RESUME_CAPTURED` values yet: database
-   testing showed that SSA definition liveness alone can capture a stale or
-   wrongly represented complex value. Captured values require both the
-   ownership proof in priority 5 and a trustworthy runtime tag.
+   Resume native callers only by the exact call-site map ID; do not repeat a
+   linear `ResumeKey` lookup. Do not enable arbitrary raw
+   `JIT_RESUME_CAPTURED` values. Cross-call values require must-availability,
+   authoritative frame homes with trustworthy runtime tags, and the ownership
+   proof in priority 5. A task loaded from a database resumes canonically and
+   may enter JIT at its bytecode anchor; native frames and contexts are never
+   serialized. Tail-call activation replacement should wait until normal and
+   exceptional frame paths have sustained database-scale validation.
 
 3. **Use effect metadata to select direct native built-in lowering.**
    Record argument prototypes and effects such as pure, allocation, possible
@@ -584,6 +1264,33 @@ the broader ownership-map and synthesized-anchor validation described below.
    cheap, continuation-free built-ins where the VM crossing is measurable.
    Never directly lower a built-in that can return `BI_CALL`, `BI_SUSPEND`, or
    `BI_ABORT` without modeling that outcome.
+
+   Built-in registration now records conservative call, suspend, abort, and
+   continuation-state effects. A fixed-ID call whose registration proves it
+   synchronous can return or raise directly into generated code; `tostr()` is
+   the first enabled allocation-returning built-in. Protected built-ins retain
+   an override guard, and complex results transfer into an explicit native
+   ownership slot. Add effects to further built-ins only after auditing every
+   package kind and side effect.
+
+   Direct JIT-to-JIT verb calls no longer push an interpreter activation for a
+   successful rollback-safe callee. The native ABI carries the caller's exact
+   environment and permissions into a shared verb-environment constructor, so
+   `caller`, command variables, waif receivers, and player propagation retain
+   interpreter semantics. Verb-call instructions are admitted transitively:
+   each dynamic target must satisfy the same side-effect-free contract, which
+   permits `A -> B -> C` and self-recursion without a static call graph or verb
+   generations. Native depth is charged against the ordinary activation limit.
+
+   The existing direct-call path remains restricted by rollback safety. The
+   general trampoline removes that restriction for normal eligible verb calls
+   by committing a frame rather than restarting completed code. General
+   built-ins and other stateful VM boundaries still require canonical
+   interpreter activations. On deopt, a raised exception, suspension, stack
+   introspection, pool invalidation, or database dump, materialize the complete
+   chain into canonical interpreter activation order and continue at the
+   precise callee and caller anchors. Only after this general bridge is
+   benchmarked should true body inlining be reconsidered.
 
 4. **Reduce type guards using consumer constraints and tagged dispatch.**
    Report local/value identity and expected/actual tags for the remaining guard
