@@ -21,6 +21,7 @@ typedef enum {
     JIT_RESUME_STACK,
     JIT_RESUME_RESULT,
     JIT_RESUME_CONSTANT,
+    JIT_RESUME_OWNER,
     JIT_RESUME_CAPTURED
 } JITResumeSource;
 
@@ -61,10 +62,13 @@ struct JITContinuationFrame {
     Num *deopt_values;
     Var *borrowed_locals;
     Var *owned_values;
+    unsigned char *home_states;
     size_t runtime_bytes;
+    JITNativeFrame *runtime_owner;
     Var result;
     int has_result;
     int dispatched;
+    int owns_runtime;
     JITContinuationFrame *previous;
     JITContinuationFrame *next;
 };
@@ -179,6 +183,11 @@ struct JITProgramUsage {
     uint64_t continuation_captures;
     uint64_t continuation_resumes;
     uint64_t continuation_materializations;
+    uint64_t continuation_fast_suspends;
+    uint64_t native_chain_calls;
+    uint64_t native_chain_returns;
+    uint64_t native_chain_promotions;
+    uint64_t native_chain_max_depth;
 };
 
 struct JITProgram {
@@ -216,6 +225,8 @@ struct JITProgram {
     int num_borrowed_locals;
     int *borrowed_local_slots;
     size_t active_runtime_bytes;
+    uint64_t active_native_frames;
+    size_t active_native_frame_bytes;
     unsigned protection_generation;
     JITProgramUsage *usage;
     uint32_t compile_attempts;

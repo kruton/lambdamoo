@@ -9,6 +9,7 @@
 
 #include "compiler.h"
 #include "db.h"
+#include "eval_env.h"
 #include "exceptions.h"
 #include "execute.h"
 #include "functions.h"
@@ -33,6 +34,8 @@
 #else
 #define bi_prop_protected(prop, progr) ((!is_wizard(progr)) && server_flag_option_cached(prop))
 #endif
+
+static int jit_runtime_value_slots(JITProgram *);
 
 static inline double
 raw_to_double(int64_t raw)
@@ -519,9 +522,775 @@ jit_rt_var_raw(const Var *value)
     return value->v.num;
 }
 
-typedef int64_t (*NativeFunction) (Var *, Var *, int *, int *, enum error *,
+typedef int64_t (*NativeFunction) (JITExecutionContext *, JITNativeFrame *,
+				   Var *, Var *, int *, int *, enum error *,
 				   JITSourceLocation *, int *, Num *, Objid,
 				   int, Var *, Var *, Var *);
+
+struct JITPromotionPlan {
+    JITExecutionContext *context;
+    JITNativeFrame **frames;
+    unsigned num_frames;
+};
+
+static JITContinuationFrame *continuation_frames;
+
+static void
+jit_continuation_unlink(JITContinuationFrame *frame)
+{
+    if (frame->previous)
+	frame->previous->next = frame->next;
+    else if (continuation_frames == frame)
+	continuation_frames = frame->next;
+    else if (frame->next)
+	panic("JIT continuation list backlink is invalid");
+    if (frame->next)
+	frame->next->previous = frame->previous;
+    frame->previous = 0;
+    frame->next = 0;
+}
+
+void
+jit_execution_context_init(JITExecutionContext *context,
+			   JITNativeFrame *root, JITProgram *program, Var *env,
+			   unsigned root_index, unsigned canonical_depth,
+			   unsigned activation_limit, int *ticks,
+			   int *timed_out, enum error *error, int entry_map)
+{
+    memset(context, 0, sizeof(*context));
+    memset(root, 0, sizeof(*root));
+    context->root_frame = root;
+    context->current_frame = root;
+    context->root_activation_index = root_index;
+    context->canonical_depth = canonical_depth;
+    context->activation_limit = activation_limit;
+    context->ticks_remaining = ticks;
+    context->task_timed_out = timed_out;
+    context->pending_error = error;
+    root->context = context;
+    root->program = program;
+    root->env = env;
+    root->canonical_index = root_index;
+    root->entry_map = entry_map;
+    root->current_map = entry_map;
+    root->kind = JIT_FRAME_ROOT_OVERLAY;
+    root->state = JIT_FRAME_RUNNING;
+}
+
+int
+jit_execution_context_push_overlay(JITExecutionContext *context,
+				   JITNativeFrame *frame, JITProgram *program,
+				   Var *env, unsigned canonical_index,
+				   int entry_map)
+{
+    JITNativeFrame *caller;
+
+    if (!context || !frame || !program || !(caller = context->current_frame)
+	|| caller->state != JIT_FRAME_RUNNING || caller->callee
+	|| canonical_index >= context->activation_limit)
+	return 0;
+    memset(frame, 0, sizeof(*frame));
+    frame->context = context;
+    frame->program = program;
+    frame->caller = caller;
+    frame->env = env;
+    frame->canonical_index = canonical_index;
+    frame->entry_map = entry_map;
+    frame->current_map = entry_map;
+    frame->kind = JIT_FRAME_CANONICAL_OVERLAY;
+    frame->state = JIT_FRAME_RUNNING;
+    caller->state = JIT_FRAME_SUSPENDED;
+    caller->callee = frame;
+    context->current_frame = frame;
+    if (jit_native_frame_verify(context, frame))
+	return 1;
+
+    context->current_frame = caller;
+    caller->callee = 0;
+    caller->state = JIT_FRAME_RUNNING;
+    memset(frame, 0, sizeof(*frame));
+    return 0;
+}
+
+int
+jit_execution_context_pop_overlay(JITExecutionContext *context,
+				  JITNativeFrame *frame)
+{
+    JITNativeFrame *caller;
+
+    if (!context || !frame || context->current_frame != frame
+	|| frame->kind == JIT_FRAME_COMPACT || frame->callee
+	|| frame->runtime_storage || frame->owns_boundary_stack
+	|| !(caller = frame->caller)
+	|| caller->callee != frame || caller->state != JIT_FRAME_SUSPENDED)
+	return 0;
+    caller->callee = 0;
+    caller->state = JIT_FRAME_RUNNING;
+    context->current_frame = caller;
+    frame->caller = 0;
+    frame->context = 0;
+    frame->state = JIT_FRAME_DETACHED;
+    return jit_native_frame_verify(context, caller);
+}
+
+int
+jit_execution_context_push_compact(JITExecutionContext *context,
+				   JITNativeFrame *frame, JITProgram *program,
+				   Var *env, JITCallerResume *resume,
+				   int entry_map)
+{
+    JITNativeFrame *caller;
+
+    if (!context || !frame || !program || !resume
+	|| !(caller = context->current_frame)
+	|| caller->state != JIT_FRAME_RUNNING || caller->callee
+	|| caller->outgoing || resume->caller != caller
+	|| resume->state != JIT_RESUME_PREPARING || resume->map_id <= 0
+	|| resume->map_id >= caller->program->num_deopt_maps
+	|| (resume->continuation
+	    ? (!jit_native_frame_continuation_matches(caller, resume->map_id)
+	       || resume->continuation != caller->runtime_borrower
+	       || resume->result_home != UINT_MAX)
+	    : (resume->result_home >= caller->num_homes
+	       || caller->home_states[resume->result_home] != JIT_HOME_EMPTY))
+	|| context->canonical_depth + context->native_depth
+	    >= context->activation_limit)
+	return 0;
+
+    memset(frame, 0, sizeof(*frame));
+    frame->context = context;
+    frame->program = program;
+    frame->caller = caller;
+    frame->incoming = resume;
+    frame->env = env;
+    frame->entry_map = entry_map;
+    frame->current_map = entry_map;
+    frame->kind = JIT_FRAME_COMPACT;
+    frame->state = JIT_FRAME_RUNNING;
+    resume->state = JIT_RESUME_DISPATCHED;
+    caller->state = JIT_FRAME_SUSPENDED;
+    caller->outgoing = resume;
+    caller->callee = frame;
+    context->current_frame = frame;
+    context->native_depth++;
+    if (jit_native_frame_verify(context, frame))
+	return 1;
+
+    context->native_depth--;
+    context->current_frame = caller;
+    caller->callee = 0;
+    caller->outgoing = 0;
+    caller->state = JIT_FRAME_RUNNING;
+    resume->state = JIT_RESUME_PREPARING;
+    memset(frame, 0, sizeof(*frame));
+    return 0;
+}
+
+int
+jit_execution_context_return_compact(JITExecutionContext *context,
+				     JITNativeFrame *frame, Var *result)
+{
+    JITNativeFrame *caller;
+    JITCallerResume *resume;
+
+    if (!context || !frame || !result || context->current_frame != frame
+	|| frame->kind != JIT_FRAME_COMPACT || frame->state != JIT_FRAME_RUNNING
+	|| frame->callee || frame->outgoing || frame->runtime_storage
+	|| frame->owns_boundary_stack
+	|| !(caller = frame->caller) || caller->callee != frame
+	|| caller->state != JIT_FRAME_SUSPENDED
+	|| !(resume = frame->incoming) || resume->caller != caller
+	|| caller->outgoing != resume || resume->state != JIT_RESUME_DISPATCHED
+	|| context->native_depth == 0 || !jit_native_frame_verify(context, frame))
+	return 0;
+
+    if (resume->continuation) {
+	jit_continuation_set_result(resume->continuation, *result);
+	result->type = TYPE_NONE;
+	result->v.num = 0;
+    } else if (!jit_native_frame_home_move(caller, resume->result_home,
+					  result))
+	return 0;
+
+    caller->callee = 0;
+    caller->outgoing = 0;
+    caller->state = JIT_FRAME_RUNNING;
+    context->current_frame = caller;
+    context->native_depth--;
+    resume->state = JIT_RESUME_RETURNED;
+    frame->caller = 0;
+    frame->incoming = 0;
+    frame->context = 0;
+    frame->state = JIT_FRAME_RETURNED;
+    jit_native_frame_release_invocation(frame);
+    return jit_native_frame_verify(context, caller);
+}
+
+JITPromotionPlan *
+jit_native_chain_prepare_promotion(JITExecutionContext *context)
+{
+    JITPromotionPlan *plan;
+    JITNativeFrame *frame;
+    JITNativeFrame *last = 0;
+    unsigned count = 0;
+    unsigned i;
+
+    if (!context || !context->root_frame || !context->current_frame)
+	return 0;
+    for (frame = context->root_frame; frame; frame = frame->callee) {
+	if (!jit_native_frame_verify(context, frame)
+	    || (frame->callee && !frame->outgoing)
+	    || (!frame->callee && (frame->current_map < 0
+		|| frame->current_map >= frame->program->num_deopt_maps)))
+	    return 0;
+	count++;
+	last = frame;
+    }
+    if (last != context->current_frame
+	|| count != context->native_depth + 1)
+	return 0;
+
+    plan = mymalloc(sizeof(*plan), M_PROGRAM);
+    plan->frames = mymalloc(sizeof(JITNativeFrame *) * count, M_PROGRAM);
+    plan->context = context;
+    plan->num_frames = count;
+    frame = context->root_frame;
+    for (i = 0; i < count; i++) {
+	plan->frames[i] = frame;
+	frame = frame->callee;
+    }
+    return plan;
+}
+
+int
+jit_native_chain_commit_promotion(JITPromotionPlan *plan,
+				  JITPromotionMaterializer materialize,
+				  void *data)
+{
+    JITExecutionContext *context;
+    unsigned i;
+
+    if (!plan || !plan->num_frames || !materialize
+	|| !(context = plan->context)
+	|| context->root_frame != plan->frames[0]
+	|| context->current_frame != plan->frames[plan->num_frames - 1]
+	|| context->native_depth + 1 != plan->num_frames)
+	return 0;
+    for (i = 0; i < plan->num_frames; i++) {
+	JITNativeFrame *frame = plan->frames[i];
+
+	if (!jit_native_frame_verify(context, frame)
+	    || frame->caller != (i ? plan->frames[i - 1] : 0)
+	    || frame->callee != (i + 1 < plan->num_frames
+		? plan->frames[i + 1] : 0))
+	    return 0;
+    }
+
+    for (i = 0; i < plan->num_frames; i++) {
+	JITNativeFrame *frame = plan->frames[i];
+
+	materialize(frame, frame->outgoing, data);
+	if (frame->outgoing) {
+	    frame->outgoing->state = JIT_RESUME_PROMOTED;
+	    frame->outgoing->continuation = 0;
+	}
+	frame->state = JIT_FRAME_PROMOTED;
+    }
+    for (i = plan->num_frames; i > 0; i--) {
+	JITNativeFrame *frame = plan->frames[i - 1];
+
+	frame->caller = 0;
+	frame->callee = 0;
+	frame->incoming = 0;
+	frame->outgoing = 0;
+	frame->context = 0;
+    }
+    context->native_depth = 0;
+    context->root_frame = 0;
+    context->current_frame = 0;
+    plan->context = 0;
+    return 1;
+}
+
+void
+jit_native_chain_discard_promotion(JITPromotionPlan *plan)
+{
+    if (!plan)
+	return;
+    myfree(plan->frames, M_PROGRAM);
+    myfree(plan, M_PROGRAM);
+}
+
+unsigned
+jit_native_chain_promotion_count(const JITPromotionPlan *plan)
+{
+    return plan ? plan->num_frames : 0;
+}
+
+JITNativeFrame *
+jit_native_chain_promotion_frame(const JITPromotionPlan *plan, unsigned index)
+{
+    if (!plan || index >= plan->num_frames)
+	return 0;
+    return plan->frames[index];
+}
+
+int
+jit_execution_context_finish(JITExecutionContext *context,
+			     JITNativeFrame *root)
+{
+    if (!context || !root || context->root_frame != root
+	|| context->current_frame != root || root->caller || root->callee
+	|| root->runtime_storage || root->owns_boundary_stack
+	|| !jit_native_frame_verify(context, root))
+	return 0;
+    root->context = 0;
+    root->state = JIT_FRAME_DETACHED;
+    context->root_frame = 0;
+    context->current_frame = 0;
+    return 1;
+}
+
+int
+jit_native_frame_bind_activation(JITNativeFrame *frame, const activation *a)
+{
+    if (!frame || !a || !a->prog || !a->rt_env || !a->verb
+	|| !a->verbname || frame->owns_invocation)
+	return 0;
+    frame->bytecode_program = a->prog;
+    frame->env = a->rt_env;
+#ifdef WAIF_CORE
+    frame->receiver = a->THIS;
+#endif
+    frame->this = a->this;
+    frame->player = a->player;
+    frame->progr = a->progr;
+    frame->vloc = a->vloc;
+    frame->verb = a->verb;
+    frame->verbname = a->verbname;
+    frame->debug = a->debug;
+    return 1;
+}
+
+int
+jit_native_frame_copy_invocation(JITNativeFrame *frame, const activation *a)
+{
+    if (!frame || !a || frame->kind != JIT_FRAME_COMPACT
+	|| frame->owns_invocation || frame->bytecode_program
+	|| !a->prog || !a->rt_env || !a->verb || !a->verbname)
+	return 0;
+    frame->bytecode_program = program_ref(a->prog);
+    frame->env = copy_rt_env(a->rt_env, a->prog->num_var_names);
+#ifdef WAIF_CORE
+    frame->receiver = var_ref(a->THIS);
+#endif
+    frame->this = a->this;
+    frame->player = a->player;
+    frame->progr = a->progr;
+    frame->vloc = a->vloc;
+    frame->verb = str_ref(a->verb);
+    frame->verbname = str_ref(a->verbname);
+    frame->debug = a->debug;
+    frame->owns_invocation = 1;
+    return 1;
+}
+
+int
+jit_native_frame_take_prepared_invocation(JITNativeFrame *frame,
+					  PreparedVerbCall *prepared)
+{
+    if (!frame || !prepared || frame->kind != JIT_FRAME_COMPACT
+	|| frame->owns_invocation || frame->bytecode_program
+	|| !prepared->program || !prepared->env || !prepared->verb
+	|| !prepared->verbname || frame->env != prepared->env)
+	return 0;
+    frame->bytecode_program = prepared->program;
+#ifdef WAIF_CORE
+    frame->receiver = prepared->receiver;
+#endif
+    frame->this = prepared->this;
+    frame->player = prepared->player;
+    frame->progr = prepared->progr;
+    frame->vloc = prepared->vloc;
+    frame->verb = prepared->verb;
+    frame->verbname = prepared->verbname;
+    frame->debug = prepared->debug;
+    frame->owns_invocation = 1;
+    memset(prepared, 0, sizeof(*prepared));
+    return 1;
+}
+
+void
+jit_native_frame_release_invocation(JITNativeFrame *frame)
+{
+    if (!frame || !frame->owns_invocation)
+	return;
+    free_rt_env(frame->env, frame->bytecode_program->num_var_names);
+#ifdef WAIF_CORE
+    free_var(frame->receiver);
+    frame->receiver.type = TYPE_NONE;
+    frame->receiver.v.num = 0;
+#endif
+    free_str(frame->verb);
+    free_str(frame->verbname);
+    free_program(frame->bytecode_program);
+    frame->bytecode_program = 0;
+    frame->env = 0;
+    frame->verb = 0;
+    frame->verbname = 0;
+    frame->owns_invocation = 0;
+}
+
+void
+jit_native_frame_bind_runtime(JITNativeFrame *frame, void *storage,
+			      size_t bytes, Var *homes, unsigned num_homes,
+			      unsigned char *home_states)
+{
+    frame->runtime_storage = storage;
+    frame->runtime_bytes = bytes;
+    frame->homes = homes;
+    frame->num_homes = num_homes;
+    frame->home_states = home_states;
+}
+
+void
+jit_native_frame_mark_runtime_owned(JITNativeFrame *frame)
+{
+    if (frame && frame->runtime_storage)
+	frame->owns_runtime = 1;
+}
+
+int
+jit_native_frame_adopt_continuation_runtime(JITNativeFrame *frame,
+					    JITContinuationFrame *continuation)
+{
+    if (!frame || !continuation || frame->runtime_storage
+	|| frame->runtime_borrower || frame->program != continuation->program
+	|| !continuation->runtime_storage || !continuation->owns_runtime
+	|| continuation->runtime_owner
+	|| (continuation->owner
+	    && (continuation->owner->jit_continuation != continuation
+		|| (!continuation->previous
+		    && continuation_frames != continuation)
+		|| (continuation->previous
+		    && continuation->previous->next != continuation)
+		|| (continuation->next
+		    && continuation->next->previous != continuation))))
+	return 0;
+    if (continuation->owner) {
+	continuation->owner->jit_continuation = 0;
+	continuation->owner = 0;
+	jit_continuation_unlink(continuation);
+    }
+    jit_native_frame_bind_runtime(frame, continuation->runtime_storage,
+	continuation->runtime_bytes, continuation->owned_values,
+	continuation->program->num_owned_slots, continuation->home_states);
+    jit_native_frame_mark_runtime_owned(frame);
+    frame->runtime_borrower = continuation;
+    continuation->runtime_owner = frame;
+    continuation->owns_runtime = 0;
+    return 1;
+}
+
+int
+jit_native_frame_return_continuation_runtime(
+    JITNativeFrame *frame, JITContinuationFrame *continuation)
+{
+    if (!frame || !continuation || frame->runtime_borrower != continuation
+	|| continuation->runtime_owner != frame || !frame->owns_runtime
+	|| continuation->owns_runtime
+	|| frame->runtime_storage != continuation->runtime_storage
+	|| frame->runtime_bytes != continuation->runtime_bytes
+	|| frame->homes != continuation->owned_values
+	|| frame->home_states != continuation->home_states)
+	return 0;
+    frame->runtime_borrower = 0;
+    continuation->runtime_owner = 0;
+    continuation->owns_runtime = 1;
+    jit_native_frame_unbind_runtime(frame);
+    return 1;
+}
+
+int
+jit_native_frame_continuation_matches(const JITNativeFrame *frame, int map_id)
+{
+    JITContinuationFrame *continuation;
+
+    if (!frame || !(continuation = frame->runtime_borrower))
+	return 0;
+    return continuation->program == frame->program
+	&& continuation->map_id == map_id
+	&& continuation->runtime_owner == frame
+	&& !continuation->owns_runtime
+	&& frame->owns_runtime
+	&& continuation->runtime_storage == frame->runtime_storage;
+}
+
+void
+jit_native_frame_release_runtime(JITNativeFrame *frame)
+{
+    Var *borrowed_locals;
+    size_t deopt_bytes;
+    size_t deopt_storage_bytes;
+    int i;
+
+    if (!frame || !frame->runtime_storage)
+	return;
+    if (frame->runtime_borrower)
+	panic("Releasing native runtime with a live continuation borrower");
+    if (!frame->owns_runtime) {
+	jit_native_frame_unbind_runtime(frame);
+	return;
+    }
+    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(frame->program);
+    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    borrowed_locals = (Var *) ((char *) frame->runtime_storage
+	+ deopt_storage_bytes);
+    for (i = 0; i < frame->program->num_borrowed_locals; i++)
+	free_var(borrowed_locals[i]);
+    for (i = 0; i < frame->program->num_owned_slots; i++)
+	free_var(frame->homes[i]);
+    frame->program->active_runtime_bytes -= frame->runtime_bytes;
+    myfree(frame->runtime_storage, M_PROGRAM);
+    jit_native_frame_unbind_runtime(frame);
+}
+
+void
+jit_native_frame_unbind_runtime(JITNativeFrame *frame)
+{
+    if (frame->runtime_borrower)
+	panic("Unbinding native runtime with a live continuation borrower");
+    frame->runtime_storage = 0;
+    frame->runtime_bytes = 0;
+    frame->homes = 0;
+    frame->num_homes = 0;
+    frame->home_states = 0;
+    frame->owns_runtime = 0;
+}
+
+int
+jit_native_frame_capture_boundary(JITNativeFrame *frame, Var *stack,
+				  unsigned depth, int map_id)
+{
+    Var *captured = 0;
+    unsigned i;
+
+    if (!frame || (depth && !stack) || frame->owns_boundary_stack
+	|| frame->boundary_stack || frame->boundary_depth
+	|| !frame->program || map_id <= 0
+	|| map_id >= frame->program->num_deopt_maps)
+	return 0;
+    for (i = 0; i < depth; i++)
+	if (stack[i].type == TYPE_NONE)
+	    return 0;
+    if (depth)
+	captured = mymalloc(sizeof(Var) * depth, M_PROGRAM);
+    for (i = 0; i < depth; i++) {
+	captured[i] = stack[i];
+	stack[i].type = TYPE_NONE;
+	stack[i].v.num = 0;
+    }
+    frame->boundary_stack = captured;
+    frame->boundary_depth = depth;
+    frame->boundary_map = map_id;
+    frame->current_map = map_id;
+    frame->owns_boundary_stack = 1;
+    frame->program->active_runtime_bytes += sizeof(Var) * depth;
+    return 1;
+}
+
+void
+jit_native_frame_release_boundary(JITNativeFrame *frame)
+{
+    unsigned i;
+
+    if (!frame || !frame->owns_boundary_stack)
+	return;
+    for (i = 0; i < frame->boundary_depth; i++)
+	free_var(frame->boundary_stack[i]);
+    if (frame->program->active_runtime_bytes
+	< sizeof(Var) * frame->boundary_depth)
+	panic("Native boundary stack accounting underflow");
+    frame->program->active_runtime_bytes -= sizeof(Var)
+	* frame->boundary_depth;
+    if (frame->boundary_stack)
+	myfree(frame->boundary_stack, M_PROGRAM);
+    frame->boundary_stack = 0;
+    frame->boundary_depth = 0;
+    frame->boundary_map = 0;
+    frame->owns_boundary_stack = 0;
+}
+
+static int
+jit_native_home_needs_owner(var_type type)
+{
+    return type == TYPE_STR || type == TYPE_LIST || type == TYPE_FLOAT
+#ifdef WAIF_CORE
+	|| type == TYPE_WAIF
+#endif
+	;
+}
+
+int
+jit_native_frame_verify(const JITExecutionContext *context,
+			const JITNativeFrame *frame)
+{
+    unsigned i;
+
+    if (!context || !frame || frame->context != context
+	|| !context->root_frame
+	|| !context->current_frame || !frame->program
+	|| context->canonical_depth > context->activation_limit
+	|| context->native_depth > context->activation_limit
+	|| context->canonical_depth + context->native_depth
+	    > context->activation_limit)
+	return 0;
+    if (context->root_frame->kind != JIT_FRAME_ROOT_OVERLAY
+	|| context->root_frame->caller
+	|| context->root_frame->canonical_index
+	    != context->root_activation_index)
+	return 0;
+    if (frame->caller && frame->caller->callee != frame)
+	return 0;
+    if (frame->callee && frame->callee->caller != frame)
+	return 0;
+    if ((frame == context->current_frame
+	 && frame->state != JIT_FRAME_RUNNING)
+	|| (frame != context->current_frame && frame->callee
+	    && frame->state != JIT_FRAME_SUSPENDED))
+	return 0;
+    if (frame->incoming
+	&& (!frame->caller || frame->incoming->caller != frame->caller
+	    || frame->incoming->state != JIT_RESUME_DISPATCHED
+	    || frame->incoming->map_id <= 0
+	    || frame->incoming->map_id >= frame->incoming->caller->program->num_deopt_maps
+	    || (frame->incoming->continuation
+		? (frame->incoming->continuation
+		   != frame->incoming->caller->runtime_borrower
+		   || frame->incoming->result_home != UINT_MAX
+		   || frame->incoming->bytecode_pc
+		      != frame->incoming->caller->program->deopt_maps[
+			  frame->incoming->map_id].bytecode_pc
+		   || frame->incoming->error_pc
+		      != frame->incoming->caller->program->deopt_maps[
+			  frame->incoming->map_id].error_pc
+		   || !jit_native_frame_continuation_matches(
+		       frame->incoming->caller, frame->incoming->map_id))
+		: frame->incoming->result_home
+		  >= frame->incoming->caller->num_homes)))
+	return 0;
+    if (frame->outgoing
+	&& (frame->outgoing->caller != frame
+	    || frame->outgoing->state != JIT_RESUME_DISPATCHED
+	    || !frame->callee || frame->callee->incoming != frame->outgoing
+	    || frame->outgoing->map_id <= 0
+	    || frame->outgoing->map_id >= frame->program->num_deopt_maps
+	    || (frame->outgoing->continuation
+		? (frame->outgoing->continuation != frame->runtime_borrower
+		   || frame->outgoing->result_home != UINT_MAX
+		   || frame->outgoing->bytecode_pc
+		      != frame->program->deopt_maps[
+			  frame->outgoing->map_id].bytecode_pc
+		   || frame->outgoing->error_pc
+		      != frame->program->deopt_maps[
+			  frame->outgoing->map_id].error_pc
+		   || !jit_native_frame_continuation_matches(
+		       frame, frame->outgoing->map_id))
+		: frame->outgoing->result_home >= frame->num_homes)))
+	return 0;
+    if (frame->kind != JIT_FRAME_COMPACT
+	&& frame->canonical_index >= context->activation_limit)
+	return 0;
+    if (frame->entry_map < -1 || frame->current_map < -1
+	|| frame->entry_map >= frame->program->num_deopt_maps
+	|| frame->current_map >= frame->program->num_deopt_maps)
+	return 0;
+    if (frame->owns_boundary_stack) {
+	if ((frame->boundary_depth && !frame->boundary_stack)
+	    || frame->boundary_map <= 0
+	    || frame->boundary_map >= frame->program->num_deopt_maps
+	    || frame->current_map != frame->boundary_map)
+	    return 0;
+    } else if (frame->boundary_stack || frame->boundary_depth
+	       || frame->boundary_map)
+	return 0;
+    if (frame->owns_invocation
+	&& (frame->kind != JIT_FRAME_COMPACT || !frame->bytecode_program
+	    || !frame->env || !frame->verb || !frame->verbname))
+	return 0;
+    if (frame->owns_runtime
+	&& (!frame->runtime_storage
+	    || frame->program->active_runtime_bytes < frame->runtime_bytes))
+	return 0;
+    if (frame->owns_boundary_stack
+	&& frame->program->active_runtime_bytes
+	   < frame->runtime_bytes + sizeof(Var) * frame->boundary_depth)
+	return 0;
+    if (frame->runtime_borrower
+	&& (!frame->owns_runtime
+	    || frame->runtime_borrower->runtime_owner != frame
+	    || frame->runtime_borrower->owns_runtime
+	    || frame->runtime_borrower->program != frame->program
+	    || frame->runtime_borrower->runtime_storage
+	       != frame->runtime_storage
+	    || frame->runtime_borrower->owned_values != frame->homes
+	    || frame->runtime_borrower->home_states != frame->home_states
+	    || frame->runtime_borrower->runtime_bytes != frame->runtime_bytes))
+	return 0;
+    if ((frame->num_homes && (!frame->homes || !frame->home_states))
+	|| (!frame->num_homes && (frame->homes || frame->home_states)))
+	return 0;
+    for (i = 0; i < frame->num_homes; i++) {
+	unsigned j;
+
+	if (frame->home_states[i] == JIT_HOME_EMPTY
+	    || frame->home_states[i] == JIT_HOME_CONSUMED) {
+	    if (frame->homes[i].type != TYPE_NONE)
+		return 0;
+	} else if (frame->home_states[i] == JIT_HOME_OWNED) {
+	    if (frame->homes[i].type == TYPE_NONE)
+		return 0;
+	} else
+	    return 0;
+	if (frame->home_states[i] == JIT_HOME_OWNED
+	    && jit_native_home_needs_owner(frame->homes[i].type))
+	    for (j = 0; j < i; j++)
+		if (frame->home_states[j] == JIT_HOME_OWNED
+		    && frame->homes[j].type == frame->homes[i].type
+		    && frame->homes[j].v.num == frame->homes[i].v.num)
+		    return 0;
+    }
+    return 1;
+}
+
+int
+jit_native_frame_home_move(JITNativeFrame *frame, unsigned home, Var *value)
+{
+    if (!frame || !value || home >= frame->num_homes
+	|| frame->home_states[home] != JIT_HOME_EMPTY
+	|| frame->homes[home].type != TYPE_NONE || value->type == TYPE_NONE)
+	return 0;
+    frame->homes[home] = *value;
+    frame->home_states[home] = JIT_HOME_OWNED;
+    value->type = TYPE_NONE;
+    value->v.num = 0;
+    return 1;
+}
+
+int
+jit_native_frame_home_take(JITNativeFrame *frame, unsigned home, Var *value)
+{
+    if (!frame || !value || home >= frame->num_homes
+	|| frame->home_states[home] != JIT_HOME_OWNED
+	|| frame->homes[home].type == TYPE_NONE)
+	return 0;
+    *value = frame->homes[home];
+    frame->homes[home].type = TYPE_NONE;
+    frame->homes[home].v.num = 0;
+    frame->home_states[home] = JIT_HOME_CONSUMED;
+    return 1;
+}
 
 typedef union JITMIRAllocationHeader JITMIRAllocationHeader;
 
@@ -692,8 +1461,6 @@ typedef struct JITPool {
 
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 static uint64_t next_module_serial = 0;
-static JITContinuationFrame *continuation_frames;
-
 static void
 jit_load_externals(MIR_context_t context)
 {
@@ -834,6 +1601,7 @@ void
 jit_pool_stats(JITPoolStats *stats)
 {
     JITContinuationFrame *frame;
+    JITProgram *program;
 
     if (!stats)
 	return;
@@ -852,12 +1620,19 @@ jit_pool_stats(JITPoolStats *stats)
 	    + sizeof(Var) * (frame->values_capacity
 		+ frame->spare_values_capacity);
     }
+    for (program = jit_shared_pool.active_head; program;
+	 program = program->pool_next) {
+	stats->native_chain_active_frames += program->active_native_frames;
+	stats->native_chain_frame_bytes += program->active_native_frame_bytes;
+    }
 }
 
 typedef struct {
     MIR_context_t context;
     MIR_module_t module;
     MIR_item_t function;
+    MIR_reg_t execution_context;
+    MIR_reg_t native_frame;
     MIR_item_t proto_is_true;
     MIR_item_t import_is_true;
     MIR_item_t proto_equality;
@@ -1531,7 +2306,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
 
     build->proto_direct_verb_call = MIR_new_proto(build->context,
-	"proto_direct_verb_call", 1, &res_i32, 11,
+	"proto_direct_verb_call", 1, &res_i32, 13,
+	MIR_T_P, "execution_context", MIR_T_P, "native_frame",
 	MIR_T_I64, "obj_raw", MIR_T_I32, "obj_type",
 	MIR_T_I64, "verb_raw", MIR_T_I32, "verb_type",
 	MIR_T_I64, "args_raw", MIR_T_I32, "args_type",
@@ -1548,7 +2324,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	snprintf(func_name, sizeof(func_name), "jit_verb_%" PRIu64,
 		 next_module_serial);
     build->function = MIR_new_func(build->context, func_name, 1,
-				   &result_type, 13,
+				   &result_type, 15,
+				   MIR_T_P, "execution_context",
+				   MIR_T_P, "native_frame",
 				   MIR_T_P, "env", MIR_T_P, "result",
 				   MIR_T_P, "ticks", MIR_T_P, "timed_out",
 				   MIR_T_P, "error_out", MIR_T_P, "source_location",
@@ -1557,6 +2335,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				   MIR_T_P, "resume_stack",
 				   MIR_T_P, "continuation_values",
 				   MIR_T_P, "owned_values");
+    build->execution_context = MIR_reg(build->context, "execution_context",
+				       build->function->u.func);
+    build->native_frame = MIR_reg(build->context, "native_frame",
+				  build->function->u.func);
     env = MIR_reg(build->context, "env", build->function->u.func);
     result = MIR_reg(build->context, "result", build->function->u.func);
     ticks = MIR_reg(build->context, "ticks", build->function->u.func);
@@ -1663,6 +2445,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						 continuation_values),
 				  MIR_new_int_op(build->context, 0)));
 	for (j = 0; map->native_resume
+	     && j < map->native_resume->num_values; j++)
+	    if (map->native_resume->values[j].source == JIT_RESUME_OWNER) {
+		append(build, MIR_new_insn(build->context, MIR_JMP,
+					  MIR_new_label_op(build->context,
+							   fallback)));
+		break;
+	    }
+	for (j = 0; map->native_resume
 	     && j < map->native_resume->num_values; j++) {
 	    JITResumeValue *resume = &map->native_resume->values[j];
 
@@ -1688,6 +2478,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	    if (resume->source == JIT_RESUME_RESULT)
 		append_resume_value(build, program, values, resume->value,
 				    continuation_values, j, deopt_values,
+				    &copy_serial);
+	    else if (resume->source == JIT_RESUME_OWNER)
+		append_resume_value(build, program, values, resume->value,
+				    owned_values, resume->index, deopt_values,
 				    &copy_serial);
 	    else if (resume->source != JIT_RESUME_CONSTANT)
 		append_stored_resume_value(build, program, values,
@@ -4732,12 +5526,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_new_reg_op(build->context, deopt_values),
 			    MIR_new_int_op(build->context,
 				jit_tag_offset(program, instr->value))));
-			append(build, MIR_new_call_insn(build->context, 14,
+			append(build, MIR_new_call_insn(build->context, 16,
 			    MIR_new_ref_op(build->context,
 				build->proto_direct_verb_call),
 			    MIR_new_ref_op(build->context,
 				build->import_direct_verb_call),
 			    MIR_new_reg_op(build->context, call_result),
+			    MIR_new_reg_op(build->context,
+				build->execution_context),
+			    MIR_new_reg_op(build->context, build->native_frame),
 			    MIR_new_reg_op(build->context, raw[0]),
 			    MIR_new_reg_op(build->context, type[0]),
 			    MIR_new_reg_op(build->context, raw[1]),
@@ -5152,6 +5949,12 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	stats->continuation_resumes = program->usage->continuation_resumes;
 	stats->continuation_materializations
 	    = program->usage->continuation_materializations;
+	stats->continuation_fast_suspends
+	    = program->usage->continuation_fast_suspends;
+	stats->native_chain_calls = program->usage->native_chain_calls;
+	stats->native_chain_returns = program->usage->native_chain_returns;
+	stats->native_chain_promotions = program->usage->native_chain_promotions;
+	stats->native_chain_max_depth = program->usage->native_chain_max_depth;
     }
     stats->compile_attempts = program->compile_attempts;
     stats->compile_successes = program->compile_successes;
@@ -5159,6 +5962,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->compile_time_us = program->compile_time_us;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
     stats->runtime_bytes = program->active_runtime_bytes;
+    stats->native_chain_active_frames = program->active_native_frames;
+    stats->native_chain_frame_bytes = program->active_native_frame_bytes;
     stats->machine_code_bytes = program->machine_code_len;
     if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
 	&& program->machine_code_len > 0) {
@@ -5181,7 +5986,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	    }
     }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes + stats->continuation_bytes;
+	+ stats->native_allocated_bytes + stats->continuation_bytes
+	+ stats->native_chain_frame_bytes;
 }
 
 int
@@ -5489,6 +6295,16 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
 	    resume->literal);
 	return 1;
     }
+    if (resume->source == JIT_RESUME_OWNER) {
+	if (resume->index < 0
+	    || resume->index >= frame->program->num_owned_slots
+	    || !frame->home_states
+	    || frame->home_states[resume->index] != JIT_HOME_OWNED
+	    || frame->owned_values[resume->index].type == TYPE_NONE)
+	    return 0;
+	*materialized = var_ref(frame->owned_values[resume->index]);
+	return 1;
+    }
     type = frame->program->value_is_tagged
 	&& frame->program->value_is_tagged[value]
 	? (var_type) frame->deopt_values[
@@ -5504,7 +6320,8 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
 static JITContinuationFrame *
 jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 			 void *runtime_storage, Var *borrowed_locals,
-			 Var *owned_values, size_t runtime_bytes,
+			 Var *owned_values, unsigned char *home_states,
+			 size_t runtime_bytes,
 			 JITContinuationFrame *frame)
 {
     JITDeoptMap *map;
@@ -5513,6 +6330,16 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     int i;
 
     if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
+	return 0;
+    if (frame && frame->runtime_owner
+	&& (frame->owns_runtime
+	    || frame->runtime_owner->runtime_borrower != frame
+	    || !frame->runtime_owner->owns_runtime
+	    || frame->runtime_owner->runtime_storage != runtime_storage
+	    || frame->runtime_storage != runtime_storage
+	    || frame->owned_values != owned_values
+	    || frame->home_states != home_states
+	    || frame->runtime_bytes != runtime_bytes))
 	return 0;
     map = &program->deopt_maps[map_id];
     if (!map->native_resume || !map->native_resume->valid)
@@ -5524,6 +6351,14 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	if (resume->source == JIT_RESUME_RESULT
 	    || resume->source == JIT_RESUME_CONSTANT)
 	    continue;
+	if (resume->source == JIT_RESUME_OWNER) {
+	    if (resume->index < 0 || resume->index >= program->num_owned_slots
+		|| !home_states
+		|| home_states[resume->index] != JIT_HOME_OWNED
+		|| owned_values[resume->index].type == TYPE_NONE)
+		return 0;
+	    continue;
+	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
@@ -5564,6 +6399,10 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	}
 	if (resume->source == JIT_RESUME_CONSTANT)
 	    continue;
+	if (resume->source == JIT_RESUME_OWNER) {
+	    new_values[i] = var_ref(owned_values[resume->index]);
+	    continue;
+	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
@@ -5575,6 +6414,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     if (!frame) {
 	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
 	memset(frame, 0, sizeof(JITContinuationFrame));
+	frame->owns_runtime = runtime_storage != 0;
     } else {
 	Var *old_values = frame->values;
 	int old_values_capacity = frame->values_capacity;
@@ -5597,10 +6437,91 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     frame->deopt_values = deopt_values;
     frame->borrowed_locals = borrowed_locals;
     frame->owned_values = owned_values;
+    frame->home_states = home_states;
     frame->runtime_bytes = runtime_bytes;
     if (program->usage)
 	program->usage->continuation_captures++;
     return frame;
+}
+
+int
+jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
+				    activation *a, int map_id, int dispatched)
+{
+    JITContinuationFrame *continuation;
+    JITDeoptMap *map;
+    JITProgram *program;
+    Num *deopt_values;
+    Var *borrowed_locals = 0;
+    size_t deopt_bytes;
+    size_t deopt_storage_bytes;
+    size_t required_bytes;
+    unsigned stack_depth;
+
+    if (!native_frame || !a || !(program = native_frame->program)
+	|| a->jit_continuation || map_id <= 0
+	|| map_id >= program->num_deopt_maps
+	|| (native_frame->owns_boundary_stack && dispatched))
+	return 0;
+    map = &program->deopt_maps[map_id];
+    if ((map->num_locals && (!a->prog || !a->rt_env
+	 || (unsigned) map->num_locals > a->prog->num_var_names))
+	|| a->rt_stack_size < 0 || !a->base_rt_stack || !a->top_rt_stack
+	|| a->top_rt_stack < a->base_rt_stack
+	|| a->top_rt_stack > a->base_rt_stack + a->rt_stack_size)
+	return 0;
+    if (native_frame->owns_boundary_stack) {
+	unsigned i;
+
+	if (native_frame->boundary_map != map_id
+	    || native_frame->boundary_depth > (unsigned) a->rt_stack_size
+	    || a->top_rt_stack != a->base_rt_stack)
+	    return 0;
+	for (i = 0; i < native_frame->boundary_depth; i++)
+	    *a->top_rt_stack++ = var_ref(native_frame->boundary_stack[i]);
+	a->pc = map->bytecode_pc;
+	a->error_pc = map->error_pc;
+	a->resume_key = invalid_resume_key();
+	return 1;
+    }
+    if (!native_frame->runtime_storage
+	|| native_frame->num_homes != (unsigned) program->num_owned_slots)
+	return 0;
+    stack_depth = map->stack_depth;
+    if (dispatched) {
+	int operands = jit_call_stack_operands(map);
+
+	if (operands < 0 || (unsigned) operands > stack_depth)
+	    return 0;
+	stack_depth -= operands;
+    }
+    if (stack_depth > (unsigned) a->rt_stack_size)
+	return 0;
+    deopt_values = native_frame->runtime_storage;
+    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
+    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    required_bytes = deopt_storage_bytes
+	+ sizeof(Var) * program->num_borrowed_locals;
+    if (native_frame->runtime_bytes < required_bytes)
+	return 0;
+    if (program->num_borrowed_locals)
+	borrowed_locals = (Var *) ((char *) native_frame->runtime_storage
+	    + deopt_storage_bytes);
+    continuation = jit_continuation_capture(program, map_id, deopt_values,
+	0, borrowed_locals, native_frame->homes, native_frame->home_states, 0,
+	0);
+    if (!continuation)
+	return 0;
+    jit_continuation_attach(continuation, a);
+    if (dispatched)
+	jit_continuation_mark_dispatched(continuation);
+    if (!jit_continuation_materialize(a)) {
+	if (a->jit_continuation)
+	    jit_continuation_free(a->jit_continuation);
+	return 0;
+    }
+    return 1;
 }
 
 void
@@ -5610,6 +6531,11 @@ jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
 	return;
     if (frame->owner == owner && owner->jit_continuation == frame)
 	return;
+    if (owner->jit_continuation && owner->jit_continuation != frame)
+	panic("Attaching two JIT continuations to one activation");
+    if (frame->owner || frame->previous || frame->next
+	|| continuation_frames == frame)
+	panic("Attaching an already linked JIT continuation");
     frame->owner = owner;
     owner->jit_continuation = frame;
     frame->next = continuation_frames;
@@ -5637,6 +6563,12 @@ jit_continuation_mark_dispatched(JITContinuationFrame *frame)
 	if (frame->owner)
 	    frame->owner->top_rt_stack = frame->owner->base_rt_stack;
     }
+}
+
+int
+jit_continuation_is_dispatched(const JITContinuationFrame *frame)
+{
+    return frame && frame->dispatched;
 }
 
 void
@@ -5668,12 +6600,7 @@ jit_continuation_free(JITContinuationFrame *frame)
 	return;
     if (frame->owner && frame->owner->jit_continuation == frame)
 	frame->owner->jit_continuation = 0;
-    if (frame->previous)
-	frame->previous->next = frame->next;
-    else if (continuation_frames == frame)
-	continuation_frames = frame->next;
-    if (frame->next)
-	frame->next->previous = frame->previous;
+    jit_continuation_unlink(frame);
     for (i = 0; i < frame->num_values; i++)
 	free_var(frame->values[i]);
     if (frame->values)
@@ -5682,7 +6609,13 @@ jit_continuation_free(JITContinuationFrame *frame)
 	myfree(frame->spare_values, M_PROGRAM);
     if (frame->has_result)
 	free_var(frame->result);
-    if (frame->runtime_storage) {
+    if (frame->runtime_owner) {
+	if (frame->runtime_owner->runtime_borrower != frame)
+	    panic("Continuation runtime owner backlink is invalid");
+	frame->runtime_owner->runtime_borrower = 0;
+	frame->runtime_owner = 0;
+    }
+    if (frame->runtime_storage && frame->owns_runtime) {
 	for (i = 0; i < frame->program->num_borrowed_locals; i++)
 	    free_var(frame->borrowed_locals[i]);
 	for (i = 0; i < frame->program->num_owned_slots; i++)
@@ -5813,6 +6746,38 @@ jit_runtime_type_is_valid(var_type type)
     }
 }
 
+static int
+jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
+			       Num *deopt_values)
+{
+    int slot;
+    int value;
+    var_type type;
+
+    if (!jit_deopt_map_bridges_builtin(map)
+	|| strcmp(name_func_by_num(map->builtin_func), "suspend")
+	|| map->stack_depth == 0)
+	return 0;
+    slot = map->stack_depth - 1;
+    if (map->stack_slots && map->stack_slots[slot].kind != RSS_VALUE)
+	return 0;
+    value = map->stack_values[slot];
+    if (value <= 0 || value >= program->num_values)
+	return 0;
+    type = jit_deopt_map_stack_type(program, map, slot);
+    if (type == TYPE_ANY)
+	type = (var_type) deopt_values[jit_tag_index(program, value)];
+    if (map->builtin_args == 1)
+	return type == TYPE_INT && deopt_values[value] == 0;
+    if (map->builtin_args < 0 && type == TYPE_LIST) {
+	Var *args = (Var *) (intptr_t) deopt_values[value];
+
+	return args && args[0].v.num == 1 && args[1].type == TYPE_INT
+	    && args[1].v.num == 0;
+    }
+    return 0;
+}
+
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 		      Num *deopt_values, int operand)
@@ -5852,12 +6817,16 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
 }
 
 JITRunResult
-jit_program_execute(JITProgram *program, Var *env, Var *result,
-		    int *ticks, int *timed_out, enum error *error,
-		    JITSourceLocation *source_location, JITDeoptState *deopt,
-		    Var *deopt_stack, Objid progr, int resume_map,
-		    JITContinuationFrame *continuation_in,
-		    JITContinuationFrame **continuation_out)
+jit_program_execute_in_context(JITProgram *program,
+			       JITExecutionContext *execution_context,
+			       JITNativeFrame *native_frame, Var *env,
+			       Var *result, int *ticks, int *timed_out,
+			       enum error *error,
+			       JITSourceLocation *source_location,
+			       JITDeoptState *deopt, Var *deopt_stack,
+			       Objid progr, int resume_map,
+			       JITContinuationFrame *continuation_in,
+			       JITContinuationFrame **continuation_out)
 {
     NativeFunction function;
     int64_t native_result;
@@ -5865,15 +6834,23 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     Num *deopt_values;
     Var *borrowed_locals = 0;
     Var *owned_values = 0;
+    unsigned char *home_states = 0;
     void *runtime_storage;
     size_t deopt_bytes;
     size_t deopt_storage_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
     int runtime_from_continuation = continuation_in != 0;
+    int runtime_borrowed_from_frame = 0;
     int runtime_transferred = 0;
+    int i;
 
     (void) continuation_in;
+    if (!execution_context || !native_frame
+	|| execution_context->current_frame != native_frame
+	|| native_frame->program != program || native_frame->env != env
+	|| !jit_native_frame_verify(execution_context, native_frame))
+	return JIT_RUN_FALLBACK;
     if (continuation_out)
 	*continuation_out = 0;
     if (continuation_in) {
@@ -5883,6 +6860,18 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    || !program->deopt_maps[continuation_in->map_id].native_resume
 	    || !program->deopt_maps[continuation_in->map_id].native_resume->valid)
 	    return JIT_RUN_FALLBACK;
+	if (continuation_in->owns_runtime) {
+	    if (continuation_in->runtime_owner)
+		return JIT_RUN_FALLBACK;
+	} else {
+	    if (continuation_in->runtime_owner != native_frame
+		|| native_frame->runtime_borrower != continuation_in
+		|| !native_frame->owns_runtime
+		|| native_frame->runtime_storage
+		   != continuation_in->runtime_storage)
+		return JIT_RUN_FALLBACK;
+	    runtime_borrowed_from_frame = 1;
+	}
 	resume_map = continuation_in->map_id;
 	if (program->usage)
 	    program->usage->continuation_resumes++;
@@ -5895,6 +6884,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     source_location->source_lineno = 0;
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
+	deopt->map_id = -1;
 	deopt->builtin_func = -1;
 	deopt->operation = -1;
 	deopt->guard_local[0] = deopt->guard_local[1] = -1;
@@ -5922,12 +6912,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	* sizeof(Var);
     runtime_bytes = deopt_storage_bytes
 	+ sizeof(Var) * (program->num_borrowed_locals
-			 + program->num_owned_slots);
+			 + program->num_owned_slots)
+	+ program->num_owned_slots;
     if (runtime_from_continuation) {
 	runtime_storage = continuation_in->runtime_storage;
 	deopt_values = continuation_in->deopt_values;
 	borrowed_locals = continuation_in->borrowed_locals;
 	owned_values = continuation_in->owned_values;
+	home_states = continuation_in->home_states;
     } else {
 	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
 				   M_PROGRAM);
@@ -5951,18 +6943,32 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    owned_values = program->num_owned_slots
 		? (Var *) ((char *) runtime_storage + deopt_storage_bytes
 		    + sizeof(Var) * program->num_borrowed_locals) : 0;
-	    for (i = 0; i < program->num_owned_slots; i++)
+	    home_states = program->num_owned_slots
+		? (unsigned char *) (owned_values + program->num_owned_slots) : 0;
+	    for (i = 0; i < program->num_owned_slots; i++) {
 		owned_values[i].type = TYPE_NONE;
+		home_states[i] = JIT_HOME_EMPTY;
+	    }
 	}
 	program->active_runtime_bytes += runtime_bytes;
     }
+    jit_native_frame_bind_runtime(native_frame, runtime_storage, runtime_bytes,
+	owned_values, program->num_owned_slots, home_states);
+    if (!runtime_from_continuation)
+	jit_native_frame_mark_runtime_owned(native_frame);
     function = (NativeFunction) program->native_function;
-    native_result = function(env, result, ticks, timed_out, error,
+    native_result = function(execution_context, native_frame, env, result,
+			     ticks, timed_out, error,
 			     source_location, &deopt_map,
 			     deopt_values, progr, resume_map,
 			     deopt_stack,
 			     continuation_in ? continuation_in->values : 0,
 			     owned_values);
+    if (deopt && deopt_map >= 0 && deopt_map < program->num_deopt_maps)
+	deopt->map_id = deopt_map;
+    for (i = 0; i < program->num_owned_slots; i++)
+	home_states[i] = owned_values[i].type == TYPE_NONE
+	    ? JIT_HOME_EMPTY : JIT_HOME_OWNED;
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
@@ -5971,6 +6977,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	unsigned materialized_depth;
 	unsigned stack_start = 0;
 	int compact_boundary = 0;
+	int suspend_zero_boundary = 0;
 	int i;
 
 	if (deopt_map < 0 || deopt_map >= program->num_deopt_maps) {
@@ -5984,6 +6991,8 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		program->active_runtime_bytes -= runtime_bytes;
 		myfree(runtime_storage, M_PROGRAM);
 	    }
+	    if (!runtime_borrowed_from_frame)
+		jit_native_frame_unbind_runtime(native_frame);
 	    return JIT_RUN_FALLBACK;
 	}
 	map = &program->deopt_maps[deopt_map];
@@ -5998,7 +7007,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    if (operands >= 0 && (unsigned) operands <= map->stack_depth)
 		frame = jit_continuation_capture(program, deopt_map,
 		    deopt_values, runtime_storage, borrowed_locals,
-		    owned_values, runtime_bytes, continuation_in);
+		    owned_values, home_states, runtime_bytes, continuation_in);
 
 	    if (frame) {
 		*continuation_out = frame;
@@ -6007,6 +7016,14 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		stack_start = map->stack_depth - operands;
 		materialized_depth = operands;
 	    }
+	}
+	if (compact_boundary
+	    && jit_deopt_map_is_suspend_zero(program, map, deopt_values)) {
+	    suspend_zero_boundary = 1;
+	    if (program->usage)
+		program->usage->continuation_fast_suspends++;
+	    stack_start = map->stack_depth;
+	    materialized_depth = 0;
 	}
 	for (i = 0; !compact_boundary && i < map->num_locals; i++) {
 	    int local_value = jit_deopt_map_local_value(program, map, i);
@@ -6023,7 +7040,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 		env[i] = value;
 	    }
 	}
-	if (deopt_stack && (map->stack_depth
+	if (!suspend_zero_boundary && deopt_stack && (map->stack_depth
 			    || (jit_deopt_map_is_specialized_builtin(map)
 				&& map->builtin_args == 0)))
 	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
@@ -6061,6 +7078,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    myfree(new_stack, M_PROGRAM);
 	}
 	if (deopt) {
+	    deopt->map_id = deopt_map;
 	    deopt->bytecode_pc = map->bytecode_pc;
 	    deopt->error_pc = map->error_pc;
 	    deopt->source_lineno = map->source_lineno;
@@ -6080,7 +7098,9 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 						      env, deopt_values, i);
 	    deopt->reason = map->reason;
 	    if (native_result == JIT_RUN_CALL_VERB) {
-		if (map->reason == JIT_DEOPT_VERB_CALL)
+		if (suspend_zero_boundary)
+		    deopt->boundary = JIT_BOUNDARY_SUSPEND_ZERO;
+		else if (map->reason == JIT_DEOPT_VERB_CALL)
 		    deopt->boundary = JIT_BOUNDARY_VERB;
 		else if (jit_deopt_map_bridges_builtin(map))
 		    deopt->boundary = JIT_BOUNDARY_BUILTIN;
@@ -6092,8 +7112,6 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	    *result = var_ref(*result);
     }
     if (!runtime_from_continuation && !runtime_transferred) {
-	int i;
-
 	for (i = 0; i < program->num_borrowed_locals; i++)
 	    free_var(borrowed_locals[i]);
 	for (i = 0; i < program->num_owned_slots; i++)
@@ -6101,7 +7119,32 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
 	program->active_runtime_bytes -= runtime_bytes;
 	myfree(runtime_storage, M_PROGRAM);
     }
+    if (!runtime_borrowed_from_frame)
+	jit_native_frame_unbind_runtime(native_frame);
     return native_result;
+}
+
+JITRunResult
+jit_program_execute(JITProgram *program, Var *env, Var *result,
+		    int *ticks, int *timed_out, enum error *error,
+		    JITSourceLocation *source_location, JITDeoptState *deopt,
+		    Var *deopt_stack, Objid progr, int resume_map,
+		    JITContinuationFrame *continuation_in,
+		    JITContinuationFrame **continuation_out)
+{
+    JITExecutionContext context;
+    JITNativeFrame root;
+    JITRunResult run_result;
+
+    jit_execution_context_init(&context, &root, program, env, 0, 1,
+	(unsigned) -1, ticks, timed_out, error, resume_map);
+    run_result = jit_program_execute_in_context(program, &context, &root,
+	env, result,
+	ticks, timed_out, error, source_location, deopt, deopt_stack, progr,
+	resume_map, continuation_in, continuation_out);
+    if (!jit_execution_context_finish(&context, &root))
+	panic("JIT root execution context did not detach cleanly");
+    return run_result;
 }
 
 int
@@ -6404,15 +7447,24 @@ jit_deopt_reason_name(JITDeoptReason reason)
     }
 }
 
+static JITProgramUsage *
+jit_program_usage(JITProgram *program)
+{
+    if (!program)
+	return 0;
+    if (!program->usage) {
+	program->usage = mymalloc(sizeof(JITProgramUsage), M_PROGRAM);
+	memset(program->usage, 0, sizeof(JITProgramUsage));
+    }
+    return program->usage;
+}
+
 void
 jit_profile_record_entry(JITProgram *program)
 {
     total_jit_entries++;
     if (program) {
-	if (!program->usage) {
-	    program->usage = mymalloc(sizeof(JITProgramUsage), M_PROGRAM);
-	    memset(program->usage, 0, sizeof(JITProgramUsage));
-	}
+	jit_program_usage(program);
 	program->usage->entries++;
 	program->usage->last_used_generation = ++jit_use_generation;
 	program->usage->last_used_time = time(0);
@@ -6433,6 +7485,61 @@ jit_profile_record_vm_call(JITProgram *program)
     total_vm_calls++;
     if (program && program->usage)
 	program->usage->vm_calls++;
+}
+
+void
+jit_profile_record_native_call(JITExecutionContext *context)
+{
+    JITNativeFrame *frame;
+    uint64_t depth;
+
+    if (!context || !(frame = context->current_frame) || !frame->caller)
+	return;
+    jit_program_usage(frame->caller->program)->native_chain_calls++;
+    depth = context->native_depth + 1;
+    for (; frame; frame = frame->caller) {
+	JITProgramUsage *usage = jit_program_usage(frame->program);
+
+	if (usage->native_chain_max_depth < depth)
+	    usage->native_chain_max_depth = depth;
+    }
+}
+
+void
+jit_profile_record_native_return(JITNativeFrame *caller)
+{
+    if (caller && caller->program)
+	jit_program_usage(caller->program)->native_chain_returns++;
+}
+
+void
+jit_profile_record_native_promotion(JITNativeFrame *frame)
+{
+    if (frame && frame->program)
+	jit_program_usage(frame->program)->native_chain_promotions++;
+}
+
+void
+jit_profile_native_frame_acquired(JITNativeFrame *frame, size_t bytes)
+{
+    if (!frame || !frame->program || !bytes)
+	return;
+    frame->program->active_native_frames++;
+    frame->program->active_native_frame_bytes += bytes;
+}
+
+void
+jit_profile_native_frame_released(JITNativeFrame *frame, size_t bytes)
+{
+    JITProgram *program;
+
+    if (!frame || !(program = frame->program) || !bytes)
+	return;
+    if (!program->active_native_frames
+	|| program->active_native_frame_bytes < bytes)
+	panic("Native call-frame accounting underflow");
+    program->active_native_frames--;
+    program->active_native_frame_bytes -= bytes;
 }
 
 void

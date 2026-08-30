@@ -34,6 +34,22 @@ struct mir_dump {
     int found_source_marker;
 };
 
+struct promotion_dump {
+    JITNativeFrame *frames[4];
+    int maps[4];
+    unsigned count;
+};
+
+static void
+record_promotion(JITNativeFrame *frame, JITCallerResume *resume, void *data)
+{
+    struct promotion_dump *dump = data;
+
+    dump->frames[dump->count] = frame;
+    dump->maps[dump->count] = resume ? resume->map_id : frame->current_map;
+    dump->count++;
+}
+
 static void
 check_mir_line(const char *line, void *data)
 {
@@ -3296,6 +3312,500 @@ main(void)
     JITDeoptState deopt;
     JITSourceLocation source_location;
 
+    {
+	JITNativeFrame compact;
+	Program bytecode;
+	activation invocation;
+	Var invocation_env[1];
+
+	memset(&compact, 0, sizeof(compact));
+	memset(&bytecode, 0, sizeof(bytecode));
+	memset(&invocation, 0, sizeof(invocation));
+	compact.kind = JIT_FRAME_COMPACT;
+	bytecode.ref_count = 1;
+	bytecode.num_var_names = 1;
+	invocation_env[0].type = TYPE_STR;
+	invocation_env[0].v.str = str_dup("invocation environment");
+	invocation.prog = &bytecode;
+	invocation.rt_env = invocation_env;
+#ifdef WAIF_CORE
+	invocation.THIS.type = TYPE_OBJ;
+	invocation.THIS.v.obj = 17;
+#endif
+	invocation.this = 17;
+	invocation.player = 18;
+	invocation.progr = 19;
+	invocation.vloc = 20;
+	invocation.verb = str_dup("called");
+	invocation.verbname = str_dup("called alias");
+	invocation.debug = 1;
+	check(jit_native_frame_copy_invocation(&compact, &invocation),
+	      "compact frame invocation copy failed");
+	check(compact.owns_invocation && compact.bytecode_program == &bytecode
+	      && compact.env != invocation_env
+	      && compact.env[0].type == TYPE_STR
+	      && !strcmp(compact.env[0].v.str, "invocation environment")
+	      && compact.this == 17 && compact.player == 18
+	      && compact.progr == 19 && compact.vloc == 20
+	      && compact.debug == 1 && bytecode.ref_count == 2,
+	      "compact frame invocation metadata is incomplete");
+	jit_native_frame_release_invocation(&compact);
+	check(!compact.owns_invocation && !compact.bytecode_program
+	      && !compact.env && bytecode.ref_count == 1,
+	      "compact frame invocation release was incomplete");
+	{
+	    PreparedVerbCall prepared;
+	    Var *prepared_env = mymalloc(sizeof(Var), M_RT_ENV);
+
+	    memset(&compact, 0, sizeof(compact));
+	    memset(&prepared, 0, sizeof(prepared));
+	    prepared.program = program_ref(&bytecode);
+	    prepared.env = prepared_env;
+	    prepared_env[0].type = TYPE_STR;
+	    prepared_env[0].v.str = str_dup("prepared environment");
+#ifdef WAIF_CORE
+	    prepared.receiver.type = TYPE_OBJ;
+	    prepared.receiver.v.obj = 27;
+#endif
+	    prepared.this = 27;
+	    prepared.player = 28;
+	    prepared.progr = 29;
+	    prepared.vloc = 30;
+	    prepared.verb = str_dup("prepared");
+	    prepared.verbname = str_dup("prepared alias");
+	    prepared.debug = 1;
+	    compact.kind = JIT_FRAME_COMPACT;
+	    compact.env = invocation_env;
+	    check(!jit_native_frame_take_prepared_invocation(&compact,
+		&prepared) && prepared.program == &bytecode
+		&& prepared.env == prepared_env && !compact.owns_invocation,
+		"failed prepared invocation transfer consumed ownership");
+	    compact.env = prepared_env;
+	    check(jit_native_frame_take_prepared_invocation(&compact, &prepared),
+		"prepared invocation ownership transfer failed");
+	    check(compact.owns_invocation
+		&& compact.bytecode_program == &bytecode
+		&& compact.env == prepared_env && compact.this == 27
+		&& compact.player == 28 && compact.progr == 29
+		&& compact.vloc == 30 && compact.debug == 1
+		&& !prepared.program && !prepared.env && !prepared.verb
+		&& !prepared.verbname && bytecode.ref_count == 2,
+		"prepared invocation ownership transfer was incomplete");
+	    jit_native_frame_release_invocation(&compact);
+	    check(bytecode.ref_count == 1,
+		"prepared invocation release leaked its program reference");
+	}
+	free_var(invocation_env[0]);
+	free_str(invocation.verb);
+	free_str(invocation.verbname);
+    }
+
+    {
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame child;
+	Var homes[4];
+	unsigned char home_states[4];
+	Var value;
+	Var taken;
+	const char *shared;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+	    homes[i].type = TYPE_NONE;
+	    homes[i].v.num = 0;
+	    home_states[i] = JIT_HOME_EMPTY;
+	}
+	jit_execution_context_init(&context, &root, program, env, 2, 3, 10,
+	    &ticks, &timed_out, &error, -1);
+	check(jit_native_frame_verify(&context, &root),
+	      "native root frame verification failed");
+	jit_native_frame_bind_runtime(&root, homes, sizeof(homes), homes, 4,
+	    home_states);
+	check(jit_native_frame_verify(&context, &root),
+	      "native frame runtime binding verification failed");
+
+	value.type = TYPE_INT;
+	value.v.num = 17;
+	check(jit_native_frame_home_move(&root, 0, &value),
+	      "native integer home move failed");
+	check(value.type == TYPE_NONE
+	      && jit_native_frame_home_take(&root, 0, &taken)
+	      && taken.type == TYPE_INT && taken.v.num == 17,
+	      "native integer home take failed");
+	free_var(taken);
+
+	value.type = TYPE_STR;
+	value.v.str = str_dup("native frame home");
+	check(jit_native_frame_home_move(&root, 1, &value)
+	      && jit_native_frame_verify(&context, &root),
+	      "native string home move failed");
+	check(jit_native_frame_home_take(&root, 1, &taken),
+	      "native string home take failed");
+	free_var(taken);
+
+	value = new_list(0);
+	check(jit_native_frame_home_move(&root, 2, &value)
+	      && jit_native_frame_home_take(&root, 2, &taken),
+	      "native list home transfer failed");
+	free_var(taken);
+
+	value.type = TYPE_FLOAT;
+	value.v.fnum = box_fl(1.5);
+	check(jit_native_frame_home_move(&root, 3, &value)
+	      && jit_native_frame_home_take(&root, 3, &taken),
+	      "native float home transfer failed");
+	free_var(taken);
+	check(jit_native_frame_verify(&context, &root),
+	      "consumed native homes failed verification");
+
+	value.type = TYPE_INT;
+	value.v.num = 1;
+	check(!jit_native_frame_home_move(&root, 0, &value),
+	      "native frame reused a consumed home");
+	free_var(value);
+	home_states[0] = JIT_HOME_OWNED;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted an uninitialized owned home");
+	home_states[0] = JIT_HOME_CONSUMED;
+
+	shared = str_dup("duplicate native owner");
+	homes[0].type = homes[1].type = TYPE_STR;
+	homes[0].v.str = homes[1].v.str = shared;
+	home_states[0] = home_states[1] = JIT_HOME_OWNED;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted duplicate ownership");
+	homes[1].type = TYPE_NONE;
+	homes[1].v.num = 0;
+	home_states[1] = JIT_HOME_CONSUMED;
+	free_var(homes[0]);
+	homes[0].type = TYPE_NONE;
+	homes[0].v.num = 0;
+	home_states[0] = JIT_HOME_CONSUMED;
+
+	jit_native_frame_unbind_runtime(&root);
+	context.canonical_depth = context.activation_limit;
+	context.native_depth = 1;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted excess activation depth");
+	context.canonical_depth = 3;
+	context.native_depth = 0;
+	check(jit_execution_context_push_overlay(&context, &child, program, env,
+	    3, -1), "native canonical overlay push failed");
+	check(context.current_frame == &child && child.caller == &root
+	      && root.state == JIT_FRAME_SUSPENDED
+	      && child.state == JIT_FRAME_RUNNING,
+	      "native canonical overlay linkage is wrong");
+	check(jit_execution_context_pop_overlay(&context, &child),
+	      "native canonical overlay pop failed");
+	check(root.state == JIT_FRAME_RUNNING
+	      && child.state == JIT_FRAME_DETACHED,
+	      "native canonical overlay states were not restored");
+	check(jit_execution_context_finish(&context, &root),
+	      "native root frame did not detach cleanly");
+    }
+
+    {
+	JITProgram *chain_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame middle;
+	JITNativeFrame leaf;
+	JITCallerResume root_resume;
+	JITCallerResume middle_resume;
+	Var root_home[1];
+	Var middle_home[1];
+	unsigned char root_state[1];
+	unsigned char middle_state[1];
+	Var returned;
+	Var transferred;
+
+	root_home[0].type = middle_home[0].type = TYPE_NONE;
+	root_home[0].v.num = middle_home[0].v.num = 0;
+	root_state[0] = middle_state[0] = JIT_HOME_EMPTY;
+	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	jit_native_frame_bind_runtime(&root, root_home, sizeof(root_home),
+	    root_home, 1, root_state);
+	memset(&root_resume, 0, sizeof(root_resume));
+	root_resume.caller = &root;
+	root_resume.map_id = 1;
+	root_resume.result_home = 0;
+	root_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &middle,
+	    chain_program, deep_env, &root_resume, -1),
+	      "first compact native dispatch failed");
+	jit_native_frame_bind_runtime(&middle, middle_home,
+	    sizeof(middle_home), middle_home, 1, middle_state);
+
+	memset(&middle_resume, 0, sizeof(middle_resume));
+	middle_resume.caller = &middle;
+	middle_resume.map_id = 1;
+	middle_resume.result_home = 0;
+	middle_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &leaf,
+	    chain_program, deopt_stack, &middle_resume, -1),
+	      "second compact native dispatch failed");
+	check(context.native_depth == 2 && context.current_frame == &leaf,
+	      "compact native chain depth is wrong");
+
+	returned = new_list(1);
+	returned.v.list[1].type = TYPE_STR;
+	returned.v.list[1].v.str = str_dup("compact chain result");
+	check(jit_execution_context_return_compact(&context, &leaf, &returned),
+	      "compact leaf return failed");
+	check(returned.type == TYPE_NONE
+	      && middle_resume.state == JIT_RESUME_RETURNED
+	      && context.current_frame == &middle && context.native_depth == 1,
+	      "compact leaf return transition is wrong");
+	check(jit_native_frame_home_take(&middle, 0, &transferred),
+	      "compact middle frame did not acquire its result");
+	jit_native_frame_unbind_runtime(&middle);
+	check(jit_execution_context_return_compact(&context, &middle,
+	    &transferred), "compact middle return failed");
+	check(transferred.type == TYPE_NONE
+	      && root_resume.state == JIT_RESUME_RETURNED
+	      && context.current_frame == &root && context.native_depth == 0,
+	      "compact middle return transition is wrong");
+	check(jit_native_frame_home_take(&root, 0, &transferred),
+	      "compact root frame did not acquire the final result");
+	check(transferred.type == TYPE_LIST
+	      && transferred.v.list[1].type == TYPE_STR
+	      && !strcmp(transferred.v.list[1].v.str, "compact chain result"),
+	      "compact chain corrupted a complex result");
+	free_var(transferred);
+	jit_native_frame_unbind_runtime(&root);
+	check(jit_execution_context_finish(&context, &root),
+	      "compact chain root did not detach cleanly");
+	jit_program_free(chain_program);
+    }
+
+    {
+	JITProgram *chain_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame middle;
+	JITNativeFrame leaf;
+	JITCallerResume root_resume;
+	JITCallerResume middle_resume;
+	JITPromotionPlan *promotion;
+	struct promotion_dump dump = {{0}, {0}, 0};
+	Var root_homes[2];
+	Var middle_home[1];
+	unsigned char root_states[2];
+	unsigned char middle_state[1];
+	Var retained;
+
+	root_homes[0].type = root_homes[1].type = TYPE_NONE;
+	root_homes[0].v.num = root_homes[1].v.num = 0;
+	middle_home[0].type = TYPE_NONE;
+	middle_home[0].v.num = 0;
+	root_states[0] = root_states[1] = JIT_HOME_EMPTY;
+	middle_state[0] = JIT_HOME_EMPTY;
+	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	jit_native_frame_bind_runtime(&root, root_homes, sizeof(root_homes),
+	    root_homes, 2, root_states);
+	retained.type = TYPE_STR;
+	retained.v.str = str_dup("retained through promotion");
+	check(jit_native_frame_home_move(&root, 1, &retained),
+	      "promotion test could not retain its owned value");
+
+	memset(&root_resume, 0, sizeof(root_resume));
+	root_resume.caller = &root;
+	root_resume.map_id = 1;
+	root_resume.result_home = 0;
+	root_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &middle,
+	    chain_program, deep_env, &root_resume, -1),
+	      "promotion middle dispatch failed");
+	jit_native_frame_bind_runtime(&middle, middle_home,
+	    sizeof(middle_home), middle_home, 1, middle_state);
+	memset(&middle_resume, 0, sizeof(middle_resume));
+	middle_resume.caller = &middle;
+	middle_resume.map_id = 1;
+	middle_resume.result_home = 0;
+	middle_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &leaf,
+	    chain_program, deopt_stack, &middle_resume, 1),
+	      "promotion leaf dispatch failed");
+
+	leaf.current_map = 2;
+	check(!jit_native_chain_prepare_promotion(&context)
+	      && context.current_frame == &leaf && context.native_depth == 2
+	      && root_resume.state == JIT_RESUME_DISPATCHED
+	      && middle_resume.state == JIT_RESUME_DISPATCHED,
+	      "failed promotion preparation mutated the native chain");
+	leaf.current_map = 1;
+	promotion = jit_native_chain_prepare_promotion(&context);
+	check(promotion != 0, "native chain promotion preparation failed");
+	check(jit_native_chain_promotion_count(promotion) == 3
+	      && jit_native_chain_promotion_frame(promotion, 0) == &root
+	      && jit_native_chain_promotion_frame(promotion, 1) == &middle
+	      && jit_native_chain_promotion_frame(promotion, 2) == &leaf
+	      && !jit_native_chain_promotion_frame(promotion, 3),
+	      "native chain promotion snapshot access is wrong");
+	check(jit_native_chain_commit_promotion(promotion, record_promotion,
+	    &dump), "native chain promotion commit failed");
+	check(dump.count == 3 && dump.frames[0] == &root
+	      && dump.frames[1] == &middle && dump.frames[2] == &leaf
+	      && dump.maps[0] == 1 && dump.maps[1] == 1
+	      && dump.maps[2] == 1,
+	      "native chain promotion order or maps are wrong");
+	check(!context.root_frame && !context.current_frame
+	      && context.native_depth == 0
+	      && root.state == JIT_FRAME_PROMOTED
+	      && middle.state == JIT_FRAME_PROMOTED
+	      && leaf.state == JIT_FRAME_PROMOTED
+	      && root_resume.state == JIT_RESUME_PROMOTED
+	      && middle_resume.state == JIT_RESUME_PROMOTED,
+	      "native chain promotion did not detach every frame");
+	check(jit_native_frame_home_take(&root, 1, &retained)
+	      && retained.type == TYPE_STR
+	      && !strcmp(retained.v.str, "retained through promotion"),
+	      "native chain promotion lost an owned value");
+	free_var(retained);
+	jit_native_frame_unbind_runtime(&middle);
+	jit_native_frame_unbind_runtime(&root);
+	jit_native_chain_discard_promotion(promotion);
+	jit_program_free(chain_program);
+    }
+
+    {
+	JITProgram *owner_program = call_boundary_program();
+	JITDeoptMap *map = &owner_program->deopt_maps[1];
+	JITNativeFrame native_frame;
+	JITNativeResume *resume;
+	activation owner;
+	Var owner_stack[2];
+	Var owner_home[1];
+	unsigned char home_state[1];
+	Num stale_values[6] = { 0, 0, 0, 0, 0, 0 };
+	void *owned_storage;
+	Var *owned_home;
+	unsigned char *owned_state;
+	size_t owned_bytes;
+
+	memset(&owner, 0, sizeof(owner));
+	memset(&native_frame, 0, sizeof(native_frame));
+	owner_program->value_types = allocate(sizeof(var_type) * 3);
+	owner_program->value_is_tagged = allocate(3);
+	owner_program->value_types[1] = TYPE_ANY;
+	owner_program->value_is_tagged[1] = 1;
+	owner_program->num_owned_slots = 1;
+	resume = allocate(sizeof(*resume));
+	resume->num_values = 1;
+	resume->valid = 1;
+	resume->values = allocate(sizeof(*resume->values));
+	resume->values[0].value = 1;
+	resume->values[0].source = JIT_RESUME_OWNER;
+	resume->values[0].index = 0;
+	map->native_resume = resume;
+	map->num_locals = 0;
+	map->num_local_values = 0;
+	owner_home[0].type = TYPE_STR;
+	owner_home[0].v.str = str_dup("authoritative owner tag");
+	home_state[0] = JIT_HOME_OWNED;
+	native_frame.program = owner_program;
+	jit_native_frame_bind_runtime(&native_frame, stale_values,
+	    sizeof(stale_values), owner_home, 1, home_state);
+	owner.base_rt_stack = owner.top_rt_stack = owner_stack;
+	owner.rt_stack_size = 2;
+	native_frame.runtime_bytes--;
+	check(!jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0)
+	      && owner.top_rt_stack == owner.base_rt_stack,
+	      "native frame accepted undersized runtime storage");
+	native_frame.runtime_bytes++;
+	owner.rt_stack_size = 0;
+	check(!jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0),
+	      "native frame accepted an undersized activation stack");
+	owner.rt_stack_size = 2;
+	check(jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0),
+	      "owner-backed native frame did not prepare an activation");
+	check(owner.top_rt_stack == owner.base_rt_stack + 1
+	      && owner_stack[0].type == TYPE_STR
+	      && !strcmp(owner_stack[0].v.str, "authoritative owner tag"),
+	      "owner-backed native frame used stale payload or tag data");
+	check(home_state[0] == JIT_HOME_OWNED
+	      && owner_home[0].type == TYPE_STR,
+	      "activation preparation consumed its native owner");
+	free_var(*--owner.top_rt_stack);
+	jit_native_frame_unbind_runtime(&native_frame);
+	free_var(owner_home[0]);
+	owned_bytes = sizeof(stale_values) + sizeof(Var) + 1;
+	owned_storage = mymalloc(owned_bytes, M_PROGRAM);
+	memset(owned_storage, 0, owned_bytes);
+	owned_home = (Var *) ((char *) owned_storage + sizeof(stale_values));
+	owned_state = (unsigned char *) (owned_home + 1);
+	owned_home[0].type = TYPE_STR;
+	owned_home[0].v.str = str_dup("released native runtime");
+	owned_state[0] = JIT_HOME_OWNED;
+	owner_program->active_runtime_bytes = owned_bytes;
+	jit_native_frame_bind_runtime(&native_frame, owned_storage, owned_bytes,
+	    owned_home, 1, owned_state);
+	jit_native_frame_mark_runtime_owned(&native_frame);
+	jit_native_frame_release_runtime(&native_frame);
+	check(!native_frame.runtime_storage && !native_frame.owns_runtime
+	      && owner_program->active_runtime_bytes == 0,
+	      "owned native runtime release was incomplete");
+	jit_program_free(owner_program);
+    }
+
+    {
+	JITProgram *boundary_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	activation first = { 0 };
+	activation second = { 0 };
+	Var source[2];
+	Var first_stack[2];
+	Var second_stack[2];
+	size_t runtime_before = boundary_program->active_runtime_bytes;
+
+	source[0].type = TYPE_STR;
+	source[0].v.str = str_dup("exact boundary stack");
+	source[1] = new_list(1);
+	source[1].v.list[1].type = TYPE_INT;
+	source[1].v.list[1].v.num = 42;
+	boundary_program->deopt_maps[1].num_locals = 0;
+	jit_execution_context_init(&context, &root, boundary_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	check(jit_native_frame_capture_boundary(&root, source, 2, 1),
+	      "native frame did not capture an exact boundary stack");
+	check(source[0].type == TYPE_NONE && source[1].type == TYPE_NONE
+	      && root.owns_boundary_stack && root.boundary_depth == 2
+	      && root.boundary_map == 1
+	      && boundary_program->active_runtime_bytes
+		 == runtime_before + sizeof(source)
+	      && jit_native_frame_verify(&context, &root),
+	      "native boundary stack ownership is inconsistent");
+	check(!jit_native_frame_capture_boundary(&root, source, 0, 1),
+	      "native frame captured more than one boundary stack");
+	first.base_rt_stack = first.top_rt_stack = first_stack;
+	first.rt_stack_size = 2;
+	second.base_rt_stack = second.top_rt_stack = second_stack;
+	second.rt_stack_size = 2;
+	check(jit_native_frame_prepare_activation(&root, &first, 1, 0)
+	      && jit_native_frame_prepare_activation(&root, &second, 1, 0),
+	      "native boundary stack was not retry-safe during preparation");
+	jit_native_frame_release_boundary(&root);
+	check(first.top_rt_stack == first.base_rt_stack + 2
+	      && second.top_rt_stack == second.base_rt_stack + 2
+	      && first_stack[0].type == TYPE_STR
+	      && !strcmp(first_stack[0].v.str, "exact boundary stack")
+	      && second_stack[1].type == TYPE_LIST
+	      && second_stack[1].v.list[1].v.num == 42
+	      && boundary_program->active_runtime_bytes == runtime_before,
+	      "prepared boundary activation did not retain exact values");
+	while (first.top_rt_stack > first.base_rt_stack)
+	    free_var(*--first.top_rt_stack);
+	while (second.top_rt_stack > second.base_rt_stack)
+	    free_var(*--second.top_rt_stack);
+	check(jit_execution_context_finish(&context, &root),
+	      "boundary snapshot root frame did not detach cleanly");
+	jit_program_free(boundary_program);
+    }
+
     check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
     check(mir_dump.lines > 0, "MIR dump was empty");
@@ -3922,6 +4432,84 @@ main(void)
 		  && !strcmp(result.v.str, "compact returned"),
 		  "compact call_verb continuation returned the wrong value");
 	    free_var(result);
+	}
+	{
+	    JITContinuationFrame *continuation = 0;
+	    JITExecutionContext context;
+	    JITNativeFrame root;
+	    JITNativeFrame child;
+	    JITCallerResume native_resume;
+	    activation owner = { 0 };
+	    Var returned;
+	    size_t runtime_before = call_prog->active_runtime_bytes;
+
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		"borrowed-runtime call did not capture a continuation");
+	    check(continuation && continuation->owns_runtime
+		&& !continuation->runtime_owner
+		&& call_prog->active_runtime_bytes > runtime_before,
+		"captured continuation did not own its runtime");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    jit_execution_context_init(&context, &root, call_prog, deep_env,
+		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    jit_continuation_attach(continuation, &owner);
+	    check(jit_native_frame_adopt_continuation_runtime(&root,
+		continuation), "native frame did not adopt continuation runtime");
+	    check(root.owns_runtime && root.runtime_borrower == continuation
+		&& !continuation->owns_runtime
+		&& continuation->runtime_owner == &root
+		&& !owner.jit_continuation && !continuation->owner
+		&& jit_native_frame_verify(&context, &root),
+		"adopted continuation runtime ownership is inconsistent");
+	    check(!jit_native_frame_adopt_continuation_runtime(&root,
+		continuation), "continuation runtime was adopted more than once");
+	    memset(&native_resume, 0, sizeof(native_resume));
+	    native_resume.caller = &root;
+	    native_resume.continuation = continuation;
+	    native_resume.map_id = continuation->map_id;
+	    native_resume.bytecode_pc = deopt.bytecode_pc;
+	    native_resume.error_pc = deopt.error_pc;
+	    native_resume.result_home = UINT_MAX;
+	    native_resume.state = JIT_RESUME_PREPARING;
+	    check(jit_execution_context_push_compact(&context, &child,
+		call_prog, deep_env, &native_resume, -1),
+		"continuation-backed compact dispatch failed");
+	    returned.type = TYPE_STR;
+	    returned.v.str = str_dup("borrowed runtime returned");
+	    check(jit_execution_context_return_compact(&context, &child,
+		&returned), "continuation-backed compact return failed");
+	    check(returned.type == TYPE_NONE
+		&& native_resume.state == JIT_RESUME_RETURNED
+		&& context.current_frame == &root,
+		"compact return did not transfer its result to the continuation");
+	    check(jit_program_execute_in_context(call_prog, &context, &root,
+		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
+		deopt_stack, 2, -1, continuation, 0) == JIT_RUN_RETURNED,
+		"borrowed continuation runtime did not resume");
+	    check(root.runtime_storage && root.runtime_borrower == continuation
+		&& continuation->runtime_owner == &root
+		&& result.type == TYPE_STR
+		&& !strcmp(result.v.str, "borrowed runtime returned"),
+		"borrowed continuation resume corrupted runtime ownership");
+	    free_var(result);
+	    check(jit_native_frame_return_continuation_runtime(&root,
+		continuation),
+		"native frame did not return continuation runtime ownership");
+	    check(!root.runtime_storage && !root.runtime_borrower
+		&& continuation->owns_runtime && !continuation->runtime_owner,
+		"returned continuation runtime ownership is inconsistent");
+	    jit_continuation_attach(continuation, &owner);
+	    jit_continuation_free(continuation);
+	    check(!owner.jit_continuation
+		&& call_prog->active_runtime_bytes == runtime_before,
+		"returned continuation did not release runtime exactly once");
+	    check(jit_execution_context_finish(&context, &root),
+		"borrowed-runtime root frame did not detach cleanly");
 	}
 	{
 	    JITProgram *sparse = call_verb_program();
@@ -5572,6 +6160,36 @@ main(void)
 	jit_profile_record_entry(profile_program);
 	jit_profile_record_completed(profile_program);
 	jit_profile_record_vm_call(profile_program);
+	{
+	    JITExecutionContext context = { 0 };
+	    JITNativeFrame root = { 0 };
+	    JITNativeFrame child = { 0 };
+	    JITNativeFrame leaf = { 0 };
+
+	    root.program = child.program = leaf.program = profile_program;
+	    child.caller = &root;
+	    leaf.caller = &child;
+	    context.current_frame = &child;
+	    context.native_depth = 1;
+	    jit_profile_record_native_call(&context);
+	    context.current_frame = &leaf;
+	    context.native_depth = 2;
+	    jit_profile_record_native_call(&context);
+	    jit_profile_record_native_return(&child);
+	    jit_profile_record_native_return(&root);
+	    jit_profile_record_native_promotion(&root);
+	    jit_profile_record_native_promotion(&child);
+	    jit_profile_record_native_promotion(&leaf);
+	    jit_profile_native_frame_acquired(&child, 512);
+	    jit_program_stats(profile_program, &stats);
+	    check(stats.native_chain_active_frames == 1
+		  && stats.native_chain_frame_bytes == 512
+		  && stats.accounted_bytes == stats.metadata_bytes
+		     + stats.runtime_bytes + stats.native_allocated_bytes
+		     + stats.continuation_bytes + 512,
+		  "live native frame accounting is wrong");
+	    jit_profile_native_frame_released(&child, 512);
+	}
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));
@@ -5603,6 +6221,12 @@ main(void)
 	      "per-program JIT deopt reason totals are wrong");
 	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
 	      "per-program JIT last-use statistics are wrong");
+	check(stats.native_chain_calls == 2 && stats.native_chain_returns == 2
+	      && stats.native_chain_promotions == 3
+	      && stats.native_chain_max_depth == 3
+	      && stats.native_chain_active_frames == 0
+	      && stats.native_chain_frame_bytes == 0,
+	      "per-program native chain statistics are wrong");
 
 	/* Trigger report generation */
 	jit_profile_report();
@@ -5617,6 +6241,7 @@ main(void)
     {
 	JITPoolStats pool_stats;
 	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
+	JITNativeFrame frame = { 0 };
 
 	check(prog != 0, "failed to create test program for pool verification");
 	check(jit_program_compile(prog), "failed to compile program for pool test");
@@ -5626,6 +6251,13 @@ main(void)
 	      "pool machine code byte count is wrong");
 	check(pool_stats.total_native_allocated_bytes >= pool_stats.total_machine_code_bytes,
 	      "pool native allocated byte count is wrong");
+	frame.program = prog;
+	jit_profile_native_frame_acquired(&frame, 256);
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.native_chain_active_frames == 1
+	      && pool_stats.native_chain_frame_bytes == 256,
+	      "pool native frame accounting is wrong");
+	jit_profile_native_frame_released(&frame, 256);
 
 	/* Reset pool and verify invalidation of active programs */
 	jit_pool_reset();

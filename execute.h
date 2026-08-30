@@ -30,6 +30,11 @@
 #define ANY_RESUME_VECTOR (-2)
 
 struct JITContinuationFrame;
+struct JITExecutionContext;
+struct JITNativeFrame;
+struct JITCallerResume;
+struct JITActivationPromotion;
+struct JITNativeCall;
 
 typedef struct activation {
     Program *prog;
@@ -70,6 +75,21 @@ typedef struct activation {
 } activation;
 #define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (18 * V) + X(WAIF_CORE, B(Var)))
 
+typedef struct PreparedVerbCall {
+    Program *program;
+    Var *env;
+#ifdef WAIF_CORE
+    Var receiver;
+#endif
+    Objid this;
+    Objid player;
+    Objid progr;
+    Objid vloc;
+    const char *verb;
+    const char *verbname;
+    int debug;
+} PreparedVerbCall;
+
 extern void free_activation(activation *, char data_too);
 
 typedef struct {
@@ -102,9 +122,25 @@ extern enum error call_verb2(Objid obj, const char *vname
 			     WAIF_COMMA_ARG(Var THIS),
 			     Var args, int do_pass);
 #ifdef ENABLE_JIT
-extern int execute_jit_direct_verb_call(int64_t, int, int64_t, int, int64_t,
-					int, int *, int *, enum error *,
+extern int execute_jit_direct_verb_call(struct JITExecutionContext *,
+					struct JITNativeFrame *, int64_t, int,
+					int64_t, int, int64_t, int,
+					int *, int *, enum error *,
 					int64_t *, int *);
+extern int execute_jit_commit_prepared_verb_call(
+	struct JITExecutionContext *, struct JITNativeFrame *,
+	struct JITCallerResume *, PreparedVerbCall *, int);
+extern int execute_jit_dispatch_native_verb_call(
+	struct JITExecutionContext *, struct JITNativeFrame *, Objid,
+	const char * WAIF_COMMA_ARG(Var), Var, enum error *, int, unsigned,
+	unsigned, struct JITContinuationFrame *, struct JITNativeCall **);
+extern struct JITNativeFrame *execute_jit_native_call_frame(
+	struct JITNativeCall *);
+extern void execute_jit_free_native_call(struct JITNativeCall *);
+extern struct JITActivationPromotion *execute_jit_prepare_promotion(
+	struct JITExecutionContext *);
+extern int execute_jit_commit_promotion(struct JITActivationPromotion *);
+extern void execute_jit_discard_promotion(struct JITActivationPromotion *);
 #endif
 
 extern int setup_activ_for_eval(Program * prog);
