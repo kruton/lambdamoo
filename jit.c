@@ -6552,6 +6552,12 @@ jit_continuation_mark_dispatched(JITContinuationFrame *frame)
     }
 }
 
+int
+jit_continuation_is_dispatched(const JITContinuationFrame *frame)
+{
+    return frame && frame->dispatched;
+}
+
 void
 jit_continuation_set_result(JITContinuationFrame *frame, Var value)
 {
@@ -6865,6 +6871,7 @@ jit_program_execute_in_context(JITProgram *program,
     source_location->source_lineno = 0;
     if (deopt) {
 	memset(deopt, 0, sizeof(*deopt));
+	deopt->map_id = -1;
 	deopt->builtin_func = -1;
 	deopt->operation = -1;
 	deopt->guard_local[0] = deopt->guard_local[1] = -1;
@@ -6944,6 +6951,8 @@ jit_program_execute_in_context(JITProgram *program,
 			     deopt_stack,
 			     continuation_in ? continuation_in->values : 0,
 			     owned_values);
+    if (deopt && deopt_map >= 0 && deopt_map < program->num_deopt_maps)
+	deopt->map_id = deopt_map;
     for (i = 0; i < program->num_owned_slots; i++)
 	home_states[i] = owned_values[i].type == TYPE_NONE
 	    ? JIT_HOME_EMPTY : JIT_HOME_OWNED;
@@ -7056,6 +7065,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    myfree(new_stack, M_PROGRAM);
 	}
 	if (deopt) {
+	    deopt->map_id = deopt_map;
 	    deopt->bytecode_pc = map->bytecode_pc;
 	    deopt->error_pc = map->error_pc;
 	    deopt->source_lineno = map->source_lineno;

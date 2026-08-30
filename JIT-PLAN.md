@@ -769,11 +769,15 @@ prepared environment acquires its own reference, so every pre-publication
 failure can destroy the descriptor without consuming the caller's operands.
 The returned call object cannot be freed while linked into a context.
 
-This publisher is not yet called from `run()`.  Its caller-resume record now
-retains the captured continuation, requires the caller frame to own that
+`run()` now drives this publisher from an iterative native-call trampoline.
+Its caller-resume record retains the captured continuation, requires the
+caller frame to own that
 continuation's runtime at publication, and records the map's exact bytecode and
 error PCs.  Publication suspends the caller; normal return transfers the result
-to the retained continuation and makes the caller current again.  Runtime
+to the retained continuation, destroys only the completed callee, and makes
+the caller current again.  A target is compiled before publication, so a
+compile failure remains a pre-publication fallback and never leaves an
+unmaterializable compact callee.  Runtime
 ownership at a captured boundary is now explicit: a fresh
 `JITContinuationFrame` owns its allocation,
 and `jit_native_frame_adopt_continuation_runtime()` moves that ownership into
@@ -803,15 +807,21 @@ The interpreter loop has a final safety gate before fetching an opcode: if JIT
 re-entry was skipped while the activation still owns a continuation, it
 materializes that continuation first.  An eligibility change, compilation
 failure, or other conservative guard therefore cannot enter the bytecode
-interpreter with a compact stack layout.
+interpreter with a compact stack layout.  An attached but undispatched
+continuation is never a native-resume input: `run()` skips JIT re-entry and
+lets this gate reconstruct the call operands and execute the call opcode.
+Only a dispatched continuation can represent the after-call native ABI.
 
-The remaining integration step is to call the publisher from `run()`, capture
-any exact active boundary, and drive callee execution and caller resumption.
-Normal return must destroy the completed call object only after transferring
-its result, while the resumed caller retains its continuation borrower until
-the next native execution or promotion.  General dispatch remains gated until
-that driver uses these ownership operations and passes nested return,
-promotion, and fallback tests.
+The initial `run()` driver supports repeated eligible verb dispatch and normal
+return through arbitrary compact depth.  It gives each active compact callee a
+separate materialization stack, transfers return values through the exact
+caller continuation, and retains the resumed caller's runtime borrower until
+the next native execution or promotion.  Every other outcome in a non-empty
+native suffix captures the active boundary as either a continuation or exact
+stack snapshot, promotes the complete suffix bottom-up, and reloads the
+interpreter caches from the newly authoritative activation.  Built-ins,
+suspension, errors, aborts, and ordinary deopts therefore remain conservative
+whole-chain promotion boundaries in this implementation stage.
 
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup

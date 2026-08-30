@@ -905,6 +905,7 @@ typedef struct {
 struct JITNativeCall {
     JITNativeFrame frame;
     JITCallerResume resume;
+    struct JITNativeCall *parent;
 };
 #endif
 
@@ -1077,7 +1078,7 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
     if (!context || !frame || !resume || !prepared || !prepared->program
 	|| !prepared->env || !prepared->verb || !prepared->verbname
 	|| !(program = prepared->program->jit)
-	|| !jit_program_is_eligible(program))
+	|| !jit_program_is_eligible(program) || !jit_program_compile(program))
 	return 0;
     if (!jit_execution_context_push_compact(context, frame, program,
 	prepared->env, resume, entry_map))
@@ -1162,6 +1163,206 @@ execute_jit_free_native_call(struct JITNativeCall *call)
     jit_native_frame_release_runtime(&call->frame);
     jit_native_frame_release_invocation(&call->frame);
     myfree(call, M_VM);
+}
+
+typedef struct {
+    Var value;
+    JITRunResult result;
+    JITSourceLocation source;
+    JITDeoptState deopt;
+    JITContinuationFrame *continuation;
+    enum error error;
+    int promoted;
+} JITChainRunResult;
+
+static void
+free_jit_boundary_values(Var *stack, unsigned depth)
+{
+    unsigned i;
+
+    for (i = 0; i < depth; i++) {
+	free_var(stack[i]);
+	stack[i].type = TYPE_NONE;
+	stack[i].v.num = 0;
+    }
+}
+
+static int
+dispatch_jit_native_boundary(JITExecutionContext *context,
+			     JITNativeFrame *caller, Var *stack,
+			     const JITDeoptState *deopt,
+			     JITContinuationFrame *continuation,
+			     struct JITNativeCall **call_out)
+{
+    Var *obj = &stack[0];
+    Var *verb = &stack[1];
+    Var *args = &stack[2];
+    Objid class = NOTHING;
+    enum error error = E_NONE;
+
+    if (deopt->stack_depth != 3 || args->type != TYPE_LIST
+	|| verb->type != TYPE_STR)
+	return 0;
+#ifdef WAIF_CORE
+    if (obj->type == TYPE_WAIF) {
+	char *name;
+
+	if (!valid(class = obj->v.waif->class))
+	    return 0;
+	name = mymalloc(strlen(verb->v.str) + 2, M_STRING);
+	name[0] = WAIF_VERB_PREFIX;
+	strcpy(name + 1, verb->v.str);
+	free_str(verb->v.str);
+	verb->v.str = name;
+    } else
+#endif
+    {
+	if (obj->type != TYPE_OBJ || !valid(class = obj->v.obj))
+	    return 0;
+#ifdef WAIF_CORE
+	if (verb->v.str[0] == WAIF_VERB_PREFIX)
+	    return 0;
+#endif
+    }
+    return execute_jit_dispatch_native_verb_call(context, caller, class,
+	verb->v.str WAIF_COMMA_ARG(*obj), *args, &error, deopt->map_id,
+	deopt->bytecode_pc, deopt->error_pc, continuation, call_out);
+}
+
+static void
+free_jit_native_call_chain(struct JITNativeCall *call)
+{
+    while (call) {
+	struct JITNativeCall *parent = call->parent;
+
+	execute_jit_free_native_call(call);
+	call = parent;
+    }
+}
+
+static void
+run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
+		     Var *root_stack, int root_resume_map,
+		     JITContinuationFrame *root_continuation, int *ticks,
+		     int *timed_out, JITChainRunResult *out)
+{
+    struct JITNativeCall *active_call = 0;
+    JITNativeFrame *active = root;
+    JITContinuationFrame *continuation_in = root_continuation;
+    int resume_map = root_resume_map;
+
+    memset(out, 0, sizeof(*out));
+    out->value.type = TYPE_NONE;
+    for (;;) {
+	JITContinuationFrame *continuation = 0;
+	Var *stack = root_stack;
+	int allocated_stack = active != root;
+	unsigned materialized_depth = 0;
+
+	if (allocated_stack)
+	    stack = mymalloc(MAX(active->bytecode_program->main_vector.max_stack,
+		1) * sizeof(Var), M_RT_STACK);
+	out->error = E_NONE;
+	out->result = jit_program_execute_in_context(active->program, context,
+	    active, active->env, &out->value, ticks, timed_out, &out->error,
+	    &out->source, &out->deopt, stack, active->progr, resume_map,
+	    continuation_in, &continuation);
+	if (continuation_in && continuation_in != continuation) {
+	    jit_continuation_free(continuation_in);
+	    if (active->runtime_storage)
+		jit_native_frame_release_runtime(active);
+	}
+	continuation_in = 0;
+	resume_map = -1;
+
+	if (out->result == JIT_RUN_RETURNED && active_call) {
+	    struct JITNativeCall *completed = active_call;
+
+	    if (continuation)
+		panic("Returning native frame retained a continuation");
+	    jit_profile_record_completed(active->program);
+	    active_call = completed->parent;
+	    if (!jit_execution_context_return_compact(context, active,
+		&out->value))
+		panic("Native verb return could not resume its caller");
+	    if (allocated_stack)
+		myfree(stack, M_RT_STACK);
+	    execute_jit_free_native_call(completed);
+	    active = context->current_frame;
+	    continuation_in = active->runtime_borrower;
+	    continue;
+	}
+
+	if (out->result == JIT_RUN_CALL_VERB && continuation
+	    && out->deopt.boundary == JIT_BOUNDARY_VERB) {
+	    struct JITNativeCall *callee = 0;
+
+	    active->current_map = out->deopt.map_id;
+	    if (!jit_native_frame_continuation_matches(active,
+		out->deopt.map_id)
+		&& !jit_native_frame_adopt_continuation_runtime(active,
+		    continuation))
+		panic("Native caller could not adopt its continuation");
+	    if (dispatch_jit_native_boundary(context, active, stack,
+		&out->deopt, continuation, &callee)) {
+		callee->parent = active_call;
+		active_call = callee;
+		free_jit_boundary_values(stack, out->deopt.stack_depth);
+		if (allocated_stack)
+		    myfree(stack, M_RT_STACK);
+		active = &callee->frame;
+		jit_profile_record_entry(active->program);
+		continue;
+	    }
+	}
+
+	if (active_call) {
+	    struct JITActivationPromotion *promotion;
+
+	    if (out->deopt.map_id <= 0)
+		panic("Native chain reached a boundary without a deopt map");
+	    active->current_map = out->deopt.map_id;
+	    if (continuation
+		&& !jit_native_frame_continuation_matches(active,
+		    out->deopt.map_id)
+		&& !jit_native_frame_adopt_continuation_runtime(active,
+		    continuation))
+		panic("Native boundary continuation ownership is invalid");
+	    if (!continuation) {
+		materialized_depth = out->deopt.materialized
+		    ? out->deopt.stack_depth : 0;
+		if (!jit_native_frame_capture_boundary(active, stack,
+			materialized_depth, out->deopt.map_id))
+		    panic("Native boundary capture failed before promotion");
+	    }
+	    promotion = execute_jit_prepare_promotion(context);
+	    if (!promotion || !execute_jit_commit_promotion(promotion))
+		panic("Native call-chain promotion failed");
+	    if (continuation)
+		materialized_depth = out->deopt.stack_depth;
+	    free_jit_boundary_values(stack, materialized_depth);
+	    if (allocated_stack)
+		myfree(stack, M_RT_STACK);
+	    free_jit_native_call_chain(active_call);
+	    out->continuation = 0;
+	    out->promoted = 1;
+	    return;
+	}
+
+	if (allocated_stack)
+	    myfree(stack, M_RT_STACK);
+	if (continuation && root->runtime_borrower == continuation) {
+	    if (!jit_native_frame_return_continuation_runtime(root,
+		    continuation))
+		panic("JIT root continuation runtime handoff failed");
+	    jit_continuation_attach(continuation,
+		&activ_stack[root->canonical_index]);
+	}
+	if (!jit_execution_context_finish(context, root))
+	    panic("JIT root execution context did not detach cleanly");
+	out->continuation = continuation;
+	return;
+    }
 }
 #endif /* ENABLE_JIT */
 
@@ -1505,6 +1706,8 @@ do {								\
 	/* Transient eval programs have no vloc and cannot release individual
 	 * modules from the shared MIR context. */
 	if ((at_entry || resume_map >= 0 || continuation_in)
+	    && (!continuation_in
+		|| jit_continuation_is_dispatched(continuation_in))
 	    && (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR)
 	    && RUN_ACTIV.vloc != NOTHING
 	    && RUN_ACTIV.prog->jit
@@ -1518,7 +1721,9 @@ do {								\
 	    JITContinuationFrame *continuation = 0;
 	    JITExecutionContext execution_context;
 	    JITNativeFrame root_frame;
+	    JITChainRunResult chain_result;
 	    enum error jit_error = E_NONE;
+	    int chain_promoted;
 
 	    if (resume_map >= 0)
 		RUN_ACTIV.resume_key = invalid_resume_key();
@@ -1543,19 +1748,29 @@ do {								\
 	    if (!jit_native_frame_bind_activation(&root_frame, &RUN_ACTIV))
 		panic("JIT root activation metadata binding failed");
 	    jit_profile_record_entry(RUN_ACTIV.prog->jit);
-	    jit_result = jit_program_execute_in_context(RUN_ACTIV.prog->jit,
-					     &execution_context, &root_frame,
-					     RUN_ACTIV.rt_env, &ret_val,
-					     &ticks_remaining, &task_timed_out,
-					     &jit_error, &source_location, &deopt,
-					     RUN_ACTIV.base_rt_stack,
-					     RUN_ACTIV.progr, resume_map,
-					     continuation_in,
-					     &continuation);
-	    if (!jit_execution_context_finish(&execution_context, &root_frame))
-		panic("JIT root execution context did not detach cleanly");
-	    if (continuation_in && continuation_in != continuation)
-		jit_continuation_free(continuation_in);
+	    run_jit_native_chain(&execution_context, &root_frame,
+		RUN_ACTIV.base_rt_stack, resume_map, continuation_in,
+		&ticks_remaining, &task_timed_out, &chain_result);
+	    ret_val = chain_result.value;
+	    jit_result = chain_result.result;
+	    source_location = chain_result.source;
+	    deopt = chain_result.deopt;
+	    continuation = chain_result.continuation;
+	    jit_error = chain_result.error;
+	    chain_promoted = chain_result.promoted;
+	    if (chain_promoted) {
+		LOAD_STATE_VARIABLES();
+		if (jit_result == JIT_RUN_FALLBACK
+		    || jit_result == JIT_RUN_CALL_VERB) {
+		    if (jit_result == JIT_RUN_FALLBACK)
+			jit_profile_record_deopt(RUN_ACTIV.prog->jit,
+			    RUN_ACTIV.vloc, RUN_ACTIV.verbname, &deopt);
+		    else
+			jit_profile_record_vm_call(RUN_ACTIV.prog->jit);
+		    ticks_remaining += deopt.ticks_charged;
+		    goto next_opcode;
+		}
+	    }
 	    if (jit_result == JIT_RUN_RETURNED) {
 		jit_profile_record_completed(RUN_ACTIV.prog->jit);
 		STORE_STATE_VARIABLES();

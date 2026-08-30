@@ -153,6 +153,7 @@ typedef uint16_t JITTypeMask;
     ((JITTypeMask) 1U << ((unsigned) (type) & TYPE_DB_MASK))
 
 typedef struct {
+    int map_id;
     unsigned bytecode_pc;
     unsigned error_pc;
     unsigned source_lineno;
@@ -304,6 +305,7 @@ extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *
 				JITDeoptState *, Var *, Objid, int,
 				JITContinuationFrame *, JITContinuationFrame **);
 extern void jit_continuation_set_result(JITContinuationFrame *, Var);
+extern int jit_continuation_is_dispatched(const JITContinuationFrame *);
 extern void jit_continuation_mark_dispatched(JITContinuationFrame *);
 extern void jit_continuation_attach(JITContinuationFrame *, struct activation *);
 extern void jit_continuation_relocate(JITContinuationFrame *, struct activation *);
