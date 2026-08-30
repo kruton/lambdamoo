@@ -800,8 +800,13 @@ Canonical promotion therefore releases each frame's remaining borrower,
 runtime allocation, and boundary snapshot only after all shadow activations
 have been published.
 Frame verification rejects mismatched storage, home arrays, sizes, programs,
-or ownership bits, and runtime release or unbinding with a live borrower is a
-fatal lifecycle violation.
+or ownership bits.  The exhaustive graph verifier remains directly callable
+by unit tests, while automatic verification at calls, returns, resumes, and
+promotion is enabled only in builds configured with
+`--enable-def-JIT_VERIFY_NATIVE_FRAMES`.  Production transitions retain their
+focused precondition checks, ownership moves, accounting checks, and fatal
+guards against release or unbinding with a live borrower; they do not walk the
+complete frame graph on every hot transition.
 
 The interpreter loop has a final safety gate before fetching an opcode: if JIT
 re-entry was skipped while the activation still owns a continuation, it

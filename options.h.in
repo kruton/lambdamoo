@@ -331,9 +331,14 @@ useful for anything other than quick experiments.)
  * Debug settings:
  *
  * DEBUG_LOG_TRACEBACKS prints all tracebacks to the server log.
+ *
+ * JIT_VERIFY_NATIVE_FRAMES exhaustively verifies the complete native-frame
+ * ownership and linkage graph at runtime transitions.  This is intended for
+ * verification builds; it is too expensive for production JIT execution.
  */
 
 #undef DEBUG_LOG_TRACEBACKS
+#undef JIT_VERIFY_NATIVE_FRAMES
 
 /******************************************************************************
  * NETWORK_PROTOCOL must be defined as one of the following:

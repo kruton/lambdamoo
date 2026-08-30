@@ -602,7 +602,7 @@ jit_execution_context_push_overlay(JITExecutionContext *context,
     caller->state = JIT_FRAME_SUSPENDED;
     caller->callee = frame;
     context->current_frame = frame;
-    if (jit_native_frame_verify(context, frame))
+    if (jit_native_frame_verify_runtime(context, frame))
 	return 1;
 
     context->current_frame = caller;
@@ -630,7 +630,7 @@ jit_execution_context_pop_overlay(JITExecutionContext *context,
     frame->caller = 0;
     frame->context = 0;
     frame->state = JIT_FRAME_DETACHED;
-    return jit_native_frame_verify(context, caller);
+    return jit_native_frame_verify_runtime(context, caller);
 }
 
 int
@@ -673,7 +673,7 @@ jit_execution_context_push_compact(JITExecutionContext *context,
     caller->callee = frame;
     context->current_frame = frame;
     context->native_depth++;
-    if (jit_native_frame_verify(context, frame))
+    if (jit_native_frame_verify_runtime(context, frame))
 	return 1;
 
     context->native_depth--;
@@ -701,7 +701,8 @@ jit_execution_context_return_compact(JITExecutionContext *context,
 	|| caller->state != JIT_FRAME_SUSPENDED
 	|| !(resume = frame->incoming) || resume->caller != caller
 	|| caller->outgoing != resume || resume->state != JIT_RESUME_DISPATCHED
-	|| context->native_depth == 0 || !jit_native_frame_verify(context, frame))
+	|| context->native_depth == 0
+	|| !jit_native_frame_verify_runtime(context, frame))
 	return 0;
 
     if (resume->continuation) {
@@ -723,7 +724,7 @@ jit_execution_context_return_compact(JITExecutionContext *context,
     frame->context = 0;
     frame->state = JIT_FRAME_RETURNED;
     jit_native_frame_release_invocation(frame);
-    return jit_native_frame_verify(context, caller);
+    return jit_native_frame_verify_runtime(context, caller);
 }
 
 JITPromotionPlan *
@@ -738,7 +739,7 @@ jit_native_chain_prepare_promotion(JITExecutionContext *context)
     if (!context || !context->root_frame || !context->current_frame)
 	return 0;
     for (frame = context->root_frame; frame; frame = frame->callee) {
-	if (!jit_native_frame_verify(context, frame)
+	if (!jit_native_frame_verify_runtime(context, frame)
 	    || (frame->callee && !frame->outgoing)
 	    || (!frame->callee && (frame->current_map < 0
 		|| frame->current_map >= frame->program->num_deopt_maps)))
@@ -779,7 +780,7 @@ jit_native_chain_commit_promotion(JITPromotionPlan *plan,
     for (i = 0; i < plan->num_frames; i++) {
 	JITNativeFrame *frame = plan->frames[i];
 
-	if (!jit_native_frame_verify(context, frame)
+	if (!jit_native_frame_verify_runtime(context, frame)
 	    || frame->caller != (i ? plan->frames[i - 1] : 0)
 	    || frame->callee != (i + 1 < plan->num_frames
 		? plan->frames[i + 1] : 0))
@@ -842,7 +843,7 @@ jit_execution_context_finish(JITExecutionContext *context,
     if (!context || !root || context->root_frame != root
 	|| context->current_frame != root || root->caller || root->callee
 	|| root->runtime_storage || root->owns_boundary_stack
-	|| !jit_native_frame_verify(context, root))
+	|| !jit_native_frame_verify_runtime(context, root))
 	return 0;
     root->context = 0;
     root->state = JIT_FRAME_DETACHED;
@@ -6849,7 +6850,7 @@ jit_program_execute_in_context(JITProgram *program,
     if (!execution_context || !native_frame
 	|| execution_context->current_frame != native_frame
 	|| native_frame->program != program || native_frame->env != env
-	|| !jit_native_frame_verify(execution_context, native_frame))
+	|| !jit_native_frame_verify_runtime(execution_context, native_frame))
 	return JIT_RUN_FALLBACK;
     if (continuation_out)
 	*continuation_out = 0;

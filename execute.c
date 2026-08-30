@@ -1088,7 +1088,7 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
 
     if (!jit_native_frame_take_prepared_invocation(frame, prepared))
 	panic("Prepared verb call ownership transfer failed after publication");
-    if (!jit_native_frame_verify(context, frame))
+    if (!jit_native_frame_verify_runtime(context, frame))
 	panic("Prepared verb call produced an invalid compact frame");
     return 1;
 }
@@ -1500,7 +1500,7 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
     if (verb.type != TYPE_STR || args.type != TYPE_LIST)
 	return 0;
     if (!execution_context || execution_context->current_frame != caller_frame
-	|| !jit_native_frame_verify(execution_context, caller_frame))
+	|| !jit_native_frame_verify_runtime(execution_context, caller_frame))
 	return 0;
 #ifdef WAIF_CORE
     if (obj.type == TYPE_WAIF) {

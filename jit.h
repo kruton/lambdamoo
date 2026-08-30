@@ -2,6 +2,7 @@
 #define JIT_H 1
 
 #include "config.h"
+#include "options.h"
 
 #include "my-time.h"
 
@@ -282,6 +283,13 @@ extern int jit_native_frame_capture_boundary(JITNativeFrame *, Var *,
 extern void jit_native_frame_release_boundary(JITNativeFrame *);
 extern int jit_native_frame_verify(const JITExecutionContext *,
 				   const JITNativeFrame *);
+#ifdef JIT_VERIFY_NATIVE_FRAMES
+#define jit_native_frame_verify_runtime(context, frame) \
+    jit_native_frame_verify((context), (frame))
+#else
+#define jit_native_frame_verify_runtime(context, frame) \
+    ((void) (context), (void) (frame), 1)
+#endif
 extern int jit_native_frame_home_move(JITNativeFrame *, unsigned, Var *);
 extern int jit_native_frame_home_take(JITNativeFrame *, unsigned, Var *);
 extern int jit_native_frame_prepare_activation(JITNativeFrame *,
