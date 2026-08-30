@@ -132,6 +132,8 @@ extern Byte *pc_for_bi_func_data(void);
 
 extern unsigned builtin_protection_generation(void);
 extern int builtin_function_is_protected(unsigned);
+extern void set_builtin_jit_compact_return_only(unsigned);
+extern int builtin_function_is_jit_compact_return_only(unsigned, int);
 extern void load_server_options(void);
 
 #endif		/* !Functions_H */

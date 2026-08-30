@@ -1420,7 +1420,8 @@ bf_decode_chars(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr
 void
 register_list(void)
 {
-    register_function("value_bytes", 1, 1, bf_value_bytes, TYPE_ANY);
+    set_builtin_jit_compact_return_only(
+	register_function("value_bytes", 1, 1, bf_value_bytes, TYPE_ANY));
     register_function("value_hash", 1, 1, bf_value_hash, TYPE_ANY);
     register_function("string_hash", 1, 1, bf_string_hash, TYPE_STR);
     register_function("binary_hash", 1, 1, bf_binary_hash, TYPE_STR);
@@ -1438,7 +1439,8 @@ register_list(void)
     register_function("listdelete", 2, 2, bf_listdelete, TYPE_LIST, TYPE_INT);
     register_function("listset", 3, 3, bf_listset,
 		      TYPE_LIST, TYPE_ANY, TYPE_INT);
-    register_function("equal", 2, 2, bf_equal, TYPE_ANY, TYPE_ANY);
+    set_builtin_jit_compact_return_only(
+	register_function("equal", 2, 2, bf_equal, TYPE_ANY, TYPE_ANY));
     register_function("is_member", 2, 2, bf_is_member, TYPE_ANY, TYPE_LIST);
 
     /* string */

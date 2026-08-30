@@ -53,6 +53,7 @@ struct bft_entry {
     bf_import_type import;
     bf_export_type export;
     int protected;
+    int jit_compact_return_only;
 };
 
 static struct bft_entry bf_table[MAX_FUNC];
@@ -87,6 +88,7 @@ register_common(const char *name, int minargs, int maxargs, bf_type func,
     bf_table[top_bf_table].import = import;
     bf_table[top_bf_table].export = export;
     bf_table[top_bf_table].protected = 0;
+    bf_table[top_bf_table].jit_compact_return_only = 0;
 
     if (num_arg_types > 0)
 	bf_table[top_bf_table].prototype =
@@ -528,6 +530,22 @@ int
 builtin_function_is_protected(unsigned n)
 {
     return n < top_bf_table && bf_table[n].protected;
+}
+
+void
+set_builtin_jit_compact_return_only(unsigned n)
+{
+    if (n < top_bf_table)
+	bf_table[n].jit_compact_return_only = 1;
+}
+
+int
+builtin_function_is_jit_compact_return_only(unsigned n, int nargs)
+{
+    return n < top_bf_table && !bf_table[n].protected
+	&& bf_table[n].jit_compact_return_only
+	&& nargs >= 0 && bf_table[n].minargs == nargs
+	&& bf_table[n].maxargs == nargs;
 }
 
 Num _server_int_option_cache[SVO__CACHE_SIZE];

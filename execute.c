@@ -1303,6 +1303,35 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	}
 
 	if (out->result == JIT_RUN_CALL_VERB && continuation
+	    && out->deopt.boundary == JIT_BOUNDARY_BUILTIN
+	    && out->deopt.stack_depth == 1 && stack[0].type == TYPE_LIST
+	    && builtin_function_is_jit_compact_return_only(
+		out->deopt.builtin_func, stack[0].v.list[0].v.num)) {
+	    Var args = stack[0];
+	    package p;
+
+	    active->current_map = out->deopt.map_id;
+	    if (!jit_native_frame_continuation_matches(active,
+		    out->deopt.map_id)
+		&& !jit_native_frame_adopt_continuation_runtime(active,
+		    continuation))
+		panic("Native built-in caller could not adopt its continuation");
+	    stack[0].type = TYPE_NONE;
+	    stack[0].v.num = 0;
+	    jit_continuation_mark_dispatched(continuation);
+	    p = call_bi_func(out->deopt.builtin_func, args, 1,
+		active->progr, 0);
+	    jit_profile_record_vm_call(active->program);
+	    if (p.kind != BI_RETURN)
+		panic("Compact return-only built-in returned a non-return package");
+	    jit_continuation_set_result(continuation, p.u.ret);
+	    if (allocated_stack)
+		myfree(stack, M_RT_STACK);
+	    continuation_in = continuation;
+	    continue;
+	}
+
+	if (out->result == JIT_RUN_CALL_VERB && continuation
 	    && out->deopt.boundary == JIT_BOUNDARY_VERB) {
 	    struct JITNativeCall *callee = 0;
 

@@ -816,12 +816,26 @@ The initial `run()` driver supports repeated eligible verb dispatch and normal
 return through arbitrary compact depth.  It gives each active compact callee a
 separate materialization stack, transfers return values through the exact
 caller continuation, and retains the resumed caller's runtime borrower until
-the next native execution or promotion.  Every other outcome in a non-empty
-native suffix captures the active boundary as either a continuation or exact
-stack snapshot, promotes the complete suffix bottom-up, and reloads the
-interpreter caches from the newly authoritative activation.  Built-ins,
-suspension, errors, aborts, and ordinary deopts therefore remain conservative
-whole-chain promotion boundaries in this implementation stage.
+the next native execution or promotion.  The driver now also admits an
+explicitly registered, audited class of compact return-only built-ins.  The
+initial class is `typeof()`, `equal()`, and `value_bytes()`.  At such a boundary
+the frame adopts the caller continuation, moves the materialized argument list
+into `call_bi_func()`, moves the `BI_RETURN` value back into the continuation,
+and resumes the same frame without constructing an activation.  The call is
+charged and counted once; it is never replayed.
+
+This admission is deliberately narrower than general built-in capture.  The
+runtime argument count must exactly match the fixed registration, the function
+must not currently be protected, and its registration promises that every
+validated call returns `BI_RETURN`.  Dynamic/spliced calls are eligible only
+when their materialized list has that exact count.  A non-return package from
+an admitted function is an internal contract violation, not a reason to replay
+the call.  Protected overrides, `BI_CALL`, suspension, errors, aborts,
+introspection, and ordinary deopts still capture the exact active boundary,
+promote the complete suffix bottom-up, and reload the interpreter caches from
+the newly authoritative activation.  Expanding the registered class requires
+auditing argument validation and every package outcome; adding compact
+`BI_CALL` requires the continuation-link mechanism below.
 
 Extended `verb_info()` metadata records `native_chain_calls` against the
 caller, `native_chain_returns` against the resumed caller, and
