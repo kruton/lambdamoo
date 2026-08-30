@@ -72,6 +72,7 @@ struct JITNativeFrame {
     Objid vloc;
     const char *verb;
     const char *verbname;
+    JITContinuationFrame *runtime_borrower;
     void *runtime_storage;
     Var *homes;
     unsigned char *home_states;
@@ -250,6 +251,8 @@ extern void jit_native_frame_release_invocation(JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
 					  Var *, unsigned, unsigned char *);
 extern void jit_native_frame_mark_runtime_owned(JITNativeFrame *);
+extern int jit_native_frame_adopt_continuation_runtime(
+	JITNativeFrame *, JITContinuationFrame *);
 extern void jit_native_frame_release_runtime(JITNativeFrame *);
 extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
 extern int jit_native_frame_verify(const JITExecutionContext *,

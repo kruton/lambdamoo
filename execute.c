@@ -810,6 +810,9 @@ execute_jit_commit_promotion(struct JITActivationPromotion *promotion)
 	unsigned i;
 
 	for (i = 0; i < promotion->num_frames; i++) {
+	    if (promotion->frames[i]->runtime_borrower)
+		jit_continuation_free(
+		    promotion->frames[i]->runtime_borrower);
 	    jit_native_frame_release_runtime(promotion->frames[i]);
 	    if (i > 0)
 		jit_native_frame_release_invocation(promotion->frames[i]);

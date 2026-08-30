@@ -752,15 +752,26 @@ prepared environment acquires its own reference, so every pre-publication
 failure can destroy the descriptor without consuming the caller's operands.
 The returned call object cannot be freed while linked into a context.
 
-This publisher is not yet called from `run()`.  The existing captured
-`JITContinuationFrame` still owns the caller's runtime allocation when a verb
-boundary returns from generated code, while `JITCallerResume` and canonical
-promotion require that storage to be owned by the suspended native caller
-frame.  The next integration step must transfer that allocation without
-copying it, make the continuation borrow the frame storage while resuming, and
-teach promotion and normal return to release exactly one owner.  General
-dispatch remains gated until that ownership bridge is verifier-backed; merely
-publishing the callee now would create a chain that cannot be promoted safely.
+This publisher is not yet called from `run()`.  Runtime ownership at a captured
+boundary is now explicit: a fresh `JITContinuationFrame` owns its allocation,
+and `jit_native_frame_adopt_continuation_runtime()` moves that ownership into
+the suspended caller frame without copying storage.  The frame and continuation
+retain reciprocal owner/borrower links.  A resumed continuation may borrow
+storage only from that exact frame; repeated capture preserves the borrowed
+relationship.  Continuation destruction removes the borrower link without
+freeing storage, after which frame destruction performs the single release.
+Canonical promotion follows this order after all shadow activations have been
+published: destroy each frame's borrower, then release its runtime allocation.
+Frame verification rejects mismatched storage, home arrays, sizes, programs,
+or ownership bits, and runtime release or unbinding with a live borrower is a
+fatal lifecycle violation.
+
+The remaining integration step is to retain the captured continuation in its
+`JITCallerResume`, adopt its runtime into the caller, publish the callee, and
+drive callee execution and caller resumption from `run()`.  Normal return must
+likewise destroy the continuation borrower before releasing the frame-owned
+allocation.  General dispatch remains gated until that path is connected and
+tested.
 
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup

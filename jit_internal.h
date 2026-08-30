@@ -64,9 +64,11 @@ struct JITContinuationFrame {
     Var *owned_values;
     unsigned char *home_states;
     size_t runtime_bytes;
+    JITNativeFrame *runtime_owner;
     Var result;
     int has_result;
     int dispatched;
+    int owns_runtime;
     JITContinuationFrame *previous;
     JITContinuationFrame *next;
 };

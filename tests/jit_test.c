@@ -4374,6 +4374,58 @@ main(void)
 	    free_var(result);
 	}
 	{
+	    JITContinuationFrame *continuation = 0;
+	    JITExecutionContext context;
+	    JITNativeFrame root;
+	    Var returned;
+	    size_t runtime_before = call_prog->active_runtime_bytes;
+
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		"borrowed-runtime call did not capture a continuation");
+	    check(continuation && continuation->owns_runtime
+		&& !continuation->runtime_owner
+		&& call_prog->active_runtime_bytes > runtime_before,
+		"captured continuation did not own its runtime");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    jit_execution_context_init(&context, &root, call_prog, deep_env,
+		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    check(jit_native_frame_adopt_continuation_runtime(&root,
+		continuation), "native frame did not adopt continuation runtime");
+	    check(root.owns_runtime && root.runtime_borrower == continuation
+		&& !continuation->owns_runtime
+		&& continuation->runtime_owner == &root
+		&& jit_native_frame_verify(&context, &root),
+		"adopted continuation runtime ownership is inconsistent");
+	    check(!jit_native_frame_adopt_continuation_runtime(&root,
+		continuation), "continuation runtime was adopted more than once");
+	    returned.type = TYPE_STR;
+	    returned.v.str = str_dup("borrowed runtime returned");
+	    jit_continuation_set_result(continuation, returned);
+	    check(jit_program_execute_in_context(call_prog, &context, &root,
+		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
+		deopt_stack, 2, -1, continuation, 0) == JIT_RUN_RETURNED,
+		"borrowed continuation runtime did not resume");
+	    check(root.runtime_storage && root.runtime_borrower == continuation
+		&& continuation->runtime_owner == &root
+		&& result.type == TYPE_STR
+		&& !strcmp(result.v.str, "borrowed runtime returned"),
+		"borrowed continuation resume corrupted runtime ownership");
+	    free_var(result);
+	    jit_continuation_free(continuation);
+	    check(!root.runtime_borrower && root.owns_runtime,
+		"continuation release did not detach its runtime borrow");
+	    jit_native_frame_release_runtime(&root);
+	    check(call_prog->active_runtime_bytes == runtime_before,
+		"native frame did not release adopted runtime exactly once");
+	    check(jit_execution_context_finish(&context, &root),
+		"borrowed-runtime root frame did not detach cleanly");
+	}
+	{
 	    JITProgram *sparse = call_verb_program();
 	    JITDeoptMap *sparse_map = &sparse->deopt_maps[1];
 	    JITContinuationFrame *continuation = 0;
