@@ -1601,6 +1601,7 @@ void
 jit_pool_stats(JITPoolStats *stats)
 {
     JITContinuationFrame *frame;
+    JITProgram *program;
 
     if (!stats)
 	return;
@@ -1618,6 +1619,11 @@ jit_pool_stats(JITPoolStats *stats)
 	stats->continuation_bytes += sizeof(*frame)
 	    + sizeof(Var) * (frame->values_capacity
 		+ frame->spare_values_capacity);
+    }
+    for (program = jit_shared_pool.active_head; program;
+	 program = program->pool_next) {
+	stats->native_chain_active_frames += program->active_native_frames;
+	stats->native_chain_frame_bytes += program->active_native_frame_bytes;
     }
 }
 
@@ -5945,6 +5951,10 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	    = program->usage->continuation_materializations;
 	stats->continuation_fast_suspends
 	    = program->usage->continuation_fast_suspends;
+	stats->native_chain_calls = program->usage->native_chain_calls;
+	stats->native_chain_returns = program->usage->native_chain_returns;
+	stats->native_chain_promotions = program->usage->native_chain_promotions;
+	stats->native_chain_max_depth = program->usage->native_chain_max_depth;
     }
     stats->compile_attempts = program->compile_attempts;
     stats->compile_successes = program->compile_successes;
@@ -5952,6 +5962,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->compile_time_us = program->compile_time_us;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
     stats->runtime_bytes = program->active_runtime_bytes;
+    stats->native_chain_active_frames = program->active_native_frames;
+    stats->native_chain_frame_bytes = program->active_native_frame_bytes;
     stats->machine_code_bytes = program->machine_code_len;
     if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
 	&& program->machine_code_len > 0) {
@@ -5974,7 +5986,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	    }
     }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
-	+ stats->native_allocated_bytes + stats->continuation_bytes;
+	+ stats->native_allocated_bytes + stats->continuation_bytes
+	+ stats->native_chain_frame_bytes;
 }
 
 int
@@ -7434,15 +7447,24 @@ jit_deopt_reason_name(JITDeoptReason reason)
     }
 }
 
+static JITProgramUsage *
+jit_program_usage(JITProgram *program)
+{
+    if (!program)
+	return 0;
+    if (!program->usage) {
+	program->usage = mymalloc(sizeof(JITProgramUsage), M_PROGRAM);
+	memset(program->usage, 0, sizeof(JITProgramUsage));
+    }
+    return program->usage;
+}
+
 void
 jit_profile_record_entry(JITProgram *program)
 {
     total_jit_entries++;
     if (program) {
-	if (!program->usage) {
-	    program->usage = mymalloc(sizeof(JITProgramUsage), M_PROGRAM);
-	    memset(program->usage, 0, sizeof(JITProgramUsage));
-	}
+	jit_program_usage(program);
 	program->usage->entries++;
 	program->usage->last_used_generation = ++jit_use_generation;
 	program->usage->last_used_time = time(0);
@@ -7463,6 +7485,61 @@ jit_profile_record_vm_call(JITProgram *program)
     total_vm_calls++;
     if (program && program->usage)
 	program->usage->vm_calls++;
+}
+
+void
+jit_profile_record_native_call(JITExecutionContext *context)
+{
+    JITNativeFrame *frame;
+    uint64_t depth;
+
+    if (!context || !(frame = context->current_frame) || !frame->caller)
+	return;
+    jit_program_usage(frame->caller->program)->native_chain_calls++;
+    depth = context->native_depth + 1;
+    for (; frame; frame = frame->caller) {
+	JITProgramUsage *usage = jit_program_usage(frame->program);
+
+	if (usage->native_chain_max_depth < depth)
+	    usage->native_chain_max_depth = depth;
+    }
+}
+
+void
+jit_profile_record_native_return(JITNativeFrame *caller)
+{
+    if (caller && caller->program)
+	jit_program_usage(caller->program)->native_chain_returns++;
+}
+
+void
+jit_profile_record_native_promotion(JITNativeFrame *frame)
+{
+    if (frame && frame->program)
+	jit_program_usage(frame->program)->native_chain_promotions++;
+}
+
+void
+jit_profile_native_frame_acquired(JITNativeFrame *frame, size_t bytes)
+{
+    if (!frame || !frame->program || !bytes)
+	return;
+    frame->program->active_native_frames++;
+    frame->program->active_native_frame_bytes += bytes;
+}
+
+void
+jit_profile_native_frame_released(JITNativeFrame *frame, size_t bytes)
+{
+    JITProgram *program;
+
+    if (!frame || !(program = frame->program) || !bytes)
+	return;
+    if (!program->active_native_frames
+	|| program->active_native_frame_bytes < bytes)
+	panic("Native call-frame accounting underflow");
+    program->active_native_frames--;
+    program->active_native_frame_bytes -= bytes;
 }
 
 void

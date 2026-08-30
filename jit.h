@@ -192,8 +192,14 @@ typedef struct {
     uint64_t continuation_resumes;
     uint64_t continuation_materializations;
     uint64_t continuation_fast_suspends;
+    uint64_t native_chain_calls;
+    uint64_t native_chain_returns;
+    uint64_t native_chain_promotions;
+    uint64_t native_chain_max_depth;
     uint64_t active_continuations;
+    uint64_t native_chain_active_frames;
     size_t continuation_bytes;
+    size_t native_chain_frame_bytes;
     size_t metadata_bytes;
     size_t runtime_bytes;
     size_t machine_code_bytes;
@@ -208,13 +214,20 @@ typedef struct {
     size_t total_native_allocated_bytes;
     size_t total_mir_heap_bytes;
     uint64_t active_continuations;
+    uint64_t native_chain_active_frames;
     size_t continuation_bytes;
+    size_t native_chain_frame_bytes;
 } JITPoolStats;
 
 extern const char *jit_deopt_reason_name(JITDeoptReason);
 extern void jit_profile_record_entry(JITProgram *);
 extern void jit_profile_record_completed(JITProgram *);
 extern void jit_profile_record_vm_call(JITProgram *);
+extern void jit_profile_record_native_call(JITExecutionContext *);
+extern void jit_profile_record_native_return(JITNativeFrame *);
+extern void jit_profile_record_native_promotion(JITNativeFrame *);
+extern void jit_profile_native_frame_acquired(JITNativeFrame *, size_t);
+extern void jit_profile_native_frame_released(JITNativeFrame *, size_t);
 extern void jit_profile_record_deopt(JITProgram *, Objid, const char *,
 				     const JITDeoptState *);
 extern void jit_profile_maybe_report(int);

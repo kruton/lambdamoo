@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(31);
+    Var metadata = new_list(37);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -378,6 +378,18 @@ jit_metadata(JITProgram *program)
 					       stats.continuation_bytes);
     metadata.v.list[31] = jit_metadata_num_pair("continuation_fast_suspends",
 					       stats.continuation_fast_suspends);
+    metadata.v.list[32] = jit_metadata_num_pair("native_chain_calls",
+					       stats.native_chain_calls);
+    metadata.v.list[33] = jit_metadata_num_pair("native_chain_returns",
+					       stats.native_chain_returns);
+    metadata.v.list[34] = jit_metadata_num_pair("native_chain_promotions",
+					       stats.native_chain_promotions);
+    metadata.v.list[35] = jit_metadata_num_pair("native_chain_max_depth",
+					       stats.native_chain_max_depth);
+    metadata.v.list[36] = jit_metadata_num_pair("native_chain_active_frames",
+					       stats.native_chain_active_frames);
+    metadata.v.list[37] = jit_metadata_num_pair("native_chain_frame_bytes",
+					       stats.native_chain_frame_bytes);
     return metadata;
 }
 #endif

@@ -6160,6 +6160,36 @@ main(void)
 	jit_profile_record_entry(profile_program);
 	jit_profile_record_completed(profile_program);
 	jit_profile_record_vm_call(profile_program);
+	{
+	    JITExecutionContext context = { 0 };
+	    JITNativeFrame root = { 0 };
+	    JITNativeFrame child = { 0 };
+	    JITNativeFrame leaf = { 0 };
+
+	    root.program = child.program = leaf.program = profile_program;
+	    child.caller = &root;
+	    leaf.caller = &child;
+	    context.current_frame = &child;
+	    context.native_depth = 1;
+	    jit_profile_record_native_call(&context);
+	    context.current_frame = &leaf;
+	    context.native_depth = 2;
+	    jit_profile_record_native_call(&context);
+	    jit_profile_record_native_return(&child);
+	    jit_profile_record_native_return(&root);
+	    jit_profile_record_native_promotion(&root);
+	    jit_profile_record_native_promotion(&child);
+	    jit_profile_record_native_promotion(&leaf);
+	    jit_profile_native_frame_acquired(&child, 512);
+	    jit_program_stats(profile_program, &stats);
+	    check(stats.native_chain_active_frames == 1
+		  && stats.native_chain_frame_bytes == 512
+		  && stats.accounted_bytes == stats.metadata_bytes
+		     + stats.runtime_bytes + stats.native_allocated_bytes
+		     + stats.continuation_bytes + 512,
+		  "live native frame accounting is wrong");
+	    jit_profile_native_frame_released(&child, 512);
+	}
 
 	JITDeoptState deopt_sample;
 	memset(&deopt_sample, 0, sizeof(deopt_sample));
@@ -6191,6 +6221,12 @@ main(void)
 	      "per-program JIT deopt reason totals are wrong");
 	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
 	      "per-program JIT last-use statistics are wrong");
+	check(stats.native_chain_calls == 2 && stats.native_chain_returns == 2
+	      && stats.native_chain_promotions == 3
+	      && stats.native_chain_max_depth == 3
+	      && stats.native_chain_active_frames == 0
+	      && stats.native_chain_frame_bytes == 0,
+	      "per-program native chain statistics are wrong");
 
 	/* Trigger report generation */
 	jit_profile_report();
@@ -6205,6 +6241,7 @@ main(void)
     {
 	JITPoolStats pool_stats;
 	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
+	JITNativeFrame frame = { 0 };
 
 	check(prog != 0, "failed to create test program for pool verification");
 	check(jit_program_compile(prog), "failed to compile program for pool test");
@@ -6214,6 +6251,13 @@ main(void)
 	      "pool machine code byte count is wrong");
 	check(pool_stats.total_native_allocated_bytes >= pool_stats.total_machine_code_bytes,
 	      "pool native allocated byte count is wrong");
+	frame.program = prog;
+	jit_profile_native_frame_acquired(&frame, 256);
+	jit_pool_stats(&pool_stats);
+	check(pool_stats.native_chain_active_frames == 1
+	      && pool_stats.native_chain_frame_bytes == 256,
+	      "pool native frame accounting is wrong");
+	jit_profile_native_frame_released(&frame, 256);
 
 	/* Reset pool and verify invalidation of active programs */
 	jit_pool_reset();

@@ -823,6 +823,14 @@ interpreter caches from the newly authoritative activation.  Built-ins,
 suspension, errors, aborts, and ordinary deopts therefore remain conservative
 whole-chain promotion boundaries in this implementation stage.
 
+Extended `verb_info()` metadata records `native_chain_calls` against the
+caller, `native_chain_returns` against the resumed caller, and
+`native_chain_promotions` for each activation of that verb materialized during
+promotion.  `native_chain_max_depth` includes the canonical root frame.
+`native_chain_active_frames` and `native_chain_frame_bytes` report live compact
+call containers and their retained environments; continuation and runtime
+storage remain in their existing counters so they are not counted twice.
+
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup
 errors create no pending request and retain the existing `call_verb2()` error
@@ -1447,8 +1455,8 @@ the broader ownership-map and synthesized-anchor validation described below.
    built-in continuation links so safe built-ins can return `BI_CALL` without
    promotion. Built-ins requiring canonical entry, suspension, unmodeled errors
    or aborts, introspection, invalidation, and database writes still promote
-   before entering existing VM behavior. `verb_info(..., 1)` should report
-   continuation and native-chain captures, returns, promotions, active frames,
+   before entering existing VM behavior. `verb_info(..., 1)` reports
+   continuation and native-chain calls, returns, promotions, active frames,
    maximum depth, and retained bytes.
 
    Resume native callers only by the exact call-site map ID; do not repeat a

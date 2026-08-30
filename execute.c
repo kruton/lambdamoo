@@ -825,6 +825,7 @@ execute_jit_commit_promotion(struct JITActivationPromotion *promotion)
 	unsigned i;
 
 	for (i = 0; i < promotion->num_frames; i++) {
+	    jit_profile_record_native_promotion(promotion->frames[i]);
 	    if (promotion->frames[i]->runtime_borrower)
 		jit_continuation_free(
 		    promotion->frames[i]->runtime_borrower);
@@ -906,6 +907,7 @@ struct JITNativeCall {
     JITNativeFrame frame;
     JITCallerResume resume;
     struct JITNativeCall *parent;
+    size_t accounted_bytes;
 };
 #endif
 
@@ -1143,6 +1145,11 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	myfree(native_call, M_VM);
 	return 0;
     }
+    native_call->accounted_bytes = sizeof(*native_call)
+	+ sizeof(Var) * native_call->frame.bytecode_program->num_var_names;
+    jit_profile_native_frame_acquired(&native_call->frame,
+	native_call->accounted_bytes);
+    jit_profile_record_native_call(context);
     *call_out = native_call;
     return 1;
 }
@@ -1160,6 +1167,7 @@ execute_jit_free_native_call(struct JITNativeCall *call)
 	return;
     if (call->frame.context || call->frame.caller || call->frame.callee)
 	panic("Freeing a linked native verb call");
+    jit_profile_native_frame_released(&call->frame, call->accounted_bytes);
     jit_native_frame_release_runtime(&call->frame);
     jit_native_frame_release_invocation(&call->frame);
     myfree(call, M_VM);
@@ -1285,6 +1293,7 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    if (!jit_execution_context_return_compact(context, active,
 		&out->value))
 		panic("Native verb return could not resume its caller");
+	    jit_profile_record_native_return(context->current_frame);
 	    if (allocated_stack)
 		myfree(stack, M_RT_STACK);
 	    execute_jit_free_native_call(completed);
