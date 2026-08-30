@@ -61,6 +61,7 @@ struct JITContinuationFrame {
     Num *deopt_values;
     Var *borrowed_locals;
     Var *owned_values;
+    unsigned char *home_states;
     size_t runtime_bytes;
     Var result;
     int has_result;

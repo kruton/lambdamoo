@@ -847,7 +847,9 @@ jit_direct_var_raw(Var value)
 }
 
 int
-execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
+execute_jit_direct_verb_call(JITExecutionContext *execution_context,
+			     JITNativeFrame *caller_frame,
+			     int64_t obj_raw, int obj_type,
 			     int64_t verb_raw, int verb_type,
 			     int64_t args_raw, int args_type,
 			     int *ticks, int *timed_out, enum error *error,
@@ -860,6 +862,7 @@ execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
     JITSourceLocation source_location;
     JITDeoptState deopt;
     JITContinuationFrame *continuation = 0;
+    JITNativeFrame callee_frame;
     JITRunResult run_result;
     Program *callee;
     db_verb_handle handle;
@@ -871,6 +874,9 @@ execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
     enum error saved_error = *error;
 
     if (verb.type != TYPE_STR || args.type != TYPE_LIST)
+	return 0;
+    if (!execution_context || execution_context->current_frame != caller_frame
+	|| !jit_native_frame_verify(execution_context, caller_frame))
 	return 0;
 #ifdef WAIF_CORE
     if (obj.type == TYPE_WAIF) {
@@ -900,10 +906,23 @@ execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
 	return 0;
     }
 
+    execution_context->canonical_depth++;
+    if (!jit_execution_context_push_overlay(execution_context, &callee_frame,
+	callee->jit, RUN_ACTIV.rt_env, top_activ_stack, -1)) {
+	execution_context->canonical_depth--;
+	free_activation(&RUN_ACTIV, 0);
+	top_activ_stack--;
+	return 0;
+    }
+
     jit_profile_record_entry(callee->jit);
-    run_result = jit_program_execute(callee->jit, RUN_ACTIV.rt_env, &result,
-	    ticks, timed_out, error, &source_location, &deopt,
-	    RUN_ACTIV.base_rt_stack, RUN_ACTIV.progr, -1, 0, &continuation);
+    run_result = jit_program_execute_in_context(callee->jit,
+	    execution_context, &callee_frame, RUN_ACTIV.rt_env, &result, ticks,
+	    timed_out, error, &source_location, &deopt, RUN_ACTIV.base_rt_stack,
+	    RUN_ACTIV.progr, -1, 0, &continuation);
+    if (!jit_execution_context_pop_overlay(execution_context, &callee_frame))
+	panic("JIT direct leaf overlay did not detach cleanly");
+    execution_context->canonical_depth--;
     if (run_result == JIT_RUN_RETURNED) {
 	jit_profile_record_completed(callee->jit);
 	*result_raw = jit_direct_var_raw(result);
@@ -1105,6 +1124,8 @@ do {								\
 	    JITSourceLocation source_location;
 	    JITDeoptState deopt;
 	    JITContinuationFrame *continuation = 0;
+	    JITExecutionContext execution_context;
+	    JITNativeFrame root_frame;
 	    enum error jit_error = E_NONE;
 
 	    if (resume_map >= 0)
@@ -1123,8 +1144,13 @@ do {								\
 		    }
 		}
 	    }
+	    jit_execution_context_init(&execution_context, &root_frame,
+		RUN_ACTIV.prog->jit, RUN_ACTIV.rt_env, top_activ_stack,
+		top_activ_stack + 1, max_stack_size, &ticks_remaining,
+		&task_timed_out, &jit_error, resume_map);
 	    jit_profile_record_entry(RUN_ACTIV.prog->jit);
-	    jit_result = jit_program_execute(RUN_ACTIV.prog->jit,
+	    jit_result = jit_program_execute_in_context(RUN_ACTIV.prog->jit,
+					     &execution_context, &root_frame,
 					     RUN_ACTIV.rt_env, &ret_val,
 					     &ticks_remaining, &task_timed_out,
 					     &jit_error, &source_location, &deopt,
@@ -1132,6 +1158,8 @@ do {								\
 					     RUN_ACTIV.progr, resume_map,
 					     continuation_in,
 					     &continuation);
+	    if (!jit_execution_context_finish(&execution_context, &root_frame))
+		panic("JIT root execution context did not detach cleanly");
 	    if (continuation_in && continuation_in != continuation)
 		jit_continuation_free(continuation_in);
 	    if (jit_result == JIT_RUN_RETURNED) {

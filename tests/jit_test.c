@@ -3296,6 +3296,106 @@ main(void)
     JITDeoptState deopt;
     JITSourceLocation source_location;
 
+    {
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame child;
+	Var homes[4];
+	unsigned char home_states[4];
+	Var value;
+	Var taken;
+	const char *shared;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+	    homes[i].type = TYPE_NONE;
+	    homes[i].v.num = 0;
+	    home_states[i] = JIT_HOME_EMPTY;
+	}
+	jit_execution_context_init(&context, &root, program, env, 2, 3, 10,
+	    &ticks, &timed_out, &error, -1);
+	check(jit_native_frame_verify(&context, &root),
+	      "native root frame verification failed");
+	jit_native_frame_bind_runtime(&root, homes, sizeof(homes), homes, 4,
+	    home_states);
+	check(jit_native_frame_verify(&context, &root),
+	      "native frame runtime binding verification failed");
+
+	value.type = TYPE_INT;
+	value.v.num = 17;
+	check(jit_native_frame_home_move(&root, 0, &value),
+	      "native integer home move failed");
+	check(value.type == TYPE_NONE
+	      && jit_native_frame_home_take(&root, 0, &taken)
+	      && taken.type == TYPE_INT && taken.v.num == 17,
+	      "native integer home take failed");
+	free_var(taken);
+
+	value.type = TYPE_STR;
+	value.v.str = str_dup("native frame home");
+	check(jit_native_frame_home_move(&root, 1, &value)
+	      && jit_native_frame_verify(&context, &root),
+	      "native string home move failed");
+	check(jit_native_frame_home_take(&root, 1, &taken),
+	      "native string home take failed");
+	free_var(taken);
+
+	value = new_list(0);
+	check(jit_native_frame_home_move(&root, 2, &value)
+	      && jit_native_frame_home_take(&root, 2, &taken),
+	      "native list home transfer failed");
+	free_var(taken);
+
+	value.type = TYPE_FLOAT;
+	value.v.fnum = box_fl(1.5);
+	check(jit_native_frame_home_move(&root, 3, &value)
+	      && jit_native_frame_home_take(&root, 3, &taken),
+	      "native float home transfer failed");
+	free_var(taken);
+	check(jit_native_frame_verify(&context, &root),
+	      "consumed native homes failed verification");
+
+	value.type = TYPE_INT;
+	value.v.num = 1;
+	check(!jit_native_frame_home_move(&root, 0, &value),
+	      "native frame reused a consumed home");
+	free_var(value);
+	home_states[0] = JIT_HOME_OWNED;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted an uninitialized owned home");
+	home_states[0] = JIT_HOME_CONSUMED;
+
+	shared = str_dup("duplicate native owner");
+	homes[0].type = homes[1].type = TYPE_STR;
+	homes[0].v.str = homes[1].v.str = shared;
+	home_states[0] = home_states[1] = JIT_HOME_OWNED;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted duplicate ownership");
+	homes[1].type = TYPE_NONE;
+	homes[1].v.num = 0;
+	home_states[1] = JIT_HOME_CONSUMED;
+	free_var(homes[0]);
+	homes[0].type = TYPE_NONE;
+	homes[0].v.num = 0;
+	home_states[0] = JIT_HOME_CONSUMED;
+
+	jit_native_frame_unbind_runtime(&root);
+	context.canonical_depth = context.activation_limit;
+	context.native_depth = 1;
+	check(!jit_native_frame_verify(&context, &root),
+	      "native frame accepted excess activation depth");
+	context.canonical_depth = 3;
+	context.native_depth = 0;
+	check(jit_execution_context_push_overlay(&context, &child, program, env,
+	    3, -1), "native canonical overlay push failed");
+	check(context.current_frame == &child && child.caller == &root,
+	      "native canonical overlay linkage is wrong");
+	check(jit_execution_context_pop_overlay(&context, &child),
+	      "native canonical overlay pop failed");
+	check(jit_execution_context_finish(&context, &root),
+	      "native root frame did not detach cleanly");
+    }
+
     check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
     check(mir_dump.lines > 0, "MIR dump was empty");

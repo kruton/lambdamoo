@@ -10,7 +10,82 @@
 
 typedef struct JITProgram JITProgram;
 typedef struct JITContinuationFrame JITContinuationFrame;
+typedef struct JITExecutionContext JITExecutionContext;
+typedef struct JITNativeFrame JITNativeFrame;
+typedef struct JITCallerResume JITCallerResume;
 struct activation;
+
+#define JIT_EXECUTION_ABI_VERSION 1
+
+typedef enum {
+    JIT_FRAME_ROOT_OVERLAY,
+    JIT_FRAME_CANONICAL_OVERLAY,
+    JIT_FRAME_COMPACT
+} JITNativeFrameKind;
+
+typedef enum {
+    JIT_FRAME_PREPARING,
+    JIT_FRAME_RUNNING,
+    JIT_FRAME_SUSPENDED,
+    JIT_FRAME_RETURNED,
+    JIT_FRAME_PROMOTED,
+    JIT_FRAME_DETACHED
+} JITNativeFrameState;
+
+typedef enum {
+    JIT_HOME_EMPTY,
+    JIT_HOME_OWNED,
+    JIT_HOME_CONSUMED
+} JITFrameHomeState;
+
+typedef enum {
+    JIT_RESUME_PREPARING,
+    JIT_RESUME_DISPATCHED,
+    JIT_RESUME_RETURNED,
+    JIT_RESUME_PROMOTED
+} JITCallerResumeState;
+
+struct JITCallerResume {
+    JITNativeFrame *caller;
+    int map_id;
+    unsigned bytecode_pc;
+    unsigned error_pc;
+    unsigned result_home;
+    JITCallerResumeState state;
+};
+
+struct JITNativeFrame {
+    JITExecutionContext *context;
+    JITProgram *program;
+    JITNativeFrame *caller;
+    JITNativeFrame *callee;
+    JITCallerResume *incoming;
+    JITCallerResume *outgoing;
+    Var *env;
+    void *runtime_storage;
+    Var *homes;
+    unsigned char *home_states;
+    size_t runtime_bytes;
+    unsigned num_homes;
+    unsigned canonical_index;
+    int entry_map;
+    int current_map;
+    JITNativeFrameKind kind;
+    JITNativeFrameState state;
+};
+
+struct JITExecutionContext {
+    unsigned abi_version;
+    JITNativeFrame *root_frame;
+    JITNativeFrame *current_frame;
+    unsigned root_activation_index;
+    unsigned canonical_depth;
+    unsigned native_depth;
+    unsigned activation_limit;
+    int *ticks_remaining;
+    int *task_timed_out;
+    enum error *pending_error;
+};
 
 typedef enum {
     JIT_STATE_PENDING,
@@ -127,6 +202,24 @@ extern void jit_pool_stats(JITPoolStats *);
 extern void jit_pool_reset(void);
 extern void jit_shutdown(void);
 
+extern void jit_execution_context_init(JITExecutionContext *, JITNativeFrame *,
+				       JITProgram *, Var *, unsigned, unsigned,
+				       unsigned, int *, int *, enum error *, int);
+extern int jit_execution_context_push_overlay(JITExecutionContext *,
+					      JITNativeFrame *, JITProgram *, Var *,
+					      unsigned, int);
+extern int jit_execution_context_pop_overlay(JITExecutionContext *,
+					     JITNativeFrame *);
+extern int jit_execution_context_finish(JITExecutionContext *,
+					JITNativeFrame *);
+extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
+					  Var *, unsigned, unsigned char *);
+extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
+extern int jit_native_frame_verify(const JITExecutionContext *,
+				   const JITNativeFrame *);
+extern int jit_native_frame_home_move(JITNativeFrame *, unsigned, Var *);
+extern int jit_native_frame_home_take(JITNativeFrame *, unsigned, Var *);
+
 extern JITProgram *jit_program_unsupported(const char *);
 extern JITProgram *jit_program_unsupported_with_diagnostic(const char *, const char *);
 extern void jit_program_free(JITProgram *);
@@ -145,6 +238,14 @@ extern int jit_program_resume_map(JITProgram *, ResumeKey);
 extern int jit_program_has_location(JITProgram *);
 extern void jit_program_note_location(JITProgram *, Objid, unsigned);
 extern int jit_program_compile(JITProgram *);
+extern JITRunResult jit_program_execute_in_context(JITProgram *,
+						   JITExecutionContext *,
+						   JITNativeFrame *, Var *, Var *,
+						   int *, int *, enum error *,
+						   JITSourceLocation *, JITDeoptState *,
+						   Var *, Objid, int,
+						   JITContinuationFrame *,
+						   JITContinuationFrame **);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 				enum error *, JITSourceLocation *,
 				JITDeoptState *, Var *, Objid, int,

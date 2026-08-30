@@ -73,12 +73,16 @@ builtin_protection_generation(void)
 }
 
 int
-execute_jit_direct_verb_call(int64_t obj_raw, int obj_type,
+execute_jit_direct_verb_call(struct JITExecutionContext *execution_context,
+			     struct JITNativeFrame *native_frame,
+			     int64_t obj_raw, int obj_type,
 			     int64_t verb_raw, int verb_type,
 			     int64_t args_raw, int args_type,
 			     int *ticks, int *timed_out, enum error *error,
 			     int64_t *result_raw, int *result_type)
 {
+    (void) execution_context;
+    (void) native_frame;
     (void) obj_raw;
     (void) obj_type;
     (void) verb_raw;
