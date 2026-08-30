@@ -241,7 +241,7 @@ jit_rt_make_singleton_list(int64_t elem_raw, int elem_type)
 }
 
 Var *
-jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
+jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type, int consume)
 {
     Var l, elem, res;
 
@@ -250,7 +250,7 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
 
     elem = var_ref(raw_to_var(elem_raw, elem_type));
 
-    res = listappend(var_ref(l), elem);
+    res = listappend(consume ? l : var_ref(l), elem);
     return res.v.list;
 }
 
@@ -2243,6 +2243,41 @@ jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 }
 
 static int
+jit_list_tail_consumes_source(JITProgram *program, JITInstruction *tail)
+{
+    JITBlock *block;
+    unsigned uses = 0;
+    int value;
+
+    if (!program->value_ownership || !program->value_owned_slots
+	|| tail->op != HIR_OP_LIST_ADD_TAIL)
+	return 0;
+    value = tail->src1;
+    if (value <= 0 || value >= program->num_values
+	|| program->value_ownership[value] != JIT_OWNERSHIP_OWNED
+	|| program->value_owned_slots[value] >= 0)
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    uses += instr->src1 == value;
+	    uses += instr->src2 == value;
+	    uses += instr->src3 == value;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		uses += copy->src == value;
+	    if (uses > 1)
+		return 0;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return uses == 1;
+}
+
+static int
 build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 {
     MIR_type_t result_type = MIR_T_I64;
@@ -2313,8 +2348,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_singleton_list = MIR_new_import(build->context, "jit_rt_make_singleton_list");
 
-    build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 3,
-					     MIR_T_P, "l", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+    build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 4,
+					     MIR_T_P, "l", MIR_T_I64, "elem_raw",
+					     MIR_T_I32, "elem_type", MIR_T_I32, "consume");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
 
     build->proto_owned_replace = MIR_new_proto(build->context,
@@ -3442,13 +3478,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			}
 			raw_value = append_raw_value(build, program, values,
 				instr->src2, deopt_values, &copy_serial);
-			append(build, MIR_new_call_insn(build->context, 6,
+			append(build, MIR_new_call_insn(build->context, 7,
 			    MIR_new_ref_op(build->context, build->proto_list_append),
 			    MIR_new_ref_op(build->context, build->import_list_append),
 			    MIR_new_reg_op(build->context, values[instr->value]),
 			    MIR_new_reg_op(build->context, values[instr->src1]),
 			    MIR_new_reg_op(build->context, raw_value),
-			    MIR_new_reg_op(build->context, type_reg)));
+			    MIR_new_reg_op(build->context, type_reg),
+			    MIR_new_int_op(build->context,
+				jit_list_tail_consumes_source(program, instr))));
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,

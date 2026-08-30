@@ -4955,6 +4955,7 @@ jit_build_value_ownership(JITProgram *program)
 			JIT_OWNERSHIP_IMMORTAL;
 		else if ((instr->kind == HIR_TAC_UNARY
 			  && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+			 || instr->kind == HIR_TAC_RANGE_REF
 			 || (instr->kind == HIR_TAC_BINARY
 			     && (instr->op == HIR_OP_LIST_ADD_TAIL
 				 || instr->op == HIR_OP_LIST_APPEND
@@ -5020,6 +5021,21 @@ jit_build_value_ownership(JITProgram *program)
 
 	    for (instr = block->first; instr; instr = instr->next) {
 		JITCopy *copy;
+
+		if (instr->kind == HIR_TAC_UNARY
+		    && instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE
+		    && instr->src1 > 0 && instr->src1 < program->num_values
+		    && instr->value > 0 && instr->value < program->num_values
+		    && program->value_ownership[instr->src1]
+		       != JIT_OWNERSHIP_UNKNOWN
+		    && program->value_ownership[instr->value]
+		       == JIT_OWNERSHIP_UNKNOWN) {
+		    program->value_ownership[instr->value] =
+			program->value_ownership[instr->src1];
+		    program->value_owner_root[instr->value] =
+			program->value_owner_root[instr->src1];
+		    changed = 1;
+		}
 
 		for (copy = instr->copies; copy; copy = copy->next)
 		    if (copy->src > 0 && copy->src < program->num_values

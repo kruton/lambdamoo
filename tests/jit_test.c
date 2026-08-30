@@ -6042,12 +6042,30 @@ main(void)
 	lconcat_var.v.list = lconcat;
 	free_var(lconcat_var);
 
-	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT);
+	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT, 0);
 	check(lapp && lapp[0].v.num == 2 && lapp[2].v.num == 333, "jit_rt_list_append int");
 	Var lapp_var;
 	lapp_var.type = TYPE_LIST;
 	lapp_var.v.list = lapp;
 	free_var(lapp_var);
+	{
+	    Var consumed = new_list(1);
+	    Var consumed_result;
+
+	    consumed.v.list[1].type = TYPE_INT;
+	    consumed.v.list[1].v.num = 444;
+	    consumed_result.type = TYPE_LIST;
+	    consumed_result.v.list = jit_rt_list_append(consumed.v.list,
+		555, TYPE_INT, 1);
+	    consumed.type = TYPE_NONE;
+	    check(consumed_result.v.list[0].v.num == 2
+		  && consumed_result.v.list[1].v.num == 444
+		  && consumed_result.v.list[2].v.num == 555,
+		  "jit_rt_list_append consumes owned list");
+	    check(var_refcount(consumed_result) == 1,
+		  "consumed list append preserves exclusive ownership");
+	    free_var(consumed_result);
+	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */
 	{
