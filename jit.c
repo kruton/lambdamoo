@@ -314,6 +314,18 @@ jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
     owned_values[value] = raw_to_var(raw, type);
 }
 
+void
+jit_rt_discard_owned(Var *owned_values, int owner, int64_t raw, int type)
+{
+    if (owner >= 0) {
+	assert(owned_values && owned_values[owner].type != TYPE_NONE);
+	free_var(owned_values[owner]);
+	owned_values[owner].type = TYPE_NONE;
+	owned_values[owner].v.num = 0;
+    } else
+	free_var(raw_to_var(raw, type));
+}
+
 Var *
 jit_rt_list_index_set(Var *env, int local_id, Var *list, int64_t index,
 		      int64_t value_raw, int value_type, int32_t *err_out)
@@ -1600,6 +1612,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_fixed_list_append_owned",
 		      (void *) jit_rt_fixed_list_append_owned);
     MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
+    MIR_load_external(context, "jit_rt_discard_owned",
+		      (void *) jit_rt_discard_owned);
     MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
@@ -1789,6 +1803,8 @@ typedef struct {
     MIR_item_t import_fixed_list_append_owned;
     MIR_item_t proto_owned_replace;
     MIR_item_t import_owned_replace;
+    MIR_item_t proto_discard_owned;
+    MIR_item_t import_discard_owned;
     MIR_item_t proto_list_index_set;
     MIR_item_t import_list_index_set;
     MIR_item_t proto_sublist_from;
@@ -2458,6 +2474,22 @@ jit_list_tail_consume_mode(JITProgram *program, JITInstruction *tail)
 }
 
 static int
+jit_value_is_dead_owned_list(JITProgram *program, JITInstruction *instr)
+{
+    if (!program->value_ownership || !program->value_use_counts
+	|| !program->value_escape_flags || instr->value <= 0
+	|| instr->value >= program->num_values
+	|| program->value_ownership[instr->value] != JIT_OWNERSHIP_OWNED
+	|| program->value_use_counts[instr->value] != 0
+	|| program->value_escape_flags[instr->value] != JIT_ESCAPE_NONE)
+	return 0;
+    return (instr->kind == HIR_TAC_UNARY
+	    && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	|| (instr->kind == HIR_TAC_BINARY
+	    && instr->op == HIR_OP_LIST_ADD_TAIL);
+}
+
+static int
 build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 {
     MIR_type_t result_type = MIR_T_I64;
@@ -2555,6 +2587,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	MIR_T_I32, "value", MIR_T_I64, "raw", MIR_T_I32, "type");
     build->import_owned_replace = MIR_new_import(build->context,
 	"jit_rt_owned_replace");
+    build->proto_discard_owned = MIR_new_proto(build->context,
+	"proto_discard_owned", 0, 0, 4, MIR_T_P, "owned_values",
+	MIR_T_I32, "owner", MIR_T_I64, "raw", MIR_T_I32, "type");
+    build->import_discard_owned = MIR_new_import(build->context,
+	"jit_rt_discard_owned");
 
     build->proto_list_index_set = MIR_new_proto(build->context, "proto_list_index_set", 1, &res_p, 7,
 						MIR_T_P, "env", MIR_T_I32, "local", MIR_T_P, "list",
@@ -5971,6 +6008,28 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			MIR_new_reg_op(build->context, owned_values),
 			MIR_new_int_op(build->context,
 			    program->value_owned_slots[instr->value]),
+			MIR_new_reg_op(build->context, raw), type));
+		}
+		if (jit_value_is_dead_owned_list(program, instr)) {
+		    MIR_reg_t raw = append_raw_value(build, program, values,
+			instr->value, deopt_values, &copy_serial);
+		    MIR_op_t type = program->value_is_tagged
+			&& program->value_is_tagged[instr->value]
+			? MIR_new_mem_op(build->context, tag_t,
+			    jit_tag_offset(program, instr->value),
+			    deopt_values, 0, 1)
+			: MIR_new_int_op(build->context,
+			    program->value_types[instr->value]);
+		    int owner = program->value_owned_slots
+			? program->value_owned_slots[instr->value] : -1;
+
+		    append(build, MIR_new_call_insn(build->context, 6,
+			MIR_new_ref_op(build->context,
+			    build->proto_discard_owned),
+			MIR_new_ref_op(build->context,
+			    build->import_discard_owned),
+			MIR_new_reg_op(build->context, owned_values),
+			MIR_new_int_op(build->context, owner),
 			MIR_new_reg_op(build->context, raw), type));
 		}
 		if (instr == block->last)
