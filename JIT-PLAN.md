@@ -743,9 +743,24 @@ the caller.  The frame is returned to its caller only after the owned form
 passes `jit_native_frame_verify()`.
 
 No database lookup or environment reconstruction belongs in compact commit.
-General dispatch still needs to allocate the frame and caller resume record,
-prepare the descriptor, and call this routine from the trampoline; adding that
-call site is the next step.
+`execute_jit_dispatch_native_verb_call()` now performs the surrounding
+allocation and publication step.  It allocates one `JITNativeCall` containing
+the frame and its caller-resume record, resolves the target once, constructs
+the callee environment from either a root overlay or compact caller frame, and
+invokes the move-only commit.  The call arguments are borrowed by this API; the
+prepared environment acquires its own reference, so every pre-publication
+failure can destroy the descriptor without consuming the caller's operands.
+The returned call object cannot be freed while linked into a context.
+
+This publisher is not yet called from `run()`.  The existing captured
+`JITContinuationFrame` still owns the caller's runtime allocation when a verb
+boundary returns from generated code, while `JITCallerResume` and canonical
+promotion require that storage to be owned by the suspended native caller
+frame.  The next integration step must transfer that allocation without
+copying it, make the continuation borrow the frame storage while resuming, and
+teach promotion and normal return to release exactly one owner.  General
+dispatch remains gated until that ownership bridge is verifier-backed; merely
+publishing the callee now would create a chain that cannot be promoted safely.
 
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup

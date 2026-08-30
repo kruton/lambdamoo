@@ -34,6 +34,7 @@ struct JITExecutionContext;
 struct JITNativeFrame;
 struct JITCallerResume;
 struct JITActivationPromotion;
+struct JITNativeCall;
 
 typedef struct activation {
     Program *prog;
@@ -126,6 +127,13 @@ extern int execute_jit_direct_verb_call(struct JITExecutionContext *,
 extern int execute_jit_commit_prepared_verb_call(
 	struct JITExecutionContext *, struct JITNativeFrame *,
 	struct JITCallerResume *, PreparedVerbCall *, int);
+extern int execute_jit_dispatch_native_verb_call(
+	struct JITExecutionContext *, struct JITNativeFrame *, Objid,
+	const char * WAIF_COMMA_ARG(Var), Var, enum error *, int, unsigned,
+	unsigned, unsigned, struct JITNativeCall **);
+extern struct JITNativeFrame *execute_jit_native_call_frame(
+	struct JITNativeCall *);
+extern void execute_jit_free_native_call(struct JITNativeCall *);
 extern struct JITActivationPromotion *execute_jit_prepare_promotion(
 	struct JITExecutionContext *);
 extern int execute_jit_commit_promotion(struct JITActivationPromotion *);

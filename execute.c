@@ -879,6 +879,13 @@ typedef struct {
     const char *verb;
 } ResolvedVerbCall;
 
+#ifdef ENABLE_JIT
+struct JITNativeCall {
+    JITNativeFrame frame;
+    JITCallerResume resume;
+};
+#endif
+
 static enum error
 resolve_verb_call(Objid this, const char *vname
 		  WAIF_COMMA_ARG(Var THIS), int do_pass,
@@ -908,13 +915,21 @@ resolve_verb_call(Objid this, const char *vname
 }
 
 static void
-prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
-		  const ResolvedVerbCall *call, Var args)
+prepare_verb_call_for_caller(PreparedVerbCall *prepared, Var *caller_env,
+#ifdef WAIF_CORE
+			     Var caller_receiver,
+#endif
+			     Objid caller_this, Objid caller_player,
+			     Objid caller_progr,
+			     const ResolvedVerbCall *call, Var args)
 {
     Program *program = call->program;
     Var *env;
     Var v;
 
+#ifdef WAIF_CORE
+    (void) caller_this;
+#endif
     memset(prepared, 0, sizeof(*prepared));
     prepared->program = program_ref(program);
     prepared->this = call->this;
@@ -931,14 +946,14 @@ prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
 
 #ifdef WAIF_CORE
     set_rt_env_var(env, SLOT_THIS, var_ref(call->receiver));
-    set_rt_env_var(env, SLOT_CALLER, var_ref(caller->THIS));
+    set_rt_env_var(env, SLOT_CALLER, var_ref(caller_receiver));
 #else
     set_rt_env_obj(env, SLOT_THIS, call->this);
-    set_rt_env_obj(env, SLOT_CALLER, caller->this);
+    set_rt_env_obj(env, SLOT_CALLER, caller_this);
 #endif
 
 #define ENV_COPY(slot) \
-    set_rt_env_var(env, slot, var_ref(caller->rt_env[slot]))
+    set_rt_env_var(env, slot, var_ref(caller_env[slot]))
 
     ENV_COPY(SLOT_ARGSTR);
     ENV_COPY(SLOT_DOBJ);
@@ -947,11 +962,11 @@ prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
     ENV_COPY(SLOT_IOBJ);
     ENV_COPY(SLOT_IOBJSTR);
 
-    if (is_wizard(caller->progr)
-	&& caller->rt_env[SLOT_PLAYER].type == TYPE_OBJ)
+    if (is_wizard(caller_progr)
+	&& caller_env[SLOT_PLAYER].type == TYPE_OBJ)
 	ENV_COPY(SLOT_PLAYER);
     else
-	set_rt_env_obj(env, SLOT_PLAYER, caller->player);
+	set_rt_env_obj(env, SLOT_PLAYER, caller_player);
     prepared->player = env[SLOT_PLAYER].v.obj;
 
 #undef ENV_COPY
@@ -966,6 +981,34 @@ prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
     set_rt_env_var(env, SLOT_VERB, v);
     set_rt_env_var(env, SLOT_ARGS, args);
 }
+
+static void
+prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
+		  const ResolvedVerbCall *call, Var args)
+{
+    prepare_verb_call_for_caller(prepared, caller->rt_env,
+#ifdef WAIF_CORE
+	caller->THIS,
+#endif
+	caller->this, caller->player, caller->progr, call, args);
+}
+
+#ifdef ENABLE_JIT
+static void
+discard_prepared_verb_call(PreparedVerbCall *prepared)
+{
+    if (!prepared || !prepared->program)
+	return;
+    free_rt_env(prepared->env, prepared->program->num_var_names);
+#ifdef WAIF_CORE
+    free_var(prepared->receiver);
+#endif
+    free_str(prepared->verb);
+    free_str(prepared->verbname);
+    free_program(prepared->program);
+    memset(prepared, 0, sizeof(*prepared));
+}
+#endif
 
 static enum error
 commit_verb_activation(const ResolvedVerbCall *call, Var args)
@@ -1023,6 +1066,76 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
     if (!jit_native_frame_verify(context, frame))
 	panic("Prepared verb call produced an invalid compact frame");
     return 1;
+}
+
+int
+execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
+				      JITNativeFrame *caller, Objid this,
+				      const char *vname
+				      WAIF_COMMA_ARG(Var THIS), Var args,
+				      enum error *error_out, int map_id,
+				      unsigned bytecode_pc,
+				      unsigned error_pc, unsigned result_home,
+				      struct JITNativeCall **call_out)
+{
+    struct JITNativeCall *native_call;
+    ResolvedVerbCall resolved;
+    PreparedVerbCall prepared;
+    enum error error = E_NONE;
+
+    if (call_out)
+	*call_out = 0;
+
+    if (error_out)
+	*error_out = E_NONE;
+    if (!context || !caller || !call_out || !error_out
+	|| context->current_frame != caller || !caller->env)
+	return 0;
+    error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
+	&resolved);
+    if (error != E_NONE) {
+	*error_out = error;
+	return 0;
+    }
+    native_call = mymalloc(sizeof(*native_call), M_VM);
+    memset(native_call, 0, sizeof(*native_call));
+    native_call->resume.caller = caller;
+    native_call->resume.map_id = map_id;
+    native_call->resume.bytecode_pc = bytecode_pc;
+    native_call->resume.error_pc = error_pc;
+    native_call->resume.result_home = result_home;
+    native_call->resume.state = JIT_RESUME_PREPARING;
+    prepare_verb_call_for_caller(&prepared, caller->env,
+#ifdef WAIF_CORE
+	caller->receiver,
+#endif
+	caller->this, caller->player, caller->progr, &resolved, var_ref(args));
+    if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
+	&native_call->resume, &prepared, -1)) {
+	discard_prepared_verb_call(&prepared);
+	myfree(native_call, M_VM);
+	return 0;
+    }
+    *call_out = native_call;
+    return 1;
+}
+
+JITNativeFrame *
+execute_jit_native_call_frame(struct JITNativeCall *call)
+{
+    return call ? &call->frame : 0;
+}
+
+void
+execute_jit_free_native_call(struct JITNativeCall *call)
+{
+    if (!call)
+	return;
+    if (call->frame.context || call->frame.caller || call->frame.callee)
+	panic("Freeing a linked native verb call");
+    jit_native_frame_release_runtime(&call->frame);
+    jit_native_frame_release_invocation(&call->frame);
+    myfree(call, M_VM);
 }
 #endif /* ENABLE_JIT */
 
