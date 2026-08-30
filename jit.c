@@ -320,7 +320,7 @@ jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
 
 int
 jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
-		int64_t *out_raw, int32_t *out_type, int32_t *err_out)
+		int64_t *out_raw, int64_t *out_type, int32_t *err_out)
 {
     Objid oid = (Objid) oid_num;
     Objid progr = (Objid) progr_num;
@@ -3407,7 +3407,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			int obj_is_obj = program->value_types
 			    && program->value_types[instr->src1] == TYPE_OBJ;
 
-			if ((obj_is_obj || obj_tagged)
+			/* An owned home may alias a tagged receiver across a
+			   continuation; keep that path canonical until the home can
+			   be transferred with the receiver. */
+			if ((obj_is_obj
+			     || (obj_tagged && program->num_owned_slots == 0))
 			    && program->value_types
 			    && program->value_types[instr->src2] == TYPE_STR) {
 			    char name[32];

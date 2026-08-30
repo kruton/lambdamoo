@@ -6092,16 +6092,17 @@ main(void)
 
 	/* 7. get_prop test */
 	int64_t prop_raw = 0;
-	int32_t prop_type = 0;
+	int64_t prop_type = INT64_C(0x5555555500000000);
 	int ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 1 && rt_err == E_NONE && prop_type == TYPE_INT && prop_raw == 123,
-	      "jit_rt_get_prop valid property read");
+	      "jit_rt_get_prop replaces the complete result tag");
 
 	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
 
 	ok = jit_rt_put_prop(0, "name", 2, 456, TYPE_INT, &rt_err);
 	check(ok == 1 && rt_err == E_NONE, "jit_rt_put_prop valid property write");
+	prop_type = INT64_C(0x5555555500000000);
 	ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 1 && prop_type == TYPE_INT && prop_raw == 456,
 	      "jit_rt_put_prop stored property value");

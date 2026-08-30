@@ -306,7 +306,7 @@ extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
-extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
+extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int64_t *, int32_t *);
 extern int jit_rt_put_prop(int64_t, const char *, int64_t, int64_t, int, int32_t *);
 extern int64_t jit_rt_seconds_left(void);
 extern int64_t jit_rt_time(void);
