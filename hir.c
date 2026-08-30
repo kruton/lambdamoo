@@ -4620,6 +4620,18 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 	seen = mymalloc(program->num_deopt_maps, M_PROGRAM);
 	memset(seen, 0, program->num_deopt_maps);
 	seen[0] = 1;
+	if (!program->value_use_counts || !program->value_escape_flags) {
+		record_unsupported(ctx, "ownership-escape: missing analysis");
+		goto invalid;
+	}
+	for (i = 1; i < program->num_values; i++)
+		if (!!(program->value_escape_flags[i]
+		       & JIT_ESCAPE_MULTIPLE_USES)
+		    != (program->value_use_counts[i] > 1)) {
+			record_unsupported_fmt(ctx,
+			    "ownership-escape: inconsistent uses for value %d", i);
+			goto invalid;
+		}
 	for (block = program->blocks; block; block = block->next) {
 		JITInstruction *instr;
 
@@ -5019,9 +5031,93 @@ jit_value_is_singleton_list(JITProgram *program, int value)
 }
 
 static void
+jit_note_value_escape(JITProgram *program, int value, JITValueEscape escape)
+{
+    if (value > 0 && value < program->num_values)
+	program->value_escape_flags[value] |= escape;
+}
+
+static void
+jit_build_ownership_escape_analysis(JITProgram *program)
+{
+    JITBlock *block;
+    int value;
+
+    program->value_use_counts = mymalloc(
+	sizeof(unsigned int) * program->num_values, M_PROGRAM);
+    program->value_escape_flags = mymalloc(program->num_values, M_PROGRAM);
+    memset(program->value_use_counts, 0,
+	   sizeof(unsigned int) * program->num_values);
+    memset(program->value_escape_flags, JIT_ESCAPE_NONE,
+	   program->num_values);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+	    int operands[3] = { instr->src1, instr->src2, instr->src3 };
+	    int operand;
+
+	    for (operand = 0; operand < 3; operand++)
+		if (operands[operand] > 0
+		    && operands[operand] < program->num_values)
+		    program->value_use_counts[operands[operand]]++;
+	    if (instr->kind == HIR_TAC_RETURN)
+		jit_note_value_escape(program, instr->src1, JIT_ESCAPE_RETURN);
+	    if (instr->kind == HIR_TAC_CALL || instr->kind == HIR_TAC_CALL_VERB) {
+		jit_note_value_escape(program, instr->src1, JIT_ESCAPE_CALL);
+		jit_note_value_escape(program, instr->src2, JIT_ESCAPE_CALL);
+		jit_note_value_escape(program, instr->src3, JIT_ESCAPE_CALL);
+	    }
+	    if (instr->kind == HIR_TAC_PUT_PROP
+		|| instr->kind == HIR_TAC_INDEX_SET
+		|| instr->kind == HIR_TAC_RANGE_SET)
+		jit_note_value_escape(program, instr->src3, JIT_ESCAPE_STORE);
+	    for (copy = instr->copies; copy; copy = copy->next) {
+		if (copy->src > 0 && copy->src < program->num_values)
+		    program->value_use_counts[copy->src]++;
+		jit_note_value_escape(program, copy->src, JIT_ESCAPE_MERGE);
+	    }
+	    if (instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		int slot;
+
+		for (slot = 0; slot < map->num_locals; slot++)
+		    jit_note_value_escape(program,
+			jit_deopt_map_local_value(program, map, slot),
+			JIT_ESCAPE_FRAME);
+		for (slot = 0; slot < (int) map->stack_depth; slot++)
+		    if (!map->stack_slots
+			|| map->stack_slots[slot].kind == RSS_VALUE)
+			jit_note_value_escape(program, map->stack_values[slot],
+			    JIT_ESCAPE_FRAME);
+		if (instr->kind == HIR_TAC_CALL
+		    || instr->kind == HIR_TAC_CALL_VERB) {
+		    int operands = jit_call_stack_operands(map);
+		    int first = operands >= 0
+			&& (unsigned) operands <= map->stack_depth
+			? map->stack_depth - operands : map->stack_depth;
+
+		    for (slot = first; slot < (int) map->stack_depth; slot++)
+			if (!map->stack_slots
+			    || map->stack_slots[slot].kind == RSS_VALUE)
+			    jit_note_value_escape(program,
+				map->stack_values[slot], JIT_ESCAPE_CALL);
+		}
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (value = 1; value < program->num_values; value++)
+	if (program->value_use_counts[value] > 1)
+	    program->value_escape_flags[value] |= JIT_ESCAPE_MULTIPLE_USES;
+}
+
+static void
 jit_build_value_ownership(JITProgram *program)
 {
-    unsigned int *uses;
     JITBlock *block;
     int changed;
     int i;
@@ -5031,8 +5127,6 @@ jit_build_value_ownership(JITProgram *program)
 					 M_PROGRAM);
     program->value_owned_slots = mymalloc(sizeof(int) * program->num_values,
 					  M_PROGRAM);
-    uses = mymalloc(sizeof(unsigned int) * program->num_values, M_PROGRAM);
-    memset(uses, 0, sizeof(unsigned int) * program->num_values);
     memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
 	   program->num_values);
     for (i = 0; i < program->num_values; i++) {
@@ -5075,42 +5169,24 @@ jit_build_value_ownership(JITProgram *program)
 	JITInstruction *instr;
 
 	for (instr = block->first; instr; instr = instr->next) {
-	    JITCopy *copy;
-
-	    if (instr->src1 > 0 && instr->src1 < program->num_values)
-		uses[instr->src1]++;
-	    if (instr->src2 > 0 && instr->src2 < program->num_values)
-		uses[instr->src2]++;
-	    if (instr->src3 > 0 && instr->src3 < program->num_values)
-		uses[instr->src3]++;
-	    for (copy = instr->copies; copy; copy = copy->next)
-		if (copy->src > 0 && copy->src < program->num_values)
-		    uses[copy->src]++;
-	    if (instr == block->last)
-		break;
-	}
-    }
-    for (block = program->blocks; block; block = block->next) {
-	JITInstruction *instr;
-
-	for (instr = block->first; instr; instr = instr->next) {
 	    if (instr->value > 0 && instr->value < program->num_values
 		&& instr->kind == HIR_TAC_BINARY
 		&& instr->op == HIR_OP_LIST_ADD_TAIL
 		&& program->value_owned_slots[instr->value] < 0) {
 		if (instr->src1 > 0 && instr->src1 < program->num_values
 		    && program->value_owned_slots[instr->src1] < 0
-		    && uses[instr->src1] == 1
+		    && program->value_use_counts[instr->src1] == 1
 		    && jit_value_is_singleton_list(program, instr->src1))
 		    program->value_owned_slots[instr->src1] =
 			program->num_owned_slots++;
 		if (instr->src1 > 0 && instr->src1 < program->num_values
 		    && program->value_owned_slots[instr->src1] >= 0
-		    && uses[instr->src1] == 1) {
+		    && program->value_use_counts[instr->src1] == 1) {
 		    program->value_owned_slots[instr->value] =
 			jit_list_tail_owner_slot(
 			    program->value_owned_slots[instr->src1],
-			    uses[instr->src1], program->num_owned_slots);
+			    program->value_use_counts[instr->src1],
+			    program->num_owned_slots);
 		} else
 		    program->value_owned_slots[instr->value] =
 			jit_list_tail_owner_slot(-1, 0,
@@ -5120,7 +5196,6 @@ jit_build_value_ownership(JITProgram *program)
 		break;
 	}
     }
-    myfree(uses, M_PROGRAM);
     do {
 	changed = 0;
 	for (block = program->blocks; block; block = block->next) {
@@ -6838,6 +6913,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
     jit_build_tag_slots(program);
+    jit_build_ownership_escape_analysis(program);
     jit_build_value_ownership(program);
     jit_build_deopt_owner_slots(program);
     jit_build_int_list_values(program);

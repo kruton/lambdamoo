@@ -2356,32 +2356,24 @@ static JITInstruction *
 jit_unique_list_tail_user(JITProgram *program, int value)
 {
     JITBlock *block;
-    JITInstruction *user = 0;
-    unsigned uses = 0;
+
+    if (!program->value_use_counts || value <= 0
+	|| value >= program->num_values
+	|| program->value_use_counts[value] != 1)
+	return 0;
 
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
 	for (instr = block->first; instr; instr = instr->next) {
-	    JITCopy *copy;
-
-	    if (instr->src1 == value) {
-		uses++;
-		if (instr->kind == HIR_TAC_BINARY
-		    && instr->op == HIR_OP_LIST_ADD_TAIL)
-		    user = instr;
-	    }
-	    uses += instr->src2 == value;
-	    uses += instr->src3 == value;
-	    for (copy = instr->copies; copy; copy = copy->next)
-		uses += copy->src == value;
-	    if (uses > 1)
-		return 0;
+	    if (instr->src1 == value && instr->kind == HIR_TAC_BINARY
+		&& instr->op == HIR_OP_LIST_ADD_TAIL)
+		return instr;
 	    if (instr == block->last)
 		break;
 	}
     }
-    return uses == 1 ? user : 0;
+    return 0;
 }
 
 static int
@@ -2443,36 +2435,20 @@ typedef enum {
 static JITListAppendMode
 jit_list_tail_consume_mode(JITProgram *program, JITInstruction *tail)
 {
-    JITBlock *block;
-    unsigned uses = 0;
     int value;
 
     if (!program->value_ownership || !program->value_owned_slots
+	|| !program->value_use_counts || !program->value_escape_flags
 	|| tail->op != HIR_OP_LIST_ADD_TAIL)
 	return JIT_LIST_APPEND_BORROWED;
     value = tail->src1;
     if (value <= 0 || value >= program->num_values
 	|| tail->value <= 0 || tail->value >= program->num_values
-	|| program->value_ownership[value] != JIT_OWNERSHIP_OWNED)
-	return JIT_LIST_APPEND_BORROWED;
-    for (block = program->blocks; block; block = block->next) {
-	JITInstruction *instr;
-
-	for (instr = block->first; instr; instr = instr->next) {
-	    JITCopy *copy;
-
-	    uses += instr->src1 == value;
-	    uses += instr->src2 == value;
-	    uses += instr->src3 == value;
-	    for (copy = instr->copies; copy; copy = copy->next)
-		uses += copy->src == value;
-	    if (uses > 1)
-		return JIT_LIST_APPEND_BORROWED;
-	    if (instr == block->last)
-		break;
-	}
-    }
-    if (uses != 1)
+	|| program->value_ownership[value] != JIT_OWNERSHIP_OWNED
+	|| program->value_use_counts[value] != 1
+	|| (program->value_escape_flags[value]
+	    & (JIT_ESCAPE_RETURN | JIT_ESCAPE_CALL | JIT_ESCAPE_STORE
+	       | JIT_ESCAPE_MERGE | JIT_ESCAPE_MULTIPLE_USES)))
 	return JIT_LIST_APPEND_BORROWED;
     if (program->value_owned_slots[value] < 0)
 	return JIT_LIST_APPEND_CONSUME_VALUE;
@@ -6237,6 +6213,10 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_ownership, M_PROGRAM);
     if (program->value_owner_root)
 	myfree(program->value_owner_root, M_PROGRAM);
+    if (program->value_use_counts)
+	myfree(program->value_use_counts, M_PROGRAM);
+    if (program->value_escape_flags)
+	myfree(program->value_escape_flags, M_PROGRAM);
     if (program->value_owned_slots)
 	myfree(program->value_owned_slots, M_PROGRAM);
     if (program->value_is_int_list)
@@ -6279,6 +6259,10 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(unsigned char) * program->num_values;
     if (program->value_owner_root)
 	bytes += sizeof(int) * program->num_values;
+    if (program->value_use_counts)
+	bytes += sizeof(unsigned int) * program->num_values;
+    if (program->value_escape_flags)
+	bytes += sizeof(unsigned char) * program->num_values;
     if (program->value_owned_slots)
 	bytes += sizeof(int) * program->num_values;
     if (program->value_is_int_list)
@@ -7670,11 +7654,13 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
 	snprintf(line, sizeof(line),
-	    "v%d type=%d tagged=%d ownership=%d root=%d int-list=%d", i,
+	    "v%d type=%d tagged=%d ownership=%d root=%d uses=%u escapes=%u int-list=%d", i,
 	    program->value_types ? program->value_types[i] : TYPE_ANY,
 	    program->value_is_tagged ? program->value_is_tagged[i] : 0,
 	    program->value_ownership ? program->value_ownership[i] : 0,
 	    program->value_owner_root ? program->value_owner_root[i] : -1,
+	    program->value_use_counts ? program->value_use_counts[i] : 0,
+	    program->value_escape_flags ? program->value_escape_flags[i] : 0,
 	    program->value_is_int_list ? program->value_is_int_list[i] : 0);
 	add_line(line, data);
     }

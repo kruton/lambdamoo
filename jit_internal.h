@@ -34,6 +34,16 @@ typedef enum {
     JIT_OWNERSHIP_IMMORTAL
 } JITValueOwnership;
 
+typedef enum {
+    JIT_ESCAPE_NONE = 0,
+    JIT_ESCAPE_RETURN = 1 << 0,
+    JIT_ESCAPE_CALL = 1 << 1,
+    JIT_ESCAPE_STORE = 1 << 2,
+    JIT_ESCAPE_MERGE = 1 << 3,
+    JIT_ESCAPE_FRAME = 1 << 4,
+    JIT_ESCAPE_MULTIPLE_USES = 1 << 5
+} JITValueEscape;
+
 struct JITResumeValue {
     int value;
     JITResumeSource source;
@@ -221,6 +231,8 @@ struct JITProgram {
     int *value_tag_slots;
     unsigned char *value_ownership;
     int *value_owner_root;
+    unsigned int *value_use_counts;
+    unsigned char *value_escape_flags;
     int num_owned_slots;
     int *value_owned_slots;
     unsigned char *value_is_int_list;
