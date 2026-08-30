@@ -241,6 +241,19 @@ jit_rt_make_singleton_list(int64_t elem_raw, int elem_type)
 }
 
 Var *
+jit_rt_make_fixed_list_head(int64_t elem_raw, int elem_type, int capacity)
+{
+    Var elem, list;
+
+    assert(capacity > 1);
+    elem = var_ref(raw_to_var(elem_raw, elem_type));
+    list = new_list(capacity);
+    list.v.list[0].v.num = 1;
+    list.v.list[1] = elem;
+    return list.v.list;
+}
+
+Var *
 jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type, int consume)
 {
     Var l, elem, res;
@@ -270,6 +283,28 @@ jit_rt_list_append_owned(Var *owned_values, int owner, Var *list,
     res = listappend(res, elem);
     owned_values[owner] = res;
     return res.v.list;
+}
+
+Var *
+jit_rt_fixed_list_append_owned(Var *owned_values, int owner, Var *list,
+			       int index, int64_t elem_raw, int elem_type)
+{
+    Var elem;
+
+    assert(owned_values && owner >= 0);
+    /*
+     * Promotion may transfer the partially constructed list to the
+     * canonical activation.  The resumed continuation then borrows that
+     * same list even though its native owner home is empty.
+     */
+    assert(owned_values[owner].type == TYPE_NONE
+	   || (owned_values[owner].type == TYPE_LIST
+	       && owned_values[owner].v.list == list));
+    assert(index > 1 && list[0].v.num == index - 1);
+    elem = var_ref(raw_to_var(elem_raw, elem_type));
+    list[index] = elem;
+    list[0].v.num = index;
+    return list;
 }
 
 void
@@ -1557,9 +1592,13 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_list_range_ref", (void *) jit_rt_list_range_ref);
     MIR_load_external(context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
+    MIR_load_external(context, "jit_rt_make_fixed_list_head",
+		      (void *) jit_rt_make_fixed_list_head);
     MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
     MIR_load_external(context, "jit_rt_list_append_owned",
 		      (void *) jit_rt_list_append_owned);
+    MIR_load_external(context, "jit_rt_fixed_list_append_owned",
+		      (void *) jit_rt_fixed_list_append_owned);
     MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
     MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
@@ -1739,10 +1778,14 @@ typedef struct {
     MIR_item_t import_list_concat;
     MIR_item_t proto_singleton_list;
     MIR_item_t import_singleton_list;
+    MIR_item_t proto_fixed_list_head;
+    MIR_item_t import_fixed_list_head;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
     MIR_item_t proto_list_append_owned;
     MIR_item_t import_list_append_owned;
+    MIR_item_t proto_fixed_list_append_owned;
+    MIR_item_t import_fixed_list_append_owned;
     MIR_item_t proto_owned_replace;
     MIR_item_t import_owned_replace;
     MIR_item_t proto_list_index_set;
@@ -2264,6 +2307,106 @@ jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 	&& program->deopt_maps[call->deopt_map].native_resume->valid;
 }
 
+static JITInstruction *
+jit_value_definition(JITProgram *program, int value)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value)
+		return instr;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static JITInstruction *
+jit_unique_list_tail_user(JITProgram *program, int value)
+{
+    JITBlock *block;
+    JITInstruction *user = 0;
+    unsigned uses = 0;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->src1 == value) {
+		uses++;
+		if (instr->kind == HIR_TAC_BINARY
+		    && instr->op == HIR_OP_LIST_ADD_TAIL)
+		    user = instr;
+	    }
+	    uses += instr->src2 == value;
+	    uses += instr->src3 == value;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		uses += copy->src == value;
+	    if (uses > 1)
+		return 0;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return uses == 1 ? user : 0;
+}
+
+static int
+jit_fixed_list_capacity(JITProgram *program, JITInstruction *head)
+{
+    JITInstruction *tail;
+    int capacity = 1;
+
+    if (!head || head->kind != HIR_TAC_UNARY
+	|| head->op != HIR_OP_MAKE_SINGLETON_LIST)
+	return 1;
+    while ((tail = jit_unique_list_tail_user(program, head->value)) != 0) {
+	if (!program->value_ownership || !program->value_owned_slots
+	    || head->value <= 0 || head->value >= program->num_values
+	    || tail->value <= 0 || tail->value >= program->num_values
+	    || program->value_ownership[head->value] != JIT_OWNERSHIP_OWNED
+	    || program->value_owned_slots[head->value] < 0
+	    || program->value_owned_slots[tail->value]
+	       != program->value_owned_slots[head->value])
+	    break;
+	capacity++;
+	head = tail;
+    }
+    return capacity;
+}
+
+static int
+jit_fixed_list_tail_index(JITProgram *program, JITInstruction *tail)
+{
+    JITInstruction *current = tail;
+    JITInstruction *definition;
+    int index = 2;
+
+    if (!tail || tail->kind != HIR_TAC_BINARY
+	|| tail->op != HIR_OP_LIST_ADD_TAIL)
+	return 0;
+    while ((definition = jit_value_definition(program, current->src1)) != 0) {
+	if (jit_unique_list_tail_user(program, definition->value) != current)
+	    return 0;
+	if (definition->kind == HIR_TAC_UNARY
+	    && definition->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return jit_fixed_list_capacity(program, definition) >= index
+		? index : 0;
+	if (definition->kind != HIR_TAC_BINARY
+	    || definition->op != HIR_OP_LIST_ADD_TAIL)
+	    return 0;
+	current = definition;
+	index++;
+    }
+    return 0;
+}
+
 typedef enum {
     JIT_LIST_APPEND_BORROWED,
     JIT_LIST_APPEND_CONSUME_VALUE,
@@ -2381,6 +2524,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_singleton_list = MIR_new_proto(build->context, "proto_singleton_list", 1, &res_p, 2,
 						MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_singleton_list = MIR_new_import(build->context, "jit_rt_make_singleton_list");
+    build->proto_fixed_list_head = MIR_new_proto(build->context,
+	"proto_fixed_list_head", 1, &res_p, 3, MIR_T_I64, "elem_raw",
+	MIR_T_I32, "elem_type", MIR_T_I32, "capacity");
+    build->import_fixed_list_head = MIR_new_import(build->context,
+	"jit_rt_make_fixed_list_head");
 
     build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 4,
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw",
@@ -2392,6 +2540,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	MIR_T_I32, "elem_type");
     build->import_list_append_owned = MIR_new_import(build->context,
 	"jit_rt_list_append_owned");
+    build->proto_fixed_list_append_owned = MIR_new_proto(build->context,
+	"proto_fixed_list_append_owned", 1, &res_p, 6, MIR_T_P,
+	"owned_values", MIR_T_I32, "owner", MIR_T_P, "l", MIR_T_I32,
+	"index", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+    build->import_fixed_list_append_owned = MIR_new_import(build->context,
+	"jit_rt_fixed_list_append_owned");
 
     build->proto_owned_replace = MIR_new_proto(build->context,
 	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
@@ -2869,6 +3023,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    if (instr->op == HIR_OP_MAKE_SINGLETON_LIST) {
 			char name[32];
 			MIR_reg_t raw_value;
+			int fixed_capacity = jit_fixed_list_capacity(program,
+			    instr);
 			sprintf(name, "sing_elem_type%d", copy_serial++);
 			MIR_reg_t type_reg = new_reg(build, name);
 			if (program->value_is_tagged
@@ -2889,12 +3045,28 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			}
 			raw_value = append_raw_value(build, program, values,
 				instr->src1, deopt_values, &copy_serial);
-			append(build, MIR_new_call_insn(build->context, 5,
-			    MIR_new_ref_op(build->context, build->proto_singleton_list),
-			    MIR_new_ref_op(build->context, build->import_singleton_list),
-			    MIR_new_reg_op(build->context, values[instr->value]),
-			    MIR_new_reg_op(build->context, raw_value),
-			    MIR_new_reg_op(build->context, type_reg)));
+			if (fixed_capacity > 1)
+			    append(build, MIR_new_call_insn(build->context, 6,
+				MIR_new_ref_op(build->context,
+				    build->proto_fixed_list_head),
+				MIR_new_ref_op(build->context,
+				    build->import_fixed_list_head),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg),
+				MIR_new_int_op(build->context,
+				    fixed_capacity)));
+			else
+			    append(build, MIR_new_call_insn(build->context, 5,
+				MIR_new_ref_op(build->context,
+				    build->proto_singleton_list),
+				MIR_new_ref_op(build->context,
+				    build->import_singleton_list),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg)));
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3478,6 +3650,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			MIR_reg_t raw_value;
 			JITListAppendMode consume_mode =
 			    jit_list_tail_consume_mode(program, instr);
+			int fixed_index = jit_fixed_list_tail_index(program, instr);
 			int tagged_list = program->value_is_tagged
 			    && program->value_is_tagged[instr->src1];
 			MIR_label_t deopt = 0;
@@ -3520,7 +3693,24 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			}
 			raw_value = append_raw_value(build, program, values,
 				instr->src2, deopt_values, &copy_serial);
-			if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME)
+			if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME
+			    && fixed_index > 0)
+			    append(build, MIR_new_call_insn(build->context, 9,
+				MIR_new_ref_op(build->context,
+				    build->proto_fixed_list_append_owned),
+				MIR_new_ref_op(build->context,
+				    build->import_fixed_list_append_owned),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context, owned_values),
+				MIR_new_int_op(build->context,
+				    program->value_owned_slots[instr->src1]),
+				MIR_new_reg_op(build->context,
+				    values[instr->src1]),
+				MIR_new_int_op(build->context, fixed_index),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg)));
+			else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME)
 			    append(build, MIR_new_call_insn(build->context, 8,
 				MIR_new_ref_op(build->context,
 				    build->proto_list_append_owned),
@@ -5750,10 +5940,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		}
 		if (instr->value > 0 && instr->value < program->num_values
 		    && program->value_owned_slots
-		    && instr->kind == HIR_TAC_BINARY
-		    && instr->op == HIR_OP_LIST_ADD_TAIL
-		    && jit_list_tail_consume_mode(program, instr)
-		       != JIT_LIST_APPEND_CONSUME_HOME) {
+		    && program->value_owned_slots[instr->value] >= 0
+		    && ((instr->kind == HIR_TAC_UNARY
+			 && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+			|| (instr->kind == HIR_TAC_BINARY
+			    && instr->op == HIR_OP_LIST_ADD_TAIL
+			    && jit_list_tail_consume_mode(program, instr)
+			       != JIT_LIST_APPEND_CONSUME_HOME))) {
 		    MIR_reg_t raw = append_raw_value(build, program, values,
 			instr->value, deopt_values, &copy_serial);
 		    MIR_op_t type;

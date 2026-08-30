@@ -300,8 +300,11 @@ extern const char *jit_rt_str_range_ref(const char *, int64_t, int64_t, int32_t 
 extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
+extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int, int);
 extern Var *jit_rt_list_append_owned(Var *, int, Var *, int64_t, int);
+extern Var *jit_rt_fixed_list_append_owned(Var *, int, Var *, int, int64_t,
+					   int);
 extern void jit_rt_owned_replace(Var *, int, int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);

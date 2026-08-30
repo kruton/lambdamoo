@@ -6083,6 +6083,26 @@ main(void)
 		  "owner-backed list append remains exclusive");
 	    free_var(homes[0]);
 	}
+	{
+	    Var homes[1];
+	    Var *fixed_result;
+
+	    homes[0].type = TYPE_LIST;
+	    homes[0].v.list = jit_rt_make_fixed_list_head(111, TYPE_INT, 3);
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+		homes[0].v.list, 2, 222, TYPE_INT);
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+		fixed_result, 3, 333, TYPE_INT);
+	    check(fixed_result == homes[0].v.list
+		  && fixed_result[0].v.num == 3
+		  && fixed_result[1].v.num == 111
+		  && fixed_result[2].v.num == 222
+		  && fixed_result[3].v.num == 333,
+		  "fixed list construction fills one allocation");
+	    check(var_refcount(homes[0]) == 1,
+		  "fixed list construction remains exclusive");
+	    free_var(homes[0]);
+	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */
 	{

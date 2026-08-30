@@ -4917,6 +4917,25 @@ jit_value_type_is_scalar(JITProgram *program, int value)
 	&& type != TYPE_WAIF;
 }
 
+static int
+jit_value_is_singleton_list(JITProgram *program, int value)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value && instr->kind == HIR_TAC_UNARY
+		&& instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+		return 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
 static void
 jit_build_value_ownership(JITProgram *program)
 {
@@ -4997,6 +5016,12 @@ jit_build_value_ownership(JITProgram *program)
 		&& instr->kind == HIR_TAC_BINARY
 		&& instr->op == HIR_OP_LIST_ADD_TAIL
 		&& program->value_owned_slots[instr->value] < 0) {
+		if (instr->src1 > 0 && instr->src1 < program->num_values
+		    && program->value_owned_slots[instr->src1] < 0
+		    && uses[instr->src1] == 1
+		    && jit_value_is_singleton_list(program, instr->src1))
+		    program->value_owned_slots[instr->src1] =
+			program->num_owned_slots++;
 		if (instr->src1 > 0 && instr->src1 < program->num_values
 		    && program->value_owned_slots[instr->src1] >= 0
 		    && uses[instr->src1] == 1) {
