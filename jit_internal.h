@@ -153,6 +153,15 @@ struct JITCopy {
     JITCopy *next;
 };
 
+typedef enum {
+    JIT_OWNER_ROOT_CONFLICT = -2,
+    JIT_OWNER_ROOT_NONE = -1
+} JITOwnerRootSpecial;
+
+typedef enum {
+    JIT_OWNER_SLOT_NONE = -1
+} JITOwnerSlotSpecial;
+
 struct JITInstruction {
     HIRTacKind kind;
     ResumeKey resume_key;

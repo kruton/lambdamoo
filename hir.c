@@ -5130,8 +5130,8 @@ jit_build_value_ownership(JITProgram *program)
     memset(program->value_ownership, JIT_OWNERSHIP_UNKNOWN,
 	   program->num_values);
     for (i = 0; i < program->num_values; i++) {
-	program->value_owner_root[i] = -1;
-	program->value_owned_slots[i] = -1;
+	program->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	program->value_owned_slots[i] = JIT_OWNER_SLOT_NONE;
 	if (jit_value_type_is_scalar(program, i))
 	    program->value_ownership[i] = JIT_OWNERSHIP_SCALAR;
     }
@@ -5229,6 +5229,8 @@ jit_build_value_ownership(JITProgram *program)
 		for (copy = instr->copies; copy; copy = copy->next)
 		    if (copy->src > 0 && copy->src < program->num_values
 			&& copy->dst > 0 && copy->dst < program->num_values
+			&& program->value_owner_root[copy->dst]
+			   != JIT_OWNER_ROOT_CONFLICT
 			&& program->value_ownership[copy->src]
 			   != JIT_OWNERSHIP_UNKNOWN
 			&& program->value_ownership[copy->dst]
@@ -5237,6 +5239,21 @@ jit_build_value_ownership(JITProgram *program)
 			    program->value_ownership[copy->src];
 			program->value_owner_root[copy->dst] =
 			    program->value_owner_root[copy->src];
+			changed = 1;
+		    } else if (copy->src > 0
+			       && copy->src < program->num_values
+			       && copy->dst > 0
+			       && copy->dst < program->num_values
+			       && program->value_owner_root[copy->dst] >= 0
+			       && program->value_owner_root[copy->src] >= 0
+			       && (program->value_ownership[copy->dst]
+				   != program->value_ownership[copy->src]
+				   || program->value_owner_root[copy->dst]
+				      != program->value_owner_root[copy->src])) {
+			program->value_ownership[copy->dst] =
+			    JIT_OWNERSHIP_UNKNOWN;
+			program->value_owner_root[copy->dst] =
+			    JIT_OWNER_ROOT_CONFLICT;
 			changed = 1;
 		    }
 		if (instr == block->last)
