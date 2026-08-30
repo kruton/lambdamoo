@@ -4585,6 +4585,25 @@ jit_instr_can_materialize(JITInstruction *instr)
 }
 
 static int
+jit_instr_needs_deopt_map(JITInstruction *instr, var_type *value_types,
+			  unsigned char *value_is_tagged, int num_values)
+{
+    if (!jit_instr_can_materialize(instr))
+	return 0;
+    if (instr->kind == HIR_TAC_UNARY
+	&& instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	return 0;
+    if (instr->kind == HIR_TAC_BINARY
+	&& instr->op == HIR_OP_LIST_ADD_TAIL
+	&& instr->src1 > 0 && instr->src1 < num_values
+	&& value_types && value_is_tagged
+	&& !value_is_tagged[instr->src1]
+	&& value_types[instr->src1] == TYPE_LIST)
+	return 0;
+    return 1;
+}
+
+static int
 jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			 Program *bytecode_program)
 {
@@ -4607,8 +4626,19 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			const ResumePoint *point;
 			int operands;
 
-			if (instr->deopt_map == 0)
+			if (instr->deopt_map == 0) {
+				if (instr->bytecode_pc != NO_BYTECODE_PC
+				    && jit_instr_needs_deopt_map(instr,
+					program->value_types,
+					program->value_is_tagged,
+					program->num_values)) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: missing map at pc %u",
+					    instr->bytecode_pc);
+					goto invalid;
+				}
 				goto next_instruction;
+			}
 			if (instr->deopt_map < 0
 			    || instr->deopt_map >= program->num_deopt_maps) {
 				record_unsupported_fmt(ctx,
@@ -6475,7 +6505,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			instr->kind = HIR_TAC_DEOPT;
 		}
 	    }
-	    instr->deopt_map = jit_instr_can_materialize(instr)
+	    instr->deopt_map = jit_instr_needs_deopt_map(instr, value_types,
+		value_is_tagged, program->num_values)
 		? jit_add_deopt_map(program, ssa_instr,
 				    &bytecode_program->main_vector,
 				    value_types, value_is_tagged)
