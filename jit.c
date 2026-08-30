@@ -599,6 +599,82 @@ jit_execution_context_pop_overlay(JITExecutionContext *context,
 }
 
 int
+jit_execution_context_push_compact(JITExecutionContext *context,
+				   JITNativeFrame *frame, JITProgram *program,
+				   Var *env, JITCallerResume *resume,
+				   int entry_map)
+{
+    JITNativeFrame *caller;
+
+    if (!context || !frame || !program || !resume
+	|| !(caller = context->current_frame)
+	|| caller->state != JIT_FRAME_RUNNING || caller->callee
+	|| caller->outgoing || resume->caller != caller
+	|| resume->state != JIT_RESUME_PREPARING || resume->map_id <= 0
+	|| resume->map_id >= caller->program->num_deopt_maps
+	|| resume->result_home >= caller->num_homes
+	|| caller->home_states[resume->result_home] != JIT_HOME_EMPTY
+	|| context->canonical_depth + context->native_depth
+	    >= context->activation_limit)
+	return 0;
+
+    memset(frame, 0, sizeof(*frame));
+    frame->context = context;
+    frame->program = program;
+    frame->caller = caller;
+    frame->incoming = resume;
+    frame->env = env;
+    frame->entry_map = entry_map;
+    frame->current_map = entry_map;
+    frame->kind = JIT_FRAME_COMPACT;
+    frame->state = JIT_FRAME_RUNNING;
+    resume->state = JIT_RESUME_DISPATCHED;
+    caller->outgoing = resume;
+    caller->callee = frame;
+    context->current_frame = frame;
+    context->native_depth++;
+    if (jit_native_frame_verify(context, frame))
+	return 1;
+
+    context->native_depth--;
+    context->current_frame = caller;
+    caller->callee = 0;
+    caller->outgoing = 0;
+    resume->state = JIT_RESUME_PREPARING;
+    memset(frame, 0, sizeof(*frame));
+    return 0;
+}
+
+int
+jit_execution_context_return_compact(JITExecutionContext *context,
+				     JITNativeFrame *frame, Var *result)
+{
+    JITNativeFrame *caller;
+    JITCallerResume *resume;
+
+    if (!context || !frame || !result || context->current_frame != frame
+	|| frame->kind != JIT_FRAME_COMPACT || frame->state != JIT_FRAME_RUNNING
+	|| frame->callee || frame->outgoing || frame->runtime_storage
+	|| !(caller = frame->caller) || caller->callee != frame
+	|| !(resume = frame->incoming) || resume->caller != caller
+	|| caller->outgoing != resume || resume->state != JIT_RESUME_DISPATCHED
+	|| context->native_depth == 0 || !jit_native_frame_verify(context, frame)
+	|| !jit_native_frame_home_move(caller, resume->result_home, result))
+	return 0;
+
+    caller->callee = 0;
+    caller->outgoing = 0;
+    context->current_frame = caller;
+    context->native_depth--;
+    resume->state = JIT_RESUME_RETURNED;
+    frame->caller = 0;
+    frame->incoming = 0;
+    frame->context = 0;
+    frame->state = JIT_FRAME_RETURNED;
+    return jit_native_frame_verify(context, caller);
+}
+
+int
 jit_execution_context_finish(JITExecutionContext *context,
 			     JITNativeFrame *root)
 {
@@ -671,6 +747,7 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	return 0;
     if (frame->incoming
 	&& (!frame->caller || frame->incoming->caller != frame->caller
+	    || frame->incoming->state != JIT_RESUME_DISPATCHED
 	    || frame->incoming->map_id <= 0
 	    || frame->incoming->map_id >= frame->incoming->caller->program->num_deopt_maps
 	    || frame->incoming->result_home
@@ -678,6 +755,8 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	return 0;
     if (frame->outgoing
 	&& (frame->outgoing->caller != frame
+	    || frame->outgoing->state != JIT_RESUME_DISPATCHED
+	    || !frame->callee || frame->callee->incoming != frame->outgoing
 	    || frame->outgoing->map_id <= 0
 	    || frame->outgoing->map_id >= frame->program->num_deopt_maps
 	    || frame->outgoing->result_home >= frame->num_homes))

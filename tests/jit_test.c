@@ -3396,6 +3396,81 @@ main(void)
 	      "native root frame did not detach cleanly");
     }
 
+    {
+	JITProgram *chain_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame middle;
+	JITNativeFrame leaf;
+	JITCallerResume root_resume;
+	JITCallerResume middle_resume;
+	Var root_home[1];
+	Var middle_home[1];
+	unsigned char root_state[1];
+	unsigned char middle_state[1];
+	Var returned;
+	Var transferred;
+
+	root_home[0].type = middle_home[0].type = TYPE_NONE;
+	root_home[0].v.num = middle_home[0].v.num = 0;
+	root_state[0] = middle_state[0] = JIT_HOME_EMPTY;
+	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	jit_native_frame_bind_runtime(&root, root_home, sizeof(root_home),
+	    root_home, 1, root_state);
+	memset(&root_resume, 0, sizeof(root_resume));
+	root_resume.caller = &root;
+	root_resume.map_id = 1;
+	root_resume.result_home = 0;
+	root_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &middle,
+	    chain_program, deep_env, &root_resume, -1),
+	      "first compact native dispatch failed");
+	jit_native_frame_bind_runtime(&middle, middle_home,
+	    sizeof(middle_home), middle_home, 1, middle_state);
+
+	memset(&middle_resume, 0, sizeof(middle_resume));
+	middle_resume.caller = &middle;
+	middle_resume.map_id = 1;
+	middle_resume.result_home = 0;
+	middle_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &leaf,
+	    chain_program, deopt_stack, &middle_resume, -1),
+	      "second compact native dispatch failed");
+	check(context.native_depth == 2 && context.current_frame == &leaf,
+	      "compact native chain depth is wrong");
+
+	returned = new_list(1);
+	returned.v.list[1].type = TYPE_STR;
+	returned.v.list[1].v.str = str_dup("compact chain result");
+	check(jit_execution_context_return_compact(&context, &leaf, &returned),
+	      "compact leaf return failed");
+	check(returned.type == TYPE_NONE
+	      && middle_resume.state == JIT_RESUME_RETURNED
+	      && context.current_frame == &middle && context.native_depth == 1,
+	      "compact leaf return transition is wrong");
+	check(jit_native_frame_home_take(&middle, 0, &transferred),
+	      "compact middle frame did not acquire its result");
+	jit_native_frame_unbind_runtime(&middle);
+	check(jit_execution_context_return_compact(&context, &middle,
+	    &transferred), "compact middle return failed");
+	check(transferred.type == TYPE_NONE
+	      && root_resume.state == JIT_RESUME_RETURNED
+	      && context.current_frame == &root && context.native_depth == 0,
+	      "compact middle return transition is wrong");
+	check(jit_native_frame_home_take(&root, 0, &transferred),
+	      "compact root frame did not acquire the final result");
+	check(transferred.type == TYPE_LIST
+	      && transferred.v.list[1].type == TYPE_STR
+	      && !strcmp(transferred.v.list[1].v.str, "compact chain result"),
+	      "compact chain corrupted a complex result");
+	free_var(transferred);
+	jit_native_frame_unbind_runtime(&root);
+	check(jit_execution_context_finish(&context, &root),
+	      "compact chain root did not detach cleanly");
+	jit_program_free(chain_program);
+    }
+
     check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
     check(mir_dump.lines > 0, "MIR dump was empty");

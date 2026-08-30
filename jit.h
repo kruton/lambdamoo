@@ -210,6 +210,11 @@ extern int jit_execution_context_push_overlay(JITExecutionContext *,
 					      unsigned, int);
 extern int jit_execution_context_pop_overlay(JITExecutionContext *,
 					     JITNativeFrame *);
+extern int jit_execution_context_push_compact(JITExecutionContext *,
+					      JITNativeFrame *, JITProgram *, Var *,
+					      JITCallerResume *, int);
+extern int jit_execution_context_return_compact(JITExecutionContext *,
+						JITNativeFrame *, Var *);
 extern int jit_execution_context_finish(JITExecutionContext *,
 					JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
