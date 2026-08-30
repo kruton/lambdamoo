@@ -3572,6 +3572,59 @@ main(void)
 	jit_program_free(chain_program);
     }
 
+    {
+	JITProgram *owner_program = call_boundary_program();
+	JITDeoptMap *map = &owner_program->deopt_maps[1];
+	JITContinuationFrame *continuation;
+	JITNativeResume *resume;
+	activation owner;
+	Var owner_stack[2];
+	Var owner_home[1];
+	unsigned char home_state[1];
+	Num stale_values[3] = { 0, 0, 0 };
+
+	memset(&owner, 0, sizeof(owner));
+	owner_program->value_types = allocate(sizeof(var_type) * 3);
+	owner_program->value_is_tagged = allocate(3);
+	owner_program->value_types[1] = TYPE_ANY;
+	owner_program->value_is_tagged[1] = 1;
+	owner_program->num_owned_slots = 1;
+	resume = allocate(sizeof(*resume));
+	resume->num_values = 1;
+	resume->valid = 1;
+	resume->values = allocate(sizeof(*resume->values));
+	resume->values[0].value = 1;
+	resume->values[0].source = JIT_RESUME_OWNER;
+	resume->values[0].index = 0;
+	map->native_resume = resume;
+	map->num_locals = 0;
+	map->num_local_values = 0;
+	owner_home[0].type = TYPE_STR;
+	owner_home[0].v.str = str_dup("authoritative owner tag");
+	home_state[0] = JIT_HOME_OWNED;
+	continuation = allocate(sizeof(*continuation));
+	continuation->program = owner_program;
+	continuation->map_id = 1;
+	continuation->num_values = 1;
+	continuation->values = allocate(sizeof(*continuation->values));
+	continuation->values_capacity = 1;
+	continuation->values[0].type = TYPE_NONE;
+	continuation->deopt_values = stale_values;
+	continuation->owned_values = owner_home;
+	continuation->home_states = home_state;
+	owner.base_rt_stack = owner.top_rt_stack = owner_stack;
+	jit_continuation_attach(continuation, &owner);
+	check(jit_continuation_materialize(&owner),
+	      "owner-backed continuation did not materialize");
+	check(owner.top_rt_stack == owner.base_rt_stack + 1
+	      && owner_stack[0].type == TYPE_STR
+	      && !strcmp(owner_stack[0].v.str, "authoritative owner tag"),
+	      "owner-backed continuation used stale payload or tag data");
+	free_var(*--owner.top_rt_stack);
+	free_var(owner_home[0]);
+	jit_program_free(owner_program);
+    }
+
     check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
     check(mir_dump.lines > 0, "MIR dump was empty");

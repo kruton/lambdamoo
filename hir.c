@@ -5297,6 +5297,137 @@ jit_build_direct_int_list_updates(JITProgram *program)
 }
 
 static int
+jit_value_defined_by_instruction(JITProgram *program, int value)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value && jit_instr_defines_value(instr))
+		return 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static int
+jit_value_must_be_available(JITProgram *program, JITInstruction *call,
+			    int value)
+{
+    JITBlock *block;
+    unsigned char *available_in;
+    unsigned char *available_out;
+    unsigned char *reachable;
+    int max_block = 0;
+    int changed;
+    int result = 0;
+
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    available_in = mymalloc(max_block + 1, M_PROGRAM);
+    available_out = mymalloc(max_block + 1, M_PROGRAM);
+    reachable = mymalloc(max_block + 1, M_PROGRAM);
+    memset(available_in, 0, max_block + 1);
+    memset(available_out, 0, max_block + 1);
+    memset(reachable, 0, max_block + 1);
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    JITBlock *predecessor;
+	    int in = 1;
+	    int has_predecessor = 0;
+	    int out;
+
+	    if (block == program->blocks) {
+		in = 0;
+		if (!reachable[block->id]) {
+		    reachable[block->id] = 1;
+		    changed = 1;
+		}
+	    } else {
+		for (predecessor = program->blocks; predecessor;
+		     predecessor = predecessor->next) {
+		    int successor;
+
+		    if (!reachable[predecessor->id])
+			continue;
+		    for (successor = 0;
+			 successor < predecessor->num_successors; successor++)
+			if (predecessor->successors[successor] == block->id) {
+			    has_predecessor = 1;
+			    in = in && available_out[predecessor->id];
+			}
+		}
+		if (!has_predecessor)
+		    continue;
+		if (!reachable[block->id]) {
+		    reachable[block->id] = 1;
+		    changed = 1;
+		}
+	    }
+	    if (available_in[block->id] != in) {
+		available_in[block->id] = in;
+		changed = 1;
+	    }
+	    out = in;
+	    if (!out) {
+		JITInstruction *instr;
+
+		for (instr = block->first; instr; instr = instr->next) {
+		    JITCopy *copy;
+
+		    if (instr->value == value && jit_instr_defines_value(instr))
+			out = 1;
+		    for (copy = instr->copies; copy; copy = copy->next)
+			if (copy->dst == value)
+			    out = 1;
+		    if (instr == block->last)
+			break;
+		}
+	    }
+	    if (available_out[block->id] != out) {
+		available_out[block->id] = out;
+		changed = 1;
+	    }
+	}
+    } while (changed);
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	int available;
+
+	if (!reachable[block->id])
+	    continue;
+	available = available_in[block->id];
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr == call) {
+		result = available;
+		goto done;
+	    }
+	    if (instr->value == value && jit_instr_defines_value(instr))
+		available = 1;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->dst == value)
+		    available = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+done:
+    myfree(reachable, M_PROGRAM);
+    myfree(available_out, M_PROGRAM);
+    myfree(available_in, M_PROGRAM);
+    return result;
+}
+
+static int
 jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		  JITInstruction *call, int value, JITResumeValue *resume)
 {
@@ -5334,6 +5465,17 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	    if (instr == block->last)
 		break;
 	}
+    }
+    if (program->value_owned_slots
+	&& program->value_ownership
+	&& program->value_owned_slots[value] >= 0
+	&& (program->value_ownership[value] == JIT_OWNERSHIP_OWNED
+	    || program->value_ownership[value] == JIT_OWNERSHIP_STABLE_OWNED)
+	&& jit_value_defined_by_instruction(program, value)
+	&& jit_value_must_be_available(program, call, value)) {
+	resume->source = JIT_RESUME_OWNER;
+	resume->index = program->value_owned_slots[value];
+	return 1;
     }
     return 0;
 }
@@ -5533,10 +5675,11 @@ jit_build_resume_liveness(JITProgram *program)
 		resume->rehydratable = jit_resume_stack_is_safe(map,
 							    call_operands);
 		live_count = 0;
-		for (value = 1; value < program->num_values; value++)
-		    if (needed[value]
-			&& !jit_resume_source(program, map, instr, value,
-					      &resume->values[live_count++])) {
+		for (value = 1; value < program->num_values; value++) {
+		    if (!needed[value])
+			continue;
+		    if (!jit_resume_source(program, map, instr, value,
+			&resume->values[live_count++])) {
 			const char *func_name = instr->kind == HIR_TAC_CALL
 			    ? name_func_by_num(instr->func) : 0;
 
@@ -5549,7 +5692,10 @@ jit_build_resume_liveness(JITProgram *program)
 			    resume->valid = 0;
 			    resume->values[live_count - 1].index = -1;
 			}
-		    }
+		    } else if (resume->values[live_count - 1].source
+			       == JIT_RESUME_OWNER)
+			resume->rehydratable = 0;
+		}
 		myfree(needed, M_PROGRAM);
 	    }
 	    memset(uses, 0, program->num_values);

@@ -2070,6 +2070,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						 continuation_values),
 				  MIR_new_int_op(build->context, 0)));
 	for (j = 0; map->native_resume
+	     && j < map->native_resume->num_values; j++)
+	    if (map->native_resume->values[j].source == JIT_RESUME_OWNER) {
+		append(build, MIR_new_insn(build->context, MIR_JMP,
+					  MIR_new_label_op(build->context,
+							   fallback)));
+		break;
+	    }
+	for (j = 0; map->native_resume
 	     && j < map->native_resume->num_values; j++) {
 	    JITResumeValue *resume = &map->native_resume->values[j];
 
@@ -2095,6 +2103,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	    if (resume->source == JIT_RESUME_RESULT)
 		append_resume_value(build, program, values, resume->value,
 				    continuation_values, j, deopt_values,
+				    &copy_serial);
+	    else if (resume->source == JIT_RESUME_OWNER)
+		append_resume_value(build, program, values, resume->value,
+				    owned_values, resume->index, deopt_values,
 				    &copy_serial);
 	    else if (resume->source != JIT_RESUME_CONSTANT)
 		append_stored_resume_value(build, program, values,
@@ -5901,6 +5913,16 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
 	    resume->literal);
 	return 1;
     }
+    if (resume->source == JIT_RESUME_OWNER) {
+	if (resume->index < 0
+	    || resume->index >= frame->program->num_owned_slots
+	    || !frame->home_states
+	    || frame->home_states[resume->index] != JIT_HOME_OWNED
+	    || frame->owned_values[resume->index].type == TYPE_NONE)
+	    return 0;
+	*materialized = var_ref(frame->owned_values[resume->index]);
+	return 1;
+    }
     type = frame->program->value_is_tagged
 	&& frame->program->value_is_tagged[value]
 	? (var_type) frame->deopt_values[
@@ -5937,6 +5959,14 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	if (resume->source == JIT_RESUME_RESULT
 	    || resume->source == JIT_RESUME_CONSTANT)
 	    continue;
+	if (resume->source == JIT_RESUME_OWNER) {
+	    if (resume->index < 0 || resume->index >= program->num_owned_slots
+		|| !home_states
+		|| home_states[resume->index] != JIT_HOME_OWNED
+		|| owned_values[resume->index].type == TYPE_NONE)
+		return 0;
+	    continue;
+	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
@@ -5977,6 +6007,10 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	}
 	if (resume->source == JIT_RESUME_CONSTANT)
 	    continue;
+	if (resume->source == JIT_RESUME_OWNER) {
+	    new_values[i] = var_ref(owned_values[resume->index]);
+	    continue;
+	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
@@ -6429,6 +6463,9 @@ jit_program_execute_in_context(JITProgram *program,
 			     deopt_stack,
 			     continuation_in ? continuation_in->values : 0,
 			     owned_values);
+    for (i = 0; i < program->num_owned_slots; i++)
+	home_states[i] = owned_values[i].type == TYPE_NONE
+	    ? JIT_HOME_EMPTY : JIT_HOME_OWNED;
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
@@ -6569,9 +6606,6 @@ jit_program_execute_in_context(JITProgram *program,
 	if (result)
 	    *result = var_ref(*result);
     }
-    for (i = 0; i < program->num_owned_slots; i++)
-	home_states[i] = owned_values[i].type == TYPE_NONE
-	    ? JIT_HOME_EMPTY : JIT_HOME_OWNED;
     if (!runtime_from_continuation && !runtime_transferred) {
 	for (i = 0; i < program->num_borrowed_locals; i++)
 	    free_var(borrowed_locals[i]);

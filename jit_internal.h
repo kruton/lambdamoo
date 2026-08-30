@@ -21,6 +21,7 @@ typedef enum {
     JIT_RESUME_STACK,
     JIT_RESUME_RESULT,
     JIT_RESUME_CONSTANT,
+    JIT_RESUME_OWNER,
     JIT_RESUME_CAPTURED
 } JITResumeSource;
 
