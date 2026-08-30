@@ -30,6 +30,18 @@ jit_list_tail_owner_slot(int source_slot, unsigned int source_uses,
 }
 
 static int
+jit_string_concat_owner_slot(int source1_slot, int source1_last,
+			     int source2_slot, int source2_last,
+			     int next_slot)
+{
+    if (source1_last && source1_slot >= 0)
+	return source1_slot;
+    if (source2_last && source2_slot >= 0)
+	return source2_slot;
+    return next_slot;
+}
+
+static int
 jit_int_list_result(HIROp op, int left_is_int_list, int right_is_int_list,
 		    var_type right_type)
 {
@@ -5154,13 +5166,17 @@ jit_build_value_ownership(JITProgram *program)
 			 || (instr->kind == HIR_TAC_BINARY
 			     && (instr->op == HIR_OP_LIST_ADD_TAIL
 				 || instr->op == HIR_OP_LIST_APPEND
-				 || instr->op == HIR_OP_SUBLIST_FROM))) {
+				 || instr->op == HIR_OP_SUBLIST_FROM
+				 || (instr->op == HIR_OP_ADD
+				     && program->value_types
+				     && program->value_types[instr->value]
+					== TYPE_STR)))) {
 		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
 		    program->value_owner_root[instr->value] = instr->value;
 		} else if (instr->kind == HIR_TAC_BINARY
 			 && instr->op == HIR_OP_GET_PROP) {
 		    program->value_ownership[instr->value] =
-			JIT_OWNERSHIP_STABLE_OWNED;
+			JIT_OWNERSHIP_OWNED_PROPERTY;
 		    program->value_owner_root[instr->value] = instr->value;
 		}
 	    }
@@ -5277,6 +5293,54 @@ jit_literal_is_int_list(JITInstruction *instr)
 	if (list[i].type != TYPE_INT)
 	    return 0;
     return 1;
+}
+
+static void
+jit_build_string_concat_owner_slots(JITProgram *program)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_BINARY && instr->op == HIR_OP_ADD
+		&& instr->value > 0 && instr->value < program->num_values
+		&& instr->src1 > 0 && instr->src1 < program->num_values
+		&& instr->src2 > 0 && instr->src2 < program->num_values
+		&& program->value_types && program->value_is_tagged
+		&& !program->value_is_tagged[instr->value]
+		&& !program->value_is_tagged[instr->src1]
+		&& !program->value_is_tagged[instr->src2]
+		&& program->value_types[instr->value] == TYPE_STR
+		&& program->value_types[instr->src1] == TYPE_STR
+		&& program->value_types[instr->src2] == TYPE_STR
+		&& (instr->owned_last_use
+		    & (JIT_LAST_USE_SRC1 | JIT_LAST_USE_SRC2))
+		&& program->value_owned_slots[instr->value] < 0) {
+		int owner = jit_string_concat_owner_slot(
+		    program->value_owned_slots[instr->src1],
+		    instr->owned_last_use & JIT_LAST_USE_SRC1,
+		    program->value_owned_slots[instr->src2],
+		    instr->owned_last_use & JIT_LAST_USE_SRC2,
+		    program->num_owned_slots);
+
+		program->value_owned_slots[instr->value] = owner;
+		if (owner == program->value_owned_slots[instr->src1]
+		    && (instr->owned_last_use & JIT_LAST_USE_SRC1))
+		    program->value_owner_root[instr->value] =
+			program->value_owner_root[instr->src1];
+		else if (owner == program->value_owned_slots[instr->src2]
+			 && (instr->owned_last_use & JIT_LAST_USE_SRC2))
+		    program->value_owner_root[instr->value] =
+			program->value_owner_root[instr->src2];
+		else
+		    program->num_owned_slots++;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
 }
 
 static void
@@ -5663,6 +5727,10 @@ jit_published_owner_value(JITProgram *program, JITInstruction *instr,
     if (instr->kind == HIR_TAC_BINARY
 	&& instr->op == HIR_OP_LIST_ADD_TAIL)
 	return instr->value;
+    if (instr->kind == HIR_TAC_BINARY && instr->op == HIR_OP_ADD
+	&& program->value_types
+	&& program->value_types[instr->value] == TYPE_STR)
+	return instr->value;
     return 0;
 }
 
@@ -5877,7 +5945,7 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	&& program->value_ownership
 	&& program->value_owned_slots[value] >= 0
 	&& (program->value_ownership[value] == JIT_OWNERSHIP_OWNED
-	    || program->value_ownership[value] == JIT_OWNERSHIP_STABLE_OWNED)
+	    || program->value_ownership[value] == JIT_OWNERSHIP_OWNED_PROPERTY)
 	&& jit_value_defined_by_instruction(program, value)
 	&& jit_value_must_be_available(program, call, value)) {
 	resume->source = JIT_RESUME_OWNER;
@@ -5893,7 +5961,7 @@ jit_owned_value_is_fresh(JITProgram *program, JITInstruction *call, int value)
     JITBlock *block;
 
     if (program->value_ownership[value] != JIT_OWNERSHIP_OWNED
-	&& program->value_ownership[value] != JIT_OWNERSHIP_STABLE_OWNED)
+	&& program->value_ownership[value] != JIT_OWNERSHIP_OWNED_PROPERTY)
 	return 0;
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
@@ -6939,6 +7007,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     jit_build_tag_slots(program);
     jit_build_ownership_escape_analysis(program);
     jit_build_value_ownership(program);
+    jit_analyze_owned_last_uses(program);
+    jit_build_string_concat_owner_slots(program);
     jit_build_deopt_owner_slots(program);
     jit_build_int_list_values(program);
     jit_build_direct_int_list_updates(program);
@@ -10430,6 +10500,15 @@ hir_test_list_tail_owner_slot(int source_slot, unsigned int source_uses,
 			      int next_slot)
 {
     return jit_list_tail_owner_slot(source_slot, source_uses, next_slot);
+}
+
+int
+hir_test_string_concat_owner_slot(int source1_slot, int source1_last,
+				  int source2_slot, int source2_last,
+				  int next_slot)
+{
+    return jit_string_concat_owner_slot(source1_slot, source1_last,
+				source2_slot, source2_last, next_slot);
 }
 
 int

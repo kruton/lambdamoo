@@ -133,6 +133,35 @@ jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
     return res;
 }
 
+int
+jit_rt_str_concat_owned(Var *owned_values, int owner, const char *s1,
+			const char *s2, int last_use, int64_t *result_out,
+			int32_t *err_out)
+{
+    const char *result;
+    Var *home;
+    int consumes_home;
+
+    assert(owned_values && owner >= 0);
+    home = &owned_values[owner];
+    assert(home->type == TYPE_NONE || home->type == TYPE_STR);
+    consumes_home = home->type == TYPE_NONE
+	|| ((last_use & JIT_LAST_USE_SRC1) && home->v.str == s1)
+	|| ((last_use & JIT_LAST_USE_SRC2) && home->v.str == s2);
+    if (!consumes_home) {
+	*err_out = E_NONE;
+	return 0;
+    }
+    result = jit_rt_str_concat(s1, s2, err_out);
+    if (*err_out != E_NONE)
+	return 1;
+    free_var(*home);
+    home->type = TYPE_STR;
+    home->v.str = result;
+    *result_out = (int64_t) (intptr_t) result;
+    return 1;
+}
+
 const char *
 jit_rt_str_ref(const char *str, int64_t idx, int32_t *err_out)
 {
@@ -407,7 +436,12 @@ jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
 	*err_out = E_PERM;
 	return 0;
     }
-    val = h.built_in ? prop : var_ref(prop);
+    /* Built-in complex properties are constructed or retained by
+       db_find_property(); ordinary property values are borrowed.  Normalize
+       both paths to an owned result before returning to native code. */
+    val = prop;
+    if (!h.built_in)
+	val = var_ref(val);
     *out_type = val.type;
     if (val.type == TYPE_FLOAT) {
 	double d = (double) fl_unbox(val.v.fnum);
@@ -1599,6 +1633,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_equality", (void *) jit_rt_equality);
     MIR_load_external(context, "jit_rt_str_cmp", (void *) jit_rt_str_cmp);
     MIR_load_external(context, "jit_rt_str_concat", (void *) jit_rt_str_concat);
+    MIR_load_external(context, "jit_rt_str_concat_owned",
+		      (void *) jit_rt_str_concat_owned);
     MIR_load_external(context, "jit_rt_str_ref", (void *) jit_rt_str_ref);
     MIR_load_external(context, "jit_rt_str_range_ref", (void *) jit_rt_str_range_ref);
     MIR_load_external(context, "jit_rt_list_range_ref", (void *) jit_rt_list_range_ref);
@@ -1783,6 +1819,8 @@ typedef struct {
     MIR_item_t import_str_cmp;
     MIR_item_t proto_str_concat;
     MIR_item_t import_str_concat;
+    MIR_item_t proto_str_concat_owned;
+    MIR_item_t import_str_concat_owned;
     MIR_item_t proto_str_ref;
     MIR_item_t import_str_ref;
     MIR_item_t proto_str_range_ref;
@@ -2490,6 +2528,286 @@ jit_value_is_dead_owned_list(JITProgram *program, JITInstruction *instr)
 }
 
 static int
+jit_owned_alias_root(int *roots, int value)
+{
+    while (roots[value] != value) {
+	roots[value] = roots[roots[value]];
+	value = roots[value];
+    }
+    return value;
+}
+
+static void
+jit_join_owned_aliases(int *roots, int left, int right)
+{
+    left = jit_owned_alias_root(roots, left);
+    right = jit_owned_alias_root(roots, right);
+    if (left != right)
+	roots[right] = left;
+}
+
+static void
+jit_owned_liveness(JITProgram *program, JITInstruction *instr,
+		   unsigned char *uses, unsigned char *defs)
+{
+    JITCopy *copy;
+    JITDeoptMap *map;
+    int value;
+
+    if (instr->value > 0 && instr->value < program->num_values
+	&& (instr->kind == HIR_TAC_CONST
+	    || instr->kind == HIR_TAC_LOAD_LOCAL
+	    || instr->kind == HIR_TAC_LOAD_ERROR
+	    || instr->kind == HIR_TAC_UNARY
+	    || instr->kind == HIR_TAC_BINARY
+	    || instr->kind == HIR_TAC_CALL
+	    || instr->kind == HIR_TAC_CALL_VERB
+	    || instr->kind == HIR_TAC_PUT_PROP
+	    || instr->kind == HIR_TAC_INDEX_SET
+	    || instr->kind == HIR_TAC_RANGE_REF
+	    || instr->kind == HIR_TAC_RANGE_SET
+	    || instr->kind == HIR_TAC_UNSUPPORTED))
+	defs[instr->value] = 1;
+    if (instr->kind == HIR_TAC_PARALLEL_COPY)
+	for (copy = instr->copies; copy; copy = copy->next) {
+	    if (copy->src > 0 && copy->src < program->num_values)
+		uses[copy->src] = 1;
+	    if (copy->dst > 0 && copy->dst < program->num_values)
+		defs[copy->dst] = 1;
+	}
+    if (instr->src1 > 0 && instr->src1 < program->num_values)
+	uses[instr->src1] = 1;
+    if (instr->src2 > 0 && instr->src2 < program->num_values)
+	uses[instr->src2] = 1;
+    if (instr->src3 > 0 && instr->src3 < program->num_values)
+	uses[instr->src3] = 1;
+    if (instr->deopt_map <= 0
+	|| instr->deopt_map >= program->num_deopt_maps)
+	return;
+    map = &program->deopt_maps[instr->deopt_map];
+    for (value = 0; value < map->num_locals; value++) {
+	int local = jit_deopt_map_local_value(program, map, value);
+
+	if (local > 0 && local < program->num_values)
+	    uses[local] = 1;
+    }
+    for (value = 0; value < (int) map->stack_depth; value++)
+	if ((!map->stack_slots || map->stack_slots[value].kind == RSS_VALUE)
+	    && map->stack_values[value] > 0
+	    && map->stack_values[value] < program->num_values)
+	    uses[map->stack_values[value]] = 1;
+}
+
+static int
+jit_owned_alias_is_live(JITProgram *program, int *roots,
+			unsigned char *owned_roots, unsigned char *live,
+			JITInstruction *instr, int source)
+{
+    int root;
+    int value;
+
+    if (source <= 0 || source >= program->num_values)
+	return 1;
+    root = jit_owned_alias_root(roots, source);
+    if (!owned_roots[root])
+	return 1;
+    for (value = 1; value < program->num_values; value++)
+	if (live[value] && jit_owned_alias_root(roots, value) == root
+	    && (!(instr->value > 0 && instr->value < program->num_values)
+		|| value != instr->value))
+	    return 1;
+    return 0;
+}
+
+void
+jit_analyze_owned_last_uses(JITProgram *program)
+{
+    JITBlock *block;
+    unsigned char **live_in, **live_out, **block_use, **block_def;
+    unsigned char *owned_roots;
+    int *roots;
+    int max_block = 0;
+    int changed;
+    int i;
+
+    if (!program || !program->blocks || program->num_values <= 1
+	|| !program->value_ownership)
+	return;
+    roots = mymalloc(sizeof(int) * program->num_values, M_PROGRAM);
+    owned_roots = mymalloc(program->num_values, M_PROGRAM);
+    for (i = 0; i < program->num_values; i++)
+	roots[i] = i;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	if (block->id > max_block)
+	    max_block = block->id;
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    instr->owned_last_use = JIT_LAST_USE_NONE;
+	    /* A copy may select different values on different incoming edges.
+	       Joining all of them deliberately over-approximates aliases. */
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values
+		    && copy->dst > 0 && copy->dst < program->num_values)
+		    jit_join_owned_aliases(roots, copy->src, copy->dst);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    memset(owned_roots, 0, program->num_values);
+    for (i = 1; i < program->num_values; i++)
+	if (program->value_ownership[i] == JIT_OWNERSHIP_OWNED
+	    || program->value_ownership[i] == JIT_OWNERSHIP_OWNED_PROPERTY)
+	    owned_roots[jit_owned_alias_root(roots, i)] = 1;
+
+    live_in = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    live_out = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_use = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    block_def = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    memset(live_in, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(live_out, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_use, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(block_def, 0, sizeof(unsigned char *) * (max_block + 1));
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	unsigned char *seen_defs;
+	unsigned char *uses;
+	unsigned char *defs;
+
+	live_in[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	live_out[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_use[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	block_def[block->id] = mymalloc(program->num_values, M_PROGRAM);
+	seen_defs = mymalloc(program->num_values, M_PROGRAM);
+	uses = mymalloc(program->num_values, M_PROGRAM);
+	defs = mymalloc(program->num_values, M_PROGRAM);
+	memset(live_in[block->id], 0, program->num_values);
+	memset(live_out[block->id], 0, program->num_values);
+	memset(block_use[block->id], 0, program->num_values);
+	memset(block_def[block->id], 0, program->num_values);
+	memset(seen_defs, 0, program->num_values);
+	for (instr = block->first; instr; instr = instr->next) {
+	    int value;
+
+	    memset(uses, 0, program->num_values);
+	    memset(defs, 0, program->num_values);
+	    jit_owned_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++) {
+		if (uses[value] && !seen_defs[value])
+		    block_use[block->id][value] = 1;
+		if (defs[value]) {
+		    seen_defs[value] = 1;
+		    block_def[block->id][value] = 1;
+		}
+	    }
+	    if (instr == block->last)
+		break;
+	}
+	myfree(defs, M_PROGRAM);
+	myfree(uses, M_PROGRAM);
+	myfree(seen_defs, M_PROGRAM);
+    }
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    int successor;
+	    int value;
+
+	    for (value = 1; value < program->num_values; value++) {
+		int out = 0;
+
+		for (successor = 0; successor < block->num_successors;
+		     successor++)
+		    if (block->successors[successor] >= 0
+			&& block->successors[successor] <= max_block
+			&& live_in[block->successors[successor]]
+			&& live_in[block->successors[successor]][value])
+			out = 1;
+		if (live_out[block->id][value] != out) {
+		    live_out[block->id][value] = out;
+		    changed = 1;
+		}
+		out = block_use[block->id][value]
+		    || (out && !block_def[block->id][value]);
+		if (live_in[block->id][value] != out) {
+		    live_in[block->id][value] = out;
+		    changed = 1;
+		}
+	    }
+	}
+    } while (changed);
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction **instructions;
+	JITInstruction *instr;
+	unsigned char *live;
+	unsigned char *uses;
+	unsigned char *defs;
+	int count = 0;
+	int index;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    count++;
+	    if (instr == block->last)
+		break;
+	}
+	instructions = mymalloc(sizeof(JITInstruction *) * count, M_PROGRAM);
+	count = 0;
+	for (instr = block->first; instr; instr = instr->next) {
+	    instructions[count++] = instr;
+	    if (instr == block->last)
+		break;
+	}
+	live = mymalloc(program->num_values, M_PROGRAM);
+	uses = mymalloc(program->num_values, M_PROGRAM);
+	defs = mymalloc(program->num_values, M_PROGRAM);
+	memcpy(live, live_out[block->id], program->num_values);
+	for (index = count - 1; index >= 0; index--) {
+	    int value;
+
+	    instr = instructions[index];
+	    /* The newly defined value may carry a replacement allocation.  It
+	       does not keep the consumed dynamic instance alive. */
+	    if (instr->src1 > 0
+		&& !jit_owned_alias_is_live(program, roots, owned_roots,
+		    live, instr, instr->src1))
+		instr->owned_last_use |= JIT_LAST_USE_SRC1;
+	    if (instr->src2 > 0
+		&& !jit_owned_alias_is_live(program, roots, owned_roots,
+		    live, instr, instr->src2))
+		instr->owned_last_use |= JIT_LAST_USE_SRC2;
+	    if (instr->src3 > 0
+		&& !jit_owned_alias_is_live(program, roots, owned_roots,
+		    live, instr, instr->src3))
+		instr->owned_last_use |= JIT_LAST_USE_SRC3;
+	    memset(uses, 0, program->num_values);
+	    memset(defs, 0, program->num_values);
+	    jit_owned_liveness(program, instr, uses, defs);
+	    for (value = 1; value < program->num_values; value++)
+		live[value] = uses[value] || (live[value] && !defs[value]);
+	}
+	myfree(defs, M_PROGRAM);
+	myfree(uses, M_PROGRAM);
+	myfree(live, M_PROGRAM);
+	myfree(instructions, M_PROGRAM);
+    }
+    for (i = 0; i <= max_block; i++) {
+	if (live_in[i]) myfree(live_in[i], M_PROGRAM);
+	if (live_out[i]) myfree(live_out[i], M_PROGRAM);
+	if (block_use[i]) myfree(block_use[i], M_PROGRAM);
+	if (block_def[i]) myfree(block_def[i], M_PROGRAM);
+    }
+    myfree(block_def, M_PROGRAM);
+    myfree(block_use, M_PROGRAM);
+    myfree(live_out, M_PROGRAM);
+    myfree(live_in, M_PROGRAM);
+    myfree(owned_roots, M_PROGRAM);
+    myfree(roots, M_PROGRAM);
+}
+
+static int
 build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 {
     MIR_type_t result_type = MIR_T_I64;
@@ -2539,6 +2857,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_str_concat = MIR_new_proto(build->context, "proto_str_concat", 1, &res_p, 3,
 					    MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_P, "err");
     build->import_str_concat = MIR_new_import(build->context, "jit_rt_str_concat");
+    build->proto_str_concat_owned = MIR_new_proto(build->context,
+	"proto_str_concat_owned", 1, &res_i32, 7, MIR_T_P, "owned_values",
+	MIR_T_I32, "owner", MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_I32,
+	"last_use", MIR_T_P, "result", MIR_T_P, "err");
+    build->import_str_concat_owned = MIR_new_import(build->context,
+	"jit_rt_str_concat_owned");
 
     build->proto_str_ref = MIR_new_proto(build->context, "proto_str_ref", 1, &res_p, 3,
 					 MIR_T_P, "s", MIR_T_I64, "idx", MIR_T_P, "err");
@@ -4304,26 +4628,92 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 			if (is_str1 && is_str2) {
 			    char name[32];
+			    int owner = program->value_owned_slots
+				? program->value_owned_slots[instr->value] : -1;
 			    sprintf(name, "str_err%d", copy_serial++);
 			    MIR_reg_t err_reg = new_reg(build, name);
 			    MIR_label_t quota_error = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_QUOTA,
 				instr->deopt_map, instr->bytecode_pc,
 				instr->source_lineno);
-			    append(build, MIR_new_call_insn(build->context, 6,
-				MIR_new_ref_op(build->context, build->proto_str_concat),
-				MIR_new_ref_op(build->context, build->import_str_concat),
-				MIR_new_reg_op(build->context, values[instr->value]),
-				MIR_new_reg_op(build->context, values[instr->src1]),
-				MIR_new_reg_op(build->context, values[instr->src2]),
-				MIR_new_reg_op(build->context, error_out)));
-			    append(build, MIR_new_insn(build->context, MIR_MOV,
-				MIR_new_reg_op(build->context, err_reg),
-				MIR_new_mem_op(build->context, MIR_T_I32, 0, error_out, 0, 1)));
-			    append(build, MIR_new_insn(build->context, MIR_BNE,
-				MIR_new_label_op(build->context, quota_error),
-				MIR_new_reg_op(build->context, err_reg),
-				MIR_new_int_op(build->context, E_NONE)));
+
+			    if (owner >= 0) {
+				MIR_label_t deopt = MIR_new_label(build->context);
+				MIR_label_t done = MIR_new_label(build->context);
+				MIR_reg_t transferred;
+				MIR_reg_t result_out;
+
+				sprintf(name, "str_owned%d", copy_serial++);
+				transferred = new_reg(build, name);
+				sprintf(name, "str_out%d", copy_serial++);
+				result_out = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_ADD,
+				    MIR_new_reg_op(build->context, result_out),
+				    MIR_new_reg_op(build->context, deopt_values),
+				    MIR_new_int_op(build->context,
+					instr->value * sizeof(Num))));
+				append(build, MIR_new_call_insn(build->context, 10,
+				    MIR_new_ref_op(build->context,
+					build->proto_str_concat_owned),
+				    MIR_new_ref_op(build->context,
+					build->import_str_concat_owned),
+				    MIR_new_reg_op(build->context, transferred),
+				    MIR_new_reg_op(build->context, owned_values),
+				    MIR_new_int_op(build->context, owner),
+				    MIR_new_reg_op(build->context,
+					values[instr->src1]),
+				    MIR_new_reg_op(build->context,
+					values[instr->src2]),
+				    MIR_new_int_op(build->context,
+					instr->owned_last_use),
+				    MIR_new_reg_op(build->context, result_out),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_BF,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, transferred)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+					error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, quota_error),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context,
+					values[instr->value]),
+				    MIR_new_mem_op(build->context, MIR_T_P,
+					instr->value * sizeof(Num), deopt_values,
+					0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, done)));
+				append(build, deopt);
+				append_deopt_exit(build, program, instr->deopt_map,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				append(build, done);
+			    } else {
+				append(build, MIR_new_call_insn(build->context, 6,
+				    MIR_new_ref_op(build->context,
+					build->proto_str_concat),
+				    MIR_new_ref_op(build->context,
+					build->import_str_concat),
+				    MIR_new_reg_op(build->context,
+					values[instr->value]),
+				    MIR_new_reg_op(build->context,
+					values[instr->src1]),
+				    MIR_new_reg_op(build->context,
+					values[instr->src2]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+					error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, quota_error),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
+			    }
 			    if (program->value_is_tagged
 				&& program->value_is_tagged[instr->value]) {
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -7751,7 +8141,7 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		    owner_homes += map->stack_owner_slots[slot] >= 0;
 	    }
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d owner-homes=%d direct-int-list=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d owner-homes=%d last-use=%u direct-int-list=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->func, func_name, instr->value,
 		     instr->src1, instr->src2,
@@ -7763,7 +8153,8 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     instr->deopt_map > 0
 		     && program->deopt_maps[instr->deopt_map].native_resume
 		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
-		     : -1, owner_homes, instr->direct_int_list_index_set);
+		     : -1, owner_homes, instr->owned_last_use,
+		     instr->direct_int_list_index_set);
 	    add_line(line, data);
 	    if (instr->deopt_map > 0
 		&& program->deopt_maps[instr->deopt_map].native_resume) {

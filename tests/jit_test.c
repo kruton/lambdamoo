@@ -3266,6 +3266,117 @@ check(int condition, const char *message)
     }
 }
 
+static JITProgram *
+owned_last_use_program(int loop, int use_old_after)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *candidate = instruction(HIR_TAC_BINARY);
+    JITInstruction *after = use_old_after
+	? instruction(HIR_TAC_UNARY) : 0;
+    JITInstruction *terminal = instruction(loop ? HIR_TAC_JUMP
+					       : HIR_TAC_RETURN);
+    JITCopy *pair = allocate(sizeof(JITCopy));
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    program->blocks = program->last_block = block;
+    program->value_ownership = allocate(program->num_values);
+    program->value_ownership[1] = JIT_OWNERSHIP_OWNED;
+    block->id = 1;
+    block->num_successors = loop ? 1 : 0;
+    block->successors[0] = 1;
+    pair->dst = 3;
+    pair->src = 1;
+    copy->copies = pair;
+    copy->next = candidate;
+    candidate->value = loop ? 1 : 2;
+    candidate->src1 = 3;
+    candidate->op = HIR_OP_ADD;
+    if (after) {
+	candidate->next = after;
+	after->value = 2;
+	after->src1 = 3;
+	after->op = HIR_OP_NOT;
+	after->next = terminal;
+    } else
+	candidate->next = terminal;
+    if (loop) {
+	JITInstruction *backedge = instruction(HIR_TAC_PARALLEL_COPY);
+	JITCopy *backedge_pair = allocate(sizeof(JITCopy));
+
+	backedge_pair->dst = 3;
+	backedge_pair->src = 1;
+	backedge->copies = backedge_pair;
+	if (after)
+	    after->next = backedge;
+	else
+	    candidate->next = backedge;
+	backedge->next = terminal;
+    } else {
+	terminal->src1 = use_old_after ? 3 : 2;
+	terminal->literal_type = TYPE_INT;
+    }
+    block->first = copy;
+    block->last = terminal;
+    return program;
+}
+
+static JITInstruction *
+owned_last_use_candidate(JITProgram *program)
+{
+    return program->blocks->first->next;
+}
+
+static JITProgram *
+owned_last_use_branch_program(int old_value_on_successor)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *entry = allocate(sizeof(JITBlock));
+    JITBlock *left = allocate(sizeof(JITBlock));
+    JITBlock *right = allocate(sizeof(JITBlock));
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *candidate = instruction(HIR_TAC_BINARY);
+    JITInstruction *branch = instruction(HIR_TAC_BRANCH_FALSE);
+    JITInstruction *left_return = instruction(HIR_TAC_RETURN);
+    JITInstruction *right_return = instruction(HIR_TAC_RETURN);
+    JITCopy *pair = allocate(sizeof(JITCopy));
+
+    program->num_values = 5;
+    program->num_blocks = 3;
+    program->blocks = entry;
+    program->last_block = right;
+    program->value_ownership = allocate(program->num_values);
+    program->value_ownership[1] = JIT_OWNERSHIP_OWNED;
+    entry->id = 1;
+    entry->num_successors = 2;
+    entry->successors[0] = 2;
+    entry->successors[1] = 3;
+    entry->next = left;
+    left->id = 2;
+    left->next = right;
+    right->id = 3;
+    pair->dst = 3;
+    pair->src = 1;
+    copy->copies = pair;
+    copy->next = candidate;
+    candidate->value = 2;
+    candidate->src1 = 3;
+    candidate->op = HIR_OP_ADD;
+    candidate->next = branch;
+    branch->src1 = 4;
+    entry->first = copy;
+    entry->last = branch;
+    left_return->src1 = old_value_on_successor ? 3 : 2;
+    left_return->literal_type = TYPE_INT;
+    left->first = left->last = left_return;
+    right_return->src1 = 2;
+    right_return->literal_type = TYPE_INT;
+    right->first = right->last = right_return;
+    return program;
+}
+
 int
 main(void)
 {
@@ -3311,6 +3422,46 @@ main(void)
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
+
+    {
+	JITProgram *dead = owned_last_use_program(0, 0);
+	JITProgram *live = owned_last_use_program(0, 1);
+	JITProgram *loop_dead = owned_last_use_program(1, 0);
+	JITProgram *loop_live = owned_last_use_program(1, 1);
+	JITProgram *branch_dead = owned_last_use_branch_program(0);
+	JITProgram *branch_live = owned_last_use_branch_program(1);
+
+	jit_analyze_owned_last_uses(dead);
+	jit_analyze_owned_last_uses(live);
+	jit_analyze_owned_last_uses(loop_dead);
+	jit_analyze_owned_last_uses(loop_live);
+	jit_analyze_owned_last_uses(branch_dead);
+	jit_analyze_owned_last_uses(branch_live);
+	check(owned_last_use_candidate(dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed a dead alias");
+	check(!(owned_last_use_candidate(live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis discarded a live alias");
+	check(owned_last_use_candidate(loop_dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed a loop-carried replacement");
+	check(!(owned_last_use_candidate(loop_live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis ignored a live loop alias");
+	check(owned_last_use_candidate(branch_dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed dead CFG successors");
+	check(!(owned_last_use_candidate(branch_live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis ignored a live CFG successor");
+	jit_program_free(branch_live);
+	jit_program_free(branch_dead);
+	jit_program_free(loop_live);
+	jit_program_free(loop_dead);
+	jit_program_free(live);
+	jit_program_free(dead);
+    }
 
     {
 	JITNativeFrame compact;
@@ -6013,6 +6164,31 @@ main(void)
 	      "jit_rt_str_concat success");
 	if (concat_res)
 	    free_str(concat_res);
+	{
+	    Var homes[1];
+	    const char *owned;
+	    int64_t owned_raw = 0;
+
+	    homes[0].type = TYPE_NONE;
+	    check(jit_rt_str_concat_owned(homes, 0, "a", "b",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && homes[0].type == TYPE_STR
+		  && homes[0].v.str == (const char *) (intptr_t) owned_raw
+		  && !strcmp(homes[0].v.str, "ab"),
+		  "owned string concat publishes an empty home");
+	    owned = homes[0].v.str;
+	    check(jit_rt_str_concat_owned(homes, 0, owned, "c",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && !strcmp(homes[0].v.str, "abc")
+		  && var_refcount(homes[0]) == 1,
+		  "owned string concat transfers a last-use operand");
+	    owned = homes[0].v.str;
+	    check(!jit_rt_str_concat_owned(homes, 0, "x", "y",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && homes[0].v.str == owned,
+		  "owned string concat rejects an owner mismatch");
+	    free_var(homes[0]);
+	}
 
 	const char *char_res = jit_rt_str_ref("LambdaMOO", 7, &rt_err);
 	check(rt_err == E_NONE && char_res && strcmp(char_res, "M") == 0,
