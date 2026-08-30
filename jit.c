@@ -254,6 +254,24 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type, int consume)
     return res.v.list;
 }
 
+Var *
+jit_rt_list_append_owned(Var *owned_values, int owner, Var *list,
+			 int64_t elem_raw, int elem_type)
+{
+    Var elem, res;
+
+    assert(owned_values && owner >= 0);
+    assert(owned_values[owner].type == TYPE_LIST);
+    assert(owned_values[owner].v.list == list);
+    elem = var_ref(raw_to_var(elem_raw, elem_type));
+    res = owned_values[owner];
+    owned_values[owner].type = TYPE_NONE;
+    owned_values[owner].v.num = 0;
+    res = listappend(res, elem);
+    owned_values[owner] = res;
+    return res.v.list;
+}
+
 void
 jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
 {
@@ -1540,6 +1558,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_list_concat", (void *) jit_rt_list_concat);
     MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
+    MIR_load_external(context, "jit_rt_list_append_owned",
+		      (void *) jit_rt_list_append_owned);
     MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
     MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
@@ -1721,6 +1741,8 @@ typedef struct {
     MIR_item_t import_singleton_list;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
+    MIR_item_t proto_list_append_owned;
+    MIR_item_t import_list_append_owned;
     MIR_item_t proto_owned_replace;
     MIR_item_t import_owned_replace;
     MIR_item_t proto_list_index_set;
@@ -2242,8 +2264,14 @@ jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 	&& program->deopt_maps[call->deopt_map].native_resume->valid;
 }
 
-static int
-jit_list_tail_consumes_source(JITProgram *program, JITInstruction *tail)
+typedef enum {
+    JIT_LIST_APPEND_BORROWED,
+    JIT_LIST_APPEND_CONSUME_VALUE,
+    JIT_LIST_APPEND_CONSUME_HOME
+} JITListAppendMode;
+
+static JITListAppendMode
+jit_list_tail_consume_mode(JITProgram *program, JITInstruction *tail)
 {
     JITBlock *block;
     unsigned uses = 0;
@@ -2251,12 +2279,12 @@ jit_list_tail_consumes_source(JITProgram *program, JITInstruction *tail)
 
     if (!program->value_ownership || !program->value_owned_slots
 	|| tail->op != HIR_OP_LIST_ADD_TAIL)
-	return 0;
+	return JIT_LIST_APPEND_BORROWED;
     value = tail->src1;
     if (value <= 0 || value >= program->num_values
-	|| program->value_ownership[value] != JIT_OWNERSHIP_OWNED
-	|| program->value_owned_slots[value] >= 0)
-	return 0;
+	|| tail->value <= 0 || tail->value >= program->num_values
+	|| program->value_ownership[value] != JIT_OWNERSHIP_OWNED)
+	return JIT_LIST_APPEND_BORROWED;
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
@@ -2269,12 +2297,18 @@ jit_list_tail_consumes_source(JITProgram *program, JITInstruction *tail)
 	    for (copy = instr->copies; copy; copy = copy->next)
 		uses += copy->src == value;
 	    if (uses > 1)
-		return 0;
+		return JIT_LIST_APPEND_BORROWED;
 	    if (instr == block->last)
 		break;
 	}
     }
-    return uses == 1;
+    if (uses != 1)
+	return JIT_LIST_APPEND_BORROWED;
+    if (program->value_owned_slots[value] < 0)
+	return JIT_LIST_APPEND_CONSUME_VALUE;
+    return program->value_owned_slots[tail->value]
+	== program->value_owned_slots[value]
+	? JIT_LIST_APPEND_CONSUME_HOME : JIT_LIST_APPEND_BORROWED;
 }
 
 static int
@@ -2352,6 +2386,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw",
 					     MIR_T_I32, "elem_type", MIR_T_I32, "consume");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
+    build->proto_list_append_owned = MIR_new_proto(build->context,
+	"proto_list_append_owned", 1, &res_p, 5, MIR_T_P, "owned_values",
+	MIR_T_I32, "owner", MIR_T_P, "l", MIR_T_I64, "elem_raw",
+	MIR_T_I32, "elem_type");
+    build->import_list_append_owned = MIR_new_import(build->context,
+	"jit_rt_list_append_owned");
 
     build->proto_owned_replace = MIR_new_proto(build->context,
 	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
@@ -3436,6 +3476,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    if (instr->op == HIR_OP_LIST_ADD_TAIL) {
 			char name[32];
 			MIR_reg_t raw_value;
+			JITListAppendMode consume_mode =
+			    jit_list_tail_consume_mode(program, instr);
 			int tagged_list = program->value_is_tagged
 			    && program->value_is_tagged[instr->src1];
 			MIR_label_t deopt = 0;
@@ -3478,15 +3520,36 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			}
 			raw_value = append_raw_value(build, program, values,
 				instr->src2, deopt_values, &copy_serial);
-			append(build, MIR_new_call_insn(build->context, 7,
-			    MIR_new_ref_op(build->context, build->proto_list_append),
-			    MIR_new_ref_op(build->context, build->import_list_append),
-			    MIR_new_reg_op(build->context, values[instr->value]),
-			    MIR_new_reg_op(build->context, values[instr->src1]),
-			    MIR_new_reg_op(build->context, raw_value),
-			    MIR_new_reg_op(build->context, type_reg),
-			    MIR_new_int_op(build->context,
-				jit_list_tail_consumes_source(program, instr))));
+			if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME)
+			    append(build, MIR_new_call_insn(build->context, 8,
+				MIR_new_ref_op(build->context,
+				    build->proto_list_append_owned),
+				MIR_new_ref_op(build->context,
+				    build->import_list_append_owned),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context, owned_values),
+				MIR_new_int_op(build->context,
+				    program->value_owned_slots[instr->src1]),
+				MIR_new_reg_op(build->context,
+				    values[instr->src1]),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg)));
+			else
+			    append(build, MIR_new_call_insn(build->context, 7,
+				MIR_new_ref_op(build->context,
+				    build->proto_list_append),
+				MIR_new_ref_op(build->context,
+				    build->import_list_append),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context,
+				    values[instr->src1]),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg),
+				MIR_new_int_op(build->context,
+				    consume_mode
+				    == JIT_LIST_APPEND_CONSUME_VALUE)));
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->value]) {
 			    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -5688,7 +5751,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		if (instr->value > 0 && instr->value < program->num_values
 		    && program->value_owned_slots
 		    && instr->kind == HIR_TAC_BINARY
-		    && instr->op == HIR_OP_LIST_ADD_TAIL) {
+		    && instr->op == HIR_OP_LIST_ADD_TAIL
+		    && jit_list_tail_consume_mode(program, instr)
+		       != JIT_LIST_APPEND_CONSUME_HOME) {
 		    MIR_reg_t raw = append_raw_value(build, program, values,
 			instr->value, deopt_values, &copy_serial);
 		    MIR_op_t type;

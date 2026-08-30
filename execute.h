@@ -130,7 +130,7 @@ extern int execute_jit_commit_prepared_verb_call(
 	struct JITCallerResume *, PreparedVerbCall *, int);
 extern int execute_jit_dispatch_native_verb_call(
 	struct JITExecutionContext *, struct JITNativeFrame *, Objid,
-	const char * WAIF_COMMA_ARG(Var), Var, enum error *, int, unsigned,
+	const char * WAIF_COMMA_ARG(Var), Var *, enum error *, int, unsigned,
 	unsigned, struct JITContinuationFrame *, struct JITNativeCall **);
 extern struct JITNativeFrame *execute_jit_native_call_frame(
 	struct JITNativeCall *);

@@ -6066,6 +6066,23 @@ main(void)
 		  "consumed list append preserves exclusive ownership");
 	    free_var(consumed_result);
 	}
+	{
+	    Var homes[1];
+	    Var *owned_result;
+
+	    homes[0] = new_list(1);
+	    homes[0].v.list[1].type = TYPE_INT;
+	    homes[0].v.list[1].v.num = 666;
+	    owned_result = jit_rt_list_append_owned(homes, 0,
+		homes[0].v.list, 777, TYPE_INT);
+	    check(owned_result == homes[0].v.list
+		  && homes[0].v.list[0].v.num == 2
+		  && homes[0].v.list[2].v.num == 777,
+		  "owner-backed list append updates its home");
+	    check(var_refcount(homes[0]) == 1,
+		  "owner-backed list append remains exclusive");
+	    free_var(homes[0]);
+	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */
 	{

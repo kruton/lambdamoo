@@ -1102,7 +1102,7 @@ int
 execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 				      JITNativeFrame *caller, Objid this,
 				      const char *vname
-				      WAIF_COMMA_ARG(Var THIS), Var args,
+				      WAIF_COMMA_ARG(Var THIS), Var *args,
 				      enum error *error_out, int map_id,
 				      unsigned bytecode_pc,
 				      unsigned error_pc,
@@ -1119,7 +1119,8 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 
     if (error_out)
 	*error_out = E_NONE;
-    if (!context || !caller || !call_out || !error_out
+    if (!context || !caller || !args || args->type != TYPE_LIST
+	|| !call_out || !error_out
 	|| context->current_frame != caller || !caller->env || !continuation
 	|| continuation != caller->runtime_borrower
 	|| !jit_native_frame_continuation_matches(caller, map_id))
@@ -1143,13 +1144,17 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 #ifdef WAIF_CORE
 	caller->receiver,
 #endif
-	caller->this, caller->player, caller->progr, &resolved, var_ref(args));
+	caller->this, caller->player, caller->progr, &resolved, *args);
     if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
 	&native_call->resume, &prepared, -1)) {
+	prepared.env[SLOT_ARGS].type = TYPE_NONE;
+	prepared.env[SLOT_ARGS].v.num = 0;
 	discard_prepared_verb_call(&prepared);
 	myfree(native_call, M_VM);
 	return 0;
     }
+    args->type = TYPE_NONE;
+    args->v.num = 0;
     native_call->accounted_bytes = sizeof(*native_call)
 	+ sizeof(Var) * native_call->frame.bytecode_program->num_var_names;
     jit_profile_native_frame_acquired(&native_call->frame,
@@ -1238,7 +1243,7 @@ dispatch_jit_native_boundary(JITExecutionContext *context,
 #endif
     }
     return execute_jit_dispatch_native_verb_call(context, caller, class,
-	verb->v.str WAIF_COMMA_ARG(*obj), *args, &error, deopt->map_id,
+	verb->v.str WAIF_COMMA_ARG(*obj), args, &error, deopt->map_id,
 	deopt->bytecode_pc, deopt->error_pc, continuation, call_out);
 }
 
