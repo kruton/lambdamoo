@@ -6,6 +6,7 @@
 #include "my-stdio.h"
 #include "my-string.h"
 #include "my-time.h"
+#include "my-unistd.h"
 
 #include "compiler.h"
 #include "db.h"
@@ -1462,6 +1463,70 @@ typedef struct JITPool {
 
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 static uint64_t next_module_serial = 0;
+static FILE *jit_perf_map_file = 0;
+static char jit_perf_map_filename[64];
+
+static void
+jit_perf_map_write_program(JITProgram *program)
+{
+    char name[160];
+
+    if (!jit_perf_map_file || !program || !program->machine_code
+	|| !program->machine_code_len)
+	return;
+    if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
+	snprintf(name, sizeof(name), "moo_jit_#%" PRIdN "_%u",
+		 program->diagnostic_object, program->diagnostic_verb);
+    else
+	snprintf(name, sizeof(name), "moo_jit_unknown_%lx",
+		 (unsigned long) (uintptr_t) program->machine_code);
+    fprintf(jit_perf_map_file, "%lx %lx %s\n",
+	    (unsigned long) (uintptr_t) program->machine_code,
+	    (unsigned long) program->machine_code_len, name);
+    fflush(jit_perf_map_file);
+}
+
+int
+jit_perf_map_start(void)
+{
+    JITProgram *program;
+
+    if (jit_perf_map_file)
+	return 1;
+    snprintf(jit_perf_map_filename, sizeof(jit_perf_map_filename),
+	     "/tmp/perf-%ld.map", (long) getpid());
+    jit_perf_map_file = fopen(jit_perf_map_filename, "w");
+    if (!jit_perf_map_file) {
+	jit_perf_map_filename[0] = '\0';
+	return 0;
+    }
+    for (program = jit_shared_pool.active_head; program;
+	 program = program->pool_next)
+	jit_perf_map_write_program(program);
+    return 1;
+}
+
+void
+jit_perf_map_stop(void)
+{
+    if (!jit_perf_map_file)
+	return;
+    fclose(jit_perf_map_file);
+    jit_perf_map_file = 0;
+}
+
+int
+jit_perf_map_active(void)
+{
+    return jit_perf_map_file != 0;
+}
+
+const char *
+jit_perf_map_path(void)
+{
+    return jit_perf_map_filename;
+}
+
 static void
 jit_load_externals(MIR_context_t context)
 {
@@ -1525,6 +1590,7 @@ jit_pool_register(JITProgram *program)
     jit_shared_pool.active_tail = program;
     jit_shared_pool.compiled_count++;
     jit_shared_pool.total_machine_code_bytes += program->machine_code_len;
+    jit_perf_map_write_program(program);
 }
 
 static void
@@ -1596,6 +1662,7 @@ void
 jit_shutdown(void)
 {
     jit_pool_reset();
+    jit_perf_map_stop();
 }
 
 void

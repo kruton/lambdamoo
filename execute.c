@@ -963,6 +963,7 @@ prepare_verb_call_for_caller(PreparedVerbCall *prepared, Var *caller_env,
 #endif
     prepared->progr = db_verb_owner(call->handle);
     prepared->vloc = db_verb_definer(call->handle);
+    prepared->verb_index = db_verb_index(call->handle);
     prepared->verb = str_ref(call->verb);
     prepared->verbname = str_ref(db_verb_names(call->handle));
     prepared->debug = (db_verb_flags(call->handle) & VF_DEBUG);
@@ -1080,7 +1081,11 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
     if (!context || !frame || !resume || !prepared || !prepared->program
 	|| !prepared->env || !prepared->verb || !prepared->verbname
 	|| !(program = prepared->program->jit)
-	|| !jit_program_is_eligible(program) || !jit_program_compile(program))
+	|| !jit_program_is_eligible(program))
+	return 0;
+    jit_program_note_location(program, prepared->vloc,
+	prepared->verb_index);
+    if (!jit_program_compile(program))
 	return 0;
     if (!jit_execution_context_push_compact(context, frame, program,
 	prepared->env, resume, entry_map))

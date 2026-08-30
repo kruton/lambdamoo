@@ -85,6 +85,7 @@ typedef struct PreparedVerbCall {
     Objid player;
     Objid progr;
     Objid vloc;
+    unsigned verb_index;
     const char *verb;
     const char *verbname;
     int debug;

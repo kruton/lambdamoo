@@ -734,6 +734,31 @@ bf_jit_compile(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
     metadata = jit_metadata(db_verb_program(h)->jit);
     return make_var_pack(metadata);
 }
+
+static package
+bf_jit_perf_map(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
+{
+    int nargs = arglist.v.list[0].v.num;
+    int enabled = nargs == 0 || is_true(arglist.v.list[1]);
+    Var result;
+
+    free_var(arglist);
+    if (!is_wizard(progr))
+	return make_error_pack(E_PERM);
+    if (nargs > 0) {
+	if (enabled) {
+	    if (!jit_perf_map_start())
+		return make_error_pack(E_QUOTA);
+	} else
+	    jit_perf_map_stop();
+    }
+    result = new_list(2);
+    result.v.list[1].type = TYPE_INT;
+    result.v.list[1].v.num = jit_perf_map_active();
+    result.v.list[2].type = TYPE_STR;
+    result.v.list[2].v.str = str_dup(jit_perf_map_path());
+    return make_var_pack(result);
+}
 #endif
 
 void
@@ -745,6 +770,7 @@ register_verbs(void)
 		      TYPE_OBJ, TYPE_ANY, TYPE_ANY);
     register_function("jit_compile", 2, 2, bf_jit_compile,
 		      TYPE_OBJ, TYPE_ANY);
+    register_function("jit_perf_map", 0, 1, bf_jit_perf_map, TYPE_ANY);
 #else
     register_function("verb_info", 2, 2, bf_verb_info, TYPE_OBJ, TYPE_ANY);
 #endif

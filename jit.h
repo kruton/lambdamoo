@@ -236,6 +236,10 @@ extern void jit_profile_report(void);
 extern void jit_profile_reset(void);
 extern void jit_pool_stats(JITPoolStats *);
 extern void jit_pool_reset(void);
+extern int jit_perf_map_start(void);
+extern void jit_perf_map_stop(void);
+extern int jit_perf_map_active(void);
+extern const char *jit_perf_map_path(void);
 extern void jit_shutdown(void);
 
 extern void jit_execution_context_init(JITExecutionContext *, JITNativeFrame *,
