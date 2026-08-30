@@ -478,16 +478,17 @@ the concrete structure must follow the project's C layout and dependency
 rules.  Its responsibilities and ownership are normative.
 
 The concrete foundation now uses `JITExecutionContext`, `JITNativeFrame`, and
-`JITCallerResume` in `jit.h`.  The context records the ABI version, root and
-current frames, anchored activation index, canonical and compact depths,
-ordinary activation limit, and task tick, timeout, and pending-error pointers.
-A frame records its context and JIT program, caller/callee and incoming/outgoing
-resume links, runtime environment, native runtime allocation, authoritative
-home array and per-home state array, exact entry/current maps, canonical anchor
-when applicable, kind, and lifecycle state.  Root and canonical-overlay frames
-borrow their activation environment; compact frames will additionally carry
-the owned bytecode program and invocation metadata before production dispatch
-is enabled.
+`JITCallerResume` in `jit.h`.  The context records the root and current frames,
+anchored activation index, canonical and compact depths, ordinary activation
+limit, and task tick, timeout, and pending-error pointers.  A frame records its
+context, JIT and bytecode programs, caller/callee and incoming/outgoing resume
+links, runtime environment, receiver, player, permissions, verb identity,
+native runtime allocation, authoritative home array and per-home state array,
+exact entry/current maps, canonical anchor when applicable, kind, and lifecycle
+state.  Root and canonical-overlay frames borrow this invocation state from
+their canonical activation.  Compact frames own referenced program,
+environment, receiver, and verb metadata until return or promotion releases
+it.
 
 Home state is explicit: `JIT_HOME_EMPTY` has never received a value,
 `JIT_HOME_OWNED` contains the sole authoritative complete `Var`, and
@@ -654,22 +655,32 @@ activation whose program, environment, runtime stack, receiver, permissions,
 player, verb metadata, and built-in continuation fields have already been
 initialized by the interpreter side.  It validates the exact map and bounded
 native runtime layout, acquires references for every reconstructed value, and
-materializes locals, stack, `temp`, `pc`, `error_pc`, and the resume key into
-that private activation.  It does not consume the native frame's runtime
-allocation or owner homes.  A preparation failure may leave the private
+materializes locals, stack, `pc`, `error_pc`, and the resume key into that
+private activation.  The current frame format requires `temp` to be empty.  It
+does not consume the native frame's runtime allocation or owner homes.  A
+preparation failure may leave the private
 activation partially populated, so the caller destroys that private activation
 and leaves the complete native chain authoritative.  The root overlay is
 likewise prepared in private storage; it is not written into the anchored
 activation before commit.
 
-The interpreter prepares every activation in the suffix this way before
-calling `jit_native_chain_commit_promotion()`.  The commit callback only
-publishes the already prepared activation at its reserved canonical index; it
-does not run continuation reconstruction or allocate.  After all publications
-succeed, compact invocation metadata and runtime homes are released from the
-now-promoted frames.  The current primitive deliberately stops short of that
-interpreter allocator/publisher and of general JIT-to-JIT dispatch; those are
-the next integration steps.
+The interpreter-side `JITActivationPromotion` now implements that allocator and
+publisher.  It verifies that the native root is the current canonical top,
+checks that the complete suffix fits within the task's fixed activation limit,
+and rejects built-in continuation or `temp` state not represented by the frame
+format.  It prepares a private shadow activation for the root and a private
+activation for each younger compact frame.  Compact preparation requires
+frame-owned invocation metadata.  A failure destroys only these private
+activations and the snapshot; the canonical stack and native chain remain
+unchanged.
+
+`execute_jit_commit_promotion()` revalidates the native snapshot, frees and
+replaces the anchored root, appends younger activations in root-to-leaf order,
+and advances the canonical top.  Its callback performs no allocation or value
+reconstruction.  Only after every activation has been published does it release
+the native runtime allocation and compact invocation references.  General
+JIT-to-JIT dispatch remains disabled until the shared verb resolver can create
+the owned compact invocation descriptor directly.
 
 Using the platform machine stack for these homes is intentionally excluded from
 the portable ABI.  C and MIR stack-frame layouts are target-specific, unwind
@@ -781,10 +792,17 @@ consults a process-global pending-frame list.
 The context must provide or reach all mutable execution state whose identity is
 shared across verbs, including tick accounting, timeout and kill state, native
 depth, the activation limit, and the owning VM.  Runtime operations should be
-accessed through an explicit, versioned service table or ABI helpers rather
+accessed through an explicit service table or ABI helpers rather
 than embedding arbitrary C addresses and structure offsets throughout generated
-code.  Changes to the context layout, service table, value representation, or
-calling convention invalidate compiled programs.
+code.
+
+This calling convention has no numeric compatibility version.  Native code is
+generated within the current process, belongs to the live JIT pool, and is
+discarded rather than serialized with suspended tasks or database files.  Pool
+reset and process exit are its compatibility boundaries.  Direct frame/context
+verification catches runtime mismatches; a persistent version would become
+necessary only if native code were cached across processes or supplied by a
+separately compiled module.
 
 The portable ABI treats `context` and `frame` as hidden function arguments.
 Correctness must not depend on a particular physical register.  A backend may

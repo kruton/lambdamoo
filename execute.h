@@ -32,6 +32,7 @@
 struct JITContinuationFrame;
 struct JITExecutionContext;
 struct JITNativeFrame;
+struct JITActivationPromotion;
 
 typedef struct activation {
     Program *prog;
@@ -106,6 +107,10 @@ extern int execute_jit_direct_verb_call(struct JITExecutionContext *,
 					int64_t, int, int64_t, int,
 					int *, int *, enum error *,
 					int64_t *, int *);
+extern struct JITActivationPromotion *execute_jit_prepare_promotion(
+	struct JITExecutionContext *);
+extern int execute_jit_commit_promotion(struct JITActivationPromotion *);
+extern void execute_jit_discard_promotion(struct JITActivationPromotion *);
 #endif
 
 extern int setup_activ_for_eval(Program * prog);

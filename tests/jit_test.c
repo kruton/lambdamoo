@@ -3313,6 +3313,52 @@ main(void)
     JITSourceLocation source_location;
 
     {
+	JITNativeFrame compact;
+	Program bytecode;
+	activation invocation;
+	Var invocation_env[1];
+
+	memset(&compact, 0, sizeof(compact));
+	memset(&bytecode, 0, sizeof(bytecode));
+	memset(&invocation, 0, sizeof(invocation));
+	compact.kind = JIT_FRAME_COMPACT;
+	bytecode.ref_count = 1;
+	bytecode.num_var_names = 1;
+	invocation_env[0].type = TYPE_STR;
+	invocation_env[0].v.str = str_dup("invocation environment");
+	invocation.prog = &bytecode;
+	invocation.rt_env = invocation_env;
+#ifdef WAIF_CORE
+	invocation.THIS.type = TYPE_OBJ;
+	invocation.THIS.v.obj = 17;
+#endif
+	invocation.this = 17;
+	invocation.player = 18;
+	invocation.progr = 19;
+	invocation.vloc = 20;
+	invocation.verb = str_dup("called");
+	invocation.verbname = str_dup("called alias");
+	invocation.debug = 1;
+	check(jit_native_frame_copy_invocation(&compact, &invocation),
+	      "compact frame invocation copy failed");
+	check(compact.owns_invocation && compact.bytecode_program == &bytecode
+	      && compact.env != invocation_env
+	      && compact.env[0].type == TYPE_STR
+	      && !strcmp(compact.env[0].v.str, "invocation environment")
+	      && compact.this == 17 && compact.player == 18
+	      && compact.progr == 19 && compact.vloc == 20
+	      && compact.debug == 1 && bytecode.ref_count == 2,
+	      "compact frame invocation metadata is incomplete");
+	jit_native_frame_release_invocation(&compact);
+	check(!compact.owns_invocation && !compact.bytecode_program
+	      && !compact.env && bytecode.ref_count == 1,
+	      "compact frame invocation release was incomplete");
+	free_var(invocation_env[0]);
+	free_str(invocation.verb);
+	free_str(invocation.verbname);
+    }
+
+    {
 	JITExecutionContext context;
 	JITNativeFrame root;
 	JITNativeFrame child;
@@ -3546,6 +3592,12 @@ main(void)
 	leaf.current_map = 1;
 	promotion = jit_native_chain_prepare_promotion(&context);
 	check(promotion != 0, "native chain promotion preparation failed");
+	check(jit_native_chain_promotion_count(promotion) == 3
+	      && jit_native_chain_promotion_frame(promotion, 0) == &root
+	      && jit_native_chain_promotion_frame(promotion, 1) == &middle
+	      && jit_native_chain_promotion_frame(promotion, 2) == &leaf
+	      && !jit_native_chain_promotion_frame(promotion, 3),
+	      "native chain promotion snapshot access is wrong");
 	check(jit_native_chain_commit_promotion(promotion, record_promotion,
 	    &dump), "native chain promotion commit failed");
 	check(dump.count == 3 && dump.frames[0] == &root
@@ -3582,6 +3634,10 @@ main(void)
 	Var owner_home[1];
 	unsigned char home_state[1];
 	Num stale_values[6] = { 0, 0, 0, 0, 0, 0 };
+	void *owned_storage;
+	Var *owned_home;
+	unsigned char *owned_state;
+	size_t owned_bytes;
 
 	memset(&owner, 0, sizeof(owner));
 	memset(&native_frame, 0, sizeof(native_frame));
@@ -3607,11 +3663,16 @@ main(void)
 	jit_native_frame_bind_runtime(&native_frame, stale_values,
 	    sizeof(stale_values), owner_home, 1, home_state);
 	owner.base_rt_stack = owner.top_rt_stack = owner_stack;
+	owner.rt_stack_size = 2;
 	native_frame.runtime_bytes--;
 	check(!jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0)
 	      && owner.top_rt_stack == owner.base_rt_stack,
 	      "native frame accepted undersized runtime storage");
 	native_frame.runtime_bytes++;
+	owner.rt_stack_size = 0;
+	check(!jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0),
+	      "native frame accepted an undersized activation stack");
+	owner.rt_stack_size = 2;
 	check(jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0),
 	      "owner-backed native frame did not prepare an activation");
 	check(owner.top_rt_stack == owner.base_rt_stack + 1
@@ -3624,6 +3685,22 @@ main(void)
 	free_var(*--owner.top_rt_stack);
 	jit_native_frame_unbind_runtime(&native_frame);
 	free_var(owner_home[0]);
+	owned_bytes = sizeof(stale_values) + sizeof(Var) + 1;
+	owned_storage = mymalloc(owned_bytes, M_PROGRAM);
+	memset(owned_storage, 0, owned_bytes);
+	owned_home = (Var *) ((char *) owned_storage + sizeof(stale_values));
+	owned_state = (unsigned char *) (owned_home + 1);
+	owned_home[0].type = TYPE_STR;
+	owned_home[0].v.str = str_dup("released native runtime");
+	owned_state[0] = JIT_HOME_OWNED;
+	owner_program->active_runtime_bytes = owned_bytes;
+	jit_native_frame_bind_runtime(&native_frame, owned_storage, owned_bytes,
+	    owned_home, 1, owned_state);
+	jit_native_frame_mark_runtime_owned(&native_frame);
+	jit_native_frame_release_runtime(&native_frame);
+	check(!native_frame.runtime_storage && !native_frame.owns_runtime
+	      && owner_program->active_runtime_bytes == 0,
+	      "owned native runtime release was incomplete");
 	jit_program_free(owner_program);
     }
 

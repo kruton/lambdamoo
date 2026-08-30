@@ -674,6 +674,173 @@ free_activation(activation * ap, char data_too)
 	free_data(ap->bi_func_data);
     /* else bi_func_state will be later freed by bi_function */
 }
+
+#ifdef ENABLE_JIT
+struct JITActivationPromotion {
+    JITPromotionPlan *native_plan;
+    JITNativeFrame **frames;
+    activation *prepared;
+    unsigned num_frames;
+    unsigned num_prepared;
+    unsigned root_index;
+    unsigned publish_index;
+};
+
+static int
+prepare_jit_activation_shell(JITNativeFrame *frame, activation *a)
+{
+    if (!frame || !a || !frame->bytecode_program || !frame->env
+	|| !frame->verb || !frame->verbname)
+	return 0;
+    memset(a, 0, sizeof(*a));
+    a->prog = program_ref(frame->bytecode_program);
+    a->rt_env = copy_rt_env(frame->env, a->prog->num_var_names);
+    alloc_rt_stack(a, a->prog->main_vector.max_stack);
+#ifdef WAIF_CORE
+    a->THIS = var_ref(frame->receiver);
+#endif
+    a->this = frame->this;
+    a->player = frame->player;
+    a->progr = frame->progr;
+    a->vloc = frame->vloc;
+    a->verb = str_ref(frame->verb);
+    a->verbname = str_ref(frame->verbname);
+    a->debug = frame->debug;
+    a->resume_key = invalid_resume_key();
+    a->temp.type = TYPE_NONE;
+    return 1;
+}
+
+struct JITActivationPromotion *
+execute_jit_prepare_promotion(JITExecutionContext *context)
+{
+    struct JITActivationPromotion *promotion;
+    JITPromotionPlan *native_plan;
+    unsigned count;
+    unsigned i;
+
+    if (!context || context->root_activation_index != top_activ_stack
+	|| context->canonical_depth != top_activ_stack + 1)
+	return 0;
+    native_plan = jit_native_chain_prepare_promotion(context);
+    if (!native_plan)
+	return 0;
+    count = jit_native_chain_promotion_count(native_plan);
+    if (!count || count > max_stack_size - context->root_activation_index
+	|| RUN_ACTIV.temp.type != TYPE_NONE) {
+	jit_native_chain_discard_promotion(native_plan);
+	return 0;
+    }
+    promotion = mymalloc(sizeof(*promotion), M_VM);
+    memset(promotion, 0, sizeof(*promotion));
+    promotion->frames = mymalloc(sizeof(JITNativeFrame *) * count, M_VM);
+    promotion->prepared = mymalloc(sizeof(activation) * count, M_VM);
+    memset(promotion->prepared, 0, sizeof(activation) * count);
+    promotion->native_plan = native_plan;
+    promotion->num_frames = count;
+    promotion->root_index = context->root_activation_index;
+    for (i = 0; i < count; i++) {
+	JITNativeFrame *frame =
+	    jit_native_chain_promotion_frame(native_plan, i);
+	JITCallerResume *resume;
+	int map_id;
+
+	if (!frame || (i == 0 && frame->kind != JIT_FRAME_ROOT_OVERLAY)
+	    || (i > 0 && (frame->kind != JIT_FRAME_COMPACT
+			  || !frame->owns_invocation)))
+	    goto fail;
+	promotion->frames[i] = frame;
+	resume = frame->outgoing;
+	map_id = resume ? resume->map_id : frame->current_map;
+	if (!prepare_jit_activation_shell(frame, &promotion->prepared[i]))
+	    goto fail;
+	if (i == 0) {
+	    promotion->prepared[i].bi_func_pc = RUN_ACTIV.bi_func_pc;
+	    promotion->prepared[i].bi_func_id = RUN_ACTIV.bi_func_id;
+	    promotion->prepared[i].bi_func_data = RUN_ACTIV.bi_func_data;
+	}
+	promotion->num_prepared++;
+	if (!jit_native_frame_prepare_activation(frame,
+	    &promotion->prepared[i], map_id, resume != 0))
+	    goto fail;
+    }
+    return promotion;
+
+  fail:
+    execute_jit_discard_promotion(promotion);
+    return 0;
+}
+
+static void
+publish_jit_activation(JITNativeFrame *frame, JITCallerResume *resume,
+		       void *data)
+{
+    struct JITActivationPromotion *promotion = data;
+    unsigned index = promotion->publish_index;
+    unsigned canonical_index = promotion->root_index + index;
+
+    (void) resume;
+    if (index >= promotion->num_frames
+	|| promotion->frames[index] != frame)
+	panic("JIT activation promotion publication order changed");
+    if (index == 0)
+	free_activation(&activ_stack[canonical_index], 0);
+    activ_stack[canonical_index] = promotion->prepared[index];
+    memset(&promotion->prepared[index], 0, sizeof(activation));
+    top_activ_stack = canonical_index;
+    promotion->publish_index++;
+}
+
+int
+execute_jit_commit_promotion(struct JITActivationPromotion *promotion)
+{
+    int committed;
+
+    if (!promotion || promotion->num_prepared != promotion->num_frames
+	|| promotion->root_index != top_activ_stack
+	|| promotion->publish_index != 0)
+	return 0;
+    committed = jit_native_chain_commit_promotion(promotion->native_plan,
+	publish_jit_activation, promotion);
+    if (!committed)
+	return 0;
+    if (promotion->publish_index != promotion->num_frames)
+	panic("JIT activation promotion published an incomplete chain");
+    {
+	unsigned i;
+
+	for (i = 0; i < promotion->num_frames; i++) {
+	    jit_native_frame_release_runtime(promotion->frames[i]);
+	    if (i > 0)
+		jit_native_frame_release_invocation(promotion->frames[i]);
+	}
+    }
+    jit_native_chain_discard_promotion(promotion->native_plan);
+    promotion->native_plan = 0;
+    myfree(promotion->frames, M_VM);
+    myfree(promotion->prepared, M_VM);
+    myfree(promotion, M_VM);
+    return 1;
+}
+
+void
+execute_jit_discard_promotion(struct JITActivationPromotion *promotion)
+{
+    unsigned i;
+
+    if (!promotion)
+	return;
+    for (i = 0; i < promotion->num_prepared; i++)
+	free_activation(&promotion->prepared[i], 0);
+    if (promotion->native_plan)
+	jit_native_chain_discard_promotion(promotion->native_plan);
+    if (promotion->frames)
+	myfree(promotion->frames, M_VM);
+    if (promotion->prepared)
+	myfree(promotion->prepared, M_VM);
+    myfree(promotion, M_VM);
+}
+#endif /* ENABLE_JIT */
 
 
 /** Set up another activation for calling a verb
@@ -914,6 +1081,13 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
 	top_activ_stack--;
 	return 0;
     }
+    if (!jit_native_frame_bind_activation(&callee_frame, &RUN_ACTIV)) {
+	jit_execution_context_pop_overlay(execution_context, &callee_frame);
+	execution_context->canonical_depth--;
+	free_activation(&RUN_ACTIV, 0);
+	top_activ_stack--;
+	return 0;
+    }
 
     jit_profile_record_entry(callee->jit);
     run_result = jit_program_execute_in_context(callee->jit,
@@ -1148,6 +1322,8 @@ do {								\
 		RUN_ACTIV.prog->jit, RUN_ACTIV.rt_env, top_activ_stack,
 		top_activ_stack + 1, max_stack_size, &ticks_remaining,
 		&task_timed_out, &jit_error, resume_map);
+	    if (!jit_native_frame_bind_activation(&root_frame, &RUN_ACTIV))
+		panic("JIT root activation metadata binding failed");
 	    jit_profile_record_entry(RUN_ACTIV.prog->jit);
 	    jit_result = jit_program_execute_in_context(RUN_ACTIV.prog->jit,
 					     &execution_context, &root_frame,

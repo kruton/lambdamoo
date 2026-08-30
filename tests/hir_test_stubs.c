@@ -1,5 +1,6 @@
 #include "compiler.h"
 #include "db.h"
+#include "eval_env.h"
 #include "execute.h"
 #include "functions.h"
 #include "list.h"
@@ -19,6 +20,40 @@ static unsigned test_protection_generation = 1;
 static int test_length_protected;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
 Var zero = { .type = TYPE_INT, .v.num = 0 };
+
+Program *
+program_ref(Program *program)
+{
+    program->ref_count++;
+    return program;
+}
+
+void
+free_program(Program *program)
+{
+    program->ref_count--;
+}
+
+Var *
+copy_rt_env(Var *from, unsigned size)
+{
+    Var *copy = mymalloc(sizeof(Var) * size, M_RT_ENV);
+    unsigned i;
+
+    for (i = 0; i < size; i++)
+	copy[i] = var_ref(from[i]);
+    return copy;
+}
+
+void
+free_rt_env(Var *env, unsigned size)
+{
+    unsigned i;
+
+    for (i = 0; i < size; i++)
+	free_var(env[i]);
+    myfree(env, M_RT_ENV);
+}
 
 ResumeKey
 invalid_resume_key(void)

@@ -16,8 +16,6 @@ typedef struct JITCallerResume JITCallerResume;
 typedef struct JITPromotionPlan JITPromotionPlan;
 struct activation;
 
-#define JIT_EXECUTION_ABI_VERSION 1
-
 typedef enum {
     JIT_FRAME_ROOT_OVERLAY,
     JIT_FRAME_CANONICAL_OVERLAY,
@@ -62,7 +60,17 @@ struct JITNativeFrame {
     JITNativeFrame *callee;
     JITCallerResume *incoming;
     JITCallerResume *outgoing;
+    Program *bytecode_program;
     Var *env;
+#ifdef WAIF_CORE
+    Var receiver;
+#endif
+    Objid this;
+    Objid player;
+    Objid progr;
+    Objid vloc;
+    const char *verb;
+    const char *verbname;
     void *runtime_storage;
     Var *homes;
     unsigned char *home_states;
@@ -71,12 +79,14 @@ struct JITNativeFrame {
     unsigned canonical_index;
     int entry_map;
     int current_map;
+    int debug;
+    int owns_invocation;
+    int owns_runtime;
     JITNativeFrameKind kind;
     JITNativeFrameState state;
 };
 
 struct JITExecutionContext {
-    unsigned abi_version;
     JITNativeFrame *root_frame;
     JITNativeFrame *current_frame;
     unsigned root_activation_index;
@@ -221,13 +231,23 @@ extern int jit_execution_context_return_compact(JITExecutionContext *,
 						JITNativeFrame *, Var *);
 extern JITPromotionPlan *jit_native_chain_prepare_promotion(
 	JITExecutionContext *);
+extern unsigned jit_native_chain_promotion_count(const JITPromotionPlan *);
+extern JITNativeFrame *jit_native_chain_promotion_frame(
+	const JITPromotionPlan *, unsigned);
 extern int jit_native_chain_commit_promotion(JITPromotionPlan *,
 	JITPromotionMaterializer, void *);
 extern void jit_native_chain_discard_promotion(JITPromotionPlan *);
 extern int jit_execution_context_finish(JITExecutionContext *,
 					JITNativeFrame *);
+extern int jit_native_frame_bind_activation(JITNativeFrame *,
+					    const struct activation *);
+extern int jit_native_frame_copy_invocation(JITNativeFrame *,
+					    const struct activation *);
+extern void jit_native_frame_release_invocation(JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
 					  Var *, unsigned, unsigned char *);
+extern void jit_native_frame_mark_runtime_owned(JITNativeFrame *);
+extern void jit_native_frame_release_runtime(JITNativeFrame *);
 extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
 extern int jit_native_frame_verify(const JITExecutionContext *,
 				   const JITNativeFrame *);
