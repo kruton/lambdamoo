@@ -76,14 +76,18 @@ struct JITNativeFrame {
     void *runtime_storage;
     Var *homes;
     unsigned char *home_states;
+    Var *boundary_stack;
     size_t runtime_bytes;
     unsigned num_homes;
+    unsigned boundary_depth;
     unsigned canonical_index;
     int entry_map;
     int current_map;
+    int boundary_map;
     int debug;
     int owns_invocation;
     int owns_runtime;
+    int owns_boundary_stack;
     JITNativeFrameKind kind;
     JITNativeFrameState state;
 };
@@ -253,8 +257,14 @@ extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
 extern void jit_native_frame_mark_runtime_owned(JITNativeFrame *);
 extern int jit_native_frame_adopt_continuation_runtime(
 	JITNativeFrame *, JITContinuationFrame *);
+extern int jit_native_frame_return_continuation_runtime(
+	JITNativeFrame *, JITContinuationFrame *);
+extern int jit_native_frame_continuation_matches(const JITNativeFrame *, int);
 extern void jit_native_frame_release_runtime(JITNativeFrame *);
 extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
+extern int jit_native_frame_capture_boundary(JITNativeFrame *, Var *,
+					     unsigned, int);
+extern void jit_native_frame_release_boundary(JITNativeFrame *);
 extern int jit_native_frame_verify(const JITExecutionContext *,
 				   const JITNativeFrame *);
 extern int jit_native_frame_home_move(JITNativeFrame *, unsigned, Var *);

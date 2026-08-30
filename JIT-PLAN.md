@@ -664,6 +664,19 @@ and leaves the complete native chain authoritative.  The root overlay is
 likewise prepared in private storage; it is not written into the anchored
 activation before commit.
 
+An active frame may instead own an exact boundary snapshot.  This is the
+interpreter-ready operand stack already materialized by a non-call deopt, not a
+second compact continuation.  `jit_native_frame_capture_boundary()` allocates
+the destination first and then moves every `Var` from the temporary boundary
+stack, recording the precise map that supplied its `pc` and `error_pc`.
+Preparation takes references from that snapshot into a shadow activation and
+does not consume it, so allocation or validation failure can discard the
+shadow and retry promotion without reconstructing or replaying native work.
+Commit releases the snapshot only after publication.  Verification rejects a
+snapshot without exclusive ownership, a valid map, or agreement with the
+frame's current map.  Snapshot storage is included in the program's active JIT
+runtime-byte accounting from capture through release.
+
 The interpreter-side `JITActivationPromotion` now implements that allocator and
 publisher.  It verifies that the native root is the current canonical top,
 checks that the complete suffix fits within the task's fixed activation limit,
@@ -760,18 +773,36 @@ retain reciprocal owner/borrower links.  A resumed continuation may borrow
 storage only from that exact frame; repeated capture preserves the borrowed
 relationship.  Continuation destruction removes the borrower link without
 freeing storage, after which frame destruction performs the single release.
-Canonical promotion follows this order after all shadow activations have been
-published: destroy each frame's borrower, then release its runtime allocation.
+Adoption also detaches the continuation from its old canonical activation; the
+frame is then its only runtime owner.  The inverse
+`jit_native_frame_return_continuation_runtime()` operation is allocation-free
+and restores ownership to that same continuation during canonical promotion.
+When the active continuation still describes the frame's current map,
+promotion publishes an empty activation shell, returns the runtime allocation,
+and attaches the continuation to the new canonical activation.  When it does
+not, the exact boundary snapshot is authoritative and the stale borrower is
+destroyed after the shadow activation has been published.  Suspended callers
+with outgoing calls continue to be reconstructed as dispatched continuations.
+Canonical promotion therefore releases each frame's remaining borrower,
+runtime allocation, and boundary snapshot only after all shadow activations
+have been published.
 Frame verification rejects mismatched storage, home arrays, sizes, programs,
 or ownership bits, and runtime release or unbinding with a live borrower is a
 fatal lifecycle violation.
 
+The interpreter loop has a final safety gate before fetching an opcode: if JIT
+re-entry was skipped while the activation still owns a continuation, it
+materializes that continuation first.  An eligibility change, compilation
+failure, or other conservative guard therefore cannot enter the bytecode
+interpreter with a compact stack layout.
+
 The remaining integration step is to retain the captured continuation in its
-`JITCallerResume`, adopt its runtime into the caller, publish the callee, and
-drive callee execution and caller resumption from `run()`.  Normal return must
-likewise destroy the continuation borrower before releasing the frame-owned
-allocation.  General dispatch remains gated until that path is connected and
-tested.
+`JITCallerResume`, adopt its runtime into the caller, capture any exact active
+boundary, publish the callee, and drive callee execution and caller resumption
+from `run()`.  Normal return must likewise destroy the continuation borrower
+before releasing the frame-owned allocation.  General dispatch remains gated
+until that driver uses these ownership operations and passes nested return,
+promotion, and fallback tests.
 
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup

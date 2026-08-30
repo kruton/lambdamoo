@@ -533,6 +533,23 @@ struct JITPromotionPlan {
     unsigned num_frames;
 };
 
+static JITContinuationFrame *continuation_frames;
+
+static void
+jit_continuation_unlink(JITContinuationFrame *frame)
+{
+    if (frame->previous)
+	frame->previous->next = frame->next;
+    else if (continuation_frames == frame)
+	continuation_frames = frame->next;
+    else if (frame->next)
+	panic("JIT continuation list backlink is invalid");
+    if (frame->next)
+	frame->next->previous = frame->previous;
+    frame->previous = 0;
+    frame->next = 0;
+}
+
 void
 jit_execution_context_init(JITExecutionContext *context,
 			   JITNativeFrame *root, JITProgram *program, Var *env,
@@ -595,7 +612,8 @@ jit_execution_context_pop_overlay(JITExecutionContext *context,
 
     if (!context || !frame || context->current_frame != frame
 	|| frame->kind == JIT_FRAME_COMPACT || frame->callee
-	|| frame->runtime_storage || !(caller = frame->caller)
+	|| frame->runtime_storage || frame->owns_boundary_stack
+	|| !(caller = frame->caller)
 	|| caller->callee != frame)
 	return 0;
     caller->callee = 0;
@@ -663,6 +681,7 @@ jit_execution_context_return_compact(JITExecutionContext *context,
     if (!context || !frame || !result || context->current_frame != frame
 	|| frame->kind != JIT_FRAME_COMPACT || frame->state != JIT_FRAME_RUNNING
 	|| frame->callee || frame->outgoing || frame->runtime_storage
+	|| frame->owns_boundary_stack
 	|| !(caller = frame->caller) || caller->callee != frame
 	|| !(resume = frame->incoming) || resume->caller != caller
 	|| caller->outgoing != resume || resume->state != JIT_RESUME_DISPATCHED
@@ -796,7 +815,8 @@ jit_execution_context_finish(JITExecutionContext *context,
 {
     if (!context || !root || context->root_frame != root
 	|| context->current_frame != root || root->caller || root->callee
-	|| root->runtime_storage || !jit_native_frame_verify(context, root))
+	|| root->runtime_storage || root->owns_boundary_stack
+	|| !jit_native_frame_verify(context, root))
 	return 0;
     root->context = 0;
     root->state = JIT_FRAME_DETACHED;
@@ -921,8 +941,21 @@ jit_native_frame_adopt_continuation_runtime(JITNativeFrame *frame,
     if (!frame || !continuation || frame->runtime_storage
 	|| frame->runtime_borrower || frame->program != continuation->program
 	|| !continuation->runtime_storage || !continuation->owns_runtime
-	|| continuation->runtime_owner)
+	|| continuation->runtime_owner
+	|| (continuation->owner
+	    && (continuation->owner->jit_continuation != continuation
+		|| (!continuation->previous
+		    && continuation_frames != continuation)
+		|| (continuation->previous
+		    && continuation->previous->next != continuation)
+		|| (continuation->next
+		    && continuation->next->previous != continuation))))
 	return 0;
+    if (continuation->owner) {
+	continuation->owner->jit_continuation = 0;
+	continuation->owner = 0;
+	jit_continuation_unlink(continuation);
+    }
     jit_native_frame_bind_runtime(frame, continuation->runtime_storage,
 	continuation->runtime_bytes, continuation->owned_values,
 	continuation->program->num_owned_slots, continuation->home_states);
@@ -931,6 +964,40 @@ jit_native_frame_adopt_continuation_runtime(JITNativeFrame *frame,
     continuation->runtime_owner = frame;
     continuation->owns_runtime = 0;
     return 1;
+}
+
+int
+jit_native_frame_return_continuation_runtime(
+    JITNativeFrame *frame, JITContinuationFrame *continuation)
+{
+    if (!frame || !continuation || frame->runtime_borrower != continuation
+	|| continuation->runtime_owner != frame || !frame->owns_runtime
+	|| continuation->owns_runtime
+	|| frame->runtime_storage != continuation->runtime_storage
+	|| frame->runtime_bytes != continuation->runtime_bytes
+	|| frame->homes != continuation->owned_values
+	|| frame->home_states != continuation->home_states)
+	return 0;
+    frame->runtime_borrower = 0;
+    continuation->runtime_owner = 0;
+    continuation->owns_runtime = 1;
+    jit_native_frame_unbind_runtime(frame);
+    return 1;
+}
+
+int
+jit_native_frame_continuation_matches(const JITNativeFrame *frame, int map_id)
+{
+    JITContinuationFrame *continuation;
+
+    if (!frame || !(continuation = frame->runtime_borrower))
+	return 0;
+    return continuation->program == frame->program
+	&& continuation->map_id == map_id
+	&& continuation->runtime_owner == frame
+	&& !continuation->owns_runtime
+	&& frame->owns_runtime
+	&& continuation->runtime_storage == frame->runtime_storage;
 }
 
 void
@@ -974,6 +1041,59 @@ jit_native_frame_unbind_runtime(JITNativeFrame *frame)
     frame->num_homes = 0;
     frame->home_states = 0;
     frame->owns_runtime = 0;
+}
+
+int
+jit_native_frame_capture_boundary(JITNativeFrame *frame, Var *stack,
+				  unsigned depth, int map_id)
+{
+    Var *captured = 0;
+    unsigned i;
+
+    if (!frame || (depth && !stack) || frame->owns_boundary_stack
+	|| frame->boundary_stack || frame->boundary_depth
+	|| !frame->program || map_id <= 0
+	|| map_id >= frame->program->num_deopt_maps)
+	return 0;
+    for (i = 0; i < depth; i++)
+	if (stack[i].type == TYPE_NONE)
+	    return 0;
+    if (depth)
+	captured = mymalloc(sizeof(Var) * depth, M_PROGRAM);
+    for (i = 0; i < depth; i++) {
+	captured[i] = stack[i];
+	stack[i].type = TYPE_NONE;
+	stack[i].v.num = 0;
+    }
+    frame->boundary_stack = captured;
+    frame->boundary_depth = depth;
+    frame->boundary_map = map_id;
+    frame->current_map = map_id;
+    frame->owns_boundary_stack = 1;
+    frame->program->active_runtime_bytes += sizeof(Var) * depth;
+    return 1;
+}
+
+void
+jit_native_frame_release_boundary(JITNativeFrame *frame)
+{
+    unsigned i;
+
+    if (!frame || !frame->owns_boundary_stack)
+	return;
+    for (i = 0; i < frame->boundary_depth; i++)
+	free_var(frame->boundary_stack[i]);
+    if (frame->program->active_runtime_bytes
+	< sizeof(Var) * frame->boundary_depth)
+	panic("Native boundary stack accounting underflow");
+    frame->program->active_runtime_bytes -= sizeof(Var)
+	* frame->boundary_depth;
+    if (frame->boundary_stack)
+	myfree(frame->boundary_stack, M_PROGRAM);
+    frame->boundary_stack = 0;
+    frame->boundary_depth = 0;
+    frame->boundary_map = 0;
+    frame->owns_boundary_stack = 0;
 }
 
 static int
@@ -1032,6 +1152,15 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	|| frame->entry_map >= frame->program->num_deopt_maps
 	|| frame->current_map >= frame->program->num_deopt_maps)
 	return 0;
+    if (frame->owns_boundary_stack) {
+	if ((frame->boundary_depth && !frame->boundary_stack)
+	    || frame->boundary_map <= 0
+	    || frame->boundary_map >= frame->program->num_deopt_maps
+	    || frame->current_map != frame->boundary_map)
+	    return 0;
+    } else if (frame->boundary_stack || frame->boundary_depth
+	       || frame->boundary_map)
+	return 0;
     if (frame->owns_invocation
 	&& (frame->kind != JIT_FRAME_COMPACT || !frame->bytecode_program
 	    || !frame->env || !frame->verb || !frame->verbname))
@@ -1039,6 +1168,10 @@ jit_native_frame_verify(const JITExecutionContext *context,
     if (frame->owns_runtime
 	&& (!frame->runtime_storage
 	    || frame->program->active_runtime_bytes < frame->runtime_bytes))
+	return 0;
+    if (frame->owns_boundary_stack
+	&& frame->program->active_runtime_bytes
+	   < frame->runtime_bytes + sizeof(Var) * frame->boundary_depth)
 	return 0;
     if (frame->runtime_borrower
 	&& (!frame->owns_runtime
@@ -1274,8 +1407,6 @@ typedef struct JITPool {
 
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 static uint64_t next_module_serial = 0;
-static JITContinuationFrame *continuation_frames;
-
 static void
 jit_load_externals(MIR_context_t context)
 {
@@ -6261,11 +6392,34 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
     unsigned stack_depth;
 
     if (!native_frame || !a || !(program = native_frame->program)
-	|| a->jit_continuation || !native_frame->runtime_storage || map_id <= 0
+	|| a->jit_continuation || map_id <= 0
 	|| map_id >= program->num_deopt_maps
-	|| native_frame->num_homes != (unsigned) program->num_owned_slots)
+	|| (native_frame->owns_boundary_stack && dispatched))
 	return 0;
     map = &program->deopt_maps[map_id];
+    if ((map->num_locals && (!a->prog || !a->rt_env
+	 || (unsigned) map->num_locals > a->prog->num_var_names))
+	|| a->rt_stack_size < 0 || !a->base_rt_stack || !a->top_rt_stack
+	|| a->top_rt_stack < a->base_rt_stack
+	|| a->top_rt_stack > a->base_rt_stack + a->rt_stack_size)
+	return 0;
+    if (native_frame->owns_boundary_stack) {
+	unsigned i;
+
+	if (native_frame->boundary_map != map_id
+	    || native_frame->boundary_depth > (unsigned) a->rt_stack_size
+	    || a->top_rt_stack != a->base_rt_stack)
+	    return 0;
+	for (i = 0; i < native_frame->boundary_depth; i++)
+	    *a->top_rt_stack++ = var_ref(native_frame->boundary_stack[i]);
+	a->pc = map->bytecode_pc;
+	a->error_pc = map->error_pc;
+	a->resume_key = invalid_resume_key();
+	return 1;
+    }
+    if (!native_frame->runtime_storage
+	|| native_frame->num_homes != (unsigned) program->num_owned_slots)
+	return 0;
     stack_depth = map->stack_depth;
     if (dispatched) {
 	int operands = jit_call_stack_operands(map);
@@ -6274,12 +6428,7 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
 	    return 0;
 	stack_depth -= operands;
     }
-    if ((map->num_locals && (!a->prog || !a->rt_env
-	 || (unsigned) map->num_locals > a->prog->num_var_names))
-	|| a->rt_stack_size < 0 || !a->base_rt_stack || !a->top_rt_stack
-	|| a->top_rt_stack < a->base_rt_stack
-	|| a->top_rt_stack > a->base_rt_stack + a->rt_stack_size
-	|| stack_depth > (unsigned) a->rt_stack_size)
+    if (stack_depth > (unsigned) a->rt_stack_size)
 	return 0;
     deopt_values = native_frame->runtime_storage;
     deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
@@ -6315,6 +6464,11 @@ jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
 	return;
     if (frame->owner == owner && owner->jit_continuation == frame)
 	return;
+    if (owner->jit_continuation && owner->jit_continuation != frame)
+	panic("Attaching two JIT continuations to one activation");
+    if (frame->owner || frame->previous || frame->next
+	|| continuation_frames == frame)
+	panic("Attaching an already linked JIT continuation");
     frame->owner = owner;
     owner->jit_continuation = frame;
     frame->next = continuation_frames;
@@ -6373,12 +6527,7 @@ jit_continuation_free(JITContinuationFrame *frame)
 	return;
     if (frame->owner && frame->owner->jit_continuation == frame)
 	frame->owner->jit_continuation = 0;
-    if (frame->previous)
-	frame->previous->next = frame->next;
-    else if (continuation_frames == frame)
-	continuation_frames = frame->next;
-    if (frame->next)
-	frame->next->previous = frame->previous;
+    jit_continuation_unlink(frame);
     for (i = 0; i < frame->num_values; i++)
 	free_var(frame->values[i]);
     if (frame->values)

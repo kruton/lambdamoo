@@ -3746,6 +3746,61 @@ main(void)
 	jit_program_free(owner_program);
     }
 
+    {
+	JITProgram *boundary_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	activation first = { 0 };
+	activation second = { 0 };
+	Var source[2];
+	Var first_stack[2];
+	Var second_stack[2];
+	size_t runtime_before = boundary_program->active_runtime_bytes;
+
+	source[0].type = TYPE_STR;
+	source[0].v.str = str_dup("exact boundary stack");
+	source[1] = new_list(1);
+	source[1].v.list[1].type = TYPE_INT;
+	source[1].v.list[1].v.num = 42;
+	boundary_program->deopt_maps[1].num_locals = 0;
+	jit_execution_context_init(&context, &root, boundary_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	check(jit_native_frame_capture_boundary(&root, source, 2, 1),
+	      "native frame did not capture an exact boundary stack");
+	check(source[0].type == TYPE_NONE && source[1].type == TYPE_NONE
+	      && root.owns_boundary_stack && root.boundary_depth == 2
+	      && root.boundary_map == 1
+	      && boundary_program->active_runtime_bytes
+		 == runtime_before + sizeof(source)
+	      && jit_native_frame_verify(&context, &root),
+	      "native boundary stack ownership is inconsistent");
+	check(!jit_native_frame_capture_boundary(&root, source, 0, 1),
+	      "native frame captured more than one boundary stack");
+	first.base_rt_stack = first.top_rt_stack = first_stack;
+	first.rt_stack_size = 2;
+	second.base_rt_stack = second.top_rt_stack = second_stack;
+	second.rt_stack_size = 2;
+	check(jit_native_frame_prepare_activation(&root, &first, 1, 0)
+	      && jit_native_frame_prepare_activation(&root, &second, 1, 0),
+	      "native boundary stack was not retry-safe during preparation");
+	jit_native_frame_release_boundary(&root);
+	check(first.top_rt_stack == first.base_rt_stack + 2
+	      && second.top_rt_stack == second.base_rt_stack + 2
+	      && first_stack[0].type == TYPE_STR
+	      && !strcmp(first_stack[0].v.str, "exact boundary stack")
+	      && second_stack[1].type == TYPE_LIST
+	      && second_stack[1].v.list[1].v.num == 42
+	      && boundary_program->active_runtime_bytes == runtime_before,
+	      "prepared boundary activation did not retain exact values");
+	while (first.top_rt_stack > first.base_rt_stack)
+	    free_var(*--first.top_rt_stack);
+	while (second.top_rt_stack > second.base_rt_stack)
+	    free_var(*--second.top_rt_stack);
+	check(jit_execution_context_finish(&context, &root),
+	      "boundary snapshot root frame did not detach cleanly");
+	jit_program_free(boundary_program);
+    }
+
     check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
 	  "MIR dump failed");
     check(mir_dump.lines > 0, "MIR dump was empty");
@@ -4377,6 +4432,7 @@ main(void)
 	    JITContinuationFrame *continuation = 0;
 	    JITExecutionContext context;
 	    JITNativeFrame root;
+	    activation owner = { 0 };
 	    Var returned;
 	    size_t runtime_before = call_prog->active_runtime_bytes;
 
@@ -4394,11 +4450,13 @@ main(void)
 	    free_var(deopt_stack[2]);
 	    jit_execution_context_init(&context, &root, call_prog, deep_env,
 		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    jit_continuation_attach(continuation, &owner);
 	    check(jit_native_frame_adopt_continuation_runtime(&root,
 		continuation), "native frame did not adopt continuation runtime");
 	    check(root.owns_runtime && root.runtime_borrower == continuation
 		&& !continuation->owns_runtime
 		&& continuation->runtime_owner == &root
+		&& !owner.jit_continuation && !continuation->owner
 		&& jit_native_frame_verify(&context, &root),
 		"adopted continuation runtime ownership is inconsistent");
 	    check(!jit_native_frame_adopt_continuation_runtime(&root,
@@ -4416,12 +4474,17 @@ main(void)
 		&& !strcmp(result.v.str, "borrowed runtime returned"),
 		"borrowed continuation resume corrupted runtime ownership");
 	    free_var(result);
+	    check(jit_native_frame_return_continuation_runtime(&root,
+		continuation),
+		"native frame did not return continuation runtime ownership");
+	    check(!root.runtime_storage && !root.runtime_borrower
+		&& continuation->owns_runtime && !continuation->runtime_owner,
+		"returned continuation runtime ownership is inconsistent");
+	    jit_continuation_attach(continuation, &owner);
 	    jit_continuation_free(continuation);
-	    check(!root.runtime_borrower && root.owns_runtime,
-		"continuation release did not detach its runtime borrow");
-	    jit_native_frame_release_runtime(&root);
-	    check(call_prog->active_runtime_bytes == runtime_before,
-		"native frame did not release adopted runtime exactly once");
+	    check(!owner.jit_continuation
+		&& call_prog->active_runtime_bytes == runtime_before,
+		"returned continuation did not release runtime exactly once");
 	    check(jit_execution_context_finish(&context, &root),
 		"borrowed-runtime root frame did not detach cleanly");
 	}

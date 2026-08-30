@@ -680,6 +680,7 @@ struct JITActivationPromotion {
     JITPromotionPlan *native_plan;
     JITNativeFrame **frames;
     activation *prepared;
+    unsigned char *handoff;
     unsigned num_frames;
     unsigned num_prepared;
     unsigned root_index;
@@ -735,7 +736,9 @@ execute_jit_prepare_promotion(JITExecutionContext *context)
     memset(promotion, 0, sizeof(*promotion));
     promotion->frames = mymalloc(sizeof(JITNativeFrame *) * count, M_VM);
     promotion->prepared = mymalloc(sizeof(activation) * count, M_VM);
+    promotion->handoff = mymalloc(count, M_VM);
     memset(promotion->prepared, 0, sizeof(activation) * count);
+    memset(promotion->handoff, 0, count);
     promotion->native_plan = native_plan;
     promotion->num_frames = count;
     promotion->root_index = context->root_activation_index;
@@ -760,8 +763,12 @@ execute_jit_prepare_promotion(JITExecutionContext *context)
 	    promotion->prepared[i].bi_func_data = RUN_ACTIV.bi_func_data;
 	}
 	promotion->num_prepared++;
-	if (!jit_native_frame_prepare_activation(frame,
-	    &promotion->prepared[i], map_id, resume != 0))
+	if (!resume && frame->runtime_borrower
+	    && !frame->owns_boundary_stack
+	    && jit_native_frame_continuation_matches(frame, map_id))
+	    promotion->handoff[i] = 1;
+	else if (!jit_native_frame_prepare_activation(frame,
+		 &promotion->prepared[i], map_id, resume != 0))
 	    goto fail;
     }
     return promotion;
@@ -779,7 +786,6 @@ publish_jit_activation(JITNativeFrame *frame, JITCallerResume *resume,
     unsigned index = promotion->publish_index;
     unsigned canonical_index = promotion->root_index + index;
 
-    (void) resume;
     if (index >= promotion->num_frames
 	|| promotion->frames[index] != frame)
 	panic("JIT activation promotion publication order changed");
@@ -787,6 +793,15 @@ publish_jit_activation(JITNativeFrame *frame, JITCallerResume *resume,
 	free_activation(&activ_stack[canonical_index], 0);
     activ_stack[canonical_index] = promotion->prepared[index];
     memset(&promotion->prepared[index], 0, sizeof(activation));
+    if (promotion->handoff[index]) {
+	JITContinuationFrame *continuation = frame->runtime_borrower;
+
+	if (resume || !continuation
+	    || !jit_native_frame_return_continuation_runtime(frame,
+		continuation))
+	    panic("JIT activation promotion continuation handoff failed");
+	jit_continuation_attach(continuation, &activ_stack[canonical_index]);
+    }
     top_activ_stack = canonical_index;
     promotion->publish_index++;
 }
@@ -814,6 +829,7 @@ execute_jit_commit_promotion(struct JITActivationPromotion *promotion)
 		jit_continuation_free(
 		    promotion->frames[i]->runtime_borrower);
 	    jit_native_frame_release_runtime(promotion->frames[i]);
+	    jit_native_frame_release_boundary(promotion->frames[i]);
 	    if (i > 0)
 		jit_native_frame_release_invocation(promotion->frames[i]);
 	}
@@ -822,6 +838,7 @@ execute_jit_commit_promotion(struct JITActivationPromotion *promotion)
     promotion->native_plan = 0;
     myfree(promotion->frames, M_VM);
     myfree(promotion->prepared, M_VM);
+    myfree(promotion->handoff, M_VM);
     myfree(promotion, M_VM);
     return 1;
 }
@@ -841,6 +858,8 @@ execute_jit_discard_promotion(struct JITActivationPromotion *promotion)
 	myfree(promotion->frames, M_VM);
     if (promotion->prepared)
 	myfree(promotion->prepared, M_VM);
+    if (promotion->handoff)
+	myfree(promotion->handoff, M_VM);
     myfree(promotion, M_VM);
 }
 #endif /* ENABLE_JIT */
@@ -1719,6 +1738,12 @@ do {								\
 		rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
 	    }
 	}
+	}
+	if (RUN_ACTIV.jit_continuation) {
+	    STORE_STATE_VARIABLES();
+	    if (!jit_continuation_materialize(&RUN_ACTIV))
+		panic("JIT continuation interpreter fallback failed");
+	    LOAD_STATE_VARIABLES();
 	}
 #endif
 	error_bv = bv;
