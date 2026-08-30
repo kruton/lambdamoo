@@ -4603,6 +4603,8 @@ jit_instr_needs_deopt_map(JITInstruction *instr, var_type *value_types,
     return 1;
 }
 
+static int jit_owner_value_must_be_current(JITProgram *, JITInstruction *, int);
+
 static int
 jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			 Program *bytecode_program)
@@ -4707,6 +4709,19 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					    instr->deopt_map, i, value);
 					goto invalid;
 				}
+				if (map->local_owner_slots
+				    && map->local_owner_slots[i] >= 0
+				    && (map->local_owner_slots[i]
+					>= program->num_owned_slots
+					|| program->value_owned_slots[value]
+					   != map->local_owner_slots[i]
+					|| !jit_owner_value_must_be_current(program,
+					       instr, value))) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d local %d has invalid owner",
+					    instr->deopt_map, i);
+					goto invalid;
+				}
 			}
 			for (i = 0; i < (int) map->stack_depth; i++)
 				if (map->stack_slots[i].kind > RSS_FINALLY
@@ -4715,6 +4730,21 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					record_unsupported_fmt(ctx,
 					    "deopt-map: map %d stack slot %d has invalid value %d",
 					    instr->deopt_map, i, map->stack_values[i]);
+					goto invalid;
+				}
+				else if (map->stack_owner_slots
+				    && map->stack_owner_slots[i] >= 0
+				    && (map->stack_slots[i].kind != RSS_VALUE
+					|| map->stack_owner_slots[i]
+					   >= program->num_owned_slots
+					|| program->value_owned_slots[
+					       map->stack_values[i]]
+					   != map->stack_owner_slots[i]
+					|| !jit_owner_value_must_be_current(program,
+					       instr, map->stack_values[i]))) {
+					record_unsupported_fmt(ctx,
+					    "deopt-map: map %d stack %d has invalid owner",
+					    instr->deopt_map, i);
 					goto invalid;
 				}
 			if (instr->kind != HIR_TAC_CALL
@@ -4943,14 +4973,16 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 	int value = jit_deopt_map_local_value(program, map, i);
 
 	if (value > 0 && value < program->num_values && !defs[value]
-	    && !jit_value_is_constant(program, value))
+	    && !jit_value_is_constant(program, value)
+	    && (!map->local_owner_slots || map->local_owner_slots[i] < 0))
 	    uses[value] = 1;
     }
     for (i = 0; i < (int) map->stack_depth; i++)
 	if (map->stack_values[i] > 0
 	    && map->stack_values[i] < program->num_values
 	    && !defs[map->stack_values[i]]
-	    && !jit_value_is_constant(program, map->stack_values[i]))
+	    && !jit_value_is_constant(program, map->stack_values[i])
+	    && (!map->stack_owner_slots || map->stack_owner_slots[i] < 0))
 	    uses[map->stack_values[i]] = 1;
 }
 
@@ -5516,6 +5548,191 @@ done:
     myfree(available_out, M_PROGRAM);
     myfree(available_in, M_PROGRAM);
     return result;
+}
+
+static int
+jit_published_owner_value(JITProgram *program, JITInstruction *instr,
+			  int owner_slot)
+{
+    if (!instr || instr->value <= 0 || instr->value >= program->num_values
+	|| !program->value_owned_slots
+	|| program->value_owned_slots[instr->value] != owner_slot)
+	return 0;
+    if (instr->kind == HIR_TAC_UNARY
+	&& instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	return instr->value;
+    if (instr->kind == HIR_TAC_BINARY
+	&& instr->op == HIR_OP_LIST_ADD_TAIL)
+	return instr->value;
+    return 0;
+}
+
+static int
+jit_owner_value_must_be_current(JITProgram *program,
+				JITInstruction *boundary, int value)
+{
+    JITBlock *block;
+    unsigned char *current_in;
+    unsigned char *current_out;
+    unsigned char *reachable;
+    int owner_slot;
+    int max_block = 0;
+    int changed;
+    int result = 0;
+
+    if (!program->value_owned_slots || value <= 0
+	|| value >= program->num_values
+	|| (owner_slot = program->value_owned_slots[value]) < 0)
+	return 0;
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    current_in = mymalloc(max_block + 1, M_PROGRAM);
+    current_out = mymalloc(max_block + 1, M_PROGRAM);
+    reachable = mymalloc(max_block + 1, M_PROGRAM);
+    memset(current_in, 0, max_block + 1);
+    memset(current_out, 0, max_block + 1);
+    memset(reachable, 0, max_block + 1);
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    JITBlock *predecessor;
+	    int in = 1;
+	    int has_predecessor = 0;
+	    int out;
+
+	    if (block == program->blocks) {
+		in = 0;
+		if (!reachable[block->id]) {
+		    reachable[block->id] = 1;
+		    changed = 1;
+		}
+	    } else {
+		for (predecessor = program->blocks; predecessor;
+		     predecessor = predecessor->next) {
+		    int successor;
+
+		    if (!reachable[predecessor->id])
+			continue;
+		    for (successor = 0;
+			 successor < predecessor->num_successors; successor++)
+			if (predecessor->successors[successor] == block->id) {
+			    has_predecessor = 1;
+			    in = in && current_out[predecessor->id];
+			}
+		}
+		if (!has_predecessor)
+		    continue;
+		if (!reachable[block->id]) {
+		    reachable[block->id] = 1;
+		    changed = 1;
+		}
+	    }
+	    if (current_in[block->id] != in) {
+		current_in[block->id] = in;
+		changed = 1;
+	    }
+	    out = in;
+	    {
+		JITInstruction *instr;
+
+		for (instr = block->first; instr; instr = instr->next) {
+		    int published = jit_published_owner_value(program, instr,
+			owner_slot);
+
+		    if (published)
+			out = published == value;
+		    if (instr == block->last)
+			break;
+		}
+	    }
+	    if (current_out[block->id] != out) {
+		current_out[block->id] = out;
+		changed = 1;
+	    }
+	}
+    } while (changed);
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+	int current;
+
+	if (!reachable[block->id])
+	    continue;
+	current = current_in[block->id];
+	for (instr = block->first; instr; instr = instr->next) {
+	    int published;
+
+	    if (instr == boundary) {
+		result = current;
+		goto done;
+	    }
+	    published = jit_published_owner_value(program, instr, owner_slot);
+	    if (published)
+		current = published == value;
+	    if (instr == block->last)
+		break;
+	}
+    }
+done:
+    myfree(reachable, M_PROGRAM);
+    myfree(current_out, M_PROGRAM);
+    myfree(current_in, M_PROGRAM);
+    return result;
+}
+
+static void
+jit_build_deopt_owner_slots(JITProgram *program)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITDeoptMap *map;
+	    int slot;
+	    int local_owners = 0;
+	    int stack_owners = 0;
+
+	    if (instr->deopt_map <= 0
+		|| instr->deopt_map >= program->num_deopt_maps)
+		goto next_instruction;
+	    map = &program->deopt_maps[instr->deopt_map];
+	    map->local_owner_slots = map->num_locals
+		? mymalloc(sizeof(int) * map->num_locals, M_PROGRAM) : 0;
+	    map->stack_owner_slots = map->stack_depth
+		? mymalloc(sizeof(int) * map->stack_depth, M_PROGRAM) : 0;
+	    for (slot = 0; slot < map->num_locals; slot++) {
+		int value = jit_deopt_map_local_value(program, map, slot);
+
+		map->local_owner_slots[slot] =
+		    jit_owner_value_must_be_current(program, instr, value)
+		    ? program->value_owned_slots[value] : -1;
+		local_owners += map->local_owner_slots[slot] >= 0;
+	    }
+	    for (slot = 0; slot < (int) map->stack_depth; slot++) {
+		int value = map->stack_values[slot];
+
+		map->stack_owner_slots[slot] = map->stack_slots
+		    && map->stack_slots[slot].kind != RSS_VALUE ? -1
+		    : (jit_owner_value_must_be_current(program, instr, value)
+		       ? program->value_owned_slots[value] : -1);
+		stack_owners += map->stack_owner_slots[slot] >= 0;
+	    }
+	    if (!local_owners && map->local_owner_slots) {
+		myfree(map->local_owner_slots, M_PROGRAM);
+		map->local_owner_slots = 0;
+	    }
+	    if (!stack_owners && map->stack_owner_slots) {
+		myfree(map->stack_owner_slots, M_PROGRAM);
+		map->stack_owner_slots = 0;
+	    }
+next_instruction:
+	    if (instr == block->last)
+		break;
+	}
+    }
 }
 
 static int
@@ -6622,6 +6839,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     program->value_is_tagged = value_is_tagged;
     jit_build_tag_slots(program);
     jit_build_value_ownership(program);
+    jit_build_deopt_owner_slots(program);
     jit_build_int_list_values(program);
     jit_build_direct_int_list_updates(program);
     jit_coalesce_deopt_locals(program);

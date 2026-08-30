@@ -1760,6 +1760,7 @@ typedef struct {
     MIR_item_t function;
     MIR_reg_t execution_context;
     MIR_reg_t native_frame;
+    MIR_reg_t owned_values;
     MIR_item_t proto_is_true;
     MIR_item_t import_is_true;
     MIR_item_t proto_equality;
@@ -2149,10 +2150,29 @@ static JITInstruction *jit_value_definition(JITProgram *, int);
 
 static void
 append_materialized_value(MIRBuild *build, JITProgram *program, int value,
-			  MIR_reg_t *values, MIR_reg_t deopt_values)
+			  int owner_slot, MIR_reg_t *values,
+			  MIR_reg_t deopt_values)
 {
     JITInstruction *definition = jit_value_definition(program, value);
 
+    if (owner_slot >= 0) {
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		value * sizeof(Num), deopt_values, 0, 1),
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		owner_slot * sizeof(Var) + offsetof(Var, v),
+		build->owned_values, 0, 1)));
+	if (program->value_is_tagged && program->value_is_tagged[value])
+	    append(build, MIR_new_insn(build->context, MIR_MOV,
+		MIR_new_mem_op(build->context, MIR_T_I32,
+		    jit_tag_offset(program, value), deopt_values, 0, 1),
+		MIR_new_mem_op(build->context, MIR_T_I32,
+		    owner_slot * sizeof(Var) + offsetof(Var, type),
+		    build->owned_values, 0, 1)));
+	return;
+    }
     if (definition && definition->kind == HIR_TAC_CONST) {
 	if (definition->literal_type == TYPE_FLOAT) {
 	    double number = raw_to_double(definition->literal);
@@ -2194,14 +2214,16 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
     for (i = 0; i < map->num_locals; i++) {
 	int val = jit_deopt_map_local_value(program, map, i);
 	if (val > 0)
-	    append_materialized_value(build, program, val, values,
+	    append_materialized_value(build, program, val,
+		map->local_owner_slots ? map->local_owner_slots[i] : -1, values,
 				      deopt_values);
     }
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int sval = map->stack_values[i];
 	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
 	    && sval > 0) {
-	    append_materialized_value(build, program, sval, values,
+	    append_materialized_value(build, program, sval,
+		map->stack_owner_slots ? map->stack_owner_slots[i] : -1, values,
 				      deopt_values);
 	}
     }
@@ -2212,7 +2234,10 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 	if (map->native_resume->values[i].source == JIT_RESUME_RESULT
 	    || value <= 0 || value >= program->num_values)
 	    continue;
-	append_materialized_value(build, program, value, values, deopt_values);
+	append_materialized_value(build, program, value,
+	    map->native_resume->values[i].source == JIT_RESUME_OWNER
+	    ? map->native_resume->values[i].index : -1,
+	    values, deopt_values);
     }
     append(build, MIR_new_insn(build->context, MIR_MOV,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
@@ -2657,6 +2682,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				  build->function->u.func);
     owned_values = MIR_reg(build->context, "owned_values",
 			  build->function->u.func);
+    build->owned_values = owned_values;
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -6188,6 +6214,10 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
 		if (program->deopt_maps[i].stack_slots)
 		    myfree(program->deopt_maps[i].stack_slots, M_PROGRAM);
+		if (program->deopt_maps[i].local_owner_slots)
+		    myfree(program->deopt_maps[i].local_owner_slots, M_PROGRAM);
+		if (program->deopt_maps[i].stack_owner_slots)
+		    myfree(program->deopt_maps[i].stack_owner_slots, M_PROGRAM);
 		if (program->deopt_maps[i].native_resume) {
 		    if (program->deopt_maps[i].native_resume->values)
 			myfree(program->deopt_maps[i].native_resume->values,
@@ -6270,6 +6300,10 @@ jit_program_metadata_bytes(JITProgram *program)
 	    bytes += sizeof(var_type) * map->stack_depth;
 	if (map->stack_slots)
 	    bytes += sizeof(ResumeStackSlot) * map->stack_depth;
+	if (map->local_owner_slots)
+	    bytes += sizeof(int) * map->num_locals;
+	if (map->stack_owner_slots)
+	    bytes += sizeof(int) * map->stack_depth;
 	if (map->native_resume) {
 	    bytes += sizeof(JITNativeResume);
 	    if (map->native_resume->values)
@@ -7654,12 +7688,25 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		&& program->value_is_tagged[instr->value];
 	    int type = instr->value > 0 && program->value_types
 		? program->value_types[instr->value] : TYPE_ANY;
+	    int owner_homes = 0;
 	    const char *func_name = (instr->kind == HIR_TAC_CALL
 				     && instr->func < FUNC_NOT_FOUND)
 		? name_func_by_num(instr->func) : "-";
 
+	    if (instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps) {
+		JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
+		int slot;
+
+		for (slot = 0; map->local_owner_slots
+		     && slot < map->num_locals; slot++)
+		    owner_homes += map->local_owner_slots[slot] >= 0;
+		for (slot = 0; map->stack_owner_slots
+		     && slot < (int) map->stack_depth; slot++)
+		    owner_homes += map->stack_owner_slots[slot] >= 0;
+	    }
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d direct-int-list=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d deopt=%d resume=%d/%d owner-homes=%d direct-int-list=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->func, func_name, instr->value,
 		     instr->src1, instr->src2,
@@ -7671,7 +7718,7 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     instr->deopt_map > 0
 		     && program->deopt_maps[instr->deopt_map].native_resume
 		     ? program->deopt_maps[instr->deopt_map].native_resume->rehydratable
-		     : -1, instr->direct_int_list_index_set);
+		     : -1, owner_homes, instr->direct_int_list_index_set);
 	    add_line(line, data);
 	    if (instr->deopt_map > 0
 		&& program->deopt_maps[instr->deopt_map].native_resume) {

@@ -94,6 +94,8 @@ struct JITDeoptMap {
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
+    int *local_owner_slots;
+    int *stack_owner_slots;
     JITNativeResume *native_resume;
     int builtin_func;
     int builtin_args;
