@@ -47,6 +47,7 @@ typedef enum {
 
 struct JITCallerResume {
     JITNativeFrame *caller;
+    JITContinuationFrame *continuation;
     int map_id;
     unsigned bytecode_pc;
     unsigned error_pc;

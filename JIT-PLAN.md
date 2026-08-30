@@ -617,11 +617,15 @@ consumes them.  It must not reconstruct them by replaying the caller.  After
 the dispatch commit point, no frame may retain a second owning copy of those
 call operands.
 
-Normal return produces a complete result `Var`.  The trampoline verifies that
-the caller result slot is empty, moves the result into it, marks it initialized,
-and only then destroys the callee frame.  An error or abort does not initialize
-the result slot; promotion reconstructs the caller as suspended after dispatch
-so the interpreter unwinder can deliver the exceptional outcome normally.
+Normal return produces a complete result `Var`.  The caller-resume record
+retains the exact `JITContinuationFrame` whose `JIT_RESUME_RESULT` entry names
+that value.  The trampoline moves the result into the continuation and only
+then destroys the callee frame.  This is the actual call-result ABI; it does not
+invent an owned-value home for a result that may be scalar or dynamically
+tagged.  Ordinary liveness homes remain authoritative for values live across
+the call.  An error or abort supplies no result; promotion reconstructs the
+caller as suspended after dispatch so the interpreter unwinder can deliver the
+exceptional outcome normally.
 
 This convention reduces the amount of runtime continuation data, but it does
 not eliminate compiler analysis.  Forward must-availability proves that each
@@ -765,8 +769,13 @@ prepared environment acquires its own reference, so every pre-publication
 failure can destroy the descriptor without consuming the caller's operands.
 The returned call object cannot be freed while linked into a context.
 
-This publisher is not yet called from `run()`.  Runtime ownership at a captured
-boundary is now explicit: a fresh `JITContinuationFrame` owns its allocation,
+This publisher is not yet called from `run()`.  Its caller-resume record now
+retains the captured continuation, requires the caller frame to own that
+continuation's runtime at publication, and records the map's exact bytecode and
+error PCs.  Publication suspends the caller; normal return transfers the result
+to the retained continuation and makes the caller current again.  Runtime
+ownership at a captured boundary is now explicit: a fresh
+`JITContinuationFrame` owns its allocation,
 and `jit_native_frame_adopt_continuation_runtime()` moves that ownership into
 the suspended caller frame without copying storage.  The frame and continuation
 retain reciprocal owner/borrower links.  A resumed continuation may borrow
@@ -796,12 +805,12 @@ materializes that continuation first.  An eligibility change, compilation
 failure, or other conservative guard therefore cannot enter the bytecode
 interpreter with a compact stack layout.
 
-The remaining integration step is to retain the captured continuation in its
-`JITCallerResume`, adopt its runtime into the caller, capture any exact active
-boundary, publish the callee, and drive callee execution and caller resumption
-from `run()`.  Normal return must likewise destroy the continuation borrower
-before releasing the frame-owned allocation.  General dispatch remains gated
-until that driver uses these ownership operations and passes nested return,
+The remaining integration step is to call the publisher from `run()`, capture
+any exact active boundary, and drive callee execution and caller resumption.
+Normal return must destroy the completed call object only after transferring
+its result, while the resumed caller retains its continuation borrower until
+the next native execution or promotion.  General dispatch remains gated until
+that driver uses these ownership operations and passes nested return,
 promotion, and fallback tests.
 
 Interpreter callers use the activation commit unchanged.  A built-in running

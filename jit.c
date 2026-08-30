@@ -599,9 +599,17 @@ jit_execution_context_push_overlay(JITExecutionContext *context,
     frame->current_map = entry_map;
     frame->kind = JIT_FRAME_CANONICAL_OVERLAY;
     frame->state = JIT_FRAME_RUNNING;
+    caller->state = JIT_FRAME_SUSPENDED;
     caller->callee = frame;
     context->current_frame = frame;
-    return jit_native_frame_verify(context, frame);
+    if (jit_native_frame_verify(context, frame))
+	return 1;
+
+    context->current_frame = caller;
+    caller->callee = 0;
+    caller->state = JIT_FRAME_RUNNING;
+    memset(frame, 0, sizeof(*frame));
+    return 0;
 }
 
 int
@@ -614,9 +622,10 @@ jit_execution_context_pop_overlay(JITExecutionContext *context,
 	|| frame->kind == JIT_FRAME_COMPACT || frame->callee
 	|| frame->runtime_storage || frame->owns_boundary_stack
 	|| !(caller = frame->caller)
-	|| caller->callee != frame)
+	|| caller->callee != frame || caller->state != JIT_FRAME_SUSPENDED)
 	return 0;
     caller->callee = 0;
+    caller->state = JIT_FRAME_RUNNING;
     context->current_frame = caller;
     frame->caller = 0;
     frame->context = 0;
@@ -638,8 +647,12 @@ jit_execution_context_push_compact(JITExecutionContext *context,
 	|| caller->outgoing || resume->caller != caller
 	|| resume->state != JIT_RESUME_PREPARING || resume->map_id <= 0
 	|| resume->map_id >= caller->program->num_deopt_maps
-	|| resume->result_home >= caller->num_homes
-	|| caller->home_states[resume->result_home] != JIT_HOME_EMPTY
+	|| (resume->continuation
+	    ? (!jit_native_frame_continuation_matches(caller, resume->map_id)
+	       || resume->continuation != caller->runtime_borrower
+	       || resume->result_home != UINT_MAX)
+	    : (resume->result_home >= caller->num_homes
+	       || caller->home_states[resume->result_home] != JIT_HOME_EMPTY))
 	|| context->canonical_depth + context->native_depth
 	    >= context->activation_limit)
 	return 0;
@@ -655,6 +668,7 @@ jit_execution_context_push_compact(JITExecutionContext *context,
     frame->kind = JIT_FRAME_COMPACT;
     frame->state = JIT_FRAME_RUNNING;
     resume->state = JIT_RESUME_DISPATCHED;
+    caller->state = JIT_FRAME_SUSPENDED;
     caller->outgoing = resume;
     caller->callee = frame;
     context->current_frame = frame;
@@ -666,6 +680,7 @@ jit_execution_context_push_compact(JITExecutionContext *context,
     context->current_frame = caller;
     caller->callee = 0;
     caller->outgoing = 0;
+    caller->state = JIT_FRAME_RUNNING;
     resume->state = JIT_RESUME_PREPARING;
     memset(frame, 0, sizeof(*frame));
     return 0;
@@ -683,14 +698,23 @@ jit_execution_context_return_compact(JITExecutionContext *context,
 	|| frame->callee || frame->outgoing || frame->runtime_storage
 	|| frame->owns_boundary_stack
 	|| !(caller = frame->caller) || caller->callee != frame
+	|| caller->state != JIT_FRAME_SUSPENDED
 	|| !(resume = frame->incoming) || resume->caller != caller
 	|| caller->outgoing != resume || resume->state != JIT_RESUME_DISPATCHED
-	|| context->native_depth == 0 || !jit_native_frame_verify(context, frame)
-	|| !jit_native_frame_home_move(caller, resume->result_home, result))
+	|| context->native_depth == 0 || !jit_native_frame_verify(context, frame))
+	return 0;
+
+    if (resume->continuation) {
+	jit_continuation_set_result(resume->continuation, *result);
+	result->type = TYPE_NONE;
+	result->v.num = 0;
+    } else if (!jit_native_frame_home_move(caller, resume->result_home,
+					  result))
 	return 0;
 
     caller->callee = 0;
     caller->outgoing = 0;
+    caller->state = JIT_FRAME_RUNNING;
     context->current_frame = caller;
     context->native_depth--;
     resume->state = JIT_RESUME_RETURNED;
@@ -766,8 +790,10 @@ jit_native_chain_commit_promotion(JITPromotionPlan *plan,
 	JITNativeFrame *frame = plan->frames[i];
 
 	materialize(frame, frame->outgoing, data);
-	if (frame->outgoing)
+	if (frame->outgoing) {
 	    frame->outgoing->state = JIT_RESUME_PROMOTED;
+	    frame->outgoing->continuation = 0;
+	}
 	frame->state = JIT_FRAME_PROMOTED;
     }
     for (i = plan->num_frames; i > 0; i--) {
@@ -1129,13 +1155,30 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	return 0;
     if (frame->callee && frame->callee->caller != frame)
 	return 0;
+    if ((frame == context->current_frame
+	 && frame->state != JIT_FRAME_RUNNING)
+	|| (frame != context->current_frame && frame->callee
+	    && frame->state != JIT_FRAME_SUSPENDED))
+	return 0;
     if (frame->incoming
 	&& (!frame->caller || frame->incoming->caller != frame->caller
 	    || frame->incoming->state != JIT_RESUME_DISPATCHED
 	    || frame->incoming->map_id <= 0
 	    || frame->incoming->map_id >= frame->incoming->caller->program->num_deopt_maps
-	    || frame->incoming->result_home
-	       >= frame->incoming->caller->num_homes))
+	    || (frame->incoming->continuation
+		? (frame->incoming->continuation
+		   != frame->incoming->caller->runtime_borrower
+		   || frame->incoming->result_home != UINT_MAX
+		   || frame->incoming->bytecode_pc
+		      != frame->incoming->caller->program->deopt_maps[
+			  frame->incoming->map_id].bytecode_pc
+		   || frame->incoming->error_pc
+		      != frame->incoming->caller->program->deopt_maps[
+			  frame->incoming->map_id].error_pc
+		   || !jit_native_frame_continuation_matches(
+		       frame->incoming->caller, frame->incoming->map_id))
+		: frame->incoming->result_home
+		  >= frame->incoming->caller->num_homes)))
 	return 0;
     if (frame->outgoing
 	&& (frame->outgoing->caller != frame
@@ -1143,7 +1186,18 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	    || !frame->callee || frame->callee->incoming != frame->outgoing
 	    || frame->outgoing->map_id <= 0
 	    || frame->outgoing->map_id >= frame->program->num_deopt_maps
-	    || frame->outgoing->result_home >= frame->num_homes))
+	    || (frame->outgoing->continuation
+		? (frame->outgoing->continuation != frame->runtime_borrower
+		   || frame->outgoing->result_home != UINT_MAX
+		   || frame->outgoing->bytecode_pc
+		      != frame->program->deopt_maps[
+			  frame->outgoing->map_id].bytecode_pc
+		   || frame->outgoing->error_pc
+		      != frame->program->deopt_maps[
+			  frame->outgoing->map_id].error_pc
+		   || !jit_native_frame_continuation_matches(
+		       frame, frame->outgoing->map_id))
+		: frame->outgoing->result_home >= frame->num_homes)))
 	return 0;
     if (frame->kind != JIT_FRAME_COMPACT
 	&& frame->canonical_index >= context->activation_limit)

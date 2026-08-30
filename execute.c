@@ -1097,7 +1097,8 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 				      WAIF_COMMA_ARG(Var THIS), Var args,
 				      enum error *error_out, int map_id,
 				      unsigned bytecode_pc,
-				      unsigned error_pc, unsigned result_home,
+				      unsigned error_pc,
+				      JITContinuationFrame *continuation,
 				      struct JITNativeCall **call_out)
 {
     struct JITNativeCall *native_call;
@@ -1111,7 +1112,9 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
     if (error_out)
 	*error_out = E_NONE;
     if (!context || !caller || !call_out || !error_out
-	|| context->current_frame != caller || !caller->env)
+	|| context->current_frame != caller || !caller->env || !continuation
+	|| continuation != caller->runtime_borrower
+	|| !jit_native_frame_continuation_matches(caller, map_id))
 	return 0;
     error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
 	&resolved);
@@ -1122,10 +1125,11 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
     native_call = mymalloc(sizeof(*native_call), M_VM);
     memset(native_call, 0, sizeof(*native_call));
     native_call->resume.caller = caller;
+    native_call->resume.continuation = continuation;
     native_call->resume.map_id = map_id;
     native_call->resume.bytecode_pc = bytecode_pc;
     native_call->resume.error_pc = error_pc;
-    native_call->resume.result_home = result_home;
+    native_call->resume.result_home = UINT_MAX;
     native_call->resume.state = JIT_RESUME_PREPARING;
     prepare_verb_call_for_caller(&prepared, caller->env,
 #ifdef WAIF_CORE

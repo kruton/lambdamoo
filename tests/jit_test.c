@@ -3492,10 +3492,15 @@ main(void)
 	context.native_depth = 0;
 	check(jit_execution_context_push_overlay(&context, &child, program, env,
 	    3, -1), "native canonical overlay push failed");
-	check(context.current_frame == &child && child.caller == &root,
+	check(context.current_frame == &child && child.caller == &root
+	      && root.state == JIT_FRAME_SUSPENDED
+	      && child.state == JIT_FRAME_RUNNING,
 	      "native canonical overlay linkage is wrong");
 	check(jit_execution_context_pop_overlay(&context, &child),
 	      "native canonical overlay pop failed");
+	check(root.state == JIT_FRAME_RUNNING
+	      && child.state == JIT_FRAME_DETACHED,
+	      "native canonical overlay states were not restored");
 	check(jit_execution_context_finish(&context, &root),
 	      "native root frame did not detach cleanly");
     }
@@ -4432,6 +4437,8 @@ main(void)
 	    JITContinuationFrame *continuation = 0;
 	    JITExecutionContext context;
 	    JITNativeFrame root;
+	    JITNativeFrame child;
+	    JITCallerResume native_resume;
 	    activation owner = { 0 };
 	    Var returned;
 	    size_t runtime_before = call_prog->active_runtime_bytes;
@@ -4461,9 +4468,25 @@ main(void)
 		"adopted continuation runtime ownership is inconsistent");
 	    check(!jit_native_frame_adopt_continuation_runtime(&root,
 		continuation), "continuation runtime was adopted more than once");
+	    memset(&native_resume, 0, sizeof(native_resume));
+	    native_resume.caller = &root;
+	    native_resume.continuation = continuation;
+	    native_resume.map_id = continuation->map_id;
+	    native_resume.bytecode_pc = deopt.bytecode_pc;
+	    native_resume.error_pc = deopt.error_pc;
+	    native_resume.result_home = UINT_MAX;
+	    native_resume.state = JIT_RESUME_PREPARING;
+	    check(jit_execution_context_push_compact(&context, &child,
+		call_prog, deep_env, &native_resume, -1),
+		"continuation-backed compact dispatch failed");
 	    returned.type = TYPE_STR;
 	    returned.v.str = str_dup("borrowed runtime returned");
-	    jit_continuation_set_result(continuation, returned);
+	    check(jit_execution_context_return_compact(&context, &child,
+		&returned), "continuation-backed compact return failed");
+	    check(returned.type == TYPE_NONE
+		&& native_resume.state == JIT_RESUME_RETURNED
+		&& context.current_frame == &root,
+		"compact return did not transfer its result to the continuation");
 	    check(jit_program_execute_in_context(call_prog, &context, &root,
 		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
 		deopt_stack, 2, -1, continuation, 0) == JIT_RUN_RETURNED,
