@@ -477,6 +477,24 @@ This is an illustrative interface rather than a declaration to copy directly:
 the concrete structure must follow the project's C layout and dependency
 rules.  Its responsibilities and ownership are normative.
 
+The concrete foundation now uses `JITExecutionContext`, `JITNativeFrame`, and
+`JITCallerResume` in `jit.h`.  The context records the ABI version, root and
+current frames, anchored activation index, canonical and compact depths,
+ordinary activation limit, and task tick, timeout, and pending-error pointers.
+A frame records its context and JIT program, caller/callee and incoming/outgoing
+resume links, runtime environment, native runtime allocation, authoritative
+home array and per-home state array, exact entry/current maps, canonical anchor
+when applicable, kind, and lifecycle state.  Root and canonical-overlay frames
+borrow their activation environment; compact frames will additionally carry
+the owned bytecode program and invocation metadata before production dispatch
+is enabled.
+
+Home state is explicit: `JIT_HOME_EMPTY` has never received a value,
+`JIT_HOME_OWNED` contains the sole authoritative complete `Var`, and
+`JIT_HOME_CONSUMED` is a one-way poison state after a move.  A consumed home is
+not reusable within the same frame instance.  The verifier rejects a state/tag
+mismatch and two owning homes containing the same complex payload.
+
 The context is allocated for, and associated with, one running task.  It
 survives every native call in that task and identifies the VM which owns the
 canonical activation stack.  `current_frame` identifies the currently
@@ -558,6 +576,24 @@ The link between a callee frame and its caller must identify at least:
 * the live-home layout or call-site map describing reconstructible values; and
 * the lifecycle state: preparing, dispatched, returned, or promoted.
 
+The target caller-resume representation names each reconstructed value with
+one of five authoritative source classes:
+
+* a canonical local;
+* a pre-call stack slot;
+* the unique result home;
+* an immutable typed constant; or
+* an owning native-frame home.
+
+The legacy captured-raw source is not an authoritative source for the new
+native chain and must not be admitted by general dispatch.  The required
+owner-backed source is not implemented yet.  It will store the home index;
+capture, native resume, and promotion must validate that the index is in range
+and the home is `JIT_HOME_OWNED`, then reload the complete `Var`, including its
+runtime tag, from `owned_values[index]`.  The raw SSA/deoptimization payload may
+still contain a cache of that value, but it must never be selected for
+owner-backed recovery.
+
 Arguments are transferred according to the shared verb-environment
 constructor.  The call request owns the receiver, verb name, and argument list
 while dispatch is being prepared.  On successful dispatch their ownership is
@@ -588,6 +624,17 @@ keep scalar values in callee-saved registers only if every promotion and
 runtime-helper safepoint has an exact recovery rule.  Complex owning `Var`
 values should continue to have authoritative frame homes; a register may cache
 their payload but never replace their ownership slot.
+
+Promotion itself is represented as a two-phase `JITPromotionPlan`.  Preparation
+walks and verifies the complete root-to-leaf chain, validates the leaf's exact
+current map and every suspended caller map, and snapshots the frame pointers
+without mutating live execution state.  Commit first revalidates the snapshot,
+then invokes an allocation-free materializer in root-to-leaf activation order.
+Only after every activation has been populated does commit mark resume links
+and frames promoted, detach all native links, clear the context, and release the
+plan.  The interpreter-side materializer must reserve activation capacity and
+all reconstruction storage before calling commit; a materializer callback is
+therefore not allowed to fail or allocate.
 
 Using the platform machine stack for these homes is intentionally excluded from
 the portable ABI.  C and MIR stack-frame layouts are target-specific, unwind
