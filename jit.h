@@ -15,6 +15,7 @@ typedef struct JITNativeFrame JITNativeFrame;
 typedef struct JITCallerResume JITCallerResume;
 typedef struct JITPromotionPlan JITPromotionPlan;
 struct activation;
+struct PreparedVerbCall;
 
 typedef enum {
     JIT_FRAME_ROOT_OVERLAY,
@@ -243,6 +244,8 @@ extern int jit_native_frame_bind_activation(JITNativeFrame *,
 					    const struct activation *);
 extern int jit_native_frame_copy_invocation(JITNativeFrame *,
 					    const struct activation *);
+extern int jit_native_frame_take_prepared_invocation(
+	JITNativeFrame *, struct PreparedVerbCall *);
 extern void jit_native_frame_release_invocation(JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
 					  Var *, unsigned, unsigned char *);

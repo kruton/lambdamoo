@@ -879,21 +879,6 @@ typedef struct {
     const char *verb;
 } ResolvedVerbCall;
 
-typedef struct {
-    Program *program;
-    Var *env;
-#ifdef WAIF_CORE
-    Var receiver;
-#endif
-    Objid this;
-    Objid player;
-    Objid progr;
-    Objid vloc;
-    const char *verb;
-    const char *verbname;
-    int debug;
-} PreparedVerbCall;
-
 static enum error
 resolve_verb_call(Objid this, const char *vname
 		  WAIF_COMMA_ARG(Var THIS), int do_pass,
@@ -1013,6 +998,33 @@ commit_verb_activation(const ResolvedVerbCall *call, Var args)
     a->temp.type = TYPE_NONE;
     return E_NONE;
 }
+
+#ifdef ENABLE_JIT
+int
+execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
+				      JITNativeFrame *frame,
+				      JITCallerResume *resume,
+				      PreparedVerbCall *prepared,
+				      int entry_map)
+{
+    JITProgram *program;
+
+    if (!context || !frame || !resume || !prepared || !prepared->program
+	|| !prepared->env || !prepared->verb || !prepared->verbname
+	|| !(program = prepared->program->jit)
+	|| !jit_program_is_eligible(program))
+	return 0;
+    if (!jit_execution_context_push_compact(context, frame, program,
+	prepared->env, resume, entry_map))
+	return 0;
+
+    if (!jit_native_frame_take_prepared_invocation(frame, prepared))
+	panic("Prepared verb call ownership transfer failed after publication");
+    if (!jit_native_frame_verify(context, frame))
+	panic("Prepared verb call produced an invalid compact frame");
+    return 1;
+}
+#endif /* ENABLE_JIT */
 
 enum error
 call_verb2(Objid this, const char *vname

@@ -729,13 +729,23 @@ check has succeeded.  The strict leaf path uses the same resolved target and
 commit helper, so it no longer performs one lookup to classify a callee and a
 second lookup to invoke it.
 
-The prepared descriptor is intentionally private until compact dispatch is
-connected.  The next step is a move-only compact commit routine: after caller
-continuation validation and native-frame allocation succeed, it transfers the
-descriptor's owned fields into `JITNativeFrame`, marks `owns_invocation`, and
-publishes the frame.  No database lookup or environment reconstruction belongs
-in that routine, and no failure after the move may return to speculative
-restart.
+`execute_jit_commit_prepared_verb_call()` is the move-only compact commit
+routine.  It first validates the prepared descriptor, target JIT program,
+caller continuation, result home, and combined interpreter/native depth.  A
+failure through this point leaves the descriptor and all of its references
+untouched.  Compact linkage then installs the descriptor's exact environment;
+`jit_native_frame_take_prepared_invocation()` verifies that identity and moves
+the program, environment, receiver, player and permission identities, and verb
+metadata into the frame.  It marks `owns_invocation` and clears the complete
+descriptor.  This post-link move performs no allocation and has no recoverable
+failure path; an invariant violation is fatal rather than permission to replay
+the caller.  The frame is returned to its caller only after the owned form
+passes `jit_native_frame_verify()`.
+
+No database lookup or environment reconstruction belongs in compact commit.
+General dispatch still needs to allocate the frame and caller resume record,
+prepare the descriptor, and call this routine from the trampoline; adding that
+call site is the next step.
 
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup

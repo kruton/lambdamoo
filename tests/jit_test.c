@@ -3353,6 +3353,48 @@ main(void)
 	check(!compact.owns_invocation && !compact.bytecode_program
 	      && !compact.env && bytecode.ref_count == 1,
 	      "compact frame invocation release was incomplete");
+	{
+	    PreparedVerbCall prepared;
+	    Var *prepared_env = mymalloc(sizeof(Var), M_RT_ENV);
+
+	    memset(&compact, 0, sizeof(compact));
+	    memset(&prepared, 0, sizeof(prepared));
+	    prepared.program = program_ref(&bytecode);
+	    prepared.env = prepared_env;
+	    prepared_env[0].type = TYPE_STR;
+	    prepared_env[0].v.str = str_dup("prepared environment");
+#ifdef WAIF_CORE
+	    prepared.receiver.type = TYPE_OBJ;
+	    prepared.receiver.v.obj = 27;
+#endif
+	    prepared.this = 27;
+	    prepared.player = 28;
+	    prepared.progr = 29;
+	    prepared.vloc = 30;
+	    prepared.verb = str_dup("prepared");
+	    prepared.verbname = str_dup("prepared alias");
+	    prepared.debug = 1;
+	    compact.kind = JIT_FRAME_COMPACT;
+	    compact.env = invocation_env;
+	    check(!jit_native_frame_take_prepared_invocation(&compact,
+		&prepared) && prepared.program == &bytecode
+		&& prepared.env == prepared_env && !compact.owns_invocation,
+		"failed prepared invocation transfer consumed ownership");
+	    compact.env = prepared_env;
+	    check(jit_native_frame_take_prepared_invocation(&compact, &prepared),
+		"prepared invocation ownership transfer failed");
+	    check(compact.owns_invocation
+		&& compact.bytecode_program == &bytecode
+		&& compact.env == prepared_env && compact.this == 27
+		&& compact.player == 28 && compact.progr == 29
+		&& compact.vloc == 30 && compact.debug == 1
+		&& !prepared.program && !prepared.env && !prepared.verb
+		&& !prepared.verbname && bytecode.ref_count == 2,
+		"prepared invocation ownership transfer was incomplete");
+	    jit_native_frame_release_invocation(&compact);
+	    check(bytecode.ref_count == 1,
+		"prepared invocation release leaked its program reference");
+	}
 	free_var(invocation_env[0]);
 	free_str(invocation.verb);
 	free_str(invocation.verbname);

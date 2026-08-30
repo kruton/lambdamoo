@@ -849,6 +849,31 @@ jit_native_frame_copy_invocation(JITNativeFrame *frame, const activation *a)
     return 1;
 }
 
+int
+jit_native_frame_take_prepared_invocation(JITNativeFrame *frame,
+					  PreparedVerbCall *prepared)
+{
+    if (!frame || !prepared || frame->kind != JIT_FRAME_COMPACT
+	|| frame->owns_invocation || frame->bytecode_program
+	|| !prepared->program || !prepared->env || !prepared->verb
+	|| !prepared->verbname || frame->env != prepared->env)
+	return 0;
+    frame->bytecode_program = prepared->program;
+#ifdef WAIF_CORE
+    frame->receiver = prepared->receiver;
+#endif
+    frame->this = prepared->this;
+    frame->player = prepared->player;
+    frame->progr = prepared->progr;
+    frame->vloc = prepared->vloc;
+    frame->verb = prepared->verb;
+    frame->verbname = prepared->verbname;
+    frame->debug = prepared->debug;
+    frame->owns_invocation = 1;
+    memset(prepared, 0, sizeof(*prepared));
+    return 1;
+}
+
 void
 jit_native_frame_release_invocation(JITNativeFrame *frame)
 {

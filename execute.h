@@ -32,6 +32,7 @@
 struct JITContinuationFrame;
 struct JITExecutionContext;
 struct JITNativeFrame;
+struct JITCallerResume;
 struct JITActivationPromotion;
 
 typedef struct activation {
@@ -73,6 +74,21 @@ typedef struct activation {
 } activation;
 #define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (18 * V) + X(WAIF_CORE, B(Var)))
 
+typedef struct PreparedVerbCall {
+    Program *program;
+    Var *env;
+#ifdef WAIF_CORE
+    Var receiver;
+#endif
+    Objid this;
+    Objid player;
+    Objid progr;
+    Objid vloc;
+    const char *verb;
+    const char *verbname;
+    int debug;
+} PreparedVerbCall;
+
 extern void free_activation(activation *, char data_too);
 
 typedef struct {
@@ -107,6 +123,9 @@ extern int execute_jit_direct_verb_call(struct JITExecutionContext *,
 					int64_t, int, int64_t, int,
 					int *, int *, enum error *,
 					int64_t *, int *);
+extern int execute_jit_commit_prepared_verb_call(
+	struct JITExecutionContext *, struct JITNativeFrame *,
+	struct JITCallerResume *, PreparedVerbCall *, int);
 extern struct JITActivationPromotion *execute_jit_prepare_promotion(
 	struct JITExecutionContext *);
 extern int execute_jit_commit_promotion(struct JITActivationPromotion *);
