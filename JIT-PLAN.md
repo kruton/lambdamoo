@@ -718,6 +718,25 @@ by `call_verb2()`:
 3. commit that descriptor either as an interpreter activation or as a native
    verb frame.
 
+The first two operations and the interpreter half of the third are now
+factored in `execute.c`.  `ResolvedVerbCall` records the single authoritative
+lookup result, including the selected verb handle, program, and receiver.
+`PreparedVerbCall` then owns the program reference, complete runtime
+environment, receiver reference, player and permission identities, and verb
+metadata.  It is independent of an interpreter runtime stack.  Canonical
+commit moves those fields into a new activation only after the ordinary depth
+check has succeeded.  The strict leaf path uses the same resolved target and
+commit helper, so it no longer performs one lookup to classify a callee and a
+second lookup to invoke it.
+
+The prepared descriptor is intentionally private until compact dispatch is
+connected.  The next step is a move-only compact commit routine: after caller
+continuation validation and native-frame allocation succeed, it transfers the
+descriptor's owned fields into `JITNativeFrame`, marks `owns_invocation`, and
+publishes the frame.  No database lookup or environment reconstruction belongs
+in that routine, and no failure after the move may return to speculative
+restart.
+
 Interpreter callers use the activation commit unchanged.  A built-in running
 under native capture uses the frame commit after it returns `BI_CALL`.  Lookup
 errors create no pending request and retain the existing `call_verb2()` error

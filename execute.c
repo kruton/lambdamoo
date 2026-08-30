@@ -869,6 +869,151 @@ call_verb(Objid this, const char *vname_in, Var args, int do_pass)
     return result;
 }
 
+typedef struct {
+    db_verb_handle handle;
+    Program *program;
+    Objid this;
+#ifdef WAIF_CORE
+    Var receiver;
+#endif
+    const char *verb;
+} ResolvedVerbCall;
+
+typedef struct {
+    Program *program;
+    Var *env;
+#ifdef WAIF_CORE
+    Var receiver;
+#endif
+    Objid this;
+    Objid player;
+    Objid progr;
+    Objid vloc;
+    const char *verb;
+    const char *verbname;
+    int debug;
+} PreparedVerbCall;
+
+static enum error
+resolve_verb_call(Objid this, const char *vname
+		  WAIF_COMMA_ARG(Var THIS), int do_pass,
+		  ResolvedVerbCall *call)
+{
+    Objid where;
+
+    if (do_pass) {
+	if (!valid(RUN_ACTIV.vloc))
+	    return E_INVIND;
+	where = db_object_parent(RUN_ACTIV.vloc);
+    } else
+	where = this;
+
+    if (!valid(where))
+	return E_INVIND;
+    call->handle = db_find_callable_verb(where, vname);
+    if (!call->handle.ptr)
+	return E_VERBNF;
+    call->program = db_verb_program(call->handle);
+    call->this = this;
+#ifdef WAIF_CORE
+    call->receiver = THIS;
+#endif
+    call->verb = vname;
+    return E_NONE;
+}
+
+static void
+prepare_verb_call(PreparedVerbCall *prepared, const activation *caller,
+		  const ResolvedVerbCall *call, Var args)
+{
+    Program *program = call->program;
+    Var *env;
+    Var v;
+
+    memset(prepared, 0, sizeof(*prepared));
+    prepared->program = program_ref(program);
+    prepared->this = call->this;
+#ifdef WAIF_CORE
+    prepared->receiver = var_ref(call->receiver);
+#endif
+    prepared->progr = db_verb_owner(call->handle);
+    prepared->vloc = db_verb_definer(call->handle);
+    prepared->verb = str_ref(call->verb);
+    prepared->verbname = str_ref(db_verb_names(call->handle));
+    prepared->debug = (db_verb_flags(call->handle) & VF_DEBUG);
+    prepared->env = env = new_rt_env(program->num_var_names);
+    fill_in_rt_consts(env, program->version);
+
+#ifdef WAIF_CORE
+    set_rt_env_var(env, SLOT_THIS, var_ref(call->receiver));
+    set_rt_env_var(env, SLOT_CALLER, var_ref(caller->THIS));
+#else
+    set_rt_env_obj(env, SLOT_THIS, call->this);
+    set_rt_env_obj(env, SLOT_CALLER, caller->this);
+#endif
+
+#define ENV_COPY(slot) \
+    set_rt_env_var(env, slot, var_ref(caller->rt_env[slot]))
+
+    ENV_COPY(SLOT_ARGSTR);
+    ENV_COPY(SLOT_DOBJ);
+    ENV_COPY(SLOT_DOBJSTR);
+    ENV_COPY(SLOT_PREPSTR);
+    ENV_COPY(SLOT_IOBJ);
+    ENV_COPY(SLOT_IOBJSTR);
+
+    if (is_wizard(caller->progr)
+	&& caller->rt_env[SLOT_PLAYER].type == TYPE_OBJ)
+	ENV_COPY(SLOT_PLAYER);
+    else
+	set_rt_env_obj(env, SLOT_PLAYER, caller->player);
+    prepared->player = env[SLOT_PLAYER].v.obj;
+
+#undef ENV_COPY
+
+    v.type = TYPE_STR;
+#ifdef WAIF_CORE
+    if (call->verb[0] == WAIF_VERB_PREFIX)
+	v.v.str = str_dup(call->verb + 1);
+    else
+#endif
+	v.v.str = str_ref(call->verb);
+    set_rt_env_var(env, SLOT_VERB, v);
+    set_rt_env_var(env, SLOT_ARGS, args);
+}
+
+static enum error
+commit_verb_activation(const ResolvedVerbCall *call, Var args)
+{
+    PreparedVerbCall prepared;
+    activation *a;
+
+    if (top_activ_stack >= max_stack_size - 1)
+	return E_MAXREC;
+    prepare_verb_call(&prepared, &RUN_ACTIV, call, args);
+    if (!push_activation())
+	panic("Verb activation capacity changed during call preparation");
+    a = &RUN_ACTIV;
+    memset(a, 0, sizeof(*a));
+    a->prog = prepared.program;
+    a->rt_env = prepared.env;
+#ifdef WAIF_CORE
+    a->THIS = prepared.receiver;
+#endif
+    a->this = prepared.this;
+    a->player = prepared.player;
+    a->progr = prepared.progr;
+    a->vloc = prepared.vloc;
+    a->verb = prepared.verb;
+    a->verbname = prepared.verbname;
+    a->debug = prepared.debug;
+    memset(&prepared, 0, sizeof(prepared));
+    alloc_rt_stack(a, a->prog->main_vector.max_stack);
+    a->resume_key = invalid_resume_key();
+    a->temp.type = TYPE_NONE;
+    return E_NONE;
+}
+
 enum error
 call_verb2(Objid this, const char *vname
 	   WAIF_COMMA_ARG(Var THIS),
@@ -885,91 +1030,13 @@ call_verb2(Objid this, const char *vname
        case, else sets up the activ_stack for the verb call and then returns
        E_NONE */
 
-    Objid where;
-    db_verb_handle h;
-    Program *program;
-    Var *env;
-    Var v;
+    ResolvedVerbCall call;
+    enum error error = resolve_verb_call(this, vname
+	WAIF_COMMA_ARG(THIS), do_pass, &call);
 
-    if (do_pass)
-	if (!valid(RUN_ACTIV.vloc))
-	    return E_INVIND;
-	else
-	    where = db_object_parent(RUN_ACTIV.vloc);
-    else
-	where = this;
-
-    if (!valid(where))
-	return E_INVIND;
-    h = db_find_callable_verb(where, vname);
-    if (!h.ptr)
-	return E_VERBNF;
-    else if (!push_activation())
-	return E_MAXREC;
-
-    program = db_verb_program(h);
-    RUN_ACTIV.prog = program_ref(program);
-    RUN_ACTIV.this = this;
-#ifdef WAIF_CORE
-    RUN_ACTIV.THIS = var_ref(THIS);
-#endif
-    RUN_ACTIV.progr = db_verb_owner(h);
-    RUN_ACTIV.vloc = db_verb_definer(h);
-    RUN_ACTIV.verb = str_ref(vname);
-    RUN_ACTIV.verbname = str_ref(db_verb_names(h));
-    RUN_ACTIV.debug = (db_verb_flags(h) & VF_DEBUG);
-
-    alloc_rt_stack(&RUN_ACTIV, program->main_vector.max_stack);
-    RUN_ACTIV.pc = 0;
-    RUN_ACTIV.error_pc = 0;
-    RUN_ACTIV.resume_key = invalid_resume_key();
-    RUN_ACTIV.bi_func_pc = 0;
-    RUN_ACTIV.temp.type = TYPE_NONE;
-
-    RUN_ACTIV.rt_env = env = new_rt_env(RUN_ACTIV.prog->num_var_names);
-
-    fill_in_rt_consts(env, program->version);
-
-#ifdef WAIF_CORE
-    set_rt_env_var(env, SLOT_THIS, var_ref(THIS));
-    set_rt_env_var(env, SLOT_CALLER, var_ref(CALLER_ACTIV.THIS));
-#else
-    set_rt_env_obj(env, SLOT_THIS, this);
-    set_rt_env_obj(env, SLOT_CALLER, CALLER_ACTIV.this);
-#endif
-
-#define ENV_COPY(slot) \
-    set_rt_env_var(env, slot, var_ref(CALLER_ACTIV.rt_env[slot]))
-
-    ENV_COPY(SLOT_ARGSTR);
-    ENV_COPY(SLOT_DOBJ);
-    ENV_COPY(SLOT_DOBJSTR);
-    ENV_COPY(SLOT_PREPSTR);
-    ENV_COPY(SLOT_IOBJ);
-    ENV_COPY(SLOT_IOBJSTR);
-
-    if (is_wizard(CALLER_ACTIV.progr) &&
-	(CALLER_ACTIV.rt_env[SLOT_PLAYER].type == TYPE_OBJ))
-	ENV_COPY(SLOT_PLAYER);
-    else
-	set_rt_env_obj(env, SLOT_PLAYER, CALLER_ACTIV.player);
-    RUN_ACTIV.player = env[SLOT_PLAYER].v.obj;
-
-#undef ENV_COPY
-
-    v.type = TYPE_STR;
-
-#ifdef WAIF_CORE
-    if (vname[0] == WAIF_VERB_PREFIX)
-	v.v.str = str_dup(vname + 1);
-    else
-#endif
-	v.v.str = str_ref(vname);
-
-    set_rt_env_var(env, SLOT_VERB, v);	/* no var_dup */
-    set_rt_env_var(env, SLOT_ARGS, args);	/* no var_dup */
-
-    return E_NONE;
+    if (error != E_NONE)
+	return error;
+    return commit_verb_activation(&call, args);
 }
 
 #ifdef ENABLE_JIT
@@ -1032,7 +1099,7 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
     JITNativeFrame callee_frame;
     JITRunResult run_result;
     Program *callee;
-    db_verb_handle handle;
+    ResolvedVerbCall call;
     Objid receiver;
     Var call_args;
     enum error call_error;
@@ -1058,16 +1125,16 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
 	receiver = obj.v.obj;
     }
 
-    handle = db_find_callable_verb(receiver, verb.v.str);
-    if (!handle.ptr)
+    call_error = resolve_verb_call(receiver, verb.v.str
+	WAIF_COMMA_ARG(obj), 0, &call);
+    if (call_error != E_NONE)
 	return 0;
-    callee = db_verb_program(handle);
+    callee = call.program;
     if (!callee->jit || !jit_program_is_direct_leaf(callee->jit))
 	return 0;
 
     call_args = var_ref(args);
-    call_error = call_verb2(receiver, verb.v.str WAIF_COMMA_ARG(obj),
-	call_args, 0);
+    call_error = commit_verb_activation(&call, call_args);
     if (call_error != E_NONE) {
 	free_var(call_args);
 	return 0;
