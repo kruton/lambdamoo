@@ -1366,18 +1366,21 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		&& !jit_native_frame_adopt_continuation_runtime(active,
 		    continuation))
 		panic("Native boundary continuation ownership is invalid");
-	    if (!continuation) {
-		materialized_depth = out->deopt.materialized
+	    if (continuation
+		&& out->deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO) {
+		stack[0] = new_list(1);
+		stack[0].v.list[1].type = TYPE_INT;
+		stack[0].v.list[1].v.num = 0;
+		materialized_depth = 1;
+	    } else
+		materialized_depth = out->deopt.materialized || continuation
 		    ? out->deopt.stack_depth : 0;
-		if (!jit_native_frame_capture_boundary(active, stack,
-			materialized_depth, out->deopt.map_id))
-		    panic("Native boundary capture failed before promotion");
-	    }
+	    if (!jit_native_frame_capture_boundary(active, stack,
+		    materialized_depth, out->deopt.map_id))
+		panic("Native boundary capture failed before promotion");
 	    promotion = execute_jit_prepare_promotion(context);
 	    if (!promotion || !execute_jit_commit_promotion(promotion))
 		panic("Native call-chain promotion failed");
-	    if (continuation)
-		materialized_depth = out->deopt.stack_depth;
 	    free_jit_boundary_values(stack, materialized_depth);
 	    if (allocated_stack)
 		myfree(stack, M_RT_STACK);

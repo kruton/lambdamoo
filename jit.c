@@ -6322,6 +6322,89 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
     return 1;
 }
 
+static int
+jit_continuation_prepare_boundary_activation(JITContinuationFrame *frame,
+					     activation *a, Var *boundary,
+					     unsigned boundary_depth)
+{
+    JITProgram *program;
+    JITDeoptMap *map;
+    unsigned outer_depth;
+    unsigned published_depth;
+    unsigned i;
+    int operands;
+    int unpack_builtin;
+
+    if (!frame || !a || !(program = frame->program)
+	|| frame->map_id <= 0 || frame->map_id >= program->num_deopt_maps
+	|| frame->dispatched || frame->has_result
+	|| (boundary_depth && !boundary))
+	return 0;
+    map = &program->deopt_maps[frame->map_id];
+    operands = jit_call_stack_operands(map);
+    if (operands < 0 || (unsigned) operands > map->stack_depth)
+	return 0;
+    outer_depth = map->stack_depth - operands;
+    unpack_builtin = jit_deopt_map_is_specialized_builtin(map);
+    if (unpack_builtin
+	&& (boundary_depth != 1 || boundary[0].type != TYPE_LIST
+	    || boundary[0].v.list[0].v.num != map->builtin_args))
+	return 0;
+    published_depth = unpack_builtin
+	? (unsigned) map->builtin_args : boundary_depth;
+    if (outer_depth + published_depth > (unsigned) a->rt_stack_size
+	|| a->top_rt_stack != a->base_rt_stack)
+	return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+
+	if (value > 0 && !jit_continuation_resume_value(frame, value))
+	    return 0;
+    }
+    for (i = 0; i < outer_depth; i++)
+	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
+	    && !jit_continuation_resume_value(frame, map->stack_values[i]))
+	    return 0;
+    for (i = 0; i < (unsigned) map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+	Var saved;
+
+	if (value > 0
+	    && jit_continuation_materialized_value(frame, value, &saved)) {
+	    free_var(a->rt_env[i]);
+	    a->rt_env[i] = saved;
+	}
+    }
+    for (i = 0; i < outer_depth; i++) {
+	ResumeStackSlot slot = map->stack_slots
+	    ? map->stack_slots[i]
+	    : (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
+	Var value;
+
+	if (slot.kind == RSS_VALUE) {
+	    if (!jit_continuation_materialized_value(frame,
+		map->stack_values[i], &value))
+		return 0;
+	} else {
+	    value.type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		: slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+	    value.v.num = slot.data;
+	}
+	*a->top_rt_stack++ = value;
+    }
+    if (unpack_builtin) {
+	for (i = 0; i < published_depth; i++)
+	    *a->top_rt_stack++ = var_ref(boundary[0].v.list[i + 1]);
+    } else {
+	for (i = 0; i < boundary_depth; i++)
+	    *a->top_rt_stack++ = var_ref(boundary[i]);
+    }
+    a->pc = map->bytecode_pc;
+    a->error_pc = map->error_pc;
+    a->resume_key = invalid_resume_key();
+    return 1;
+}
+
 static JITContinuationFrame *
 jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 			 void *runtime_storage, Var *borrowed_locals,
@@ -6482,6 +6565,10 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
 	    || native_frame->boundary_depth > (unsigned) a->rt_stack_size
 	    || a->top_rt_stack != a->base_rt_stack)
 	    return 0;
+	if (native_frame->runtime_borrower)
+	    return jit_continuation_prepare_boundary_activation(
+		native_frame->runtime_borrower, a,
+		native_frame->boundary_stack, native_frame->boundary_depth);
 	for (i = 0; i < native_frame->boundary_depth; i++)
 	    *a->top_rt_stack++ = var_ref(native_frame->boundary_stack[i]);
 	a->pc = map->bytecode_pc;
