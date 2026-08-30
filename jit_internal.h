@@ -53,11 +53,11 @@ struct JITContinuationFrame {
     JITProgram *program;
     struct activation *owner;
     int map_id;
-    int num_values;
-    Var *values;
-    int values_capacity;
-    Var *spare_values;
-    int spare_values_capacity;
+    int num_retained;
+    Var *retained_values;
+    int retained_capacity;
+    Var *spare_retained;
+    int spare_retained_capacity;
     void *runtime_storage;
     Num *deopt_values;
     Var *borrowed_locals;

@@ -1744,8 +1744,8 @@ jit_pool_stats(JITPoolStats *stats)
     for (frame = continuation_frames; frame; frame = frame->next) {
 	stats->active_continuations++;
 	stats->continuation_bytes += sizeof(*frame)
-	    + sizeof(Var) * (frame->values_capacity
-		+ frame->spare_values_capacity);
+	    + sizeof(Var) * (frame->retained_capacity
+		+ frame->spare_retained_capacity);
     }
     for (program = jit_shared_pool.active_head; program;
 	 program = program->pool_next) {
@@ -2775,7 +2775,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 	    if (resume->source == JIT_RESUME_RESULT)
 		append_resume_value(build, program, values, resume->value,
-				    continuation_values, j, deopt_values,
+				    continuation_values, 0, deopt_values,
 				    &copy_serial);
 	    else if (resume->source == JIT_RESUME_OWNER)
 		append_resume_value(build, program, values, resume->value,
@@ -6350,7 +6350,8 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
 	    if (frame->program == program) {
 		stats->active_continuations++;
 		stats->continuation_bytes += sizeof(*frame)
-		    + sizeof(Var) * frame->num_values;
+		    + sizeof(Var) * (frame->retained_capacity
+			+ frame->spare_retained_capacity);
 	    }
     }
     stats->accounted_bytes = stats->metadata_bytes + stats->runtime_bytes
@@ -6634,7 +6635,7 @@ jit_continuation_resume_value(JITContinuationFrame *frame, int value)
     int i;
 
     resume = frame->program->deopt_maps[frame->map_id].native_resume;
-    for (i = 0; i < frame->num_values; i++) {
+    for (i = 0; i < resume->num_values; i++) {
 	if (resume->values[i].value == value) {
 	    return &resume->values[i];
 	}
@@ -6683,6 +6684,28 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
     *materialized = materialize_deopt_value(type,
 	frame->deopt_values[value]);
     return 1;
+}
+
+static int
+jit_resume_value_needs_capture(JITProgram *program, JITResumeValue *resume,
+			       var_type type)
+{
+    if (!jit_continuation_type_needs_owner(type))
+	return 0;
+    if (resume->source == JIT_RESUME_OWNER
+	|| resume->source == JIT_RESUME_CONSTANT
+	|| resume->source == JIT_RESUME_RESULT)
+	return 0;
+    if (resume->source == JIT_RESUME_LOCAL
+	&& program->value_ownership
+	&& program->value_owner_root
+	&& program->value_ownership[resume->value]
+	   == JIT_OWNERSHIP_BORROWED_LOCAL
+	&& program->value_owner_root[resume->value] == resume->index)
+	return 0;
+    return resume->source == JIT_RESUME_LOCAL
+	|| resume->source == JIT_RESUME_STACK
+	|| resume->source == JIT_RESUME_CAPTURED;
 }
 
 static int
@@ -6778,6 +6801,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     JITDeoptMap *map;
     Var *new_values;
     int new_values_capacity;
+    int captured_values = 0;
     int i;
 
     if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
@@ -6816,50 +6840,43 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	    : program->value_types[resume->value];
 	if (!jit_runtime_type_is_valid(type))
 	    return 0;
+	if (jit_resume_value_needs_capture(program, resume, type))
+	    captured_values++;
     }
-    new_values_capacity = map->native_resume->num_values;
+    new_values_capacity = captured_values;
     if (frame) {
-	new_values = frame->spare_values;
-	new_values_capacity = frame->spare_values_capacity;
-	if (new_values_capacity < map->native_resume->num_values) {
+	new_values = frame->spare_retained;
+	new_values_capacity = frame->spare_retained_capacity;
+	if (new_values_capacity < captured_values) {
 	    if (new_values)
 		new_values = myrealloc(new_values,
-		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
+		    sizeof(Var) * captured_values, M_PROGRAM);
 	    else
 		new_values = mymalloc(
-		    sizeof(Var) * map->native_resume->num_values, M_PROGRAM);
-	    new_values_capacity = map->native_resume->num_values;
+		    sizeof(Var) * captured_values, M_PROGRAM);
+	    new_values_capacity = captured_values;
 	}
     } else
-	new_values = map->native_resume->num_values
-	    ? mymalloc(sizeof(Var) * map->native_resume->num_values, M_PROGRAM)
+	new_values = captured_values
+	    ? mymalloc(sizeof(Var) * captured_values, M_PROGRAM)
 	    : 0;
-    for (i = 0; i < map->native_resume->num_values; i++)
+    for (i = 0; i < captured_values; i++)
 	new_values[i].type = TYPE_NONE;
+    captured_values = 0;
     for (i = 0; i < map->native_resume->num_values; i++) {
 	JITResumeValue *resume = &map->native_resume->values[i];
 	var_type type;
 
-	if (resume->source == JIT_RESUME_RESULT)
+	if (resume->source == JIT_RESUME_RESULT
+	    || resume->source == JIT_RESUME_CONSTANT
+	    || resume->source == JIT_RESUME_OWNER)
 	    continue;
-	if (resume->source == JIT_RESUME_CONSTANT
-	    && jit_continuation_type_needs_owner(resume->literal_type)) {
-	    new_values[i] = materialize_deopt_value(
-		resume->literal_type, resume->literal);
-	    continue;
-	}
-	if (resume->source == JIT_RESUME_CONSTANT)
-	    continue;
-	if (resume->source == JIT_RESUME_OWNER) {
-	    new_values[i] = var_ref(owned_values[resume->index]);
-	    continue;
-	}
 	type = program->value_is_tagged
 	    && program->value_is_tagged[resume->value]
 	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
 	    : program->value_types[resume->value];
-	if (jit_continuation_type_needs_owner(type))
-	    new_values[i] = materialize_deopt_value(type,
+	if (jit_resume_value_needs_capture(program, resume, type))
+	    new_values[captured_values++] = materialize_deopt_value(type,
 		deopt_values[resume->value]);
     }
     if (!frame) {
@@ -6867,23 +6884,23 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	memset(frame, 0, sizeof(JITContinuationFrame));
 	frame->owns_runtime = runtime_storage != 0;
     } else {
-	Var *old_values = frame->values;
-	int old_values_capacity = frame->values_capacity;
+	Var *old_values = frame->retained_values;
+	int old_values_capacity = frame->retained_capacity;
 
-	for (i = 0; i < frame->num_values; i++)
-	    free_var(frame->values[i]);
+	for (i = 0; i < frame->num_retained; i++)
+	    free_var(frame->retained_values[i]);
 	if (frame->has_result)
 	    free_var(frame->result);
-	frame->spare_values = old_values;
-	frame->spare_values_capacity = old_values_capacity;
+	frame->spare_retained = old_values;
+	frame->spare_retained_capacity = old_values_capacity;
 	frame->has_result = 0;
 	frame->dispatched = 0;
     }
     frame->program = program;
     frame->map_id = map_id;
-    frame->num_values = map->native_resume->num_values;
-    frame->values = new_values;
-    frame->values_capacity = new_values_capacity;
+    frame->num_retained = captured_values;
+    frame->retained_values = new_values;
+    frame->retained_capacity = new_values_capacity;
     frame->runtime_storage = runtime_storage;
     frame->deopt_values = deopt_values;
     frame->borrowed_locals = borrowed_locals;
@@ -7029,21 +7046,12 @@ jit_continuation_is_dispatched(const JITContinuationFrame *frame)
 void
 jit_continuation_set_result(JITContinuationFrame *frame, Var value)
 {
-    JITNativeResume *resume;
-    int i;
-
     if (!frame)
 	return;
     if (frame->has_result)
 	free_var(frame->result);
     frame->result = value;
     frame->has_result = 1;
-    resume = frame->program->deopt_maps[frame->map_id].native_resume;
-    for (i = 0; i < frame->num_values; i++)
-	if (resume->values[i].source == JIT_RESUME_RESULT) {
-	    free_var(frame->values[i]);
-	    frame->values[i] = var_ref(value);
-	}
 }
 
 void
@@ -7056,12 +7064,12 @@ jit_continuation_free(JITContinuationFrame *frame)
     if (frame->owner && frame->owner->jit_continuation == frame)
 	frame->owner->jit_continuation = 0;
     jit_continuation_unlink(frame);
-    for (i = 0; i < frame->num_values; i++)
-	free_var(frame->values[i]);
-    if (frame->values)
-	myfree(frame->values, M_PROGRAM);
-    if (frame->spare_values)
-	myfree(frame->spare_values, M_PROGRAM);
+    for (i = 0; i < frame->num_retained; i++)
+	free_var(frame->retained_values[i]);
+    if (frame->retained_values)
+	myfree(frame->retained_values, M_PROGRAM);
+    if (frame->spare_retained)
+	myfree(frame->spare_retained, M_PROGRAM);
     if (frame->has_result)
 	free_var(frame->result);
     if (frame->runtime_owner) {
@@ -7417,7 +7425,8 @@ jit_program_execute_in_context(JITProgram *program,
 			     source_location, &deopt_map,
 			     deopt_values, progr, resume_map,
 			     deopt_stack,
-			     continuation_in ? continuation_in->values : 0,
+			     continuation_in && continuation_in->has_result
+			     ? &continuation_in->result : 0,
 			     owned_values);
     if (deopt && deopt_map >= 0 && deopt_map < program->num_deopt_maps)
 	deopt->map_id = deopt_map;
