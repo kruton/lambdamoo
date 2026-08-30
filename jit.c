@@ -524,6 +524,12 @@ typedef int64_t (*NativeFunction) (JITExecutionContext *, JITNativeFrame *,
 				   JITSourceLocation *, int *, Num *, Objid,
 				   int, Var *, Var *, Var *);
 
+struct JITPromotionPlan {
+    JITExecutionContext *context;
+    JITNativeFrame **frames;
+    unsigned num_frames;
+};
+
 void
 jit_execution_context_init(JITExecutionContext *context,
 			   JITNativeFrame *root, JITProgram *program, Var *env,
@@ -672,6 +678,99 @@ jit_execution_context_return_compact(JITExecutionContext *context,
     frame->context = 0;
     frame->state = JIT_FRAME_RETURNED;
     return jit_native_frame_verify(context, caller);
+}
+
+JITPromotionPlan *
+jit_native_chain_prepare_promotion(JITExecutionContext *context)
+{
+    JITPromotionPlan *plan;
+    JITNativeFrame *frame;
+    JITNativeFrame *last = 0;
+    unsigned count = 0;
+    unsigned i;
+
+    if (!context || !context->root_frame || !context->current_frame)
+	return 0;
+    for (frame = context->root_frame; frame; frame = frame->callee) {
+	if (!jit_native_frame_verify(context, frame)
+	    || (frame->callee && !frame->outgoing)
+	    || (!frame->callee && (frame->current_map < 0
+		|| frame->current_map >= frame->program->num_deopt_maps)))
+	    return 0;
+	count++;
+	last = frame;
+    }
+    if (last != context->current_frame
+	|| count != context->native_depth + 1)
+	return 0;
+
+    plan = mymalloc(sizeof(*plan), M_PROGRAM);
+    plan->frames = mymalloc(sizeof(JITNativeFrame *) * count, M_PROGRAM);
+    plan->context = context;
+    plan->num_frames = count;
+    frame = context->root_frame;
+    for (i = 0; i < count; i++) {
+	plan->frames[i] = frame;
+	frame = frame->callee;
+    }
+    return plan;
+}
+
+int
+jit_native_chain_commit_promotion(JITPromotionPlan *plan,
+				  JITPromotionMaterializer materialize,
+				  void *data)
+{
+    JITExecutionContext *context;
+    unsigned i;
+
+    if (!plan || !plan->num_frames || !materialize
+	|| !(context = plan->context)
+	|| context->root_frame != plan->frames[0]
+	|| context->current_frame != plan->frames[plan->num_frames - 1]
+	|| context->native_depth + 1 != plan->num_frames)
+	return 0;
+    for (i = 0; i < plan->num_frames; i++) {
+	JITNativeFrame *frame = plan->frames[i];
+
+	if (!jit_native_frame_verify(context, frame)
+	    || frame->caller != (i ? plan->frames[i - 1] : 0)
+	    || frame->callee != (i + 1 < plan->num_frames
+		? plan->frames[i + 1] : 0))
+	    return 0;
+    }
+
+    for (i = 0; i < plan->num_frames; i++) {
+	JITNativeFrame *frame = plan->frames[i];
+
+	materialize(frame, frame->outgoing, data);
+	if (frame->outgoing)
+	    frame->outgoing->state = JIT_RESUME_PROMOTED;
+	frame->state = JIT_FRAME_PROMOTED;
+    }
+    for (i = plan->num_frames; i > 0; i--) {
+	JITNativeFrame *frame = plan->frames[i - 1];
+
+	frame->caller = 0;
+	frame->callee = 0;
+	frame->incoming = 0;
+	frame->outgoing = 0;
+	frame->context = 0;
+    }
+    context->native_depth = 0;
+    context->root_frame = 0;
+    context->current_frame = 0;
+    plan->context = 0;
+    return 1;
+}
+
+void
+jit_native_chain_discard_promotion(JITPromotionPlan *plan)
+{
+    if (!plan)
+	return;
+    myfree(plan->frames, M_PROGRAM);
+    myfree(plan, M_PROGRAM);
 }
 
 int

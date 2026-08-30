@@ -34,6 +34,22 @@ struct mir_dump {
     int found_source_marker;
 };
 
+struct promotion_dump {
+    JITNativeFrame *frames[4];
+    int maps[4];
+    unsigned count;
+};
+
+static void
+record_promotion(JITNativeFrame *frame, JITCallerResume *resume, void *data)
+{
+    struct promotion_dump *dump = data;
+
+    dump->frames[dump->count] = frame;
+    dump->maps[dump->count] = resume ? resume->map_id : frame->current_map;
+    dump->count++;
+}
+
 static void
 check_mir_line(const char *line, void *data)
 {
@@ -3468,6 +3484,91 @@ main(void)
 	jit_native_frame_unbind_runtime(&root);
 	check(jit_execution_context_finish(&context, &root),
 	      "compact chain root did not detach cleanly");
+	jit_program_free(chain_program);
+    }
+
+    {
+	JITProgram *chain_program = call_boundary_program();
+	JITExecutionContext context;
+	JITNativeFrame root;
+	JITNativeFrame middle;
+	JITNativeFrame leaf;
+	JITCallerResume root_resume;
+	JITCallerResume middle_resume;
+	JITPromotionPlan *promotion;
+	struct promotion_dump dump = {{0}, {0}, 0};
+	Var root_homes[2];
+	Var middle_home[1];
+	unsigned char root_states[2];
+	unsigned char middle_state[1];
+	Var retained;
+
+	root_homes[0].type = root_homes[1].type = TYPE_NONE;
+	root_homes[0].v.num = root_homes[1].v.num = 0;
+	middle_home[0].type = TYPE_NONE;
+	middle_home[0].v.num = 0;
+	root_states[0] = root_states[1] = JIT_HOME_EMPTY;
+	middle_state[0] = JIT_HOME_EMPTY;
+	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
+	    4, &ticks, &timed_out, &error, -1);
+	jit_native_frame_bind_runtime(&root, root_homes, sizeof(root_homes),
+	    root_homes, 2, root_states);
+	retained.type = TYPE_STR;
+	retained.v.str = str_dup("retained through promotion");
+	check(jit_native_frame_home_move(&root, 1, &retained),
+	      "promotion test could not retain its owned value");
+
+	memset(&root_resume, 0, sizeof(root_resume));
+	root_resume.caller = &root;
+	root_resume.map_id = 1;
+	root_resume.result_home = 0;
+	root_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &middle,
+	    chain_program, deep_env, &root_resume, -1),
+	      "promotion middle dispatch failed");
+	jit_native_frame_bind_runtime(&middle, middle_home,
+	    sizeof(middle_home), middle_home, 1, middle_state);
+	memset(&middle_resume, 0, sizeof(middle_resume));
+	middle_resume.caller = &middle;
+	middle_resume.map_id = 1;
+	middle_resume.result_home = 0;
+	middle_resume.state = JIT_RESUME_PREPARING;
+	check(jit_execution_context_push_compact(&context, &leaf,
+	    chain_program, deopt_stack, &middle_resume, 1),
+	      "promotion leaf dispatch failed");
+
+	leaf.current_map = 2;
+	check(!jit_native_chain_prepare_promotion(&context)
+	      && context.current_frame == &leaf && context.native_depth == 2
+	      && root_resume.state == JIT_RESUME_DISPATCHED
+	      && middle_resume.state == JIT_RESUME_DISPATCHED,
+	      "failed promotion preparation mutated the native chain");
+	leaf.current_map = 1;
+	promotion = jit_native_chain_prepare_promotion(&context);
+	check(promotion != 0, "native chain promotion preparation failed");
+	check(jit_native_chain_commit_promotion(promotion, record_promotion,
+	    &dump), "native chain promotion commit failed");
+	check(dump.count == 3 && dump.frames[0] == &root
+	      && dump.frames[1] == &middle && dump.frames[2] == &leaf
+	      && dump.maps[0] == 1 && dump.maps[1] == 1
+	      && dump.maps[2] == 1,
+	      "native chain promotion order or maps are wrong");
+	check(!context.root_frame && !context.current_frame
+	      && context.native_depth == 0
+	      && root.state == JIT_FRAME_PROMOTED
+	      && middle.state == JIT_FRAME_PROMOTED
+	      && leaf.state == JIT_FRAME_PROMOTED
+	      && root_resume.state == JIT_RESUME_PROMOTED
+	      && middle_resume.state == JIT_RESUME_PROMOTED,
+	      "native chain promotion did not detach every frame");
+	check(jit_native_frame_home_take(&root, 1, &retained)
+	      && retained.type == TYPE_STR
+	      && !strcmp(retained.v.str, "retained through promotion"),
+	      "native chain promotion lost an owned value");
+	free_var(retained);
+	jit_native_frame_unbind_runtime(&middle);
+	jit_native_frame_unbind_runtime(&root);
+	jit_native_chain_discard_promotion(promotion);
 	jit_program_free(chain_program);
     }
 

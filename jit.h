@@ -13,6 +13,7 @@ typedef struct JITContinuationFrame JITContinuationFrame;
 typedef struct JITExecutionContext JITExecutionContext;
 typedef struct JITNativeFrame JITNativeFrame;
 typedef struct JITCallerResume JITCallerResume;
+typedef struct JITPromotionPlan JITPromotionPlan;
 struct activation;
 
 #define JIT_EXECUTION_ABI_VERSION 1
@@ -86,6 +87,9 @@ struct JITExecutionContext {
     int *task_timed_out;
     enum error *pending_error;
 };
+
+typedef void (*JITPromotionMaterializer) (JITNativeFrame *,
+					 JITCallerResume *, void *);
 
 typedef enum {
     JIT_STATE_PENDING,
@@ -215,6 +219,11 @@ extern int jit_execution_context_push_compact(JITExecutionContext *,
 					      JITCallerResume *, int);
 extern int jit_execution_context_return_compact(JITExecutionContext *,
 						JITNativeFrame *, Var *);
+extern JITPromotionPlan *jit_native_chain_prepare_promotion(
+	JITExecutionContext *);
+extern int jit_native_chain_commit_promotion(JITPromotionPlan *,
+	JITPromotionMaterializer, void *);
+extern void jit_native_chain_discard_promotion(JITPromotionPlan *);
 extern int jit_execution_context_finish(JITExecutionContext *,
 					JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
