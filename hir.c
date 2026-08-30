@@ -4893,6 +4893,24 @@ jit_build_deopt_tag_values(JITProgram *program)
     myfree(seen, M_PROGRAM);
 }
 
+static int
+jit_value_is_constant(JITProgram *program, int value)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CONST && instr->value == value)
+		return 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
 static void
 jit_instr_liveness(JITProgram *program, JITInstruction *instr,
 		   unsigned char *uses, unsigned char *defs)
@@ -4924,13 +4942,15 @@ jit_instr_liveness(JITProgram *program, JITInstruction *instr,
     for (i = 0; i < map->num_locals; i++) {
 	int value = jit_deopt_map_local_value(program, map, i);
 
-	if (value > 0 && value < program->num_values && !defs[value])
+	if (value > 0 && value < program->num_values && !defs[value]
+	    && !jit_value_is_constant(program, value))
 	    uses[value] = 1;
     }
     for (i = 0; i < (int) map->stack_depth; i++)
 	if (map->stack_values[i] > 0
 	    && map->stack_values[i] < program->num_values
-	    && !defs[map->stack_values[i]])
+	    && !defs[map->stack_values[i]]
+	    && !jit_value_is_constant(program, map->stack_values[i]))
 	    uses[map->stack_values[i]] = 1;
 }
 

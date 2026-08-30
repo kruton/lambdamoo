@@ -2145,6 +2145,43 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
     }
 }
 
+static JITInstruction *jit_value_definition(JITProgram *, int);
+
+static void
+append_materialized_value(MIRBuild *build, JITProgram *program, int value,
+			  MIR_reg_t *values, MIR_reg_t deopt_values)
+{
+    JITInstruction *definition = jit_value_definition(program, value);
+
+    if (definition && definition->kind == HIR_TAC_CONST) {
+	if (definition->literal_type == TYPE_FLOAT) {
+	    double number = raw_to_double(definition->literal);
+
+	    append(build, MIR_new_insn(build->context, MIR_DMOV,
+		MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+		    deopt_values, 0, 1),
+		MIR_new_double_op(build->context, number)));
+	} else
+	    append(build, MIR_new_insn(build->context, MIR_MOV,
+		MIR_new_mem_op(build->context,
+		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		    value * sizeof(Num), deopt_values, 0, 1),
+		MIR_new_int_op(build->context, definition->literal)));
+	return;
+    }
+    if (program->value_types && program->value_types[value] == TYPE_FLOAT)
+	append(build, MIR_new_insn(build->context, MIR_DMOV,
+	    MIR_new_mem_op(build->context, MIR_T_D, value * sizeof(Num),
+		deopt_values, 0, 1),
+	    MIR_new_reg_op(build->context, values[value])));
+    else
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		value * sizeof(Num), deopt_values, 0, 1),
+	    MIR_new_reg_op(build->context, values[value])));
+}
+
 static void
 append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 			 MIR_reg_t *values, MIR_reg_t deopt_map_out,
@@ -2156,41 +2193,16 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 
     for (i = 0; i < map->num_locals; i++) {
 	int val = jit_deopt_map_local_value(program, map, i);
-	if (val > 0) {
-	    if (program->value_types && program->value_types[val] == TYPE_FLOAT) {
-		append(build, MIR_new_insn(build->context, MIR_DMOV,
-		    MIR_new_mem_op(build->context, MIR_T_D,
-				   val * sizeof(Num),
-				   deopt_values, 0, 1),
-		    MIR_new_reg_op(build->context, values[val])));
-	    } else {
-		append(build, MIR_new_insn(build->context, MIR_MOV,
-		    MIR_new_mem_op(build->context,
-				   sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-				   val * sizeof(Num),
-				   deopt_values, 0, 1),
-		    MIR_new_reg_op(build->context, values[val])));
-	    }
-	}
+	if (val > 0)
+	    append_materialized_value(build, program, val, values,
+				      deopt_values);
     }
     for (i = 0; i < (int) map->stack_depth; i++) {
 	int sval = map->stack_values[i];
 	if ((!map->stack_slots || map->stack_slots[i].kind == RSS_VALUE)
 	    && sval > 0) {
-	    if (program->value_types && program->value_types[sval] == TYPE_FLOAT) {
-		append(build, MIR_new_insn(build->context, MIR_DMOV,
-		    MIR_new_mem_op(build->context, MIR_T_D,
-				   sval * sizeof(Num),
-				   deopt_values, 0, 1),
-		    MIR_new_reg_op(build->context, values[sval])));
-	    } else {
-		append(build, MIR_new_insn(build->context, MIR_MOV,
-		    MIR_new_mem_op(build->context,
-				   sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-				   sval * sizeof(Num),
-				   deopt_values, 0, 1),
-		    MIR_new_reg_op(build->context, values[sval])));
-	    }
+	    append_materialized_value(build, program, sval, values,
+				      deopt_values);
 	}
     }
     for (i = 0; map->native_resume
@@ -2200,17 +2212,7 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 	if (map->native_resume->values[i].source == JIT_RESUME_RESULT
 	    || value <= 0 || value >= program->num_values)
 	    continue;
-	if (program->value_types && program->value_types[value] == TYPE_FLOAT)
-	    append(build, MIR_new_insn(build->context, MIR_DMOV,
-		MIR_new_mem_op(build->context, MIR_T_D,
-			       value * sizeof(Num), deopt_values, 0, 1),
-		MIR_new_reg_op(build->context, values[value])));
-	else
-	    append(build, MIR_new_insn(build->context, MIR_MOV,
-		MIR_new_mem_op(build->context,
-			       sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-			       value * sizeof(Num), deopt_values, 0, 1),
-		MIR_new_reg_op(build->context, values[value])));
+	append_materialized_value(build, program, value, values, deopt_values);
     }
     append(build, MIR_new_insn(build->context, MIR_MOV,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
