@@ -648,6 +648,29 @@ plan.  The interpreter-side materializer must reserve activation capacity and
 all reconstruction storage before calling commit; a materializer callback is
 therefore not allowed to fail or allocate.
 
+The first concrete preparation primitive is
+`jit_native_frame_prepare_activation()`.  It accepts a fresh, detached
+activation whose program, environment, runtime stack, receiver, permissions,
+player, verb metadata, and built-in continuation fields have already been
+initialized by the interpreter side.  It validates the exact map and bounded
+native runtime layout, acquires references for every reconstructed value, and
+materializes locals, stack, `temp`, `pc`, `error_pc`, and the resume key into
+that private activation.  It does not consume the native frame's runtime
+allocation or owner homes.  A preparation failure may leave the private
+activation partially populated, so the caller destroys that private activation
+and leaves the complete native chain authoritative.  The root overlay is
+likewise prepared in private storage; it is not written into the anchored
+activation before commit.
+
+The interpreter prepares every activation in the suffix this way before
+calling `jit_native_chain_commit_promotion()`.  The commit callback only
+publishes the already prepared activation at its reserved canonical index; it
+does not run continuation reconstruction or allocate.  After all publications
+succeed, compact invocation metadata and runtime homes are released from the
+now-promoted frames.  The current primitive deliberately stops short of that
+interpreter allocator/publisher and of general JIT-to-JIT dispatch; those are
+the next integration steps.
+
 Using the platform machine stack for these homes is intentionally excluded from
 the portable ABI.  C and MIR stack-frame layouts are target-specific, unwind
 through C is not the MOO activation model, and suspended or promoted state must

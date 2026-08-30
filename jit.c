@@ -6051,6 +6051,50 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     return frame;
 }
 
+int
+jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
+				    activation *a, int map_id, int dispatched)
+{
+    JITContinuationFrame *continuation;
+    JITProgram *program;
+    Num *deopt_values;
+    Var *borrowed_locals = 0;
+    size_t deopt_bytes;
+    size_t deopt_storage_bytes;
+    size_t required_bytes;
+
+    if (!native_frame || !a || !(program = native_frame->program)
+	|| a->jit_continuation || !native_frame->runtime_storage || map_id <= 0
+	|| map_id >= program->num_deopt_maps
+	|| native_frame->num_homes != (unsigned) program->num_owned_slots)
+	return 0;
+    deopt_values = native_frame->runtime_storage;
+    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
+    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    required_bytes = deopt_storage_bytes
+	+ sizeof(Var) * program->num_borrowed_locals;
+    if (native_frame->runtime_bytes < required_bytes)
+	return 0;
+    if (program->num_borrowed_locals)
+	borrowed_locals = (Var *) ((char *) native_frame->runtime_storage
+	    + deopt_storage_bytes);
+    continuation = jit_continuation_capture(program, map_id, deopt_values,
+	0, borrowed_locals, native_frame->homes, native_frame->home_states, 0,
+	0);
+    if (!continuation)
+	return 0;
+    jit_continuation_attach(continuation, a);
+    if (dispatched)
+	jit_continuation_mark_dispatched(continuation);
+    if (!jit_continuation_materialize(a)) {
+	if (a->jit_continuation)
+	    jit_continuation_free(a->jit_continuation);
+	return 0;
+    }
+    return 1;
+}
+
 void
 jit_continuation_attach(JITContinuationFrame *frame, activation *owner)
 {

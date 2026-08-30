@@ -233,6 +233,8 @@ extern int jit_native_frame_verify(const JITExecutionContext *,
 				   const JITNativeFrame *);
 extern int jit_native_frame_home_move(JITNativeFrame *, unsigned, Var *);
 extern int jit_native_frame_home_take(JITNativeFrame *, unsigned, Var *);
+extern int jit_native_frame_prepare_activation(JITNativeFrame *,
+					       struct activation *, int, int);
 
 extern JITProgram *jit_program_unsupported(const char *);
 extern JITProgram *jit_program_unsupported_with_diagnostic(const char *, const char *);

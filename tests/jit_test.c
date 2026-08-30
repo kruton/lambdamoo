@@ -3575,15 +3575,16 @@ main(void)
     {
 	JITProgram *owner_program = call_boundary_program();
 	JITDeoptMap *map = &owner_program->deopt_maps[1];
-	JITContinuationFrame *continuation;
+	JITNativeFrame native_frame;
 	JITNativeResume *resume;
 	activation owner;
 	Var owner_stack[2];
 	Var owner_home[1];
 	unsigned char home_state[1];
-	Num stale_values[3] = { 0, 0, 0 };
+	Num stale_values[6] = { 0, 0, 0, 0, 0, 0 };
 
 	memset(&owner, 0, sizeof(owner));
+	memset(&native_frame, 0, sizeof(native_frame));
 	owner_program->value_types = allocate(sizeof(var_type) * 3);
 	owner_program->value_is_tagged = allocate(3);
 	owner_program->value_types[1] = TYPE_ANY;
@@ -3602,25 +3603,26 @@ main(void)
 	owner_home[0].type = TYPE_STR;
 	owner_home[0].v.str = str_dup("authoritative owner tag");
 	home_state[0] = JIT_HOME_OWNED;
-	continuation = allocate(sizeof(*continuation));
-	continuation->program = owner_program;
-	continuation->map_id = 1;
-	continuation->num_values = 1;
-	continuation->values = allocate(sizeof(*continuation->values));
-	continuation->values_capacity = 1;
-	continuation->values[0].type = TYPE_NONE;
-	continuation->deopt_values = stale_values;
-	continuation->owned_values = owner_home;
-	continuation->home_states = home_state;
+	native_frame.program = owner_program;
+	jit_native_frame_bind_runtime(&native_frame, stale_values,
+	    sizeof(stale_values), owner_home, 1, home_state);
 	owner.base_rt_stack = owner.top_rt_stack = owner_stack;
-	jit_continuation_attach(continuation, &owner);
-	check(jit_continuation_materialize(&owner),
-	      "owner-backed continuation did not materialize");
+	native_frame.runtime_bytes--;
+	check(!jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0)
+	      && owner.top_rt_stack == owner.base_rt_stack,
+	      "native frame accepted undersized runtime storage");
+	native_frame.runtime_bytes++;
+	check(jit_native_frame_prepare_activation(&native_frame, &owner, 1, 0),
+	      "owner-backed native frame did not prepare an activation");
 	check(owner.top_rt_stack == owner.base_rt_stack + 1
 	      && owner_stack[0].type == TYPE_STR
 	      && !strcmp(owner_stack[0].v.str, "authoritative owner tag"),
-	      "owner-backed continuation used stale payload or tag data");
+	      "owner-backed native frame used stale payload or tag data");
+	check(home_state[0] == JIT_HOME_OWNED
+	      && owner_home[0].type == TYPE_STR,
+	      "activation preparation consumed its native owner");
 	free_var(*--owner.top_rt_stack);
+	jit_native_frame_unbind_runtime(&native_frame);
 	free_var(owner_home[0]);
 	jit_program_free(owner_program);
     }
