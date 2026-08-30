@@ -5154,12 +5154,15 @@ jit_build_value_ownership(JITProgram *program)
 			 || (instr->kind == HIR_TAC_BINARY
 			     && (instr->op == HIR_OP_LIST_ADD_TAIL
 				 || instr->op == HIR_OP_LIST_APPEND
-				 || instr->op == HIR_OP_SUBLIST_FROM)))
+				 || instr->op == HIR_OP_SUBLIST_FROM))) {
 		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
-		else if (instr->kind == HIR_TAC_BINARY
-			 && instr->op == HIR_OP_GET_PROP)
+		    program->value_owner_root[instr->value] = instr->value;
+		} else if (instr->kind == HIR_TAC_BINARY
+			 && instr->op == HIR_OP_GET_PROP) {
 		    program->value_ownership[instr->value] =
 			JIT_OWNERSHIP_STABLE_OWNED;
+		    program->value_owner_root[instr->value] = instr->value;
+		}
 	    }
 	    if (instr == block->last)
 		break;
@@ -5187,6 +5190,10 @@ jit_build_value_ownership(JITProgram *program)
 			    program->value_owned_slots[instr->src1],
 			    program->value_use_counts[instr->src1],
 			    program->num_owned_slots);
+		    if (program->value_owned_slots[instr->value]
+			== program->value_owned_slots[instr->src1])
+			program->value_owner_root[instr->value] =
+			    program->value_owner_root[instr->src1];
 		} else
 		    program->value_owned_slots[instr->value] =
 			jit_list_tail_owner_slot(-1, 0,
