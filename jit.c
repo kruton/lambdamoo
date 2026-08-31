@@ -3435,24 +3435,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			     operand++)
 			    if (instr->guarded_operands & (1U << operand)) {
 				MIR_reg_t actual_type;
-				var_type expected_type = TYPE_NONE;
+				MIR_label_t accepted = MIR_new_label(build->context);
 				char name[32];
 				int type;
 
 				assert(guard_values[operand] > 0
 				       && guard_values[operand] < program->num_values);
 				assert(program->value_is_tagged[guard_values[operand]]);
-				assert(instr->guarded_type_masks[operand]
-				       && !(instr->guarded_type_masks[operand]
-					    & (instr->guarded_type_masks[operand] - 1)));
-				for (type = 0; type <= TYPE_DB_MASK; type++)
-				    if (instr->guarded_type_masks[operand]
-					== JIT_TYPE_MASK(type)) {
-					expected_type = jit_runtime_type_from_db_type(
-					    (var_type) type);
-					break;
-				    }
-				assert(type <= TYPE_DB_MASK);
+				assert(instr->guarded_type_masks[operand]);
 				sprintf(name, "guard_type%d", copy_serial++);
 				actual_type = new_reg(build, name);
 				append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3460,10 +3450,19 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    MIR_new_mem_op(build->context, tag_t,
 					jit_tag_offset(program, guard_values[operand]),
 					deopt_values, 0, 1)));
-				append(build, MIR_new_insn(build->context, MIR_BNE,
-				    MIR_new_label_op(build->context, deopt),
-				    MIR_new_reg_op(build->context, actual_type),
-				    MIR_new_int_op(build->context, expected_type)));
+				for (type = 0; type <= TYPE_DB_MASK; type++)
+				    if (instr->guarded_type_masks[operand]
+					& JIT_TYPE_MASK(type))
+					append(build, MIR_new_insn(build->context,
+					    MIR_BEQ,
+					    MIR_new_label_op(build->context, accepted),
+					    MIR_new_reg_op(build->context, actual_type),
+					    MIR_new_int_op(build->context,
+						jit_runtime_type_from_db_type(
+						    (var_type) type))));
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, deopt)));
+				append(build, accepted);
 			    }
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 			    MIR_new_label_op(build->context, done)));
@@ -3897,9 +3896,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_types[instr->src1] == TYPE_FLOAT;
 			int tagged_src = program->value_is_tagged
 			    && program->value_is_tagged[instr->src1];
+			int check_src = tagged_src
+			    && !(instr->guarded_operands & 1U);
 			MIR_label_t deopt = 0;
 			MIR_label_t done = 0;
-			if (tagged_src) {
+			if (check_src) {
 			    char name[32];
 			    MIR_reg_t type;
 
@@ -3975,13 +3976,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					jit_tag_offset(program, instr->value),
 					deopt_values, 0, 1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
-			    append(build, MIR_new_insn(build->context, MIR_JMP,
-				MIR_new_label_op(build->context, done)));
-			    append(build, deopt);
-			    append_deopt_exit(build, program, instr,
-				values, deopt_map_out, deopt_values, status,
-				common_return);
-			    append(build, done);
+			    if (check_src) {
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, done)));
+				append(build, deopt);
+				append_deopt_exit(build, program, instr,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				append(build, done);
+			    }
 			}
 		    } else if (instr->op == HIR_OP_LENGTH) {
 			MIR_reg_t list_ptr = values[instr->src1];
@@ -3994,6 +3997,35 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						  MIR_new_reg_op(build->context, list_ptr),
 						  MIR_new_int_op(build->context, 0)));
 			if (program->value_is_tagged
+			    && program->value_is_tagged[instr->src1]
+			    && (instr->guarded_operands & 1U)) {
+			    if (instr->guarded_type_masks[0]
+				== JIT_TYPE_MASK(TYPE_STR))
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, is_str)));
+			    else if (instr->guarded_type_masks[0]
+				     == JIT_TYPE_MASK(TYPE_LIST))
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, is_list)));
+			    else {
+				char name[32];
+				MIR_reg_t tag;
+
+				sprintf(name, "len_dispatch%d", copy_serial++);
+				tag = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, tag),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, instr->src1),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BEQ,
+				    MIR_new_label_op(build->context, is_str),
+				    MIR_new_reg_op(build->context, tag),
+				    MIR_new_int_op(build->context, TYPE_STR)));
+				append(build, MIR_new_insn(build->context, MIR_JMP,
+				    MIR_new_label_op(build->context, is_list)));
+			    }
+			} else if (program->value_is_tagged
 			    && program->value_is_tagged[instr->src1]) {
 			    char name[32];
 			    sprintf(name, "len_tag%d", copy_serial++);

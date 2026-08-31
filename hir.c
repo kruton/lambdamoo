@@ -90,6 +90,13 @@ binary_type_pair_is_valid(HIROp op, var_type left, var_type right)
     case HIR_OP_MOD:
 	return (left == TYPE_INT && right == TYPE_INT)
 	    || (left == TYPE_FLOAT && right == TYPE_FLOAT);
+    case HIR_OP_LT:
+    case HIR_OP_LE:
+    case HIR_OP_GT:
+    case HIR_OP_GE:
+	return (left == TYPE_INT && right == TYPE_INT)
+	    || (left == TYPE_FLOAT && right == TYPE_FLOAT)
+	    || (left == TYPE_STR && right == TYPE_STR);
     case HIR_OP_EXP:
 	return (left == TYPE_INT && right == TYPE_INT)
 	    || (left == TYPE_FLOAT
@@ -4388,10 +4395,16 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	break;
     case HIR_OP_EQ:
     case HIR_OP_NE:
+	contract.tagged_dispatch = 1;
+	break;
     case HIR_OP_LT:
     case HIR_OP_LE:
     case HIR_OP_GT:
     case HIR_OP_GE:
+	contract.operands[0] = binary_operand_type_mask(instr->op, 0, 0,
+		TYPE_NONE);
+	contract.operands[1] = binary_operand_type_mask(instr->op, 1, 0,
+		TYPE_NONE);
 	contract.tagged_dispatch = 1;
 	break;
     default:
@@ -4433,6 +4446,11 @@ jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
     values[1] = instr->src2;
     expected[0] = contract.operands[0];
     expected[1] = contract.operands[1];
+	if (instr->kind == HIR_TAC_UNARY && instr->src1 > 0
+	    && instr->src1 < num_values && value_types[instr->src1] != TYPE_ANY
+	    && value_types[instr->src1] != TYPE_NONE
+	    && (expected[0] & JIT_TYPE_MASK(value_types[instr->src1])))
+	    expected[0] = JIT_TYPE_MASK(value_types[instr->src1]);
     if (instr->kind == HIR_TAC_BINARY) {
 	int left_known = instr->src1 > 0 && instr->src1 < num_values
 	    && !value_is_tagged[instr->src1]
@@ -4463,12 +4481,32 @@ static int
 jit_consumer_uses_explicit_type_guards(HIRSSAInstr *instr)
 {
     if (instr->kind == HIR_TAC_UNARY)
-	return instr->op == HIR_OP_COMPLEMENT || instr->op == HIR_OP_TOINT;
+	return instr->op == HIR_OP_COMPLEMENT || instr->op == HIR_OP_TOINT
+	    || instr->op == HIR_OP_NEGATE || instr->op == HIR_OP_ABS
+	    || instr->op == HIR_OP_LENGTH;
     if (instr->kind != HIR_TAC_BINARY)
 	return 0;
     return instr->op == HIR_OP_INDEX_BF || instr->op == HIR_OP_RINDEX_BF
 	|| instr->op == HIR_OP_BITOR || instr->op == HIR_OP_BITXOR
-	|| instr->op == HIR_OP_BITAND;
+	|| instr->op == HIR_OP_BITAND || instr->op == HIR_OP_ADD
+	|| instr->op == HIR_OP_SUB || instr->op == HIR_OP_MUL
+	|| instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+	|| instr->op == HIR_OP_GT || instr->op == HIR_OP_GE;
+}
+
+static int
+jit_guard_replaces_consumer_exit(HIRSSAInstr *instr,
+				 JITTypeMask *expected)
+{
+    if (instr->kind == HIR_TAC_UNARY)
+	return instr->op != HIR_OP_LENGTH;
+    if (instr->kind != HIR_TAC_BINARY)
+	return 0;
+    if (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+	|| instr->op == HIR_OP_MUL)
+	return expected[0] == JIT_TYPE_MASK(TYPE_INT)
+	    && expected[1] == JIT_TYPE_MASK(TYPE_INT);
+    return 1;
 }
 
 static int
@@ -4623,6 +4661,26 @@ jit_value_has_static_type(int value, var_type type, var_type *value_types,
 	&& !value_is_tagged[value] && value_types[value] == type;
 }
 
+static int
+jit_guarded_consumer_is_non_exiting(JITInstruction *instr)
+{
+    if (!instr->guarded_operands)
+	return 0;
+    if (instr->kind == HIR_TAC_UNARY)
+	return instr->op != HIR_OP_LENGTH;
+    if (instr->kind != HIR_TAC_BINARY)
+	return 0;
+    if (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+	|| instr->op == HIR_OP_MUL)
+	return instr->guarded_type_masks[0] == JIT_TYPE_MASK(TYPE_INT)
+	    && instr->guarded_type_masks[1] == JIT_TYPE_MASK(TYPE_INT);
+    return instr->op == HIR_OP_INDEX_BF || instr->op == HIR_OP_RINDEX_BF
+	|| instr->op == HIR_OP_BITOR || instr->op == HIR_OP_BITXOR
+	|| instr->op == HIR_OP_BITAND || instr->op == HIR_OP_LT
+	|| instr->op == HIR_OP_LE || instr->op == HIR_OP_GT
+	|| instr->op == HIR_OP_GE;
+}
+
 static JITExitMask
 jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
 			  unsigned char *value_is_tagged, int num_values)
@@ -4651,7 +4709,7 @@ jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
     case HIR_TAC_UNSUPPORTED:
 	return JIT_EXIT_DEOPT;
     case HIR_TAC_UNARY:
-	if (instr->guarded_operands & 1U)
+	if (jit_guarded_consumer_is_non_exiting(instr))
 	    return JIT_EXIT_NONE;
 	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST)
 	    return JIT_EXIT_NONE;
@@ -4670,7 +4728,7 @@ jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
 	    return JIT_EXIT_NONE;
 	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
     case HIR_TAC_BINARY:
-	if (instr->guarded_operands)
+	if (jit_guarded_consumer_is_non_exiting(instr))
 	    return JIT_EXIT_NONE;
 	if (instr->op == HIR_OP_LIST_ADD_TAIL
 	    && jit_value_has_static_type(instr->src1, TYPE_LIST, value_types,
@@ -4744,6 +4802,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 {
 	JITBlock *block;
 	unsigned char *seen;
+	JITInstruction *previous_instr = 0;
+	JITBlock *previous_block = 0;
 	int i;
 
 	if (!program || program->num_deopt_maps <= 0) {
@@ -4795,9 +4855,7 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					&& (values[operand] <= 0
 					    || values[operand] >= program->num_values
 					    || !program->value_is_tagged[values[operand]]
-					    || !instr->guarded_type_masks[operand]
-					    || (instr->guarded_type_masks[operand]
-						& (instr->guarded_type_masks[operand] - 1)))) {
+					    || !instr->guarded_type_masks[operand])) {
 					record_unsupported_fmt(ctx,
 					    "type-guard: invalid predicate at pc %u",
 					    instr->bytecode_pc);
@@ -4860,7 +4918,13 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 				goto invalid;
 			}
 			map = &program->deopt_maps[instr->deopt_map];
-			if (seen[instr->deopt_map]) {
+			if (seen[instr->deopt_map]
+			    && !(previous_block == block
+				&& previous_instr
+				&& previous_instr->kind == HIR_TAC_GUARD_TYPE
+				&& previous_instr->deopt_map == instr->deopt_map
+				&& previous_instr->next == instr
+				&& instr->guarded_operands)) {
 				record_unsupported_fmt(ctx,
 				    "deopt-map: map %d is shared by multiple boundaries",
 				    instr->deopt_map);
@@ -5024,6 +5088,8 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 				goto invalid;
 			}
 next_instruction:
+			previous_instr = instr;
+			previous_block = block;
 			if (instr == block->last)
 				break;
 		}
@@ -6534,7 +6600,8 @@ jit_guard_fact_dominates(JITProgram *program, HIRDominatorTree *dom,
 	    for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS; operand++)
 		if ((candidate->guarded_operands & (1U << operand))
 		    && values[operand] == value
-		    && candidate->guarded_type_masks[operand] == type_mask)
+		    && (candidate->guarded_type_masks[operand] & type_mask)
+			== candidate->guarded_type_masks[operand])
 		    return 1;
 	}
     }
@@ -6595,7 +6662,8 @@ jit_eliminate_dominated_guards(JITProgram *program, HIRDominatorTree *dom)
 	    }
 	    if (instr->kind == HIR_TAC_GUARD_TYPE
 		&& !instr->guarded_operands) {
-		jit_remove_deopt_map(program, instr->deopt_map);
+		if (!next || next->deopt_map != instr->deopt_map)
+		    jit_remove_deopt_map(program, instr->deopt_map);
 		if (previous)
 		    previous->next = next;
 		else
@@ -7432,8 +7500,9 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS;
 			 operand++)
 			if (guard_expected[operand]
-			    && !(guard_expected[operand]
-				 & (guard_expected[operand] - 1))
+			    && (!(guard_expected[operand]
+				  & (guard_expected[operand] - 1))
+				|| ssa_instr->op == HIR_OP_LENGTH)
 			    && guard_values[operand] > 0
 			    && guard_values[operand] < program->num_values
 			    && value_is_tagged[guard_values[operand]])
@@ -7441,6 +7510,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		if (guarded_operands) {
 		    JITInstruction *guard = mymalloc(sizeof(JITInstruction),
 			M_PROGRAM);
+		    int replaces_exit = jit_guard_replaces_consumer_exit(ssa_instr,
+			guard_expected);
 
 		    memset(guard, 0, sizeof(JITInstruction));
 		    guard->kind = HIR_TAC_GUARD_TYPE;
@@ -7450,6 +7521,17 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    guard->src1 = guard_values[0];
 		    guard->src2 = guard_values[1];
 		    guard->deopt_map = instr->deopt_map;
+		    if (guard->deopt_map <= 0) {
+			myfree(guard, M_PROGRAM);
+			myfree(value_types_conflicted, M_PROGRAM);
+			myfree(value_types_known, M_PROGRAM);
+			myfree(value_is_tagged, M_PROGRAM);
+			myfree(value_types, M_PROGRAM);
+			jit_program_free(program);
+			return jit_program_unsupported_with_diagnostic(
+			    "invalid-guard-map",
+			    "type-guard: map allocation failed");
+		    }
 		    guard->guarded_operands = guarded_operands;
 		    guard->guarded_type_masks[0] = guard_expected[0];
 		    guard->guarded_type_masks[1] = guard_expected[1];
@@ -7457,18 +7539,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    guard->exit_classified = 1;
 		    program->deopt_maps[guard->deopt_map].reason
 			= JIT_DEOPT_TYPE_GUARD;
-		    instr->deopt_map = 0;
 		    instr->guarded_operands = guarded_operands;
 		    instr->guarded_type_masks[0] = guard_expected[0];
 		    instr->guarded_type_masks[1] = guard_expected[1];
-		    instr->exit_mask = JIT_EXIT_NONE;
+		    if (replaces_exit) {
+			instr->deopt_map = 0;
+			instr->exit_mask = JIT_EXIT_NONE;
+			program->elided_exit_sites++;
+		    }
 		    if (block->last)
 			block->last->next = guard;
 		    else
 			block->first = guard;
 		    block->last = guard;
 		    program->potential_exit_sites++;
-		    program->elided_exit_sites++;
 		    program->type_guard_sites++;
 		}
 	    }
