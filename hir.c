@@ -6246,6 +6246,152 @@ jit_prune_boundary_owner_moves_used_by_resume(JITProgram *program)
 }
 
 static int
+jit_nullable_memory_equal(const void *left, const void *right, size_t bytes)
+{
+    if (!bytes)
+	return 1;
+    if (!left || !right)
+	return left == right;
+    return !memcmp(left, right, bytes);
+}
+
+static int
+jit_reconstruction_state_matches(JITProgram *program, JITDeoptMap *map,
+				 int state_map_id)
+{
+    JITDeoptMap *state_map = &program->deopt_maps[state_map_id];
+    int slot;
+
+    if (map->num_locals != state_map->num_locals
+	|| map->stack_depth != state_map->stack_depth
+	|| map->num_tagged_values != state_map->num_tagged_values)
+	return 0;
+    for (slot = 0; slot < map->num_locals; slot++)
+	if (jit_deopt_map_local_value(program, map, slot)
+	    != jit_deopt_map_local_value(program, state_map, slot))
+	    return 0;
+    return jit_nullable_memory_equal(map->tagged_values,
+	state_map->tagged_values, sizeof(int) * map->num_tagged_values)
+	&& jit_nullable_memory_equal(map->stack_values, state_map->stack_values,
+	    sizeof(int) * map->stack_depth)
+	&& jit_nullable_memory_equal(map->stack_types, state_map->stack_types,
+	    sizeof(var_type) * map->stack_depth)
+	&& jit_nullable_memory_equal(map->stack_slots, state_map->stack_slots,
+	    sizeof(ResumeStackSlot) * map->stack_depth)
+	&& jit_nullable_memory_equal(map->local_owner_slots,
+	    state_map->local_owner_slots, sizeof(int) * map->num_locals)
+	&& jit_nullable_memory_equal(map->stack_owner_slots,
+	    state_map->stack_owner_slots, sizeof(int) * map->stack_depth)
+	&& jit_nullable_memory_equal(map->stack_boundary_ownership,
+	    state_map->stack_boundary_ownership, map->stack_depth);
+}
+
+static void
+jit_intern_reconstruction_states(JITProgram *program)
+{
+    int map_id;
+
+    if (!program || program->reconstruction_states)
+	return;
+    for (map_id = 0; map_id < program->num_deopt_maps; map_id++) {
+	JITDeoptMap *map = &program->deopt_maps[map_id];
+	int state_id;
+
+	for (state_id = 0; state_id < program->num_reconstruction_states;
+	     state_id++)
+	    if (jit_reconstruction_state_matches(program, map,
+		    program->reconstruction_states[state_id].representative_map))
+		break;
+	if (state_id == program->num_reconstruction_states) {
+	    JITReconstructionState *state;
+
+	    program->reconstruction_states = myrealloc(
+		program->reconstruction_states,
+		sizeof(JITReconstructionState)
+		* (program->num_reconstruction_states + 1), M_PROGRAM);
+	    state = &program->reconstruction_states[state_id];
+	    memset(state, 0, sizeof(*state));
+	    state->representative_map = map_id;
+	    program->num_reconstruction_states++;
+	} else {
+	    JITDeoptMap *representative = &program->deopt_maps[
+		program->reconstruction_states[state_id].representative_map];
+
+	    if (map->tagged_values)
+		myfree(map->tagged_values, M_PROGRAM);
+	    if (map->stack_values)
+		myfree(map->stack_values, M_PROGRAM);
+	    if (map->stack_types)
+		myfree(map->stack_types, M_PROGRAM);
+	    if (map->stack_slots)
+		myfree(map->stack_slots, M_PROGRAM);
+	    if (map->local_owner_slots)
+		myfree(map->local_owner_slots, M_PROGRAM);
+	    if (map->stack_owner_slots)
+		myfree(map->stack_owner_slots, M_PROGRAM);
+	    if (map->stack_boundary_ownership)
+		myfree(map->stack_boundary_ownership, M_PROGRAM);
+	    map->tagged_values = representative->tagged_values;
+	    map->stack_values = representative->stack_values;
+	    map->stack_types = representative->stack_types;
+	    map->stack_slots = representative->stack_slots;
+	    map->local_owner_slots = representative->local_owner_slots;
+	    map->stack_owner_slots = representative->stack_owner_slots;
+	    map->stack_boundary_ownership =
+		representative->stack_boundary_ownership;
+	}
+	map->reconstruction_state = state_id;
+    }
+}
+
+static int
+jit_reconstruction_states_are_valid(HIRContext *ctx, JITProgram *program)
+{
+    int map_id;
+
+    if (!program || program->num_reconstruction_states <= 0
+	|| !program->reconstruction_states) {
+	record_unsupported(ctx, "reconstruction-state: missing intern table");
+	return 0;
+    }
+    for (map_id = 0; map_id < program->num_deopt_maps; map_id++) {
+	JITDeoptMap *map = &program->deopt_maps[map_id];
+	JITDeoptMap *representative;
+	JITReconstructionState *state;
+
+	if (map->reconstruction_state < 0
+	    || map->reconstruction_state >= program->num_reconstruction_states) {
+	    record_unsupported_fmt(ctx,
+		"reconstruction-state: map %d has invalid state %d", map_id,
+		map->reconstruction_state);
+	    return 0;
+	}
+	state = &program->reconstruction_states[map->reconstruction_state];
+	representative = state->representative_map >= 0
+	    && state->representative_map < program->num_deopt_maps
+	    ? &program->deopt_maps[state->representative_map] : 0;
+	if (state->representative_map < 0
+	    || state->representative_map >= program->num_deopt_maps
+	    || representative->num_locals != map->num_locals
+	    || representative->stack_depth != map->stack_depth
+	    || representative->tagged_values != map->tagged_values
+	    || representative->stack_values != map->stack_values
+	    || representative->stack_types != map->stack_types
+	    || representative->stack_slots != map->stack_slots
+	    || representative->local_owner_slots != map->local_owner_slots
+	    || representative->stack_owner_slots != map->stack_owner_slots
+	    || representative->stack_boundary_ownership
+	       != map->stack_boundary_ownership) {
+	    record_unsupported_fmt(ctx,
+		"reconstruction-state: map %d does not match state %d", map_id,
+		map->reconstruction_state);
+	    return 0;
+	}
+    }
+    return 1;
+}
+
+static int
 jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		  JITInstruction *call, int value, JITResumeValue *resume)
 {
@@ -7520,7 +7666,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    guard->bytecode_pc = instr->bytecode_pc;
 		    guard->src1 = guard_values[0];
 		    guard->src2 = guard_values[1];
-		    guard->deopt_map = instr->deopt_map;
+		    guard->deopt_map = replaces_exit ? instr->deopt_map
+			: jit_add_deopt_map(program, ssa_instr,
+			    &bytecode_program->main_vector, value_types,
+			    value_is_tagged);
 		    if (guard->deopt_map <= 0) {
 			myfree(guard, M_PROGRAM);
 			myfree(value_types_conflicted, M_PROGRAM);
@@ -7593,6 +7742,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     jit_build_deopt_tag_values(program);
     jit_build_resume_liveness(program);
     jit_prune_boundary_owner_moves_used_by_resume(program);
+    jit_intern_reconstruction_states(program);
+    if (!jit_reconstruction_states_are_valid(ctx, program)) {
+	const char *diag = hir_context_error_message(ctx);
+	JITProgram *unsupported;
+
+	unsupported = jit_program_unsupported_with_diagnostic(
+	    "invalid-reconstruction-state", diag);
+	jit_program_free(program);
+	return unsupported;
+    }
     return program;
 }
 #endif /* ENABLE_JIT && !HIR_TESTING */

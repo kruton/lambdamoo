@@ -6972,19 +6972,47 @@ jit_program_free(JITProgram *program)
 	    for (i = 0; i < program->num_deopt_maps; i++) {
 		if (program->deopt_maps[i].local_values)
 		    myfree(program->deopt_maps[i].local_values, M_PROGRAM);
-		if (program->deopt_maps[i].tagged_values)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].tagged_values)
 		    myfree(program->deopt_maps[i].tagged_values, M_PROGRAM);
-		if (program->deopt_maps[i].stack_values)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].stack_values)
 		    myfree(program->deopt_maps[i].stack_values, M_PROGRAM);
-		if (program->deopt_maps[i].stack_types)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].stack_types)
 		    myfree(program->deopt_maps[i].stack_types, M_PROGRAM);
-		if (program->deopt_maps[i].stack_slots)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].stack_slots)
 		    myfree(program->deopt_maps[i].stack_slots, M_PROGRAM);
-		if (program->deopt_maps[i].local_owner_slots)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].local_owner_slots)
 		    myfree(program->deopt_maps[i].local_owner_slots, M_PROGRAM);
-		if (program->deopt_maps[i].stack_owner_slots)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].stack_owner_slots)
 		    myfree(program->deopt_maps[i].stack_owner_slots, M_PROGRAM);
-		if (program->deopt_maps[i].stack_boundary_ownership)
+		if ((!program->reconstruction_states
+		     || program->reconstruction_states[
+			 program->deopt_maps[i].reconstruction_state]
+			.representative_map == i)
+		    && program->deopt_maps[i].stack_boundary_ownership)
 		    myfree(program->deopt_maps[i].stack_boundary_ownership,
 			   M_PROGRAM);
 		if (program->deopt_maps[i].native_resume) {
@@ -6996,6 +7024,8 @@ jit_program_free(JITProgram *program)
 	    }
 	    myfree(program->deopt_maps, M_PROGRAM);
 	}
+    if (program->reconstruction_states)
+	myfree(program->reconstruction_states, M_PROGRAM);
     if (program->value_types)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
@@ -7042,6 +7072,8 @@ jit_program_metadata_bytes(JITProgram *program)
     if (program->diagnostic)
 	bytes += memo_strlen(program->diagnostic) + 1;
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
+    bytes += sizeof(JITReconstructionState)
+	* program->num_reconstruction_states;
     if (program->value_types)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
@@ -7066,22 +7098,25 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(JITProgramUsage);
     for (i = 0; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
+	int owns_state = !program->reconstruction_states
+	    || program->reconstruction_states[map->reconstruction_state]
+	       .representative_map == i;
 
 	if (map->local_values)
 	    bytes += sizeof(JITLocalValue) * map->num_local_values;
-	if (map->tagged_values)
+	if (owns_state && map->tagged_values)
 	    bytes += sizeof(int) * map->num_tagged_values;
-	if (map->stack_values)
+	if (owns_state && map->stack_values)
 	    bytes += sizeof(int) * map->stack_depth;
-	if (map->stack_types)
+	if (owns_state && map->stack_types)
 	    bytes += sizeof(var_type) * map->stack_depth;
-	if (map->stack_slots)
+	if (owns_state && map->stack_slots)
 	    bytes += sizeof(ResumeStackSlot) * map->stack_depth;
-	if (map->local_owner_slots)
+	if (owns_state && map->local_owner_slots)
 	    bytes += sizeof(int) * map->num_locals;
-	if (map->stack_owner_slots)
+	if (owns_state && map->stack_owner_slots)
 	    bytes += sizeof(int) * map->stack_depth;
-	if (map->stack_boundary_ownership)
+	if (owns_state && map->stack_boundary_ownership)
 	    bytes += map->stack_depth;
 	if (map->native_resume) {
 	    bytes += sizeof(JITNativeResume);
@@ -7148,6 +7183,7 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->type_guard_sites = program->type_guard_sites;
     stats->eliminated_type_guard_sites
 	= program->eliminated_type_guard_sites;
+    stats->reconstruction_states = program->num_reconstruction_states;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
     stats->runtime_bytes = program->active_runtime_bytes;
     stats->native_chain_active_frames = program->active_native_frames;
@@ -8512,10 +8548,11 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     if (release_ir && !jit_program_restore_ir(program))
 	return 0;
     snprintf(line, sizeof(line),
-	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d potential-exits=%u elided-exits=%u type-guards=%u eliminated-type-guards=%u",
+	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d reconstruction-states=%d potential-exits=%u elided-exits=%u type-guards=%u eliminated-type-guards=%u",
 	     program->num_values, program->num_tag_slots,
 	     jit_runtime_value_slots(program), program->num_blocks,
-	     program->num_deopt_maps, program->potential_exit_sites,
+	     program->num_deopt_maps, program->num_reconstruction_states,
+	     program->potential_exit_sites,
 	     program->elided_exit_sites, program->type_guard_sites,
 	     program->eliminated_type_guard_sites);
     add_line(line, data);

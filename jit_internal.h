@@ -11,6 +11,7 @@ typedef struct JITCopy JITCopy;
 typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
+typedef struct JITReconstructionState JITReconstructionState;
 typedef struct JITResumeValue JITResumeValue;
 typedef struct JITNativeResume JITNativeResume;
 typedef struct JITLocalValue JITLocalValue;
@@ -120,6 +121,11 @@ struct JITDeoptMap {
     JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
     int native_error_block;
+    int reconstruction_state;
+};
+
+struct JITReconstructionState {
+    int representative_map;
 };
 
 static inline int
@@ -255,11 +261,13 @@ struct JITProgram {
     int num_blocks;
     int num_resume_anchors;
     int num_deopt_maps;
+    int num_reconstruction_states;
     unsigned potential_exit_sites;
     unsigned elided_exit_sites;
     unsigned type_guard_sites;
     unsigned eliminated_type_guard_sites;
     JITDeoptMap *deopt_maps;
+    JITReconstructionState *reconstruction_states;
     JITBlock *blocks;
     JITBlock *last_block;
     JITInstruction *retained_constants;

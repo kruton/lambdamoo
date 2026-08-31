@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(41);
+    Var metadata = new_list(42);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -398,6 +398,8 @@ jit_metadata(JITProgram *program)
 					       stats.type_guard_sites);
     metadata.v.list[41] = jit_metadata_num_pair("eliminated_type_guard_sites",
 					       stats.eliminated_type_guard_sites);
+    metadata.v.list[42] = jit_metadata_num_pair("reconstruction_states",
+					       stats.reconstruction_states);
     return metadata;
 }
 #endif

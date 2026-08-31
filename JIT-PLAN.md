@@ -1672,6 +1672,23 @@ the broader ownership-map and synthesized-anchor validation described below.
       snapshot. Distinct sites may share a snapshot, but sites with different
       traceback, error, timeout, or resume behavior must not be merged.
 
+      The initial representation assigns every site a `reconstruction_state`
+      ID. The state table stores only the representative map ID; the
+      representative exclusively owns the immutable stack, tag, and owner-home
+      arrays, and equivalent sites borrow those arrays. State equality compares
+      fully resolved locals as well as stack values and markers, runtime-tag
+      values, owner homes, and boundary ownership. Local snapshots retain their
+      bounded base-plus-delta encoding for now. Native-resume recipes remain
+      site-owned because call operands and resume behavior are not merely frame
+      reconstruction data. A verifier checks every map-to-state reference and
+      every borrowed array identity after interning.
+
+      Type guards which replace the consumer's complete exit may own that
+      consumer's former site. A partial guard, such as the type half of
+      `length()`, must have a distinct site from the consumer's remaining
+      representation/error exit even when both sites intern to the same state.
+      This prevents a guard reason from masking a later semantic failure.
+
    4. **Shared exit-stub lowering.** After site simplification and state
       interning, share materialization and status stubs whose complete behavior
       is identical. Distinct sites may load a compact site/map ID before

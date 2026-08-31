@@ -193,6 +193,7 @@ typedef struct {
     uint64_t elided_exit_sites;
     uint64_t type_guard_sites;
     uint64_t eliminated_type_guard_sites;
+    uint64_t reconstruction_states;
     uint64_t continuation_captures;
     uint64_t continuation_resumes;
     uint64_t continuation_materializations;
