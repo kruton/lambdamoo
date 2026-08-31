@@ -18,6 +18,8 @@
 #ifndef Net_Multi_H
 #define Net_Multi_H 1
 
+#include "network.h"
+
 /* Extra networking facilities available only for the multi-user networking
  * configurations.
  */

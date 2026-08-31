@@ -6,7 +6,7 @@
 #    sets shell vars for MOO_NET_DO_REPORT:
 #      $moo_net_do_{list,check,require}
 #    sets shell vars for MOO_OPTION_ARG_ENABLES:
-#      $moo_d_{NETWORK_PROTOCOL,NETWORK_STYLE,MPLEX_STYLE,
+#      $moo_d_{NETWORK_PROTOCOL,NETWORK_STYLE,MPLEX_STYLE,NETWORK_IO_MODE,
 #              DEFAULT_{PORT,CONNECT_FILE},
 #              OUTBOUND_NETWORK}
 #    (yes this takes an argument
@@ -29,6 +29,7 @@ AS_HELP_STRING([[--enable-$1=KWD[,KWD]]],
 [                  tcp, local:  NETWORK_PROTOCOL=NP_*]
 [                   bsd, sysv:  NETWORK_STYLE=NS_*]
 [          select, poll, fake:  MPLEX_STYLE=MP_*]
+[              main, threaded:  NETWORK_IO_MODE=NIM_*]
 [   <path>/<file>, '"<file>"':  DEFAULT_CONNECT_FILE=*]
 [               <port number>:  DEFAULT_PORT=*]
 [          noout, outoff, out:  OUTBOUND_NETWORK={undef,-O,+O}]
@@ -50,6 +51,7 @@ for moo_kwd in ,x $enableval ; do
     no]],     [[moo_d=NETWORK_PROTOCOL; moo_v=NP_SINGLE
 	      moo_d_NETWORK_STYLE=no
 	      moo_d_MPLEX_STYLE=no
+	      moo_d_NETWORK_IO_MODE=NIM_MAIN
 	      moo_d_OUTBOUND_NETWORK=no]],[[
     tcp]],    [[moo_d=NETWORK_PROTOCOL; moo_v=NP_TCP]],  [[
     local]],  [[moo_d=NETWORK_PROTOCOL; moo_v=NP_LOCAL
@@ -59,6 +61,8 @@ for moo_kwd in ,x $enableval ; do
     select]], [[moo_d=MPLEX_STYLE;      moo_v=MP_SELECT]],[[
     poll]],   [[moo_d=MPLEX_STYLE;      moo_v=MP_POLL]],  [[
     fake]],   [[moo_d=MPLEX_STYLE;      moo_v=MP_FAKE]],  [[
+    main]],   [[moo_d=NETWORK_IO_MODE;  moo_v=NIM_MAIN]], [[
+    threaded]],[[moo_d=NETWORK_IO_MODE; moo_v=NIM_THREADED]],[[
     '"'*'"']],[[moo_d=DEFAULT_CONNECT_FILE; moo_v="$moo_kwd"]],    [[
     */*]],    [[moo_d=DEFAULT_CONNECT_FILE; moo_v="\"$moo_kwd\""]],[[
     *[!0-9]*]], AC_MSG_ERROR([unknown --enable-$1 keyword: $moo_kwd]),
