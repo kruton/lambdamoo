@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(37);
+    Var metadata = new_list(39);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -390,6 +390,10 @@ jit_metadata(JITProgram *program)
 					       stats.native_chain_active_frames);
     metadata.v.list[37] = jit_metadata_num_pair("native_chain_frame_bytes",
 					       stats.native_chain_frame_bytes);
+    metadata.v.list[38] = jit_metadata_num_pair("potential_exit_sites",
+					       stats.potential_exit_sites);
+    metadata.v.list[39] = jit_metadata_num_pair("elided_exit_sites",
+					       stats.elided_exit_sites);
     return metadata;
 }
 #endif

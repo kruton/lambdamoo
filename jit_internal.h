@@ -181,6 +181,14 @@ typedef enum {
     JIT_LAST_USE_SRC3 = 1 << 2
 } JITLastUseOperand;
 
+typedef enum {
+    JIT_EXIT_NONE = 0,
+    JIT_EXIT_DEOPT = 1 << 0,
+    JIT_EXIT_ERROR = 1 << 1,
+    JIT_EXIT_BOUNDARY = 1 << 2,
+    JIT_EXIT_INVALIDATION = 1 << 3
+} JITExitMask;
+
 struct JITInstruction {
     HIRTacKind kind;
     ResumeKey resume_key;
@@ -198,6 +206,8 @@ struct JITInstruction {
     Num literal;
     var_type literal_type;
     int deopt_map;
+    unsigned char exit_mask;
+    unsigned char exit_classified;
     JITCopy *copies;
     unsigned char direct_int_list_index_set;
     unsigned char owned_last_use;
@@ -243,6 +253,8 @@ struct JITProgram {
     int num_blocks;
     int num_resume_anchors;
     int num_deopt_maps;
+    unsigned potential_exit_sites;
+    unsigned elided_exit_sites;
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;

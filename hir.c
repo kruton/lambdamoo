@@ -4597,22 +4597,117 @@ jit_instr_can_materialize(JITInstruction *instr)
 }
 
 static int
-jit_instr_needs_deopt_map(JITInstruction *instr, var_type *value_types,
+jit_value_has_static_type(int value, var_type type, var_type *value_types,
 			  unsigned char *value_is_tagged, int num_values)
 {
+    return value > 0 && value < num_values && value_types && value_is_tagged
+	&& !value_is_tagged[value] && value_types[value] == type;
+}
+
+static JITExitMask
+jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
+			  unsigned char *value_is_tagged, int num_values)
+{
+    var_type t1, t2;
+    int tagged1, tagged2;
+
     if (!jit_instr_can_materialize(instr))
-	return 0;
-    if (instr->kind == HIR_TAC_UNARY
-	&& instr->op == HIR_OP_MAKE_SINGLETON_LIST)
-	return 0;
-    if (instr->kind == HIR_TAC_BINARY
-	&& instr->op == HIR_OP_LIST_ADD_TAIL
-	&& instr->src1 > 0 && instr->src1 < num_values
-	&& value_types && value_is_tagged
-	&& !value_is_tagged[instr->src1]
-	&& value_types[instr->src1] == TYPE_LIST)
-	return 0;
-    return 1;
+	return JIT_EXIT_NONE;
+    switch (instr->kind) {
+    case HIR_TAC_LOAD_LOCAL:
+	return instr->value > 0 && instr->value < num_values
+	    && value_is_tagged && value_is_tagged[instr->value]
+	    ? JIT_EXIT_NONE : JIT_EXIT_DEOPT;
+    case HIR_TAC_CALL:
+    case HIR_TAC_CALL_VERB:
+	return JIT_EXIT_BOUNDARY | JIT_EXIT_INVALIDATION;
+    case HIR_TAC_PUT_PROP:
+	return JIT_EXIT_ERROR | JIT_EXIT_BOUNDARY | JIT_EXIT_INVALIDATION;
+    case HIR_TAC_INDEX_SET:
+    case HIR_TAC_RANGE_REF:
+    case HIR_TAC_RANGE_SET:
+	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
+    case HIR_TAC_DEOPT:
+    case HIR_TAC_UNSUPPORTED:
+	return JIT_EXIT_DEOPT;
+    case HIR_TAC_UNARY:
+	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+	    return JIT_EXIT_NONE;
+	if (instr->func < FUNC_NOT_FOUND)
+	    return JIT_EXIT_BOUNDARY | JIT_EXIT_INVALIDATION;
+	if ((instr->op == HIR_OP_TYPEOF || instr->op == HIR_OP_NOT)
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values))
+	    return JIT_EXIT_NONE;
+	if ((instr->op == HIR_OP_NEGATE || instr->op == HIR_OP_ABS
+	     || instr->op == HIR_OP_COMPLEMENT)
+	    && jit_value_has_static_type(instr->src1, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values))
+	    return JIT_EXIT_NONE;
+	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
+    case HIR_TAC_BINARY:
+	if (instr->op == HIR_OP_LIST_ADD_TAIL
+	    && jit_value_has_static_type(instr->src1, TYPE_LIST, value_types,
+		value_is_tagged, num_values))
+	    return JIT_EXIT_NONE;
+	if (instr->func < FUNC_NOT_FOUND)
+	    return JIT_EXIT_BOUNDARY | JIT_EXIT_INVALIDATION;
+	tagged1 = instr->src1 > 0 && instr->src1 < num_values
+	    && value_is_tagged && value_is_tagged[instr->src1];
+	tagged2 = instr->src2 > 0 && instr->src2 < num_values
+	    && value_is_tagged && value_is_tagged[instr->src2];
+	if ((instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE)
+	    && (tagged1 || tagged2)
+	    && instr->value > 0 && instr->value < num_values
+	    && value_types && value_types[instr->value] != TYPE_FLOAT)
+	    return JIT_EXIT_NONE;
+	if (tagged1 || tagged2 || !value_types
+	    || instr->src1 <= 0 || instr->src1 >= num_values
+	    || instr->src2 <= 0 || instr->src2 >= num_values)
+	    return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
+	t1 = value_types[instr->src1];
+	t2 = value_types[instr->src2];
+	if (t1 == TYPE_INT && t2 == TYPE_INT
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+		|| instr->op == HIR_OP_MUL || instr->op == HIR_OP_EQ
+		|| instr->op == HIR_OP_NE || instr->op == HIR_OP_LT
+		|| instr->op == HIR_OP_LE || instr->op == HIR_OP_GT
+		|| instr->op == HIR_OP_GE || instr->op == HIR_OP_BITOR
+		|| instr->op == HIR_OP_BITXOR || instr->op == HIR_OP_BITAND
+		|| instr->op == HIR_OP_MIN || instr->op == HIR_OP_MAX))
+	    return JIT_EXIT_NONE;
+	if (t1 == TYPE_FLOAT && t2 == TYPE_FLOAT
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+		|| instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+		|| instr->op == HIR_OP_GT || instr->op == HIR_OP_GE))
+	    return JIT_EXIT_NONE;
+	if (t1 == TYPE_STR && t2 == TYPE_STR
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+		|| instr->op == HIR_OP_LT || instr->op == HIR_OP_LE
+		|| instr->op == HIR_OP_GT || instr->op == HIR_OP_GE))
+	    return JIT_EXIT_NONE;
+	if (t1 == TYPE_LIST && t2 == TYPE_LIST
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE))
+	    return JIT_EXIT_NONE;
+	if (t1 == TYPE_OBJ && t2 == TYPE_OBJ
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && (instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE))
+	    return JIT_EXIT_NONE;
+	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
+    default:
+	return JIT_EXIT_DEOPT;
+    }
 }
 
 static int jit_owner_value_must_be_current(JITProgram *, JITInstruction *, int);
@@ -4647,23 +4742,43 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 	for (block = program->blocks; block; block = block->next) {
 		JITInstruction *instr;
 
-		for (instr = block->first; instr; instr = instr->next) {
+	for (instr = block->first; instr; instr = instr->next) {
 			JITDeoptMap *map;
 			const ResumePoint *point;
+			JITExitMask expected_exits;
 			int operands;
 
+			expected_exits = jit_instruction_exit_mask(instr,
+			    program->value_types, program->value_is_tagged,
+			    program->num_values);
+			if (!instr->exit_classified) {
+				record_unsupported_fmt(ctx,
+				    "exit-proof: unclassified instruction at pc %u",
+				    instr->bytecode_pc);
+				goto invalid;
+			}
+			if (instr->exit_mask != expected_exits) {
+				record_unsupported_fmt(ctx,
+				    "exit-proof: stale mask %u, expected %u at pc %u",
+				    instr->exit_mask, expected_exits,
+				    instr->bytecode_pc);
+				goto invalid;
+			}
 			if (instr->deopt_map == 0) {
 				if (instr->bytecode_pc != NO_BYTECODE_PC
-				    && jit_instr_needs_deopt_map(instr,
-					program->value_types,
-					program->value_is_tagged,
-					program->num_values)) {
+				    && expected_exits != JIT_EXIT_NONE) {
 					record_unsupported_fmt(ctx,
 					    "deopt-map: missing map at pc %u",
 					    instr->bytecode_pc);
 					goto invalid;
 				}
 				goto next_instruction;
+			}
+			if (expected_exits == JIT_EXIT_NONE) {
+				record_unsupported_fmt(ctx,
+				    "deopt-map: non-exiting instruction has map %d at pc %u",
+				    instr->deopt_map, instr->bytecode_pc);
+				goto invalid;
 			}
 			if (instr->deopt_map < 0
 			    || instr->deopt_map >= program->num_deopt_maps) {
@@ -7033,8 +7148,15 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			instr->kind = HIR_TAC_DEOPT;
 		}
 	    }
-	    instr->deopt_map = jit_instr_needs_deopt_map(instr, value_types,
-		value_is_tagged, program->num_values)
+	    instr->exit_mask = jit_instruction_exit_mask(instr, value_types,
+		value_is_tagged, program->num_values);
+	    instr->exit_classified = 1;
+	    if (jit_instr_can_materialize(instr)) {
+		program->potential_exit_sites++;
+		if (instr->exit_mask == JIT_EXIT_NONE)
+		    program->elided_exit_sites++;
+	    }
+	    instr->deopt_map = instr->exit_mask != JIT_EXIT_NONE
 		? jit_add_deopt_map(program, ssa_instr,
 				    &bytecode_program->main_vector,
 				    value_types, value_is_tagged)

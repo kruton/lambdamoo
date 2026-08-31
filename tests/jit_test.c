@@ -6445,6 +6445,8 @@ main(void)
     {
 	JITProgram *profile_program = new_jit_program();
 	JITProgramStats stats;
+	profile_program->potential_exit_sites = 17;
+	profile_program->elided_exit_sites = 11;
 
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
 	      "deopt reason name none");
@@ -6535,6 +6537,8 @@ main(void)
 	      "per-program JIT deopt reason totals are wrong");
 	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
 	      "per-program JIT last-use statistics are wrong");
+	check(stats.potential_exit_sites == 17 && stats.elided_exit_sites == 11,
+	      "per-program exit-proof statistics are wrong");
 	check(stats.native_chain_calls == 2 && stats.native_chain_returns == 2
 	      && stats.native_chain_promotions == 3
 	      && stats.native_chain_max_depth == 3
