@@ -22,7 +22,11 @@
 #if NETWORK_PROTOCOL == NP_SINGLE
 #  include "net_single.c"
 #else
-#  include "net_multi.c"
+#  if NETWORK_IO_MODE == NIM_THREADED
+#    include "net_threaded.c"
+#  else
+#    include "net_multi.c"
+#  endif
 #endif
 
 #if NETWORK_PROTOCOL == NP_TCP

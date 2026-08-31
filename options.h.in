@@ -395,6 +395,20 @@ useful for anything other than quick experiments.)
 #undef MPLEX_STYLE
 
 /******************************************************************************
+ * NETWORK_IO_MODE selects which thread performs multi-user network I/O:
+ *
+ * NIM_MAIN       The interpreter thread performs multiplexing and I/O, as in
+ *                traditional LambdaMOO servers.
+ * NIM_THREADED   A dedicated thread performs multiplexing and socket I/O;
+ *                the interpreter consumes bounded per-connection buffers.
+ *
+ * Threaded I/O requires pthreads, lock-free C atomics, MP_SELECT or MP_POLL,
+ * and unforked database checkpoints.  It is opt-in.
+ */
+
+#undef NETWORK_IO_MODE
+
+/******************************************************************************
  * The built-in MOO function open_network_connection(), when enabled,
  * allows (only) wizard-owned MOO code to make outbound network connections
  * from the server.  When disabled, it raises E_PERM whenever called.

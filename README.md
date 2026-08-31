@@ -336,8 +336,8 @@ There are two classes of command-line arguments for `./configure`
   + `--enable-net`
 
     manages all networking options (`NETWORK_PROTOCOL`,
-    `NETWORK_STYLE`, `MPLEX_STYLE`, `DEFAULT_CONNECT_FILE`,
-    `DEFAULT_PORT`, and `OUTBOUND_NETWORK`),
+    `NETWORK_STYLE`, `MPLEX_STYLE`, `NETWORK_IO_MODE`,
+    `DEFAULT_CONNECT_FILE`, `DEFAULT_PORT`, and `OUTBOUND_NETWORK`),
     thence allowing you to do, e.g.,
 
     ```
@@ -354,6 +354,23 @@ There are two classes of command-line arguments for `./configure`
 
     to get a server with TCP networking, default listener on port
     8888, and `open_network_connection()` enabled by default.
+
+    Add the `threaded` keyword to have a dedicated thread perform
+    descriptor multiplexing and socket I/O, leaving the execution thread
+    to consume bounded per-connection buffers.  For example:
+
+    ```
+       ./configure --enable-net=tcp,bsd,select,threaded,8888,out
+    ```
+
+    Threaded networking requires POSIX threads, lock-free C atomic integers,
+    and either `select` or `poll`; it is not available with `fake`
+    multiplexing or single-user networking.  It also uses unforked database
+    checkpoints and a resolver thread instead of the traditional DNS helper
+    process.  An `address_lookup_timeout` of zero disables reverse DNS and
+    publishes the numeric peer address immediately.  A positive timeout
+    waits for the resolver result or the timeout before publishing the
+    connection.
 
   + `--enable-sz`
 

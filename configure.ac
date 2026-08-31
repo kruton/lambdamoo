@@ -114,9 +114,23 @@ AS_VAR_IF([moo_cv_iconv_lib],[fail],
   [AC_MSG_ERROR([[no library for iconv_open, may need to install]])
 ])
 AC_CHECK_HEADERS([unistd.h sys/cdefs.h stdlib.h tiuser.h machine/endian.h])
+AC_CHECK_HEADERS([pthread.h stdatomic.h])
 AC_CHECK_FUNCS([remove rename poll select strerror strftime strtoul matherr])
 AC_CHECK_FUNCS([random lrand48 wait3 wait2 sigsetmask sigprocmask sigrelse])
 AC_CHECK_FUNCS([strtoimax])
+AS_IF([test "x$enable_def_NETWORK_IO_MODE" = xNIM_THREADED], [
+  AC_SEARCH_LIBS([pthread_create], [pthread], [],
+    [AC_MSG_ERROR([threaded network I/O requires pthreads])])
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <stdatomic.h>
+#if ATOMIC_INT_LOCK_FREE != 2
+#error atomic int is not always lock-free
+#endif
+  ]], [[atomic_int value = ATOMIC_VAR_INIT(0); return atomic_load(&value);]])],
+    [AC_DEFINE([HAVE_LOCK_FREE_ATOMICS], [1],
+      [Define when atomic integers are always lock-free.])],
+    [AC_MSG_ERROR([threaded network I/O requires lock-free C atomic integers])])
+])
 MOO_NDECL_FUNCS([ctype.h], [tolower])
 MOO_NDECL_FUNCS([fcntl.h], [fcntl])
 MOO_NDECL_FUNCS([netinet/in.h], [htonl])

@@ -71,7 +71,18 @@
 #define MP_POLL		2
 #define MP_FAKE		3
 
+#define NIM_MAIN	1
+#define NIM_THREADED	2
+
 #include "config.h"
+
+#ifndef NETWORK_IO_MODE
+#  define NETWORK_IO_MODE NIM_MAIN
+#endif
+
+#if NETWORK_IO_MODE != NIM_MAIN && NETWORK_IO_MODE != NIM_THREADED
+#  error Illegal value for "NETWORK_IO_MODE"
+#endif
 
 #if NETWORK_PROTOCOL != NP_SINGLE  &&  !defined(MPLEX_STYLE)
 #  if NETWORK_STYLE == NS_BSD
@@ -102,6 +113,21 @@
          #error You cannot use TLI without having poll()!
 #      endif
 #    endif
+#  endif
+#endif
+
+#if NETWORK_IO_MODE == NIM_THREADED
+#  if NETWORK_PROTOCOL == NP_SINGLE
+#    error Threaded network I/O is not available with NP_SINGLE
+#  endif
+#  if MPLEX_STYLE == MP_FAKE
+#    error Threaded network I/O requires select() or poll()
+#  endif
+#  if !HAVE_PTHREAD_H || !HAVE_STDATOMIC_H || !HAVE_LOCK_FREE_ATOMICS
+#    error Threaded network I/O requires pthreads and lock-free C atomics
+#  endif
+#  ifndef UNFORKED_CHECKPOINTS
+#    define UNFORKED_CHECKPOINTS 1
 #  endif
 #endif
 

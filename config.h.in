@@ -236,6 +236,11 @@
 #undef POLL_WORKS_ON_FIFOS
 #undef SELECT_WORKS_ON_FIFOS
 
+/* Define when pthreads and lock-free C atomic integers are available. */
+#undef HAVE_PTHREAD_H
+#undef HAVE_STDATOMIC_H
+#undef HAVE_LOCK_FREE_ATOMICS
+
 /* The POSIX standard specifies a nice, simple, reliable method for performing
  * non-blocking I/O, and a lot of systems actually implement it.  Some systems,
  * though (notably Ultrix 4.1), misleadingly define the preprocessor symbols

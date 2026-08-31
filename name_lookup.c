@@ -15,10 +15,11 @@
     Pavel@Xerox.Com
  *****************************************************************************/
 
-/* This module provides IP host name lookup with timeouts.  Because
- * longjmps out of name lookups corrupt some UNIX name lookup modules, this
- * module uses a subprocess to do the name lookup.  On any failure, the
- * subprocess is restarted.
+/* This module provides IP host name lookup with timeouts.  The traditional
+ * network implementation uses a subprocess because longjmps out of name
+ * lookups corrupt some UNIX name lookup modules.  On any failure, the
+ * subprocess is restarted.  Threaded network I/O uses a resolver thread
+ * instead of a process.
  */
 
 #include "name_lookup.h"
@@ -27,6 +28,234 @@
 #include "options.h"
 
 #if NETWORK_PROTOCOL == NP_TCP	/* Skip almost entire file otherwise... */
+
+#if NETWORK_IO_MODE == NIM_THREADED
+
+#include "my-inet.h"
+#include "my-in.h"
+#include "my-socket.h"
+#include "my-stdio.h"
+#include "my-stdlib.h"
+#include "my-string.h"
+#include "my-time.h"
+#include <netdb.h>
+#include <pthread.h>
+
+#include "log.h"
+#include "storage.h"
+
+typedef enum {
+    LOOKUP_FORWARD, LOOKUP_REVERSE
+} lookup_kind;
+
+typedef struct threaded_lookup {
+    struct threaded_lookup *next;
+    lookup_kind kind;
+    char *name;
+    struct sockaddr_in address;
+    uint32_t result_address;
+    char *result_name;
+    int done, abandoned;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+} threaded_lookup;
+
+static pthread_t lookup_thread;
+static pthread_mutex_t lookup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lookup_condition = PTHREAD_COND_INITIALIZER;
+static threaded_lookup *lookup_head = NULL;
+static threaded_lookup **lookup_tail = &lookup_head;
+static int lookup_started;
+
+static void
+free_threaded_lookup(threaded_lookup *request)
+{
+    if (request->name)
+	myfree(request->name, M_NETWORK);
+    if (request->result_name)
+	myfree(request->result_name, M_NETWORK);
+    pthread_cond_destroy(&request->condition);
+    pthread_mutex_destroy(&request->mutex);
+    myfree(request, M_NETWORK);
+}
+
+static void
+perform_threaded_lookup(threaded_lookup *request)
+{
+    if (request->kind == LOOKUP_FORWARD) {
+ struct addrinfo hints = {0}, *answer = NULL;
+
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(request->name, NULL, &hints, &answer) == 0 && answer) {
+	    struct sockaddr_in *addr = (struct sockaddr_in *)answer->ai_addr;
+
+	    request->result_address = addr->sin_addr.s_addr;
+	}
+	if (answer)
+	    freeaddrinfo(answer);
+    } else {
+	char host[NI_MAXHOST];
+
+	if (getnameinfo((struct sockaddr *)&request->address,
+			sizeof(request->address), host, sizeof(host), NULL, 0,
+			NI_NAMEREQD) == 0) {
+	    size_t length = strlen(host) + 1;
+
+	    request->result_name = mymalloc(length, M_NETWORK);
+	    memcpy(request->result_name, host, length);
+	}
+    }
+}
+
+static void *
+threaded_lookup_main(void *unused UNUSED_)
+{
+    for (;;) {
+	threaded_lookup *request;
+
+	pthread_mutex_lock(&lookup_mutex);
+	while (!lookup_head)
+	    pthread_cond_wait(&lookup_condition, &lookup_mutex);
+	request = lookup_head;
+	lookup_head = request->next;
+	if (!lookup_head)
+	    lookup_tail = &lookup_head;
+	pthread_mutex_unlock(&lookup_mutex);
+
+	pthread_mutex_lock(&request->mutex);
+	if (request->abandoned) {
+	    pthread_mutex_unlock(&request->mutex);
+	    free_threaded_lookup(request);
+	    continue;
+	}
+	pthread_mutex_unlock(&request->mutex);
+	perform_threaded_lookup(request);
+	pthread_mutex_lock(&request->mutex);
+	if (request->abandoned) {
+	    pthread_mutex_unlock(&request->mutex);
+	    free_threaded_lookup(request);
+	} else {
+	    request->done = 1;
+	    pthread_cond_signal(&request->condition);
+	    pthread_mutex_unlock(&request->mutex);
+	}
+    }
+    return NULL;
+}
+
+static threaded_lookup *
+new_threaded_lookup(lookup_kind kind)
+{
+    threaded_lookup *request = mymalloc(sizeof(*request), M_NETWORK);
+
+    *request = (threaded_lookup){0};
+    request->kind = kind;
+    pthread_mutex_init(&request->mutex, NULL);
+    pthread_cond_init(&request->condition, NULL);
+    return request;
+}
+
+static int
+submit_threaded_lookup(threaded_lookup *request, unsigned timeout)
+{
+    struct timespec until;
+    int done;
+
+    pthread_mutex_lock(&lookup_mutex);
+    *lookup_tail = request;
+    lookup_tail = &request->next;
+    pthread_cond_signal(&lookup_condition);
+    pthread_mutex_unlock(&lookup_mutex);
+
+    until.tv_sec = time(0) + timeout;
+    until.tv_nsec = 0;
+    pthread_mutex_lock(&request->mutex);
+    while (!request->done) {
+	int e = pthread_cond_timedwait(&request->condition, &request->mutex,
+				       &until);
+
+	if (e != 0)
+	    break;
+    }
+    done = request->done;
+    if (!done)
+	request->abandoned = 1;
+    pthread_mutex_unlock(&request->mutex);
+    return done;
+}
+
+int
+initialize_name_lookup(void)
+{
+    pthread_attr_t attr;
+
+    if (lookup_started)
+	return 1;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&lookup_thread, &attr, threaded_lookup_main, NULL) != 0) {
+	pthread_attr_destroy(&attr);
+	errlog("NAME_LOOKUP: Can't create lookup thread\n");
+	return 0;
+    }
+    pthread_attr_destroy(&attr);
+    lookup_started = 1;
+    oklog("NAME_LOOKUP: Started lookup thread\n");
+    return 1;
+}
+
+const char *
+lookup_name_from_addr(struct sockaddr_in *addr, unsigned timeout)
+{
+    static char result[NI_MAXHOST];
+    threaded_lookup *request;
+
+    if (timeout > 0 && lookup_started
+	&& (request = new_threaded_lookup(LOOKUP_REVERSE)) != NULL) {
+	request->address = *addr;
+	if (submit_threaded_lookup(request, timeout)) {
+	    if (request->result_name) {
+		strncpy(result, request->result_name, sizeof(result) - 1);
+		result[sizeof(result) - 1] = '\0';
+		free_threaded_lookup(request);
+		return result;
+	    }
+	    free_threaded_lookup(request);
+	}
+    }
+    {
+	uint32_t a = ntohl(addr->sin_addr.s_addr);
+
+	sprintf(result, "%u.%u.%u.%u",
+		(unsigned)(a >> 24) & 0xff, (unsigned)(a >> 16) & 0xff,
+		(unsigned)(a >> 8) & 0xff, (unsigned)a & 0xff);
+	return result;
+    }
+}
+
+uint32_t
+lookup_addr_from_name(const char *name, unsigned timeout)
+{
+    threaded_lookup *request;
+    uint32_t result;
+
+    result = inet_addr((void *)name);
+    if (result != 0xffffffff || timeout == 0 || !lookup_started)
+	return result == 0xffffffff ? 0 : result;
+    request = new_threaded_lookup(LOOKUP_FORWARD);
+    if (!request)
+	return 0;
+    request->name = mymalloc(strlen(name) + 1, M_NETWORK);
+    strcpy(request->name, name);
+    if (!submit_threaded_lookup(request, timeout))
+	return 0;
+    result = request->result_address;
+    free_threaded_lookup(request);
+    return result == 0xffffffff ? 0 : result;
+}
+
+#else /* NETWORK_IO_MODE != NIM_THREADED */
 
 #include "my-signal.h"
 #include "my-stdlib.h"
@@ -409,6 +638,8 @@ lookup_addr_from_name(const char *name, unsigned timeout)
 
     return addr == 0xffffffff ? 0 : addr;
 }
+
+#endif /* NETWORK_IO_MODE != NIM_THREADED */
 
 #endif				/* NETWORK_PROTOCOL == NP_TCP */
 
