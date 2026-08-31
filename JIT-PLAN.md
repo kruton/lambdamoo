@@ -1695,6 +1695,18 @@ the broader ownership-map and synthesized-anchor validation described below.
       branching to a common stub. This is code deduplication, not permission to
       discard site-specific source or error state.
 
+      The first implemented form shares the post-materialization return tails
+      by `JITRunResult`. Each site still materializes its own required SSA
+      values and writes its exact map ID, then jumps to a stub which writes the
+      result status and enters the common epilogue. Ordinary status exits use
+      the same tails after writing their source location and error. This is safe
+      because the stubs consume no reconstruction values and therefore do not
+      extend SSA live ranges. An experiment outlining complete materialization
+      by reconstruction-state ID increased `#463:sha1` machine code because it
+      kept many SSA values live to function-end stubs and caused additional
+      register pressure; do not restore that form without an ABI which passes
+      already-spilled reconstruction storage to the stub.
+
    Only after these passes should repeated local/tag-load elimination,
    block-level tick batching, call-site specialization, and additional MIR
    optimization tiers be considered. Deopt-aware liveness is intentionally

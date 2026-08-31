@@ -1872,6 +1872,7 @@ typedef struct {
     MIR_item_t import_var_raw;
     MIR_item_t proto_direct_verb_call;
     MIR_item_t import_direct_verb_call;
+    MIR_label_t shared_return[JIT_RUN_ABORT_SECONDS + 1];
 } MIRBuild;
 
 typedef struct JITStatusExit JITStatusExit;
@@ -2022,6 +2023,28 @@ return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
 			      MIR_new_int_op(build->context, value)));
     append(build, MIR_new_insn(build->context, MIR_JMP,
 			      MIR_new_label_op(build->context, common_return)));
+}
+
+static void
+return_shared_status(MIRBuild *build, JITRunResult value)
+{
+    if (!build->shared_return[value])
+	build->shared_return[value] = MIR_new_label(build->context);
+    append(build, MIR_new_insn(build->context, MIR_JMP,
+	MIR_new_label_op(build->context, build->shared_return[value])));
+}
+
+static void
+append_shared_return_stubs(MIRBuild *build, MIR_reg_t status,
+			   MIR_label_t common_return)
+{
+    int value;
+
+    for (value = 0; value <= JIT_RUN_ABORT_SECONDS; value++)
+	if (build->shared_return[value]) {
+	    append(build, build->shared_return[value]);
+	    return_status(build, status, common_return, (JITRunResult) value);
+	}
 }
 
 static void
@@ -2222,7 +2245,7 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 		deopt_map_out, deopt_values, status, common_return,
 		JIT_RUN_ERROR);
 	else
-	    return_status(build, status, common_return, exit->status);
+	    return_shared_status(build, exit->status);
 	myfree(exit, M_PROGRAM);
 	exit = next;
     }
@@ -2287,8 +2310,8 @@ append_materialized_value(MIRBuild *build, JITProgram *program, int value,
 static void
 append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 			 MIR_reg_t *values, MIR_reg_t deopt_map_out,
-			 MIR_reg_t deopt_values, MIR_reg_t status,
-			 MIR_label_t common_return, JITRunResult result)
+			 MIR_reg_t deopt_values, MIR_reg_t status UNUSED_,
+			 MIR_label_t common_return UNUSED_, JITRunResult result)
 {
     JITDeoptMap *map = &program->deopt_maps[map_id];
     int i;
@@ -2326,7 +2349,7 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, map_id)));
-    return_status(build, status, common_return, result);
+    return_shared_status(build, result);
 }
 
 static void
@@ -6790,6 +6813,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     append_status_exits(build, status_exits, program, values, labels, source_location,
 			deopt_map_out, deopt_values, error_out, status,
 			common_return);
+    append_shared_return_stubs(build, status, common_return);
     append(build, common_return);
     append(build, MIR_new_insn(build->context, MIR_MOV,
 	MIR_new_mem_op(build->context, MIR_T_I32, 0, ticks, 0, 1),
