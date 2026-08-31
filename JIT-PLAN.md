@@ -1699,9 +1699,14 @@ the broader ownership-map and synthesized-anchor validation described below.
       by `JITRunResult`. Each site still materializes its own required SSA
       values and writes its exact map ID, then jumps to a stub which writes the
       result status and enters the common epilogue. Ordinary status exits use
-      the same tails after writing their source location and error. This is safe
-      because the stubs consume no reconstruction values and therefore do not
-      extend SSA live ranges. An experiment outlining complete materialization
+      the same tails after writing their error. Source locations are interned in
+      a program-owned side table: native status exits write one compact location
+      ID, and the runtime expands it to canonical bytecode PC, error PC, and
+      source line immediately after the native function returns. This keeps
+      immutable location metadata out of the MIR instruction stream and native
+      code while preserving the existing runtime ABI at its consumers. This is
+      safe because the stubs consume no reconstruction values and therefore do
+      not extend SSA live ranges. An experiment outlining complete materialization
       by reconstruction-state ID increased `#463:sha1` machine code because it
       kept many SSA values live to function-end stubs and caused additional
       register pressure; do not restore that form without an ABI which passes

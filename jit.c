@@ -1808,6 +1808,7 @@ jit_pool_stats(JITPoolStats *stats)
 }
 
 typedef struct {
+    JITProgram *program;
     MIR_context_t context;
     MIR_module_t module;
     MIR_item_t function;
@@ -1882,10 +1883,34 @@ struct JITStatusExit {
     JITRunResult status;
     enum error error;
     int deopt_map;
+    int location_id;
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITStatusExit *next;
 };
+
+static int
+status_location_id(JITProgram *program, unsigned bytecode_pc,
+		   unsigned source_lineno)
+{
+    JITSourceLocation *locations;
+    int i;
+
+    for (i = 0; i < program->num_status_locations; i++)
+	if (program->status_locations[i].bytecode_pc == bytecode_pc
+	    && program->status_locations[i].error_pc == bytecode_pc
+	    && program->status_locations[i].source_lineno == source_lineno)
+	    return i;
+    locations = myrealloc(program->status_locations,
+	sizeof(JITSourceLocation) * (program->num_status_locations + 1),
+	M_PROGRAM);
+    program->status_locations = locations;
+    i = program->num_status_locations++;
+    locations[i].bytecode_pc = bytecode_pc;
+    locations[i].error_pc = bytecode_pc;
+    locations[i].source_lineno = source_lineno;
+    return i;
+}
 
 static uint64_t
 elapsed_us(const struct timeval *started, const struct timeval *finished)
@@ -2121,6 +2146,8 @@ new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
     exit->status = status;
     exit->error = error;
     exit->deopt_map = deopt_map;
+    exit->location_id = status_location_id(build->program, bytecode_pc,
+					   source_lineno);
     exit->bytecode_pc = bytecode_pc;
     exit->source_lineno = source_lineno;
     exit->next = 0;
@@ -2256,17 +2283,7 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 	    MIR_new_mem_op(build->context, MIR_T_I32,
 			   offsetof(JITSourceLocation, bytecode_pc),
 			   source_location, 0, 1),
-	    MIR_new_int_op(build->context, exit->bytecode_pc)));
-	append(build, MIR_new_insn(build->context, MIR_MOV,
-	    MIR_new_mem_op(build->context, MIR_T_I32,
-			   offsetof(JITSourceLocation, error_pc),
-			   source_location, 0, 1),
-	    MIR_new_int_op(build->context, exit->bytecode_pc)));
-	append(build, MIR_new_insn(build->context, MIR_MOV,
-	    MIR_new_mem_op(build->context, MIR_T_I32,
-			   offsetof(JITSourceLocation, source_lineno),
-			   source_location, 0, 1),
-	    MIR_new_int_op(build->context, exit->source_lineno)));
+	    MIR_new_int_op(build->context, exit->location_id)));
 	if (exit->error != E_NONE)
 	    append(build, MIR_new_insn(build->context, MIR_MOV,
 		MIR_new_mem_op(build->context, MIR_T_I32,
@@ -3055,6 +3072,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
+    if (program->status_locations) {
+	myfree(program->status_locations, M_PROGRAM);
+	program->status_locations = 0;
+    }
+    program->num_status_locations = 0;
+    build->program = program;
     build->context = context;
     snprintf(module_name, sizeof(module_name), "moo_mod_%" PRIu64, ++next_module_serial);
     build->module = MIR_new_module(build->context, module_name);
@@ -7128,6 +7151,8 @@ jit_program_free(JITProgram *program)
 	}
     if (program->reconstruction_states)
 	myfree(program->reconstruction_states, M_PROGRAM);
+    if (program->status_locations)
+	myfree(program->status_locations, M_PROGRAM);
     if (program->value_types)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
@@ -7176,6 +7201,7 @@ jit_program_metadata_bytes(JITProgram *program)
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
     bytes += sizeof(JITReconstructionState)
 	* program->num_reconstruction_states;
+    bytes += sizeof(JITSourceLocation) * program->num_status_locations;
     if (program->value_types)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
@@ -8353,7 +8379,7 @@ jit_program_execute_in_context(JITProgram *program,
 
     if (!source_location)
 	source_location = &ignored_location;
-    source_location->bytecode_pc = 0;
+    source_location->bytecode_pc = (unsigned) -1;
     source_location->error_pc = 0;
     source_location->source_lineno = 0;
     if (deopt) {
@@ -8439,6 +8465,13 @@ jit_program_execute_in_context(JITProgram *program,
 			     continuation_in && continuation_in->has_result
 			     ? &continuation_in->result : 0,
 			     owned_values);
+    if (source_location->bytecode_pc < (unsigned) program->num_status_locations)
+	*source_location = program->status_locations[source_location->bytecode_pc];
+    else {
+	source_location->bytecode_pc = 0;
+	source_location->error_pc = 0;
+	source_location->source_lineno = 0;
+    }
     if (deopt && deopt_map >= 0 && deopt_map < program->num_deopt_maps)
 	deopt->map_id = deopt_map;
     for (i = 0; i < program->num_owned_slots; i++)

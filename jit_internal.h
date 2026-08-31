@@ -262,12 +262,14 @@ struct JITProgram {
     int num_resume_anchors;
     int num_deopt_maps;
     int num_reconstruction_states;
+    int num_status_locations;
     unsigned potential_exit_sites;
     unsigned elided_exit_sites;
     unsigned type_guard_sites;
     unsigned eliminated_type_guard_sites;
     JITDeoptMap *deopt_maps;
     JITReconstructionState *reconstruction_states;
+    JITSourceLocation *status_locations;
     JITBlock *blocks;
     JITBlock *last_block;
     JITInstruction *retained_constants;

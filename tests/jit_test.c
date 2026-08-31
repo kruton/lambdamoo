@@ -34,6 +34,7 @@ struct mir_dump {
     int found_source_marker;
     int timeout_checks;
     int source_location_stores;
+    int source_location_field_stores;
 };
 
 struct promotion_dump {
@@ -64,6 +65,9 @@ check_mir_line(const char *line, void *data)
 	dump->timeout_checks++;
     if (strstr(line, "i32:(source_location)"))
 	dump->source_location_stores++;
+    if (strstr(line, "4(source_location)")
+	|| strstr(line, "8(source_location)"))
+	dump->source_location_field_stores++;
 }
 
 static void
@@ -4043,6 +4047,8 @@ main(void)
 	      "duplicate-tick MIR dump failed");
 	check(exit_dump.source_location_stores == 2,
 	      "equivalent tick status exits were not shared");
+	check(exit_dump.source_location_field_stores == 0,
+	      "status exits wrote expanded source locations");
     }
     mir_dump.lines = 0;
     check(jit_program_dump_hir(program, check_mir_line, &mir_dump),
