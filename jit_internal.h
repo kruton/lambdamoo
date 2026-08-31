@@ -206,6 +206,8 @@ struct JITInstruction {
     Num literal;
     var_type literal_type;
     int deopt_map;
+    JITTypeMask guarded_type_masks[JIT_MAX_GUARD_OPERANDS];
+    unsigned char guarded_operands;
     unsigned char exit_mask;
     unsigned char exit_classified;
     JITCopy *copies;
@@ -255,6 +257,8 @@ struct JITProgram {
     int num_deopt_maps;
     unsigned potential_exit_sites;
     unsigned elided_exit_sites;
+    unsigned type_guard_sites;
+    unsigned eliminated_type_guard_sites;
     JITDeoptMap *deopt_maps;
     JITBlock *blocks;
     JITBlock *last_block;

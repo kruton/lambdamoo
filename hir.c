@@ -827,6 +827,7 @@ hir_verify_tac(HIRContext *ctx, HIRTacProgram *program)
 	switch (instr->kind) {
 	case HIR_TAC_TICK:
 	case HIR_TAC_DEOPT:
+	case HIR_TAC_GUARD_TYPE:
 	    break;
 	case HIR_TAC_CONST:
 	case HIR_TAC_LOAD_ERROR:
@@ -2019,6 +2020,7 @@ hir_kind_can_materialize(HIRTacKind kind)
 {
     switch (kind) {
     case HIR_TAC_DEOPT:
+    case HIR_TAC_GUARD_TYPE:
     case HIR_TAC_LOAD_LOCAL:
     case HIR_TAC_UNARY:
     case HIR_TAC_BINARY:
@@ -2651,6 +2653,7 @@ hir_verify_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_GUARD_TYPE:
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_ERROR:
@@ -3665,6 +3668,7 @@ hir_verify_out_of_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_GUARD_TYPE:
 		break;
 	    case HIR_TAC_CONST:
 	    case HIR_TAC_LOAD_ERROR:
@@ -3897,6 +3901,7 @@ tac_kind_name(HIRTacKind kind)
     switch (kind) {
     case HIR_TAC_TICK: return "tick";
     case HIR_TAC_DEOPT: return "deopt";
+    case HIR_TAC_GUARD_TYPE: return "guard-type";
     case HIR_TAC_CONST: return "const";
     case HIR_TAC_LOAD_ERROR: return "load-error";
     case HIR_TAC_LOAD_LOCAL: return "load-local";
@@ -3938,6 +3943,7 @@ jit_ssa_is_supported(HIRContext *ctx, HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_GUARD_TYPE:
 	    case HIR_TAC_LOAD_ERROR:
 	    case HIR_TAC_LOAD_LOCAL:
 	    case HIR_TAC_CALL:
@@ -4135,6 +4141,7 @@ jit_ssa_anchors_are_valid(HIRContext *ctx, HIRSSAProgram *ssa, Program *bytecode
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_GUARD_TYPE:
 	    case HIR_TAC_UNARY:
 	    case HIR_TAC_BINARY:
 	    case HIR_TAC_BRANCH_FALSE:
@@ -4453,6 +4460,18 @@ jit_guard_contract(HIRSSAInstr *instr, var_type *value_types,
 }
 
 static int
+jit_consumer_uses_explicit_type_guards(HIRSSAInstr *instr)
+{
+    if (instr->kind == HIR_TAC_UNARY)
+	return instr->op == HIR_OP_COMPLEMENT || instr->op == HIR_OP_TOINT;
+    if (instr->kind != HIR_TAC_BINARY)
+	return 0;
+    return instr->op == HIR_OP_INDEX_BF || instr->op == HIR_OP_RINDEX_BF
+	|| instr->op == HIR_OP_BITOR || instr->op == HIR_OP_BITXOR
+	|| instr->op == HIR_OP_BITAND;
+}
+
+static int
 jit_add_deopt_map(JITProgram *program, HIRSSAInstr *instr,
 		  Bytecodes *bytecodes, var_type *value_types,
 		  unsigned char *value_is_tagged)
@@ -4628,9 +4647,12 @@ jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
     case HIR_TAC_RANGE_SET:
 	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
     case HIR_TAC_DEOPT:
+    case HIR_TAC_GUARD_TYPE:
     case HIR_TAC_UNSUPPORTED:
 	return JIT_EXIT_DEOPT;
     case HIR_TAC_UNARY:
+	if (instr->guarded_operands & 1U)
+	    return JIT_EXIT_NONE;
 	if (instr->op == HIR_OP_MAKE_SINGLETON_LIST)
 	    return JIT_EXIT_NONE;
 	if (instr->func < FUNC_NOT_FOUND)
@@ -4648,6 +4670,8 @@ jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
 	    return JIT_EXIT_NONE;
 	return JIT_EXIT_DEOPT | JIT_EXIT_ERROR;
     case HIR_TAC_BINARY:
+	if (instr->guarded_operands)
+	    return JIT_EXIT_NONE;
 	if (instr->op == HIR_OP_LIST_ADD_TAIL
 	    && jit_value_has_static_type(instr->src1, TYPE_LIST, value_types,
 		value_is_tagged, num_values))
@@ -4711,10 +4735,12 @@ jit_instruction_exit_mask(JITInstruction *instr, var_type *value_types,
 }
 
 static int jit_owner_value_must_be_current(JITProgram *, JITInstruction *, int);
+static int jit_guard_fact_dominates(JITProgram *, HIRDominatorTree *, JITBlock *,
+	JITInstruction *, int, JITTypeMask);
 
 static int
 jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
-			 Program *bytecode_program)
+			 Program *bytecode_program, HIRDominatorTree *dominators)
 {
 	JITBlock *block;
 	unsigned char *seen;
@@ -4751,6 +4777,52 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 			expected_exits = jit_instruction_exit_mask(instr,
 			    program->value_types, program->value_is_tagged,
 			    program->num_values);
+			if (instr->kind == HIR_TAC_GUARD_TYPE) {
+				int operand;
+				int values[JIT_MAX_GUARD_OPERANDS] = {
+				    instr->src1, instr->src2
+				};
+
+				if (!instr->guarded_operands) {
+					record_unsupported_fmt(ctx,
+					    "type-guard: empty predicate at pc %u",
+					    instr->bytecode_pc);
+					goto invalid;
+				}
+				for (operand = 0;
+				     operand < JIT_MAX_GUARD_OPERANDS; operand++)
+				    if ((instr->guarded_operands & (1U << operand))
+					&& (values[operand] <= 0
+					    || values[operand] >= program->num_values
+					    || !program->value_is_tagged[values[operand]]
+					    || !instr->guarded_type_masks[operand]
+					    || (instr->guarded_type_masks[operand]
+						& (instr->guarded_type_masks[operand] - 1)))) {
+					record_unsupported_fmt(ctx,
+					    "type-guard: invalid predicate at pc %u",
+					    instr->bytecode_pc);
+					goto invalid;
+				    }
+			}
+			if (instr->kind != HIR_TAC_GUARD_TYPE
+			    && instr->guarded_operands) {
+				int operand;
+				int values[JIT_MAX_GUARD_OPERANDS] = {
+				    instr->src1, instr->src2
+				};
+
+				for (operand = 0;
+				     operand < JIT_MAX_GUARD_OPERANDS; operand++)
+				    if ((instr->guarded_operands & (1U << operand))
+					&& !jit_guard_fact_dominates(program,
+					    dominators, block, instr, values[operand],
+					    instr->guarded_type_masks[operand])) {
+					record_unsupported_fmt(ctx,
+					    "type-guard: missing dominating fact at pc %u",
+					    instr->bytecode_pc);
+					goto invalid;
+				    }
+			}
 			if (!instr->exit_classified) {
 				record_unsupported_fmt(ctx,
 				    "exit-proof: unclassified instruction at pc %u",
@@ -6435,12 +6507,118 @@ jit_build_resume_liveness(JITProgram *program)
     myfree(live_in, M_PROGRAM);
 }
 
+static int
+jit_guard_fact_dominates(JITProgram *program, HIRDominatorTree *dom,
+			 JITBlock *block, JITInstruction *target, int value,
+			 JITTypeMask type_mask)
+{
+    JITBlock *candidate_block;
+
+    for (candidate_block = program->blocks; candidate_block;
+	 candidate_block = candidate_block->next) {
+	JITInstruction *candidate;
+
+	if (!dom_block_dominates(dom, candidate_block->id, block->id))
+	    continue;
+	for (candidate = candidate_block->first; candidate;
+	     candidate = candidate->next) {
+	    int operand;
+	    int values[JIT_MAX_GUARD_OPERANDS] = {
+		candidate->src1, candidate->src2
+	    };
+
+	    if (candidate == target)
+		break;
+	    if (candidate->kind != HIR_TAC_GUARD_TYPE)
+		continue;
+	    for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS; operand++)
+		if ((candidate->guarded_operands & (1U << operand))
+		    && values[operand] == value
+		    && candidate->guarded_type_masks[operand] == type_mask)
+		    return 1;
+	}
+    }
+    return 0;
+}
+
+static void
+jit_remove_deopt_map(JITProgram *program, int map_id)
+{
+    JITDeoptMap *map;
+    JITBlock *block;
+
+    if (map_id <= 0 || map_id >= program->num_deopt_maps)
+	return;
+    map = &program->deopt_maps[map_id];
+    if (map->local_values)
+	myfree(map->local_values, M_PROGRAM);
+    if (map->stack_values)
+	myfree(map->stack_values, M_PROGRAM);
+    if (map->stack_slots)
+	myfree(map->stack_slots, M_PROGRAM);
+    memmove(map, map + 1, sizeof(JITDeoptMap)
+	    * (program->num_deopt_maps - map_id - 1));
+    program->num_deopt_maps--;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next)
+	    if (instr->deopt_map > map_id)
+		instr->deopt_map--;
+    }
+}
+
+static void
+jit_eliminate_dominated_guards(JITProgram *program, HIRDominatorTree *dom)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr = block->first;
+	JITInstruction *previous = 0;
+
+	while (instr) {
+	    JITInstruction *next = instr->next;
+
+	    if (instr->kind == HIR_TAC_GUARD_TYPE) {
+		int operand;
+		int values[JIT_MAX_GUARD_OPERANDS] = {
+		    instr->src1, instr->src2
+		};
+
+		for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS; operand++)
+		    if ((instr->guarded_operands & (1U << operand))
+			&& jit_guard_fact_dominates(program, dom, block, instr,
+			    values[operand],
+			    instr->guarded_type_masks[operand]))
+			instr->guarded_operands &= ~(1U << operand);
+	    }
+	    if (instr->kind == HIR_TAC_GUARD_TYPE
+		&& !instr->guarded_operands) {
+		jit_remove_deopt_map(program, instr->deopt_map);
+		if (previous)
+		    previous->next = next;
+		else
+		    block->first = next;
+		if (block->last == instr)
+		    block->last = previous;
+		myfree(instr, M_PROGRAM);
+		program->elided_exit_sites++;
+		program->eliminated_type_guard_sites++;
+	    } else
+		previous = instr;
+	    instr = next;
+	}
+    }
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
 {
     JITProgram *program;
     HIRSSABlock *ssa_block;
+    HIRDominatorTree *dominators;
     var_type *value_types;
     unsigned char *value_types_known;
     unsigned char *value_types_conflicted;
@@ -6457,6 +6635,10 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
 	return jit_program_unsupported_with_diagnostic("invalid-bytecode-anchor", diag);
     }
+    dominators = hir_build_dominator_tree(ctx, ssa->cfg);
+    if (!dominators)
+	return jit_program_unsupported_with_diagnostic("invalid-dominators",
+	    "guard-elimination: could not build dominator tree");
 
     program = mymalloc(sizeof(JITProgram), M_PROGRAM);
     memset(program, 0, sizeof(JITProgram));
@@ -7236,6 +7418,60 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    tail = &(*tail)->next;
 		*tail = copy;
 	    }
+	    {
+		int guard_values[JIT_MAX_GUARD_OPERANDS];
+		int guard_locals[JIT_MAX_GUARD_OPERANDS];
+		JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
+		unsigned char guarded_operands = 0;
+		int operand;
+
+		if (jit_consumer_uses_explicit_type_guards(ssa_instr)
+		    && jit_guard_contract(ssa_instr, value_types, value_is_tagged,
+			program->num_values, guard_values, guard_locals,
+			guard_expected))
+		    for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS;
+			 operand++)
+			if (guard_expected[operand]
+			    && !(guard_expected[operand]
+				 & (guard_expected[operand] - 1))
+			    && guard_values[operand] > 0
+			    && guard_values[operand] < program->num_values
+			    && value_is_tagged[guard_values[operand]])
+			    guarded_operands |= 1U << operand;
+		if (guarded_operands) {
+		    JITInstruction *guard = mymalloc(sizeof(JITInstruction),
+			M_PROGRAM);
+
+		    memset(guard, 0, sizeof(JITInstruction));
+		    guard->kind = HIR_TAC_GUARD_TYPE;
+		    guard->resume_key = instr->resume_key;
+		    guard->source_lineno = instr->source_lineno;
+		    guard->bytecode_pc = instr->bytecode_pc;
+		    guard->src1 = guard_values[0];
+		    guard->src2 = guard_values[1];
+		    guard->deopt_map = instr->deopt_map;
+		    guard->guarded_operands = guarded_operands;
+		    guard->guarded_type_masks[0] = guard_expected[0];
+		    guard->guarded_type_masks[1] = guard_expected[1];
+		    guard->exit_mask = JIT_EXIT_DEOPT;
+		    guard->exit_classified = 1;
+		    program->deopt_maps[guard->deopt_map].reason
+			= JIT_DEOPT_TYPE_GUARD;
+		    instr->deopt_map = 0;
+		    instr->guarded_operands = guarded_operands;
+		    instr->guarded_type_masks[0] = guard_expected[0];
+		    instr->guarded_type_masks[1] = guard_expected[1];
+		    instr->exit_mask = JIT_EXIT_NONE;
+		    if (block->last)
+			block->last->next = guard;
+		    else
+			block->first = guard;
+		    block->last = guard;
+		    program->potential_exit_sites++;
+		    program->elided_exit_sites++;
+		    program->type_guard_sites++;
+		}
+	    }
 	    if (block->last)
 		block->last->next = instr;
 	    else
@@ -7246,6 +7482,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	}
     }
 
+    jit_eliminate_dominated_guards(program, dominators);
     myfree(value_types_conflicted, M_PROGRAM);
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
@@ -7259,7 +7496,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     jit_build_int_list_values(program);
     jit_build_direct_int_list_updates(program);
     jit_coalesce_deopt_locals(program);
-    if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program)) {
+    if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program,
+				   dominators)) {
 	const char *diag = hir_context_error_message(ctx);
 	JITProgram *unsupported;
 
@@ -7486,6 +7724,7 @@ hir_dump_ssa_to_file(FILE *file, HIRSSAProgram *ssa)
 	    switch (instr->kind) {
 	    case HIR_TAC_TICK:
 	    case HIR_TAC_DEOPT:
+	    case HIR_TAC_GUARD_TYPE:
 		break;
 	    case HIR_TAC_CONST:
 		fprintf(file, " t%d = ", instr->value);
@@ -7600,6 +7839,8 @@ tac_kind_name(HIRTacKind kind)
 	return "tick";
     case HIR_TAC_DEOPT:
 	return "deopt";
+    case HIR_TAC_GUARD_TYPE:
+	return "guard_type";
     case HIR_TAC_CONST:
 	return "const";
     case HIR_TAC_LOAD_ERROR:

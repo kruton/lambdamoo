@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(39);
+    Var metadata = new_list(41);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -394,6 +394,10 @@ jit_metadata(JITProgram *program)
 					       stats.potential_exit_sites);
     metadata.v.list[39] = jit_metadata_num_pair("elided_exit_sites",
 					       stats.elided_exit_sites);
+    metadata.v.list[40] = jit_metadata_num_pair("type_guard_sites",
+					       stats.type_guard_sites);
+    metadata.v.list[41] = jit_metadata_num_pair("eliminated_type_guard_sites",
+					       stats.eliminated_type_guard_sites);
     return metadata;
 }
 #endif

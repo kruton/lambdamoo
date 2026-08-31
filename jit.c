@@ -2084,6 +2084,23 @@ jit_tag_offset(JITProgram *program, int value)
     return (size_t) jit_tag_index(program, value) * sizeof(Num);
 }
 
+static var_type
+jit_runtime_type_from_db_type(var_type type)
+{
+    switch (type) {
+    case _TYPE_STR:
+	return TYPE_STR;
+    case _TYPE_LIST:
+	return TYPE_LIST;
+    case _TYPE_FLOAT:
+	return TYPE_FLOAT;
+    case _TYPE_WAIF:
+	return TYPE_WAIF;
+    default:
+	return type;
+    }
+}
+
 static int
 jit_runtime_value_slots(JITProgram *program)
 {
@@ -3405,6 +3422,57 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			&& resume_continuations[instr->deopt_map])
 			append(build, resume_continuations[instr->deopt_map]);
 		    break;
+		case HIR_TAC_GUARD_TYPE:
+		    {
+			MIR_label_t deopt = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			int operand;
+			int guard_values[JIT_MAX_GUARD_OPERANDS] = {
+			    instr->src1, instr->src2
+			};
+
+			for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS;
+			     operand++)
+			    if (instr->guarded_operands & (1U << operand)) {
+				MIR_reg_t actual_type;
+				var_type expected_type = TYPE_NONE;
+				char name[32];
+				int type;
+
+				assert(guard_values[operand] > 0
+				       && guard_values[operand] < program->num_values);
+				assert(program->value_is_tagged[guard_values[operand]]);
+				assert(instr->guarded_type_masks[operand]
+				       && !(instr->guarded_type_masks[operand]
+					    & (instr->guarded_type_masks[operand] - 1)));
+				for (type = 0; type <= TYPE_DB_MASK; type++)
+				    if (instr->guarded_type_masks[operand]
+					== JIT_TYPE_MASK(type)) {
+					expected_type = jit_runtime_type_from_db_type(
+					    (var_type) type);
+					break;
+				    }
+				assert(type <= TYPE_DB_MASK);
+				sprintf(name, "guard_type%d", copy_serial++);
+				actual_type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, actual_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, guard_values[operand]),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, actual_type),
+				    MIR_new_int_op(build->context, expected_type)));
+			    }
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, deopt);
+			append_deopt_exit(build, program, instr, values,
+			    deopt_map_out, deopt_values, status, common_return);
+			append(build, done);
+		    }
+		    break;
 		case HIR_TAC_CONST:
 		    if (program->value_types
 			&& program->value_types[instr->value] == TYPE_FLOAT) {
@@ -4581,6 +4649,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->src1];
 			int tagged_s2 = program->value_is_tagged
 			    && program->value_is_tagged[instr->src2];
+			int check_s1 = tagged_s1
+			    && !(instr->guarded_operands & (1U << 0));
+			int check_s2 = tagged_s2
+			    && !(instr->guarded_operands & (1U << 1));
 			int is_str1 = program->value_types
 			    && program->value_types[instr->src1] == TYPE_STR;
 			int is_str2 = program->value_types
@@ -4594,12 +4666,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_label_t deopt = 0;
 			    MIR_label_t done = 0;
 
-			    if (tagged_s1 || tagged_s2) {
+			    if (check_s1 || check_s2) {
 				char name[32];
 
 				deopt = MIR_new_label(build->context);
 				done = MIR_new_label(build->context);
-				if (tagged_s1) {
+				if (check_s1) {
 				    MIR_reg_t type;
 
 				    sprintf(name, "index_s1_type%d", copy_serial++);
@@ -4613,7 +4685,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					MIR_new_reg_op(build->context, type),
 					MIR_new_int_op(build->context, TYPE_STR)));
 				}
-				if (tagged_s2) {
+				if (check_s2) {
 				    MIR_reg_t type;
 
 				    sprintf(name, "index_s2_type%d", copy_serial++);
@@ -4634,7 +4706,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, values[instr->value]),
 				MIR_new_reg_op(build->context, values[instr->src1]),
 				MIR_new_reg_op(build->context, values[instr->src2])));
-			    if (tagged_s1 || tagged_s2) {
+			    if (check_s1 || check_s2) {
 				append(build, MIR_new_insn(build->context, MIR_JMP,
 				    MIR_new_label_op(build->context, done)));
 				append(build, deopt);
@@ -5436,13 +5508,17 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    && program->value_is_tagged[instr->src1];
 			int tagged_src2 = program->value_is_tagged
 			    && program->value_is_tagged[instr->src2];
+			int check_src1 = tagged_src1
+			    && !(instr->guarded_operands & (1U << 0));
+			int check_src2 = tagged_src2
+			    && !(instr->guarded_operands & (1U << 1));
 			int tagged_dst = program->value_is_tagged
 			    && program->value_is_tagged[instr->value];
 
-			if (tagged_src1 || tagged_src2) {
+			if (check_src1 || check_src2) {
 			    MIR_label_t deopt = MIR_new_label(build->context);
 			    MIR_label_t type_checked = MIR_new_label(build->context);
-			    if (tagged_src1) {
+			    if (check_src1) {
 				char name[32];
 				sprintf(name, "arith_t1_%d", copy_serial++);
 				MIR_reg_t t1 = new_reg(build, name);
@@ -5456,7 +5532,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    MIR_new_reg_op(build->context, t1),
 				    MIR_new_int_op(build->context, TYPE_INT)));
 			    }
-			    if (tagged_src2) {
+			    if (check_src2) {
 				char name[32];
 				sprintf(name, "arith_t2_%d", copy_serial++);
 				MIR_reg_t t2 = new_reg(build, name);
@@ -7037,6 +7113,9 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->compile_time_us = program->compile_time_us;
     stats->potential_exit_sites = program->potential_exit_sites;
     stats->elided_exit_sites = program->elided_exit_sites;
+    stats->type_guard_sites = program->type_guard_sites;
+    stats->eliminated_type_guard_sites
+	= program->eliminated_type_guard_sites;
     stats->metadata_bytes = jit_program_metadata_bytes(program);
     stats->runtime_bytes = program->active_runtime_bytes;
     stats->native_chain_active_frames = program->active_native_frames;
@@ -8401,11 +8480,12 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     if (release_ir && !jit_program_restore_ir(program))
 	return 0;
     snprintf(line, sizeof(line),
-	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d potential-exits=%u elided-exits=%u",
+	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d potential-exits=%u elided-exits=%u type-guards=%u eliminated-type-guards=%u",
 	     program->num_values, program->num_tag_slots,
 	     jit_runtime_value_slots(program), program->num_blocks,
 	     program->num_deopt_maps, program->potential_exit_sites,
-	     program->elided_exit_sites);
+	     program->elided_exit_sites, program->type_guard_sites,
+	     program->eliminated_type_guard_sites);
     add_line(line, data);
     for (i = 1; i < program->num_values; i++) {
 	snprintf(line, sizeof(line),
@@ -8452,12 +8532,14 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 			!= JIT_BOUNDARY_VALUE_RETAINED;
 	    }
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d exits=%u deopt=%d resume=%d/%d owner-homes=%d boundary-moves=%d last-use=%u direct-int-list=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d guard-mask=%u guarded=%u exits=%u deopt=%d resume=%d/%d owner-homes=%d boundary-moves=%d last-use=%u direct-int-list=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->func, func_name, instr->value,
 		     instr->src1, instr->src2,
 		     instr->src3,
-		     type, tagged, instr->local_id, instr->exit_mask,
+		     type, tagged, instr->local_id,
+		     instr->guarded_type_masks[0] | instr->guarded_type_masks[1],
+		     instr->guarded_operands, instr->exit_mask,
 		     instr->deopt_map,
 		     instr->deopt_map > 0
 		     && program->deopt_maps[instr->deopt_map].native_resume
