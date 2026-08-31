@@ -1881,6 +1881,8 @@ do {								\
 		    Var args = RUN_ACTIV.base_rt_stack[0];
 		    package p;
 
+		    RUN_ACTIV.base_rt_stack[0].type = TYPE_NONE;
+		    RUN_ACTIV.base_rt_stack[0].v.num = 0;
 		    jit_continuation_attach(continuation, caller);
 		    jit_continuation_mark_dispatched(continuation);
 		    STORE_STATE_VARIABLES();
@@ -1948,6 +1950,12 @@ do {								\
 		    Var verb = RUN_ACTIV.base_rt_stack[1];
 		    Var args = RUN_ACTIV.base_rt_stack[2];
 		    Objid class = NOTHING;
+		    int operand;
+
+		    for (operand = 0; operand < 3; operand++) {
+			RUN_ACTIV.base_rt_stack[operand].type = TYPE_NONE;
+			RUN_ACTIV.base_rt_stack[operand].v.num = 0;
+		    }
 
 		    if (args.type != TYPE_LIST || verb.type != TYPE_STR)
 			err = E_TYPE;

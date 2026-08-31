@@ -22,7 +22,8 @@ typedef enum {
     JIT_RESUME_RESULT,
     JIT_RESUME_CONSTANT,
     JIT_RESUME_OWNER,
-    JIT_RESUME_CAPTURED
+    JIT_RESUME_CAPTURED,
+    JIT_RESUME_OPERAND
 } JITResumeSource;
 
 typedef enum {
@@ -109,6 +110,7 @@ struct JITDeoptMap {
     ResumeStackSlot *stack_slots;
     int *local_owner_slots;
     int *stack_owner_slots;
+    unsigned char *stack_boundary_ownership;
     JITNativeResume *native_resume;
     int builtin_func;
     int builtin_args;
@@ -164,6 +166,13 @@ typedef enum {
 typedef enum {
     JIT_OWNER_SLOT_NONE = -1
 } JITOwnerSlotSpecial;
+
+typedef enum {
+    JIT_BOUNDARY_VALUE_RETAINED,
+    JIT_BOUNDARY_VALUE_MOVED_RAW,
+    JIT_BOUNDARY_VALUE_MOVED_OWNER,
+    JIT_BOUNDARY_VALUE_RELEASE_AFTER_RESUME
+} JITBoundaryValueOwnership;
 
 typedef enum {
     JIT_LAST_USE_NONE = 0,
