@@ -1721,6 +1721,17 @@ the broader ownership-map and synthesized-anchor validation described below.
       continue to use raw reconstruction until the must-populated proof models
       those edge-specific transitions.
 
+      Local reconstruction entries are pruned before local-map coalescing when
+      backward CFG liveness proves the slot cannot be observed before it is
+      overwritten or the activation returns. The proof unions normal and
+      exceptional successors, treats verb calls, suspension, stack
+      introspection, and unsupported interpreter boundaries as barriers, and
+      also retains a local whenever its current SSA value has a program use.
+      The SSA-use condition is required because promoted local reads consume
+      the current SSA value directly and need not produce a later
+      `HIR_TAC_LOAD_LOCAL`. No persistent liveness bitmap is needed: dead sparse
+      local entries are removed before reconstruction states are interned.
+
       An experiment outlining complete materialization
       by reconstruction-state ID increased `#463:sha1` machine code because it
       kept many SSA values live to function-end stubs and caused additional

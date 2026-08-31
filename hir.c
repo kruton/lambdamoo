@@ -5177,6 +5177,213 @@ jit_coalesce_deopt_locals(JITProgram *program)
     myfree(depth, M_PROGRAM);
 }
 
+static int
+jit_local_liveness_barrier(JITInstruction *instr)
+{
+    const char *name;
+
+    if (instr->kind == HIR_TAC_CALL_VERB
+	|| instr->kind == HIR_TAC_DEOPT
+	|| instr->kind == HIR_TAC_UNSUPPORTED)
+	return 1;
+    if (instr->kind != HIR_TAC_CALL)
+	return 0;
+    if (instr->func >= FUNC_NOT_FOUND)
+	return 1;
+    name = name_func_by_num(instr->func);
+    return name && (!strcmp(name, "task_stack")
+	|| !strcmp(name, "suspend"));
+}
+
+static void
+jit_prune_dead_deopt_locals(JITProgram *program)
+{
+    JITBlock *block;
+    unsigned char **live_in;
+    unsigned char **live_out;
+    unsigned char *processed;
+    unsigned char *used_values;
+    int max_block = 0;
+    int changed;
+    int i;
+
+    if (!program || !program->blocks || program->num_vars <= 0
+	|| program->num_deopt_maps <= 1)
+	return;
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    live_in = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    live_out = mymalloc(sizeof(unsigned char *) * (max_block + 1), M_PROGRAM);
+    memset(live_in, 0, sizeof(unsigned char *) * (max_block + 1));
+    memset(live_out, 0, sizeof(unsigned char *) * (max_block + 1));
+    for (block = program->blocks; block; block = block->next) {
+	live_in[block->id] = mymalloc(program->num_vars, M_PROGRAM);
+	live_out[block->id] = mymalloc(program->num_vars, M_PROGRAM);
+	memset(live_in[block->id], 0, program->num_vars);
+	memset(live_out[block->id], 0, program->num_vars);
+    }
+    used_values = mymalloc(program->num_values, M_PROGRAM);
+    memset(used_values, 0, program->num_values);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->src1 > 0 && instr->src1 < program->num_values)
+		used_values[instr->src1] = 1;
+	    if (instr->src2 > 0 && instr->src2 < program->num_values)
+		used_values[instr->src2] = 1;
+	    if (instr->src3 > 0 && instr->src3 < program->num_values)
+		used_values[instr->src3] = 1;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src > 0 && copy->src < program->num_values)
+		    used_values[copy->src] = 1;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    do {
+	changed = 0;
+	for (block = program->blocks; block; block = block->next) {
+	    JITInstruction **instructions;
+	    JITInstruction *instr;
+	    unsigned char *live;
+	    int count = 0;
+	    int index;
+	    int successor;
+
+	    live = mymalloc(program->num_vars, M_PROGRAM);
+	    memset(live, 0, program->num_vars);
+	    for (successor = 0; successor < block->num_successors; successor++) {
+		int successor_id = block->successors[successor];
+
+		if (successor_id < 0 || successor_id > max_block
+		    || !live_in[successor_id])
+		    continue;
+		for (i = 0; i < program->num_vars; i++)
+		    live[i] |= live_in[successor_id][i];
+	    }
+	    if (memcmp(live_out[block->id], live, program->num_vars)) {
+		memcpy(live_out[block->id], live, program->num_vars);
+		changed = 1;
+	    }
+	    for (instr = block->first; instr; instr = instr->next) {
+		count++;
+		if (instr == block->last)
+		    break;
+	    }
+	    instructions = count
+		? mymalloc(sizeof(JITInstruction *) * count, M_PROGRAM) : 0;
+	    count = 0;
+	    for (instr = block->first; instr; instr = instr->next) {
+		instructions[count++] = instr;
+		if (instr == block->last)
+		    break;
+	    }
+	    for (index = count - 1; index >= 0; index--) {
+		instr = instructions[index];
+		if (jit_local_liveness_barrier(instr))
+		    memset(live, 1, program->num_vars);
+		if (instr->kind == HIR_TAC_STORE_LOCAL
+		    && instr->local_id >= 0
+		    && instr->local_id < program->num_vars)
+		    live[instr->local_id] = 0;
+		if ((instr->kind == HIR_TAC_LOAD_LOCAL
+		     || instr->kind == HIR_TAC_INDEX_SET)
+		    && instr->local_id >= 0
+		    && instr->local_id < program->num_vars)
+		    live[instr->local_id] = 1;
+	    }
+	    if (memcmp(live_in[block->id], live, program->num_vars)) {
+		memcpy(live_in[block->id], live, program->num_vars);
+		changed = 1;
+	    }
+	    if (instructions)
+		myfree(instructions, M_PROGRAM);
+	    myfree(live, M_PROGRAM);
+	}
+    } while (changed);
+
+    processed = mymalloc(program->num_deopt_maps, M_PROGRAM);
+    memset(processed, 0, program->num_deopt_maps);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction **instructions;
+	JITInstruction *instr;
+	unsigned char *live;
+	int count = 0;
+	int index;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    count++;
+	    if (instr == block->last)
+		break;
+	}
+	instructions = count
+	    ? mymalloc(sizeof(JITInstruction *) * count, M_PROGRAM) : 0;
+	count = 0;
+	for (instr = block->first; instr; instr = instr->next) {
+	    instructions[count++] = instr;
+	    if (instr == block->last)
+		break;
+	}
+	live = mymalloc(program->num_vars, M_PROGRAM);
+	memcpy(live, live_out[block->id], program->num_vars);
+	for (index = count - 1; index >= 0; index--) {
+	    JITDeoptMap *map;
+	    int entry;
+	    int operand;
+
+	    instr = instructions[index];
+	    if (jit_local_liveness_barrier(instr))
+		memset(live, 1, program->num_vars);
+	    if (instr->kind == HIR_TAC_STORE_LOCAL
+		&& instr->local_id >= 0
+		&& instr->local_id < program->num_vars)
+		live[instr->local_id] = 0;
+	    if ((instr->kind == HIR_TAC_LOAD_LOCAL
+		 || instr->kind == HIR_TAC_INDEX_SET)
+		&& instr->local_id >= 0
+		&& instr->local_id < program->num_vars)
+		live[instr->local_id] = 1;
+	    if (instr->deopt_map <= 0
+		|| instr->deopt_map >= program->num_deopt_maps
+		|| processed[instr->deopt_map])
+		continue;
+	    map = &program->deopt_maps[instr->deopt_map];
+	    for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS; operand++)
+		if (map->guard_local[operand] >= 0
+		    && map->guard_local[operand] < program->num_vars)
+		    live[map->guard_local[operand]] = 1;
+	    entry = 0;
+	    for (i = 0; i < map->num_local_values; i++) {
+		int value = map->local_values[i].value;
+
+		if (live[map->local_values[i].slot]
+		    || (value > 0 && value < program->num_values
+			&& used_values[value]))
+		    map->local_values[entry++] = map->local_values[i];
+	    }
+	    map->num_local_values = entry;
+	    processed[instr->deopt_map] = 1;
+	}
+	myfree(live, M_PROGRAM);
+	if (instructions)
+	    myfree(instructions, M_PROGRAM);
+    }
+    myfree(processed, M_PROGRAM);
+    myfree(used_values, M_PROGRAM);
+    for (i = 0; i <= max_block; i++) {
+	if (live_in[i])
+	    myfree(live_in[i], M_PROGRAM);
+	if (live_out[i])
+	    myfree(live_out[i], M_PROGRAM);
+    }
+    myfree(live_out, M_PROGRAM);
+    myfree(live_in, M_PROGRAM);
+}
+
 static void
 jit_build_tag_slots(JITProgram *program)
 {
@@ -7789,6 +7996,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     jit_build_deopt_owner_slots(program);
     jit_build_int_list_values(program);
     jit_build_direct_int_list_updates(program);
+    jit_prune_dead_deopt_locals(program);
     jit_coalesce_deopt_locals(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program,
 				   dominators)) {
