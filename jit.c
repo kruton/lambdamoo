@@ -1978,6 +1978,45 @@ binary_code(HIROp op)
     }
 }
 
+static int
+integer_constant_value(JITProgram *program, int value, Num *constant)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CONST && instr->value == value
+		&& instr->literal_type == TYPE_INT) {
+		*constant = (Num) instr->literal;
+		return 1;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
+}
+
+static int
+positive_power_of_two_shift(Num value)
+{
+    UNum bits;
+    int shift = 0;
+
+    if (value <= 0)
+	return -1;
+    bits = (UNum) value;
+    if (bits & (bits - 1))
+	return -1;
+    while (bits > 1) {
+	bits >>= 1;
+	shift++;
+    }
+    return shift;
+}
+
 static MIR_insn_code_t
 float_binary_code(HIROp op)
 {
@@ -5288,8 +5327,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			MIR_label_t arithmetic_error = 0;
 			MIR_label_t invalid_argument = 0;
 			MIR_label_t range_error = 0;
+			Num rhs_constant = 0;
+			int modulus_shift = instr->op == HIR_OP_MOD
+			    && integer_constant_value(program, instr->src2,
+				&rhs_constant)
+			    ? positive_power_of_two_shift(rhs_constant) : -1;
 
-			if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD
+			if (instr->op == HIR_OP_DIV
+			    || (instr->op == HIR_OP_MOD && modulus_shift < 0)
 			    || instr->op == HIR_OP_EXP)
 			    arithmetic_error = new_status_exit(build, &status_exits,
 				&last_status_exit, JIT_RUN_ERROR, E_DIV,
@@ -5724,6 +5769,39 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, MIR_new_insn(build->context, MIR_JMP,
 				MIR_new_label_op(build->context, loop)));
 			append(build, done);
+		    } else if (instr->op == HIR_OP_MOD && modulus_shift >= 0) {
+			char name[32];
+			MIR_reg_t sign, bias, adjusted, multiple;
+			UNum mask = ((UNum) 1 << modulus_shift) - 1;
+
+			sprintf(name, "mod_sign%d", copy_serial++);
+			sign = new_reg(build, name);
+			sprintf(name, "mod_bias%d", copy_serial++);
+			bias = new_reg(build, name);
+			sprintf(name, "mod_adjust%d", copy_serial++);
+			adjusted = new_reg(build, name);
+			sprintf(name, "mod_multiple%d", copy_serial++);
+			multiple = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_RSH,
+			    MIR_new_reg_op(build->context, sign),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_int_op(build->context, sizeof(Num) * CHAR_BIT - 1)));
+			append(build, MIR_new_insn(build->context, MIR_AND,
+			    MIR_new_reg_op(build->context, bias),
+			    MIR_new_reg_op(build->context, sign),
+			    MIR_new_int_op(build->context, (Num) mask)));
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, adjusted),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, bias)));
+			append(build, MIR_new_insn(build->context, MIR_AND,
+			    MIR_new_reg_op(build->context, multiple),
+			    MIR_new_reg_op(build->context, adjusted),
+			    MIR_new_int_op(build->context, (Num) ~mask)));
+			append(build, MIR_new_insn(build->context, MIR_SUB,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, multiple)));
 		    } else if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
 			MIR_label_t normal = MIR_new_label(build->context);
 			MIR_label_t done = MIR_new_label(build->context);

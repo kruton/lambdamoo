@@ -3451,6 +3451,12 @@ main(void)
     JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
     JITProgram *divide_overflow = binary_program(NUM_MIN, -1, HIR_OP_DIV);
     JITProgram *modulus_overflow = binary_program(NUM_MIN, -1, HIR_OP_MOD);
+    JITProgram *modulus_power_two = binary_program(13, 8, HIR_OP_MOD);
+    JITProgram *negative_modulus_power_two = binary_program(-13, 8,
+	HIR_OP_MOD);
+    JITProgram *minimum_modulus_power_two = binary_program(NUM_MIN, 8,
+	HIR_OP_MOD);
+    JITProgram *modulus_one = binary_program(-13, 1, HIR_OP_MOD);
     JITProgram *power = binary_program(3, 13, HIR_OP_EXP);
     JITProgram *power_wrap = binary_program(2, 63, HIR_OP_EXP);
     JITProgram *power_negative = binary_program(-1, -3, HIR_OP_EXP);
@@ -4104,6 +4110,14 @@ main(void)
 		       "division overflow differed from reference execution");
     check_differential(modulus_overflow, env, 10, 0,
 		       "modulus overflow differed from reference execution");
+    check_differential(modulus_power_two, env, 10, 0,
+		       "power-of-two modulus differed from reference execution");
+    check_differential(negative_modulus_power_two, env, 10, 0,
+		       "negative power-of-two modulus differed from reference");
+    check_differential(minimum_modulus_power_two, env, 10, 0,
+		       "minimum power-of-two modulus differed from reference");
+    check_differential(modulus_one, env, 10, 0,
+		       "modulus by one differed from reference execution");
     check_differential(power, env, 10, 0,
 		       "power differed from reference execution");
     check_differential(power_wrap, env, 10, 0,
@@ -6187,6 +6201,10 @@ main(void)
     jit_program_free(divide_zero);
     jit_program_free(divide_overflow);
     jit_program_free(modulus_overflow);
+    jit_program_free(modulus_power_two);
+    jit_program_free(negative_modulus_power_two);
+    jit_program_free(minimum_modulus_power_two);
+    jit_program_free(modulus_one);
     jit_program_free(power);
     jit_program_free(power_wrap);
     jit_program_free(power_negative);
