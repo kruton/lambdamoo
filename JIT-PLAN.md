@@ -206,11 +206,39 @@ Before native code, add small verifier-backed optimizations:
 
 Each optimization should preserve line/resume metadata or explicitly remap it.
 
+Run deoptimization-point simplification after type, ownership, and effect
+analysis. Treat the following as separate transformations rather than one
+generic deopt-map deduplication pass:
+
+* prove that an instruction cannot guard, raise, call, suspend, abort, time out,
+  invalidate native assumptions, or exhaust resources, then remove both its
+  exit code and deoptimization map;
+* remove a guard only when an equivalent or stronger fact dominates it and no
+  intervening operation invalidates that fact;
+* intern identical reconstruction state independently of source-site identity;
+  and
+* share generated exit stubs when their complete observable behavior is
+  identical.
+
+The first transformation has priority because it removes branches,
+deoptimization liveness, metadata, and machine code together. Merely sharing a
+map representation does not remove an executing guard.
+
 ### 8.3 Guarded Native Operations
 
-If an SSA value degrades to `TYPE_ANY`, native specialized operations must be
-guarded. Guard failure should deoptimize to the interpreter at the attached
-ResumePoint/ResumeID.
+If an SSA value degrades to `TYPE_ANY` and the selected native operation is not
+total over its possible runtime tags, the unsupported cases must be guarded.
+An operation with complete tagged dispatch needs no type guard merely because
+its input is tagged. Guard failure should deoptimize to the interpreter at the
+attached ResumePoint/ResumeID.
+
+Guard facts are attached to SSA identities, not source-local names. A precise
+type fact for an immutable SSA value can survive a local reassignment and may
+survive a call, while facts about object validity, permissions, protected
+built-ins, property layout, or other mutable global state require an explicit
+effect or epoch proof. Type proofs do not imply range, nonzero, allocation
+quota, or finite-float proofs; those failure conditions remain guarded until
+their own analyses discharge them.
 
 ## 9. Phase 6: Runtime Semantics
 
@@ -1033,6 +1061,11 @@ Each native safepoint therefore identifies a deoptimization map containing:
 * ticks already charged at the safepoint; and
 * the boundary kind and any operands which the interpreter must consume.
 
+The map ID remains the exact site identity used by native continuations,
+promotion, profiling, and traceback reconstruction. Its storage may be split
+into a site descriptor and a shared reconstruction snapshot, but sharing the
+snapshot never aliases or renumbers distinct site IDs.
+
 Deoptimization proceeds in four phases:
 
 1. **Freeze.** Generated code stops at the safepoint and publishes its outcome,
@@ -1606,29 +1639,62 @@ the broader ownership-map and synthesized-anchor validation described below.
    granularity, and this verb suspends three times per invocation, so its
    in-database timing cannot distinguish close O1 and O2 results. Keep level 2
    as a possible hot-tier policy until that comparison shows whether its extra
-   compile cost pays for hot verbs.
+   compile cost pays for hot verbs. Those figures predate the native-chain and
+   ownership work. The current `$local.crypto:sha1` baseline has 928 SSA values,
+   898 anchors, 243 deopt maps, approximately 118 KB of retained metadata, and
+   approximately 160 KB of machine code. Use that baseline when measuring the
+   transformations below rather than comparing against the earlier tier alone.
 
-   First remove redundant guards and repeated local/tag loads. Then consider
-   block-level tick batching, call-site specialization, and MIR optimization
-   tiers. Deopt-aware liveness is intentionally broader than machine-operand
-   liveness: values named by a later interpreter-state map are genuinely live
-   even if no later native instruction reads them. Reduce that pressure by
-   running an explicit deopt-point simplification pass after type and effect
-   analysis. That pass should omit maps from instructions proven unable to
-   guard, raise, call, suspend, abort, or exhaust resources; coalesce adjacent
-   maps only when resume key, materialization, source/error location, and tick
-   state are identical; and eliminate a guard only when an equivalent
-   dominating guard remains valid across intervening calls and writes. Do not
-   reduce pressure by dropping implicit deopt uses. Every optimization must
-   preserve exact timeout, source-location, error, and deoptimization behavior
-   and be measured against interpreter and JIT O0 baselines.
+   Apply the following four transformations in order:
 
-10. **Expand differential and database-scale validation continuously.**
-    Add generated programs covering every runtime tag at every tagged consumer,
-    forced guard failures at synthesized bytecode anchors, nested catches,
-    recursion, permissions, repeated complex-value execution, checkpoint/reload,
-    and suspension. Track native completion percentage, reason distribution,
-    compile time, code size, and execution time for stable workloads.
+   1. **Exit and effect analysis.** Compute the possible exits of every
+      instruction after type, ownership, and effect propagation: type or
+      representation guard, range error, division by zero, quota error, float
+      error, call, suspension, abort, timeout, invalidation, and promotion. If
+      the set is empty, remove the exit code and its map. Calls that may promote,
+      tick/timeout boundaries, and operations with an undischarged error
+      condition remain safepoints.
+
+   2. **Dominance-based guard elimination.** Track facts by SSA identity and
+      expected mask or predicate. Remove a guard only when an equivalent or
+      stronger dominating proof remains valid. Calls need not invalidate an
+      immutable SSA type tag, but they conservatively invalidate facts about
+      object validity, permissions, protected built-ins, property layout, and
+      mutable global state unless effect metadata or an epoch guard says
+      otherwise. A type proof alone never removes bounds, nonzero, quota, or
+      finite-float checks.
+
+   3. **Reconstruction-state interning.** Keep deopt site identity separate
+      from reconstruction state. A compact site descriptor retains resume and
+      error PCs, source line, reason, tick state, native handler, and other
+      observable control state. Locals, stack values and markers, runtime tags,
+      and owner homes form an independently interned or base-plus-delta state
+      snapshot. Distinct sites may share a snapshot, but sites with different
+      traceback, error, timeout, or resume behavior must not be merged.
+
+   4. **Shared exit-stub lowering.** After site simplification and state
+      interning, share materialization and status stubs whose complete behavior
+      is identical. Distinct sites may load a compact site/map ID before
+      branching to a common stub. This is code deduplication, not permission to
+      discard site-specific source or error state.
+
+   Only after these passes should repeated local/tag-load elimination,
+   block-level tick batching, call-site specialization, and additional MIR
+   optimization tiers be considered. Deopt-aware liveness is intentionally
+   broader than machine-operand liveness: values named by a remaining
+   reconstruction snapshot are genuinely live even if no later native
+   instruction reads them. Do not reduce pressure by dropping those implicit
+   uses. Every transformation must preserve exact timeout, source-location,
+   error, ownership, and deoptimization behavior and be measured against
+   interpreter and JIT O0 baselines.
+
+9. **Expand differential and database-scale validation continuously.**
+   Add generated programs covering every runtime tag at every tagged consumer,
+   forced guard failures at synthesized bytecode anchors, nested catches,
+   recursion, permissions, repeated complex-value execution, checkpoint/reload,
+   and suspension. Track native completion percentage, reason distribution,
+   guard count, deopt-map and shared-snapshot counts, compile time, metadata,
+   machine-code size, and execution time for stable workloads.
 
 ### 14.4 JIT pool efficiency roadmap
 
@@ -1665,23 +1731,27 @@ Implement pool efficiency in this order:
    programs to the pending state without leaking module or executable state.
 
 5. **Reduce deopt metadata and register pressure.** Implement the
-   deopt-point simplification described in priority 9, then measure its effect
-   on map count, live SSA values, MIR heap, machine code, executable-page
-   utilization, and native completion. Add verifier checks that every remaining
-   potentially exiting instruction still has exactly one valid reconstruction
-   state.
+   four deopt-point transformations described in priority 8, then measure their
+   effect on guard count, site descriptors, shared reconstruction snapshots,
+   live SSA values, MIR heap, machine code, executable-page utilization, and
+   native completion. Add verifier checks that every remaining potentially
+   exiting instruction has one exact site descriptor and one valid
+   reconstruction state, whether that state is unique or shared.
 
    Local reconstruction snapshots now use bounded base-plus-delta chains, with
    a maximum depth of eight and tombstones for locals absent from a derived
    frame. Compiler IR is released after native compilation and rebuilt from
    bytecode for later HIR/MIR dumps or recompilation. Static snapshot types are
    derived from SSA metadata, native-resume state is allocated only for call
-   boundaries, and local deltas use one slot/value entry array. For
-   `#463:sha1`, these changes reduced retained metadata from 661,450 to 95,550
-   bytes while preserving 70,848 bytes of machine code and roughly 200--240 ms
-   compilation time. The next representation work is stack base/delta
-   coalescing followed by compact map scalar fields; metadata must fall below
-   machine-code bytes without dropping reconstruction liveness dependencies.
+   boundaries, and local deltas use one slot/value entry array. In the earlier
+   snapshot-compression measurement, these changes reduced `#463:sha1` retained
+   metadata from 661,450 to 95,550 bytes while preserving 70,848 bytes of
+   machine code and roughly 200--240 ms compilation time. After exit/effect
+   analysis removes unnecessary sites, the next representation work is stack
+   base/delta coalescing, interning complete reconstruction snapshots, and
+   compacting site scalar fields. Metadata must fall below machine-code bytes
+   without dropping reconstruction liveness dependencies or conflating
+   distinct source sites.
 
 6. **Benchmark policy rather than assuming it.** Run stable interpreter/JIT
    workloads at several pool budgets. Record peak and steady-state bytes,
