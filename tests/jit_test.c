@@ -32,6 +32,8 @@ struct machine_dump {
 struct mir_dump {
     int lines;
     int found_source_marker;
+    int timeout_checks;
+    int source_location_stores;
 };
 
 struct promotion_dump {
@@ -58,6 +60,10 @@ check_mir_line(const char *line, void *data)
     dump->lines++;
     if (strstr(line, "pc_11_line_7_"))
 	dump->found_source_marker = 1;
+    if (strstr(line, "i32:(timed_out)"))
+	dump->timeout_checks++;
+    if (strstr(line, "i32:(source_location)"))
+	dump->source_location_stores++;
 }
 
 static void
@@ -177,6 +183,60 @@ arithmetic_program(void)
     add->next = ret;
     block->first = one;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+two_tick_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *first_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *two = instruction(HIR_TAC_CONST);
+    JITInstruction *second_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *add = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    one->value = 1;
+    one->literal = 1;
+    first_tick->source_lineno = 7;
+    first_tick->bytecode_pc = 11;
+    two->value = 2;
+    two->literal = 2;
+    second_tick->source_lineno = 8;
+    second_tick->bytecode_pc = 12;
+    add->source_lineno = 8;
+    add->bytecode_pc = 12;
+    add->value = 3;
+    add->src1 = 1;
+    add->src2 = 2;
+    add->op = HIR_OP_ADD;
+    ret->src1 = 3;
+    one->next = first_tick;
+    first_tick->next = two;
+    two->next = second_tick;
+    second_tick->next = add;
+    add->next = ret;
+    block->first = one;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+duplicate_tick_exit_program(void)
+{
+    JITProgram *program = two_tick_program();
+    JITInstruction *first_tick = program->blocks->first->next;
+    JITInstruction *second_tick = first_tick->next->next;
+
+    second_tick->source_lineno = first_tick->source_lineno;
+    second_tick->bytecode_pc = first_tick->bytecode_pc;
     return program;
 }
 
@@ -3381,6 +3441,8 @@ int
 main(void)
 {
     JITProgram *program = arithmetic_program();
+    JITProgram *two_ticks = two_tick_program();
+    JITProgram *duplicate_tick_exits = duplicate_tick_exit_program();
     JITProgram *guard = guard_program();
     JITProgram *deep_guard = deep_guard_program();
     JITProgram *branch = branch_program();
@@ -3418,7 +3480,7 @@ main(void)
     int ticks = 10;
     int timed_out = 0;
     enum error error = E_NONE;
-    struct mir_dump mir_dump = {0, 0};
+    struct mir_dump mir_dump = { 0 };
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
@@ -3962,6 +4024,20 @@ main(void)
     check(mir_dump.lines > 0, "MIR dump was empty");
     check(mir_dump.found_source_marker,
 	  "MIR dump did not contain PC and line information");
+    {
+	struct mir_dump tick_dump = { 0 };
+	struct mir_dump exit_dump = { 0 };
+
+	check(jit_program_dump_mir(two_ticks, check_mir_line, &tick_dump),
+	      "two-tick MIR dump failed");
+	check(tick_dump.timeout_checks == 1,
+	      "basic block emitted redundant seconds-timeout checks");
+	check(jit_program_dump_mir(duplicate_tick_exits, check_mir_line,
+				   &exit_dump),
+	      "duplicate-tick MIR dump failed");
+	check(exit_dump.source_location_stores == 2,
+	      "equivalent tick status exits were not shared");
+    }
     mir_dump.lines = 0;
     check(jit_program_dump_hir(program, check_mir_line, &mir_dump),
 	  "HIR dump failed");
@@ -4074,6 +4150,10 @@ main(void)
 		       "tick abort differed from reference execution");
     check_differential(branch, env, 10, 1,
 		       "seconds abort differed from reference execution");
+    check_differential(two_ticks, env, 10, 1,
+		       "coalesced seconds abort differed from reference execution");
+    check_differential(two_ticks, env, 2, 0,
+		       "coalesced tick exhaustion differed from reference execution");
     check_differential(charge_tick, env, 1, 1,
 		       "charge-only tick differed from reference execution");
 
@@ -6090,6 +6170,8 @@ main(void)
     }
 
     jit_program_free(program);
+    jit_program_free(two_ticks);
+    jit_program_free(duplicate_tick_exits);
     jit_program_free(guard);
     jit_program_free(scatter);
     jit_program_free(local_arith);

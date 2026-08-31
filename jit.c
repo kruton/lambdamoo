@@ -36,6 +36,9 @@
 #define bi_prop_protected(prop, progr) ((!is_wizard(progr)) && server_flag_option_cached(prop))
 #endif
 
+/* Bound asynchronous timeout latency within long straight-line blocks. */
+#define JIT_TIMEOUT_CHECK_TICK_INTERVAL 16
+
 static int jit_runtime_value_slots(JITProgram *);
 
 static inline double
@@ -2042,7 +2045,15 @@ new_status_exit(MIRBuild *build, JITStatusExit **first, JITStatusExit **last,
 		JITRunResult status, enum error error, int deopt_map,
 		unsigned bytecode_pc, unsigned source_lineno)
 {
-    JITStatusExit *exit = mymalloc(sizeof(JITStatusExit), M_PROGRAM);
+    JITStatusExit *exit;
+
+    for (exit = *first; exit; exit = exit->next)
+	if (exit->status == status && exit->error == error
+	    && exit->deopt_map == deopt_map
+	    && exit->bytecode_pc == bytecode_pc
+	    && exit->source_lineno == source_lineno)
+	    return exit->label;
+    exit = mymalloc(sizeof(JITStatusExit), M_PROGRAM);
 
     exit->label = MIR_new_label(build->context);
     exit->status = status;
@@ -3330,6 +3341,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
     for (block = program->blocks; block; block = block->next) {
 	    JITInstruction *instr;
+	    int ticks_since_timeout_check = 0;
 
 	    append(build, labels[block->id]);
 	    for (instr = block->first; instr; instr = instr->next) {
@@ -3364,16 +3376,19 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						  MIR_new_reg_op(build->context,
 								 tick_result),
 						  MIR_new_int_op(build->context, 0)));
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context,
-								 timeout_value),
-						  MIR_new_mem_op(build->context, MIR_T_I32,
-								 0, timed_out, 0, 1)));
-		    append(build, MIR_new_insn(build->context, MIR_BT,
-						  MIR_new_label_op(build->context,
-								   seconds_abort),
-						  MIR_new_reg_op(build->context,
-								 timeout_value)));
+		    if (!ticks_since_timeout_check) {
+			append(build, MIR_new_insn(build->context, MIR_MOV,
+			    MIR_new_reg_op(build->context, timeout_value),
+			    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+				timed_out, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BT,
+			    MIR_new_label_op(build->context, seconds_abort),
+			    MIR_new_reg_op(build->context, timeout_value)));
+		    }
+		    ticks_since_timeout_check++;
+		    if (ticks_since_timeout_check
+			>= JIT_TIMEOUT_CHECK_TICK_INTERVAL)
+			ticks_since_timeout_check = 0;
 		    break;
 		case HIR_TAC_DEOPT:
 		    append_deopt_exit(build, program, instr->deopt_map, values,
