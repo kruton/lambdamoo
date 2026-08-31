@@ -1637,7 +1637,8 @@ the broader ownership-map and synthesized-anchor validation described below.
    code further to 49,872 bytes but raised compile time to about 316 ms. Compare
    runtime with an external monotonic timer: MOO's `time()` has one-second
    granularity, and this verb suspends three times per invocation, so its
-   in-database timing cannot distinguish close O1 and O2 results. Keep level 2
+   in-database timing cannot distinguish close O1 and O2 results. Use `ftime()`
+   to measure with float time next time it is measured. Keep level 2
    as a possible hot-tier policy until that comparison shows whether its extra
    compile cost pays for hot verbs. Those figures predate the native-chain and
    ownership work. The current `$local.crypto:sha1` baseline has 928 SSA values,
