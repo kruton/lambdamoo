@@ -11,6 +11,7 @@ typedef struct JITCopy JITCopy;
 typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
+typedef struct JITReconstructionState JITReconstructionState;
 typedef struct JITResumeValue JITResumeValue;
 typedef struct JITNativeResume JITNativeResume;
 typedef struct JITLocalValue JITLocalValue;
@@ -18,6 +19,7 @@ typedef struct JITProgramUsage JITProgramUsage;
 
 typedef enum {
     JIT_RESUME_LOCAL,
+    JIT_RESUME_BORROWED_LOCAL,
     JIT_RESUME_STACK,
     JIT_RESUME_RESULT,
     JIT_RESUME_CONSTANT,
@@ -50,17 +52,25 @@ typedef enum {
 
 struct JITResumeValue {
     int value;
-    JITResumeSource source;
     int index;
+    JITResumeSource source;
+};
+
+typedef struct {
     Num literal;
     var_type literal_type;
-};
+} JITResumeLiteral;
 
 struct JITNativeResume {
     int num_values;
+    int num_capture_values;
     JITResumeValue *values;
-    int valid;
-    int rehydratable;
+    int num_owner_values;
+    int num_literals;
+    JITResumeLiteral *literals;
+    unsigned char valid;
+    unsigned char rehydratable;
+    unsigned char capture_classified;
 };
 
 struct JITContinuationFrame {
@@ -88,8 +98,8 @@ struct JITContinuationFrame {
 };
 
 struct JITLocalValue {
-    int slot;
-    int value;
+    uint16_t slot;
+    uint16_t value;
 };
 
 struct JITDeoptMap {
@@ -102,8 +112,9 @@ struct JITDeoptMap {
     int num_locals;
     int num_local_values;
     int local_base;
-    JITLocalValue *local_values;
     int num_tagged_values;
+    int reconstruction_state;
+    JITLocalValue *local_values;
     int *tagged_values;
     int *stack_values;
     var_type *stack_types;
@@ -120,6 +131,10 @@ struct JITDeoptMap {
     JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
     JITDeoptReason reason;
     int native_error_block;
+};
+
+struct JITReconstructionState {
+    int representative_map;
 };
 
 static inline int
@@ -181,6 +196,14 @@ typedef enum {
     JIT_LAST_USE_SRC3 = 1 << 2
 } JITLastUseOperand;
 
+typedef enum {
+    JIT_EXIT_NONE = 0,
+    JIT_EXIT_DEOPT = 1 << 0,
+    JIT_EXIT_ERROR = 1 << 1,
+    JIT_EXIT_BOUNDARY = 1 << 2,
+    JIT_EXIT_INVALIDATION = 1 << 3
+} JITExitMask;
+
 struct JITInstruction {
     HIRTacKind kind;
     ResumeKey resume_key;
@@ -198,6 +221,10 @@ struct JITInstruction {
     Num literal;
     var_type literal_type;
     int deopt_map;
+    JITTypeMask guarded_type_masks[JIT_MAX_GUARD_OPERANDS];
+    unsigned char guarded_operands;
+    unsigned char exit_mask;
+    unsigned char exit_classified;
     JITCopy *copies;
     unsigned char direct_int_list_index_set;
     unsigned char owned_last_use;
@@ -243,7 +270,16 @@ struct JITProgram {
     int num_blocks;
     int num_resume_anchors;
     int num_deopt_maps;
+    int num_reconstruction_states;
+    int num_status_locations;
+    int num_constant_values;
+    unsigned potential_exit_sites;
+    unsigned elided_exit_sites;
+    unsigned type_guard_sites;
+    unsigned eliminated_type_guard_sites;
     JITDeoptMap *deopt_maps;
+    JITReconstructionState *reconstruction_states;
+    JITSourceLocation *status_locations;
     JITBlock *blocks;
     JITBlock *last_block;
     JITInstruction *retained_constants;
@@ -254,10 +290,13 @@ struct JITProgram {
     uint64_t pool_generation;
     JITProgram *pool_prev;
     JITProgram *pool_next;
-    var_type *value_types;
+    int16_t *value_types;
     unsigned char *value_is_tagged;
+    unsigned char *value_constant_bits;
+    uint16_t *constant_value_ids;
+    Num *value_constants;
     int num_tag_slots;
-    int *value_tag_slots;
+    uint16_t *value_tag_slots;
     unsigned char *value_ownership;
     int *value_owner_root;
     unsigned int *value_use_counts;
@@ -348,7 +387,7 @@ extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
-extern Var *jit_rt_list_append(Var *, int64_t, int, int);
+extern Var *jit_rt_list_append(Var *, int64_t, int);
 extern Var *jit_rt_list_append_owned(Var *, int, Var *, int64_t, int);
 extern Var *jit_rt_fixed_list_append_owned(Var *, int, Var *, int, int64_t,
 					   int);

@@ -32,6 +32,9 @@ struct machine_dump {
 struct mir_dump {
     int lines;
     int found_source_marker;
+    int timeout_checks;
+    int source_location_stores;
+    int source_location_field_stores;
 };
 
 struct promotion_dump {
@@ -58,6 +61,13 @@ check_mir_line(const char *line, void *data)
     dump->lines++;
     if (strstr(line, "pc_11_line_7_"))
 	dump->found_source_marker = 1;
+    if (strstr(line, "i32:(timed_out)"))
+	dump->timeout_checks++;
+    if (strstr(line, "i32:(source_location)"))
+	dump->source_location_stores++;
+    if (strstr(line, "4(source_location)")
+	|| strstr(line, "8(source_location)"))
+	dump->source_location_field_stores++;
 }
 
 static void
@@ -177,6 +187,60 @@ arithmetic_program(void)
     add->next = ret;
     block->first = one;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+two_tick_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *first_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *two = instruction(HIR_TAC_CONST);
+    JITInstruction *second_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *add = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    one->value = 1;
+    one->literal = 1;
+    first_tick->source_lineno = 7;
+    first_tick->bytecode_pc = 11;
+    two->value = 2;
+    two->literal = 2;
+    second_tick->source_lineno = 8;
+    second_tick->bytecode_pc = 12;
+    add->source_lineno = 8;
+    add->bytecode_pc = 12;
+    add->value = 3;
+    add->src1 = 1;
+    add->src2 = 2;
+    add->op = HIR_OP_ADD;
+    ret->src1 = 3;
+    one->next = first_tick;
+    first_tick->next = two;
+    two->next = second_tick;
+    second_tick->next = add;
+    add->next = ret;
+    block->first = one;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+duplicate_tick_exit_program(void)
+{
+    JITProgram *program = two_tick_program();
+    JITInstruction *first_tick = program->blocks->first->next;
+    JITInstruction *second_tick = first_tick->next->next;
+
+    second_tick->source_lineno = first_tick->source_lineno;
+    second_tick->bytecode_pc = first_tick->bytecode_pc;
     return program;
 }
 
@@ -3381,6 +3445,8 @@ int
 main(void)
 {
     JITProgram *program = arithmetic_program();
+    JITProgram *two_ticks = two_tick_program();
+    JITProgram *duplicate_tick_exits = duplicate_tick_exit_program();
     JITProgram *guard = guard_program();
     JITProgram *deep_guard = deep_guard_program();
     JITProgram *branch = branch_program();
@@ -3389,6 +3455,12 @@ main(void)
     JITProgram *divide_zero = binary_program(20, 0, HIR_OP_DIV);
     JITProgram *divide_overflow = binary_program(NUM_MIN, -1, HIR_OP_DIV);
     JITProgram *modulus_overflow = binary_program(NUM_MIN, -1, HIR_OP_MOD);
+    JITProgram *modulus_power_two = binary_program(13, 8, HIR_OP_MOD);
+    JITProgram *negative_modulus_power_two = binary_program(-13, 8,
+	HIR_OP_MOD);
+    JITProgram *minimum_modulus_power_two = binary_program(NUM_MIN, 8,
+	HIR_OP_MOD);
+    JITProgram *modulus_one = binary_program(-13, 1, HIR_OP_MOD);
     JITProgram *power = binary_program(3, 13, HIR_OP_EXP);
     JITProgram *power_wrap = binary_program(2, 63, HIR_OP_EXP);
     JITProgram *power_negative = binary_program(-1, -3, HIR_OP_EXP);
@@ -3418,7 +3490,7 @@ main(void)
     int ticks = 10;
     int timed_out = 0;
     enum error error = E_NONE;
-    struct mir_dump mir_dump = {0, 0};
+    struct mir_dump mir_dump = { 0 };
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
@@ -3962,6 +4034,22 @@ main(void)
     check(mir_dump.lines > 0, "MIR dump was empty");
     check(mir_dump.found_source_marker,
 	  "MIR dump did not contain PC and line information");
+    {
+	struct mir_dump tick_dump = { 0 };
+	struct mir_dump exit_dump = { 0 };
+
+	check(jit_program_dump_mir(two_ticks, check_mir_line, &tick_dump),
+	      "two-tick MIR dump failed");
+	check(tick_dump.timeout_checks == 1,
+	      "basic block emitted redundant seconds-timeout checks");
+	check(jit_program_dump_mir(duplicate_tick_exits, check_mir_line,
+				   &exit_dump),
+	      "duplicate-tick MIR dump failed");
+	check(exit_dump.source_location_stores == 2,
+	      "equivalent tick status exits were not shared");
+	check(exit_dump.source_location_field_stores == 0,
+	      "status exits wrote expanded source locations");
+    }
     mir_dump.lines = 0;
     check(jit_program_dump_hir(program, check_mir_line, &mir_dump),
 	  "HIR dump failed");
@@ -4028,6 +4116,14 @@ main(void)
 		       "division overflow differed from reference execution");
     check_differential(modulus_overflow, env, 10, 0,
 		       "modulus overflow differed from reference execution");
+    check_differential(modulus_power_two, env, 10, 0,
+		       "power-of-two modulus differed from reference execution");
+    check_differential(negative_modulus_power_two, env, 10, 0,
+		       "negative power-of-two modulus differed from reference");
+    check_differential(minimum_modulus_power_two, env, 10, 0,
+		       "minimum power-of-two modulus differed from reference");
+    check_differential(modulus_one, env, 10, 0,
+		       "modulus by one differed from reference execution");
     check_differential(power, env, 10, 0,
 		       "power differed from reference execution");
     check_differential(power_wrap, env, 10, 0,
@@ -4074,6 +4170,10 @@ main(void)
 		       "tick abort differed from reference execution");
     check_differential(branch, env, 10, 1,
 		       "seconds abort differed from reference execution");
+    check_differential(two_ticks, env, 10, 1,
+		       "coalesced seconds abort differed from reference execution");
+    check_differential(two_ticks, env, 2, 0,
+		       "coalesced tick exhaustion differed from reference execution");
     check_differential(charge_tick, env, 1, 1,
 		       "charge-only tick differed from reference execution");
 
@@ -6090,6 +6190,8 @@ main(void)
     }
 
     jit_program_free(program);
+    jit_program_free(two_ticks);
+    jit_program_free(duplicate_tick_exits);
     jit_program_free(guard);
     jit_program_free(scatter);
     jit_program_free(local_arith);
@@ -6105,6 +6207,10 @@ main(void)
     jit_program_free(divide_zero);
     jit_program_free(divide_overflow);
     jit_program_free(modulus_overflow);
+    jit_program_free(modulus_power_two);
+    jit_program_free(negative_modulus_power_two);
+    jit_program_free(minimum_modulus_power_two);
+    jit_program_free(modulus_one);
     jit_program_free(power);
     jit_program_free(power_wrap);
     jit_program_free(power_negative);
@@ -6207,6 +6313,7 @@ main(void)
 	l1.v.list[1].type = TYPE_INT;
 	l1.v.list[1].v.num = 111;
 	Var l2 = new_list(1);
+	int l1_refs;
 	l2.v.list[1].type = TYPE_INT;
 	l2.v.list[1].v.num = 222;
 
@@ -6218,30 +6325,16 @@ main(void)
 	lconcat_var.v.list = lconcat;
 	free_var(lconcat_var);
 
-	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT, 0);
+	l1_refs = var_refcount(l1);
+	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT);
 	check(lapp && lapp[0].v.num == 2 && lapp[2].v.num == 333, "jit_rt_list_append int");
+	check(var_refcount(l1) == l1_refs && l1.v.list[0].v.num == 1
+	      && l1.v.list[1].v.num == 111,
+	      "jit_rt_list_append borrows its source");
 	Var lapp_var;
 	lapp_var.type = TYPE_LIST;
 	lapp_var.v.list = lapp;
 	free_var(lapp_var);
-	{
-	    Var consumed = new_list(1);
-	    Var consumed_result;
-
-	    consumed.v.list[1].type = TYPE_INT;
-	    consumed.v.list[1].v.num = 444;
-	    consumed_result.type = TYPE_LIST;
-	    consumed_result.v.list = jit_rt_list_append(consumed.v.list,
-		555, TYPE_INT, 1);
-	    consumed.type = TYPE_NONE;
-	    check(consumed_result.v.list[0].v.num == 2
-		  && consumed_result.v.list[1].v.num == 444
-		  && consumed_result.v.list[2].v.num == 555,
-		  "jit_rt_list_append consumes owned list");
-	    check(var_refcount(consumed_result) == 1,
-		  "consumed list append preserves exclusive ownership");
-	    free_var(consumed_result);
-	}
 	{
 	    Var homes[1];
 	    Var *owned_result;
@@ -6363,6 +6456,10 @@ main(void)
     {
 	JITProgram *profile_program = new_jit_program();
 	JITProgramStats stats;
+	profile_program->potential_exit_sites = 17;
+	profile_program->elided_exit_sites = 11;
+	profile_program->type_guard_sites = 7;
+	profile_program->eliminated_type_guard_sites = 3;
 
 	check(strcmp(jit_deopt_reason_name(JIT_DEOPT_NONE), "none") == 0,
 	      "deopt reason name none");
@@ -6453,6 +6550,10 @@ main(void)
 	      "per-program JIT deopt reason totals are wrong");
 	check(stats.last_used_generation > 0 && stats.last_used_time > 0,
 	      "per-program JIT last-use statistics are wrong");
+	check(stats.potential_exit_sites == 17 && stats.elided_exit_sites == 11
+	      && stats.type_guard_sites == 7
+	      && stats.eliminated_type_guard_sites == 3,
+	      "per-program exit-proof statistics are wrong");
 	check(stats.native_chain_calls == 2 && stats.native_chain_returns == 2
 	      && stats.native_chain_promotions == 3
 	      && stats.native_chain_max_depth == 3

@@ -119,6 +119,7 @@ typedef enum {
 typedef enum {
     HIR_TAC_TICK,
     HIR_TAC_DEOPT,
+    HIR_TAC_GUARD_TYPE,
     HIR_TAC_CONST,
     HIR_TAC_LOAD_ERROR,
     HIR_TAC_LOAD_LOCAL,
