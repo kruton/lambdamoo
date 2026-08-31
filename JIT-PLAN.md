@@ -1712,7 +1712,16 @@ the broader ownership-map and synthesized-anchor validation described below.
       stack resume sources so compact continuations never depend on an omitted
       runtime slot. These transformations are safe because the stubs consume no
       reconstruction values and therefore do not extend SSA live ranges. An
-      experiment outlining complete materialization
+      owner-backed reconstruction value is likewise represented by the map's
+      owner-slot side reference instead of a copied raw value and runtime tag,
+      but only when forward analysis proves the owner home is current and the
+      slot is stable (never consumed anywhere in the function). The owning
+      `Var` is authoritative for both payload and dynamic type. Reused homes and
+      homes which an instruction can consume before taking an exceptional exit
+      continue to use raw reconstruction until the must-populated proof models
+      those edge-specific transitions.
+
+      An experiment outlining complete materialization
       by reconstruction-state ID increased `#463:sha1` machine code because it
       kept many SSA values live to function-end stubs and caused additional
       register pressure; do not restore that form without an ABI which passes

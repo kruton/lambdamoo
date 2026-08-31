@@ -2395,24 +2395,8 @@ append_materialized_value(MIRBuild *build, JITProgram *program, int value,
     if (jit_value_has_constant(program, value))
 	return;
 
-    if (owner_slot >= 0) {
-	append(build, MIR_new_insn(build->context, MIR_MOV,
-	    MIR_new_mem_op(build->context,
-		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-		value * sizeof(Num), deopt_values, 0, 1),
-	    MIR_new_mem_op(build->context,
-		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-		owner_slot * sizeof(Var) + offsetof(Var, v),
-		build->owned_values, 0, 1)));
-	if (program->value_is_tagged && program->value_is_tagged[value])
-	    append(build, MIR_new_insn(build->context, MIR_MOV,
-		MIR_new_mem_op(build->context, MIR_T_I32,
-		    jit_tag_offset(program, value), deopt_values, 0, 1),
-		MIR_new_mem_op(build->context, MIR_T_I32,
-		    owner_slot * sizeof(Var) + offsetof(Var, type),
-		    build->owned_values, 0, 1)));
+    if (owner_slot >= 0)
 	return;
-    }
     if (definition && definition->kind == HIR_TAC_CONST) {
 	if (definition->literal_type == TYPE_FLOAT) {
 	    double number = raw_to_double(definition->literal);
@@ -7718,6 +7702,17 @@ jit_deopt_raw_value(JITProgram *program, int value, Num *deopt_values)
     return deopt_values[value];
 }
 
+static Var *
+jit_owner_home(JITProgram *program, int owner, Var *owned_values,
+	       unsigned char *home_states)
+{
+    if (owner < 0 || owner >= program->num_owned_slots || !owned_values
+	|| !home_states || home_states[owner] != JIT_HOME_OWNED
+	|| owned_values[owner].type == TYPE_NONE)
+	panic("Invalid owner-home reference at JIT boundary");
+    return &owned_values[owner];
+}
+
 static Var
 jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
 			      var_type type, Num *deopt_values,
@@ -7726,30 +7721,25 @@ jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
     JITBoundaryValueOwnership ownership = map->stack_boundary_ownership
 	? map->stack_boundary_ownership[slot] : JIT_BOUNDARY_VALUE_RETAINED;
     int value = map->stack_values[slot];
+    int owner = map->stack_owner_slots ? map->stack_owner_slots[slot] : -1;
 
-    if (ownership == JIT_BOUNDARY_VALUE_MOVED_OWNER) {
-	int owner = map->stack_owner_slots ? map->stack_owner_slots[slot] : -1;
-	Var moved;
+    if (owner >= 0) {
+	Var *home = jit_owner_home(program, owner, owned_values, home_states);
 
-	if (owner < 0 || owner >= program->num_owned_slots || !owned_values)
-	    panic("Invalid owner-home move at compact JIT boundary");
-	if (owned_values[owner].type == TYPE_NONE) {
-	    moved = materialize_deopt_value_with_ownership(type,
-		jit_deopt_raw_value(program, value, deopt_values), 0);
-	    deopt_values[value] = 0;
+	type = home->type;
+	if (ownership == JIT_BOUNDARY_VALUE_MOVED_OWNER) {
+	    Var moved = *home;
+
+	    home->type = TYPE_NONE;
+	    home->v.num = 0;
+	    home_states[owner] = JIT_HOME_EMPTY;
 	    return moved;
 	}
-	if (owned_values[owner].type != type
-	    || jit_rt_var_raw(&owned_values[owner])
-	       != jit_deopt_raw_value(program, value, deopt_values))
-	    panic("Mismatched owner-home move at compact JIT boundary");
-	moved = owned_values[owner];
-	owned_values[owner].type = TYPE_NONE;
-	owned_values[owner].v.num = 0;
-	if (home_states)
-	    home_states[owner] = JIT_HOME_EMPTY;
-	deopt_values[value] = 0;
-	return moved;
+	return var_ref(*home);
+    }
+
+    if (ownership == JIT_BOUNDARY_VALUE_MOVED_OWNER) {
+	panic("Owner-home move lacks an owner-home reference");
     }
     if (ownership == JIT_BOUNDARY_VALUE_MOVED_RAW) {
 	Var moved = materialize_deopt_value_with_ownership(type,
@@ -8351,7 +8341,8 @@ jit_runtime_type_is_valid(var_type type)
 
 static int
 jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
-			       Num *deopt_values)
+			       Num *deopt_values, Var *owned_values,
+			       unsigned char *home_states)
 {
     int slot;
     int value;
@@ -8368,7 +8359,19 @@ jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
     if (value <= 0 || value >= program->num_values)
 	return 0;
     type = jit_deopt_map_stack_type(program, map, slot);
-    if (type == TYPE_ANY)
+    if (map->stack_owner_slots && map->stack_owner_slots[slot] >= 0) {
+	Var *home = jit_owner_home(program, map->stack_owner_slots[slot],
+	    owned_values, home_states);
+
+	type = home->type;
+	if (map->builtin_args == 1)
+	    return type == TYPE_INT && home->v.num == 0;
+	if (map->builtin_args < 0 && type == TYPE_LIST)
+	    return home->v.list && home->v.list[0].v.num == 1
+		&& home->v.list[1].type == TYPE_INT
+		&& home->v.list[1].v.num == 0;
+	return 0;
+    } else if (type == TYPE_ANY)
 	type = (var_type) deopt_values[jit_tag_index(program, value)];
     if (map->builtin_args == 1)
 	return type == TYPE_INT
@@ -8385,16 +8388,29 @@ jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
 
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
-		      Num *deopt_values, int operand)
+		      Num *deopt_values, Var *owned_values,
+		      unsigned char *home_states, int operand)
 {
     int value = map->guard_value[operand];
     int local = map->guard_local[operand];
+    int slot;
 
     if (!map->guard_expected[operand])
 	return TYPE_NONE;
     if (local >= 0 && local < program->num_vars && env)
 	return env[local].type;
     if (value > 0 && value < program->num_values) {
+	for (slot = 0; map->local_owner_slots && slot < map->num_locals; slot++)
+	    if (jit_deopt_map_local_value(program, map, slot) == value
+		&& map->local_owner_slots[slot] >= 0)
+		return jit_owner_home(program, map->local_owner_slots[slot],
+		    owned_values, home_states)->type;
+	for (slot = 0; map->stack_owner_slots
+	     && slot < (int) map->stack_depth; slot++)
+	    if (map->stack_values[slot] == value
+		&& map->stack_owner_slots[slot] >= 0)
+		return jit_owner_home(program, map->stack_owner_slots[slot],
+		    owned_values, home_states)->type;
 	if (program->value_is_tagged && program->value_is_tagged[value])
 	    return (var_type) deopt_values[jit_tag_index(program, value)];
 	if (program->value_types)
@@ -8630,7 +8646,8 @@ jit_program_execute_in_context(JITProgram *program,
 	    }
 	}
 	if (compact_boundary
-	    && jit_deopt_map_is_suspend_zero(program, map, deopt_values)) {
+	    && jit_deopt_map_is_suspend_zero(program, map, deopt_values,
+		owned_values, home_states)) {
 	    int first_operand = map->stack_depth - jit_call_stack_operands(map);
 
 	    suspend_zero_boundary = 1;
@@ -8654,11 +8671,20 @@ jit_program_execute_in_context(JITProgram *program,
 
 	    if (local_value > 0) {
 		var_type type = jit_deopt_map_local_type(program, map, i);
-		if (type == TYPE_ANY)
-		    type = (var_type) deopt_values[jit_tag_index(program,
-			local_value)];
-		Var value = materialize_deopt_value(type,
-		    jit_deopt_raw_value(program, local_value, deopt_values));
+		int owner = map->local_owner_slots
+		    ? map->local_owner_slots[i] : -1;
+		Var value;
+
+		if (owner >= 0)
+		    value = var_ref(*jit_owner_home(program, owner,
+			owned_values, home_states));
+		else {
+		    if (type == TYPE_ANY)
+			type = (var_type) deopt_values[jit_tag_index(program,
+			    local_value)];
+		    value = materialize_deopt_value(type,
+			jit_deopt_raw_value(program, local_value, deopt_values));
+		}
 
 		free_var(env[i]);
 		env[i] = value;
@@ -8680,7 +8706,10 @@ jit_program_execute_in_context(JITProgram *program,
 		new_stack[i - stack_start].v.num = slot.data;
 		continue;
 	    }
-	    if (type == TYPE_ANY)
+	    if (map->stack_owner_slots && map->stack_owner_slots[i] >= 0)
+		type = jit_owner_home(program, map->stack_owner_slots[i],
+		    owned_values, home_states)->type;
+	    else if (type == TYPE_ANY)
 		type = (var_type) deopt_values[jit_tag_index(program,
 		    map->stack_values[i])];
 
@@ -8719,7 +8748,8 @@ jit_program_execute_in_context(JITProgram *program,
 		   sizeof(deopt->guard_expected));
 	    for (i = 0; i < JIT_MAX_GUARD_OPERANDS; i++)
 		deopt->guard_actual[i] = jit_guard_actual_type(program, map,
-						      env, deopt_values, i);
+						      env, deopt_values,
+						      owned_values, home_states, i);
 	    deopt->reason = map->reason;
 	    if (native_result == JIT_RUN_CALL_VERB) {
 		if (suspend_zero_boundary)
