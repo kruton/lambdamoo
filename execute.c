@@ -1010,6 +1010,7 @@ prepare_verb_call_for_caller(PreparedVerbCall *prepared, Var *caller_env,
 #endif
     prepared->progr = db_verb_owner(call->handle);
     prepared->vloc = db_verb_definer(call->handle);
+    prepared->verb_index = db_verb_index(call->handle);
     prepared->verb = str_ref(call->verb);
     prepared->verbname = str_ref(db_verb_names(call->handle));
     prepared->debug = (db_verb_flags(call->handle) & VF_DEBUG);
@@ -1127,7 +1128,11 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
     if (!context || !frame || !resume || !prepared || !prepared->program
 	|| !prepared->env || !prepared->verb || !prepared->verbname
 	|| !(program = prepared->program->jit)
-	|| !jit_program_is_eligible(program) || !jit_program_compile(program))
+	|| !jit_program_is_eligible(program))
+	return 0;
+    jit_program_note_location(program, prepared->vloc,
+	prepared->verb_index);
+    if (!jit_program_compile(program))
 	return 0;
     if (!jit_execution_context_push_compact(context, frame, program,
 	prepared->env, resume, entry_map))
@@ -1135,7 +1140,7 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
 
     if (!jit_native_frame_take_prepared_invocation(frame, prepared))
 	panic("Prepared verb call ownership transfer failed after publication");
-    if (!jit_native_frame_verify(context, frame))
+    if (!jit_native_frame_verify_runtime(context, frame))
 	panic("Prepared verb call produced an invalid compact frame");
     return 1;
 }
@@ -1144,7 +1149,7 @@ int
 execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 				      JITNativeFrame *caller, Objid this,
 				      const char *vname
-				      WAIF_COMMA_ARG(Var THIS), Var args,
+				      WAIF_COMMA_ARG(Var THIS), Var *args,
 				      enum error *error_out, int map_id,
 				      unsigned bytecode_pc,
 				      unsigned error_pc,
@@ -1161,7 +1166,8 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 
     if (error_out)
 	*error_out = E_NONE;
-    if (!context || !caller || !call_out || !error_out
+    if (!context || !caller || !args || args->type != TYPE_LIST
+	|| !call_out || !error_out
 	|| context->current_frame != caller || !caller->env || !continuation
 	|| continuation != caller->runtime_borrower
 	|| !jit_native_frame_continuation_matches(caller, map_id))
@@ -1185,13 +1191,17 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 #ifdef WAIF_CORE
 	caller->receiver,
 #endif
-	caller->this, caller->player, caller->progr, &resolved, var_ref(args));
+	caller->this, caller->player, caller->progr, &resolved, *args);
     if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
 	&native_call->resume, &prepared, -1)) {
+	prepared.env[SLOT_ARGS].type = TYPE_NONE;
+	prepared.env[SLOT_ARGS].v.num = 0;
 	discard_prepared_verb_call(&prepared);
 	myfree(native_call, M_VM);
 	return 0;
     }
+    args->type = TYPE_NONE;
+    args->v.num = 0;
     native_call->accounted_bytes = sizeof(*native_call)
 	+ sizeof(Var) * native_call->frame.bytecode_program->num_var_names;
     jit_profile_native_frame_acquired(&native_call->frame,
@@ -1280,7 +1290,7 @@ dispatch_jit_native_boundary(JITExecutionContext *context,
 #endif
     }
     return execute_jit_dispatch_native_verb_call(context, caller, class,
-	verb->v.str WAIF_COMMA_ARG(*obj), *args, &error, deopt->map_id,
+	verb->v.str WAIF_COMMA_ARG(*obj), args, &error, deopt->map_id,
 	deopt->bytecode_pc, deopt->error_pc, continuation, call_out);
 }
 
@@ -1350,6 +1360,35 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	}
 
 	if (out->result == JIT_RUN_CALL_VERB && continuation
+	    && out->deopt.boundary == JIT_BOUNDARY_BUILTIN
+	    && out->deopt.stack_depth == 1 && stack[0].type == TYPE_LIST
+	    && builtin_function_is_jit_compact_return_only(
+		out->deopt.builtin_func, stack[0].v.list[0].v.num)) {
+	    Var args = stack[0];
+	    package p;
+
+	    active->current_map = out->deopt.map_id;
+	    if (!jit_native_frame_continuation_matches(active,
+		    out->deopt.map_id)
+		&& !jit_native_frame_adopt_continuation_runtime(active,
+		    continuation))
+		panic("Native built-in caller could not adopt its continuation");
+	    stack[0].type = TYPE_NONE;
+	    stack[0].v.num = 0;
+	    jit_continuation_mark_dispatched(continuation);
+	    p = call_bi_func(out->deopt.builtin_func, args, 1,
+		active->progr, 0);
+	    jit_profile_record_vm_call(active->program);
+	    if (p.kind != BI_RETURN)
+		panic("Compact return-only built-in returned a non-return package");
+	    jit_continuation_set_result(continuation, p.u.ret);
+	    if (allocated_stack)
+		myfree(stack, M_RT_STACK);
+	    continuation_in = continuation;
+	    continue;
+	}
+
+	if (out->result == JIT_RUN_CALL_VERB && continuation
 	    && out->deopt.boundary == JIT_BOUNDARY_VERB) {
 	    struct JITNativeCall *callee = 0;
 
@@ -1384,18 +1423,21 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		&& !jit_native_frame_adopt_continuation_runtime(active,
 		    continuation))
 		panic("Native boundary continuation ownership is invalid");
-	    if (!continuation) {
-		materialized_depth = out->deopt.materialized
+	    if (continuation
+		&& out->deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO) {
+		stack[0] = new_list(1);
+		stack[0].v.list[1].type = TYPE_INT;
+		stack[0].v.list[1].v.num = 0;
+		materialized_depth = 1;
+	    } else
+		materialized_depth = out->deopt.materialized || continuation
 		    ? out->deopt.stack_depth : 0;
-		if (!jit_native_frame_capture_boundary(active, stack,
-			materialized_depth, out->deopt.map_id))
-		    panic("Native boundary capture failed before promotion");
-	    }
+	    if (!jit_native_frame_capture_boundary(active, stack,
+		    materialized_depth, out->deopt.map_id))
+		panic("Native boundary capture failed before promotion");
 	    promotion = execute_jit_prepare_promotion(context);
 	    if (!promotion || !execute_jit_commit_promotion(promotion))
 		panic("Native call-chain promotion failed");
-	    if (continuation)
-		materialized_depth = out->deopt.stack_depth;
 	    free_jit_boundary_values(stack, materialized_depth);
 	    if (allocated_stack)
 		myfree(stack, M_RT_STACK);
@@ -1518,7 +1560,7 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
     if (verb.type != TYPE_STR || args.type != TYPE_LIST)
 	return 0;
     if (!execution_context || execution_context->current_frame != caller_frame
-	|| !jit_native_frame_verify(execution_context, caller_frame))
+	|| !jit_native_frame_verify_runtime(execution_context, caller_frame))
 	return 0;
 #ifdef WAIF_CORE
     if (obj.type == TYPE_WAIF) {
@@ -1889,6 +1931,8 @@ do {								\
 		    Var args = RUN_ACTIV.base_rt_stack[0];
 		    package p;
 
+		    RUN_ACTIV.base_rt_stack[0].type = TYPE_NONE;
+		    RUN_ACTIV.base_rt_stack[0].v.num = 0;
 		    jit_continuation_attach(continuation, caller);
 		    jit_continuation_mark_dispatched(continuation);
 		    STORE_STATE_VARIABLES();
@@ -1956,6 +2000,12 @@ do {								\
 		    Var verb = RUN_ACTIV.base_rt_stack[1];
 		    Var args = RUN_ACTIV.base_rt_stack[2];
 		    Objid class = NOTHING;
+		    int operand;
+
+		    for (operand = 0; operand < 3; operand++) {
+			RUN_ACTIV.base_rt_stack[operand].type = TYPE_NONE;
+			RUN_ACTIV.base_rt_stack[operand].v.num = 0;
+		    }
 
 		    if (args.type != TYPE_LIST || verb.type != TYPE_STR)
 			err = E_TYPE;

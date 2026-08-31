@@ -3266,6 +3266,117 @@ check(int condition, const char *message)
     }
 }
 
+static JITProgram *
+owned_last_use_program(int loop, int use_old_after)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *candidate = instruction(HIR_TAC_BINARY);
+    JITInstruction *after = use_old_after
+	? instruction(HIR_TAC_UNARY) : 0;
+    JITInstruction *terminal = instruction(loop ? HIR_TAC_JUMP
+					       : HIR_TAC_RETURN);
+    JITCopy *pair = allocate(sizeof(JITCopy));
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    program->blocks = program->last_block = block;
+    program->value_ownership = allocate(program->num_values);
+    program->value_ownership[1] = JIT_OWNERSHIP_OWNED;
+    block->id = 1;
+    block->num_successors = loop ? 1 : 0;
+    block->successors[0] = 1;
+    pair->dst = 3;
+    pair->src = 1;
+    copy->copies = pair;
+    copy->next = candidate;
+    candidate->value = loop ? 1 : 2;
+    candidate->src1 = 3;
+    candidate->op = HIR_OP_ADD;
+    if (after) {
+	candidate->next = after;
+	after->value = 2;
+	after->src1 = 3;
+	after->op = HIR_OP_NOT;
+	after->next = terminal;
+    } else
+	candidate->next = terminal;
+    if (loop) {
+	JITInstruction *backedge = instruction(HIR_TAC_PARALLEL_COPY);
+	JITCopy *backedge_pair = allocate(sizeof(JITCopy));
+
+	backedge_pair->dst = 3;
+	backedge_pair->src = 1;
+	backedge->copies = backedge_pair;
+	if (after)
+	    after->next = backedge;
+	else
+	    candidate->next = backedge;
+	backedge->next = terminal;
+    } else {
+	terminal->src1 = use_old_after ? 3 : 2;
+	terminal->literal_type = TYPE_INT;
+    }
+    block->first = copy;
+    block->last = terminal;
+    return program;
+}
+
+static JITInstruction *
+owned_last_use_candidate(JITProgram *program)
+{
+    return program->blocks->first->next;
+}
+
+static JITProgram *
+owned_last_use_branch_program(int old_value_on_successor)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *entry = allocate(sizeof(JITBlock));
+    JITBlock *left = allocate(sizeof(JITBlock));
+    JITBlock *right = allocate(sizeof(JITBlock));
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *candidate = instruction(HIR_TAC_BINARY);
+    JITInstruction *branch = instruction(HIR_TAC_BRANCH_FALSE);
+    JITInstruction *left_return = instruction(HIR_TAC_RETURN);
+    JITInstruction *right_return = instruction(HIR_TAC_RETURN);
+    JITCopy *pair = allocate(sizeof(JITCopy));
+
+    program->num_values = 5;
+    program->num_blocks = 3;
+    program->blocks = entry;
+    program->last_block = right;
+    program->value_ownership = allocate(program->num_values);
+    program->value_ownership[1] = JIT_OWNERSHIP_OWNED;
+    entry->id = 1;
+    entry->num_successors = 2;
+    entry->successors[0] = 2;
+    entry->successors[1] = 3;
+    entry->next = left;
+    left->id = 2;
+    left->next = right;
+    right->id = 3;
+    pair->dst = 3;
+    pair->src = 1;
+    copy->copies = pair;
+    copy->next = candidate;
+    candidate->value = 2;
+    candidate->src1 = 3;
+    candidate->op = HIR_OP_ADD;
+    candidate->next = branch;
+    branch->src1 = 4;
+    entry->first = copy;
+    entry->last = branch;
+    left_return->src1 = old_value_on_successor ? 3 : 2;
+    left_return->literal_type = TYPE_INT;
+    left->first = left->last = left_return;
+    right_return->src1 = 2;
+    right_return->literal_type = TYPE_INT;
+    right->first = right->last = right_return;
+    return program;
+}
+
 int
 main(void)
 {
@@ -3311,6 +3422,46 @@ main(void)
     struct machine_dump machine_dump = {0, 0};
     JITDeoptState deopt;
     JITSourceLocation source_location;
+
+    {
+	JITProgram *dead = owned_last_use_program(0, 0);
+	JITProgram *live = owned_last_use_program(0, 1);
+	JITProgram *loop_dead = owned_last_use_program(1, 0);
+	JITProgram *loop_live = owned_last_use_program(1, 1);
+	JITProgram *branch_dead = owned_last_use_branch_program(0);
+	JITProgram *branch_live = owned_last_use_branch_program(1);
+
+	jit_analyze_owned_last_uses(dead);
+	jit_analyze_owned_last_uses(live);
+	jit_analyze_owned_last_uses(loop_dead);
+	jit_analyze_owned_last_uses(loop_live);
+	jit_analyze_owned_last_uses(branch_dead);
+	jit_analyze_owned_last_uses(branch_live);
+	check(owned_last_use_candidate(dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed a dead alias");
+	check(!(owned_last_use_candidate(live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis discarded a live alias");
+	check(owned_last_use_candidate(loop_dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed a loop-carried replacement");
+	check(!(owned_last_use_candidate(loop_live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis ignored a live loop alias");
+	check(owned_last_use_candidate(branch_dead)->owned_last_use
+	      & JIT_LAST_USE_SRC1,
+	      "owned last-use analysis missed dead CFG successors");
+	check(!(owned_last_use_candidate(branch_live)->owned_last_use
+		& JIT_LAST_USE_SRC1),
+	      "owned last-use analysis ignored a live CFG successor");
+	jit_program_free(branch_live);
+	jit_program_free(branch_dead);
+	jit_program_free(loop_live);
+	jit_program_free(loop_dead);
+	jit_program_free(live);
+	jit_program_free(dead);
+    }
 
     {
 	JITNativeFrame compact;
@@ -6013,6 +6164,31 @@ main(void)
 	      "jit_rt_str_concat success");
 	if (concat_res)
 	    free_str(concat_res);
+	{
+	    Var homes[1];
+	    const char *owned;
+	    int64_t owned_raw = 0;
+
+	    homes[0].type = TYPE_NONE;
+	    check(jit_rt_str_concat_owned(homes, 0, "a", "b",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && homes[0].type == TYPE_STR
+		  && homes[0].v.str == (const char *) (intptr_t) owned_raw
+		  && !strcmp(homes[0].v.str, "ab"),
+		  "owned string concat publishes an empty home");
+	    owned = homes[0].v.str;
+	    check(jit_rt_str_concat_owned(homes, 0, owned, "c",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && !strcmp(homes[0].v.str, "abc")
+		  && var_refcount(homes[0]) == 1,
+		  "owned string concat transfers a last-use operand");
+	    owned = homes[0].v.str;
+	    check(!jit_rt_str_concat_owned(homes, 0, "x", "y",
+		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		  && rt_err == E_NONE && homes[0].v.str == owned,
+		  "owned string concat rejects an owner mismatch");
+	    free_var(homes[0]);
+	}
 
 	const char *char_res = jit_rt_str_ref("LambdaMOO", 7, &rt_err);
 	check(rt_err == E_NONE && char_res && strcmp(char_res, "M") == 0,
@@ -6042,12 +6218,67 @@ main(void)
 	lconcat_var.v.list = lconcat;
 	free_var(lconcat_var);
 
-	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT);
+	Var *lapp = jit_rt_list_append(l1.v.list, 333, TYPE_INT, 0);
 	check(lapp && lapp[0].v.num == 2 && lapp[2].v.num == 333, "jit_rt_list_append int");
 	Var lapp_var;
 	lapp_var.type = TYPE_LIST;
 	lapp_var.v.list = lapp;
 	free_var(lapp_var);
+	{
+	    Var consumed = new_list(1);
+	    Var consumed_result;
+
+	    consumed.v.list[1].type = TYPE_INT;
+	    consumed.v.list[1].v.num = 444;
+	    consumed_result.type = TYPE_LIST;
+	    consumed_result.v.list = jit_rt_list_append(consumed.v.list,
+		555, TYPE_INT, 1);
+	    consumed.type = TYPE_NONE;
+	    check(consumed_result.v.list[0].v.num == 2
+		  && consumed_result.v.list[1].v.num == 444
+		  && consumed_result.v.list[2].v.num == 555,
+		  "jit_rt_list_append consumes owned list");
+	    check(var_refcount(consumed_result) == 1,
+		  "consumed list append preserves exclusive ownership");
+	    free_var(consumed_result);
+	}
+	{
+	    Var homes[1];
+	    Var *owned_result;
+
+	    homes[0] = new_list(1);
+	    homes[0].v.list[1].type = TYPE_INT;
+	    homes[0].v.list[1].v.num = 666;
+	    owned_result = jit_rt_list_append_owned(homes, 0,
+		homes[0].v.list, 777, TYPE_INT);
+	    check(owned_result == homes[0].v.list
+		  && homes[0].v.list[0].v.num == 2
+		  && homes[0].v.list[2].v.num == 777,
+		  "owner-backed list append updates its home");
+	    check(var_refcount(homes[0]) == 1,
+		  "owner-backed list append remains exclusive");
+	    free_var(homes[0]);
+	}
+	{
+	    Var homes[1];
+	    Var *fixed_result;
+
+	    homes[0].type = TYPE_LIST;
+	    homes[0].v.list = jit_rt_make_fixed_list_head(111, TYPE_INT, 3);
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+		homes[0].v.list, 2, 222, TYPE_INT);
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+		fixed_result, 3, 333, TYPE_INT);
+	    check(fixed_result == homes[0].v.list
+		  && fixed_result[0].v.num == 3
+		  && fixed_result[1].v.num == 111
+		  && fixed_result[2].v.num == 222
+		  && fixed_result[3].v.num == 333,
+		  "fixed list construction fills one allocation");
+	    check(var_refcount(homes[0]) == 1,
+		  "fixed list construction remains exclusive");
+	    free_var(homes[0]);
+	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */
 	{
@@ -6092,16 +6323,17 @@ main(void)
 
 	/* 7. get_prop test */
 	int64_t prop_raw = 0;
-	int32_t prop_type = 0;
+	int64_t prop_type = INT64_C(0x5555555500000000);
 	int ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 1 && rt_err == E_NONE && prop_type == TYPE_INT && prop_raw == 123,
-	      "jit_rt_get_prop valid property read");
+	      "jit_rt_get_prop replaces the complete result tag");
 
 	ok = jit_rt_get_prop(-1, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 0 && rt_err == E_INVIND, "jit_rt_get_prop invalid object");
 
 	ok = jit_rt_put_prop(0, "name", 2, 456, TYPE_INT, &rt_err);
 	check(ok == 1 && rt_err == E_NONE, "jit_rt_put_prop valid property write");
+	prop_type = INT64_C(0x5555555500000000);
 	ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type, &rt_err);
 	check(ok == 1 && prop_type == TYPE_INT && prop_raw == 456,
 	      "jit_rt_put_prop stored property value");

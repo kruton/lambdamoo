@@ -22,17 +22,31 @@ typedef enum {
     JIT_RESUME_RESULT,
     JIT_RESUME_CONSTANT,
     JIT_RESUME_OWNER,
-    JIT_RESUME_CAPTURED
+    JIT_RESUME_CAPTURED,
+    JIT_RESUME_OPERAND
 } JITResumeSource;
 
 typedef enum {
     JIT_OWNERSHIP_UNKNOWN,
     JIT_OWNERSHIP_SCALAR,
     JIT_OWNERSHIP_BORROWED_LOCAL,
+    /* A database-backed property value without an added reference. */
+    JIT_OWNERSHIP_BORROWED_PROPERTY,
     JIT_OWNERSHIP_OWNED,
-    JIT_OWNERSHIP_STABLE_OWNED,
+    /* A property value retained for the native frame. */
+    JIT_OWNERSHIP_OWNED_PROPERTY,
     JIT_OWNERSHIP_IMMORTAL
 } JITValueOwnership;
+
+typedef enum {
+    JIT_ESCAPE_NONE = 0,
+    JIT_ESCAPE_RETURN = 1 << 0,
+    JIT_ESCAPE_CALL = 1 << 1,
+    JIT_ESCAPE_STORE = 1 << 2,
+    JIT_ESCAPE_MERGE = 1 << 3,
+    JIT_ESCAPE_FRAME = 1 << 4,
+    JIT_ESCAPE_MULTIPLE_USES = 1 << 5
+} JITValueEscape;
 
 struct JITResumeValue {
     int value;
@@ -53,11 +67,11 @@ struct JITContinuationFrame {
     JITProgram *program;
     struct activation *owner;
     int map_id;
-    int num_values;
-    Var *values;
-    int values_capacity;
-    Var *spare_values;
-    int spare_values_capacity;
+    int num_retained;
+    Var *retained_values;
+    int retained_capacity;
+    Var *spare_retained;
+    int spare_retained_capacity;
     void *runtime_storage;
     Num *deopt_values;
     Var *borrowed_locals;
@@ -94,6 +108,9 @@ struct JITDeoptMap {
     int *stack_values;
     var_type *stack_types;
     ResumeStackSlot *stack_slots;
+    int *local_owner_slots;
+    int *stack_owner_slots;
+    unsigned char *stack_boundary_ownership;
     JITNativeResume *native_resume;
     int builtin_func;
     int builtin_args;
@@ -141,6 +158,29 @@ struct JITCopy {
     JITCopy *next;
 };
 
+typedef enum {
+    JIT_OWNER_ROOT_CONFLICT = -2,
+    JIT_OWNER_ROOT_NONE = -1
+} JITOwnerRootSpecial;
+
+typedef enum {
+    JIT_OWNER_SLOT_NONE = -1
+} JITOwnerSlotSpecial;
+
+typedef enum {
+    JIT_BOUNDARY_VALUE_RETAINED,
+    JIT_BOUNDARY_VALUE_MOVED_RAW,
+    JIT_BOUNDARY_VALUE_MOVED_OWNER,
+    JIT_BOUNDARY_VALUE_RELEASE_AFTER_RESUME
+} JITBoundaryValueOwnership;
+
+typedef enum {
+    JIT_LAST_USE_NONE = 0,
+    JIT_LAST_USE_SRC1 = 1 << 0,
+    JIT_LAST_USE_SRC2 = 1 << 1,
+    JIT_LAST_USE_SRC3 = 1 << 2
+} JITLastUseOperand;
+
 struct JITInstruction {
     HIRTacKind kind;
     ResumeKey resume_key;
@@ -160,6 +200,7 @@ struct JITInstruction {
     int deopt_map;
     JITCopy *copies;
     unsigned char direct_int_list_index_set;
+    unsigned char owned_last_use;
     JITInstruction *next;
 };
 
@@ -219,6 +260,8 @@ struct JITProgram {
     int *value_tag_slots;
     unsigned char *value_ownership;
     int *value_owner_root;
+    unsigned int *value_use_counts;
+    unsigned char *value_escape_flags;
     int num_owned_slots;
     int *value_owned_slots;
     unsigned char *value_is_int_list;
@@ -236,6 +279,8 @@ struct JITProgram {
     Objid diagnostic_object;
     unsigned diagnostic_verb;
 };
+
+extern void jit_analyze_owned_last_uses(JITProgram *);
 
 static inline __attribute__((always_inline)) int
 jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
@@ -295,18 +340,25 @@ extern int jit_rt_is_true(int64_t, int);
 extern int jit_rt_equality(int64_t, int, int64_t, int, int);
 extern int jit_rt_str_cmp(const char *, const char *, int);
 extern const char *jit_rt_str_concat(const char *, const char *, int32_t *);
+extern int jit_rt_str_concat_owned(Var *, int, const char *, const char *,
+				   int, int64_t *, int32_t *);
 extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
 extern const char *jit_rt_str_range_ref(const char *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
-extern Var *jit_rt_list_append(Var *, int64_t, int);
+extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
+extern Var *jit_rt_list_append(Var *, int64_t, int, int);
+extern Var *jit_rt_list_append_owned(Var *, int, Var *, int64_t, int);
+extern Var *jit_rt_fixed_list_append_owned(Var *, int, Var *, int, int64_t,
+					   int);
 extern void jit_rt_owned_replace(Var *, int, int64_t, int);
+extern void jit_rt_discard_owned(Var *, int, int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
-extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int32_t *, int32_t *);
+extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int64_t *, int32_t *);
 extern int jit_rt_put_prop(int64_t, const char *, int64_t, int64_t, int, int32_t *);
 extern int64_t jit_rt_seconds_left(void);
 extern int64_t jit_rt_time(void);

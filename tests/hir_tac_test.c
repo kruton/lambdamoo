@@ -149,6 +149,21 @@ test_list_tail_ownership_slots(void)
 }
 
 static void
+test_string_concat_ownership_slots(void)
+{
+    check_int("string concat reuses last left ownership slot",
+	      hir_test_string_concat_owner_slot(3, 1, 4, 0, 7), 3);
+    check_int("string concat reuses last right ownership slot",
+	      hir_test_string_concat_owner_slot(3, 0, 4, 1, 7), 4);
+    check_int("string concat prefers last left ownership slot",
+	      hir_test_string_concat_owner_slot(3, 1, 4, 1, 7), 3);
+    check_int("string concat allocates for an unowned last value",
+	      hir_test_string_concat_owner_slot(-1, 1, -1, 0, 7), 7);
+    check_int("string concat does not consume a live owner",
+	      hir_test_string_concat_owner_slot(3, 0, 4, 0, 7), 7);
+}
+
+static void
 test_string_builtin_length_anchor(void)
 {
     Byte vector[] = {OP_BI_FUNC_CALL, 6};
@@ -3753,6 +3768,7 @@ main(void)
     test_resume_stack_shape();
     test_boundary_tick_refunds();
     test_list_tail_ownership_slots();
+    test_string_concat_ownership_slots();
     test_string_builtin_length_anchor();
     test_string_add_operand_inference();
     test_binary_type_pair_contracts();

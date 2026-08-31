@@ -193,6 +193,7 @@ extern unsigned register_function(const char *, int, int, bf_type,...);
 extern void register_function_dbio(bf_read_type, bf_write_type);
 extern void register_function_free(bf_free_type);
 extern void register_function_state(bf_import_type, bf_export_type);
+extern void register_function_jit_compact_return_only(int);
 
 /*--------------*
  |  invocation  |
@@ -218,6 +219,7 @@ extern void free_bi_func_data(Byte f_id, void *vdata);
 
 extern unsigned builtin_protection_generation(void);
 extern int builtin_function_is_protected(unsigned);
+extern int builtin_function_is_jit_compact_return_only(unsigned, int);
 extern void load_server_options(void);
 
 #endif		/* !Functions_H */

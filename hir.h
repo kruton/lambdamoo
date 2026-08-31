@@ -241,6 +241,7 @@ extern unsigned short hir_test_binary_operand_type_mask(HIROp, int, int,
 extern int hir_test_unary_operand_defaults_to_list(HIROp);
 extern int hir_test_binary_operands_constrain_each_other(HIROp);
 extern int hir_test_list_tail_owner_slot(int, unsigned int, int);
+extern int hir_test_string_concat_owner_slot(int, int, int, int, int);
 extern int hir_test_int_list_result(HIROp, int, int, var_type);
 extern int hir_test_all_copy_sources_are_int_lists(unsigned int,
 					    unsigned int);

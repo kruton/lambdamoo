@@ -640,7 +640,8 @@ void
 register_objects(void)
 {
     register_function("toobj", 1, 1, bf_toobj, TYPE_ANY);
-    register_function("typeof", 1, 1, bf_typeof, TYPE_ANY);
+    register_function("typeof", 1, 1, bf_typeof, TYPE_ANY),
+	register_function_jit_compact_return_only(1);
     register_function("create", 1, 2, bf_create, TYPE_OBJ, TYPE_OBJ),
 	register_function_dbio(bf_create_read, bf_create_write),
 	register_function_state(bf_object_import, bf_object_export);
