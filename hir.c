@@ -6404,18 +6404,6 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	resume->source = JIT_RESUME_RESULT;
 	return 1;
     }
-    for (i = 0; i < map->num_locals; i++)
-	if (jit_deopt_map_local_value(program, map, i) == value) {
-	    resume->source = JIT_RESUME_LOCAL;
-	    resume->index = i;
-	    return 1;
-	}
-    for (i = 0; i + call_operands < (int) map->stack_depth; i++)
-	if (map->stack_values[i] == value) {
-	    resume->source = JIT_RESUME_STACK;
-	    resume->index = i;
-	    return 1;
-	}
     for (block = program->blocks; block; block = block->next) {
 	JITInstruction *instr;
 
@@ -6429,6 +6417,18 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 	    if (instr == block->last)
 		break;
 	}
+    }
+    for (i = 0; i < map->num_locals; i++)
+	if (jit_deopt_map_local_value(program, map, i) == value) {
+	    resume->source = JIT_RESUME_LOCAL;
+	    resume->index = i;
+	    return 1;
+	}
+    for (i = 0; i + call_operands < (int) map->stack_depth; i++)
+	if (map->stack_values[i] == value) {
+	    resume->source = JIT_RESUME_STACK;
+	    resume->index = i;
+	    return 1;
     }
     if (program->value_owned_slots
 	&& program->value_ownership

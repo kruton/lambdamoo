@@ -1704,9 +1704,15 @@ the broader ownership-map and synthesized-anchor validation described below.
       ID, and the runtime expands it to canonical bytecode PC, error PC, and
       source line immediately after the native function returns. This keeps
       immutable location metadata out of the MIR instruction stream and native
-      code while preserving the existing runtime ABI at its consumers. This is
-      safe because the stubs consume no reconstruction values and therefore do
-      not extend SSA live ranges. An experiment outlining complete materialization
+      code while preserving the existing runtime ABI at its consumers. Scalar
+      constants in reconstruction state use the same principle. Their SSA IDs are
+      recorded in a packed bitset with a sparse value table; exit code omits
+      their raw stores, and materialization or compact resume reconstructs them
+      directly from metadata. Constants must be classified before local and
+      stack resume sources so compact continuations never depend on an omitted
+      runtime slot. These transformations are safe because the stubs consume no
+      reconstruction values and therefore do not extend SSA live ranges. An
+      experiment outlining complete materialization
       by reconstruction-state ID increased `#463:sha1` machine code because it
       kept many SSA values live to function-end stubs and caused additional
       register pressure; do not restore that form without an ABI which passes

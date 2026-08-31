@@ -2003,6 +2003,82 @@ binary_code(HIROp op)
     }
 }
 
+static void
+jit_build_constant_values(JITProgram *program)
+{
+    JITBlock *block;
+    Num *dense;
+    int value;
+
+    if (program->value_constant_bits || program->num_values <= 0)
+	return;
+    program->value_constant_bits = mymalloc((program->num_values + 7) / 8,
+	M_PROGRAM);
+    dense = mymalloc(sizeof(Num) * program->num_values, M_PROGRAM);
+    memset(program->value_constant_bits, 0, (program->num_values + 7) / 8);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CONST && instr->value > 0
+		&& instr->value < program->num_values
+		&& instr->literal_type != TYPE_STR
+		&& instr->literal_type != TYPE_LIST
+#ifdef WAIF_CORE
+		&& instr->literal_type != TYPE_WAIF
+#endif
+		) {
+		program->value_constant_bits[instr->value / 8]
+		    |= 1U << (instr->value % 8);
+		dense[instr->value] = (Num) instr->literal;
+		program->num_constant_values++;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    program->value_constants = program->num_constant_values
+	? mymalloc(sizeof(Num) * program->num_constant_values, M_PROGRAM) : 0;
+    program->constant_value_ids = program->num_constant_values
+	? mymalloc(sizeof(int) * program->num_constant_values, M_PROGRAM) : 0;
+    program->num_constant_values = 0;
+    for (value = 1; value < program->num_values; value++)
+	if (program->value_constant_bits[value / 8]
+	    & (1U << (value % 8))) {
+	    program->constant_value_ids[program->num_constant_values] = value;
+	    program->value_constants[program->num_constant_values++] = dense[value];
+	}
+    myfree(dense, M_PROGRAM);
+}
+
+static int
+jit_value_has_constant(JITProgram *program, int value)
+{
+    return program->value_constant_bits
+	&& (program->value_constant_bits[value / 8]
+	    & (1U << (value % 8)));
+}
+
+static Num
+jit_constant_value(JITProgram *program, int value)
+{
+    int first = 0;
+    int last = program->num_constant_values;
+
+    assert(jit_value_has_constant(program, value));
+    while (first < last) {
+	int middle = first + (last - first) / 2;
+
+	if (program->constant_value_ids[middle] < value)
+	    first = middle + 1;
+	else
+	    last = middle;
+    }
+    assert(first < program->num_constant_values
+	&& program->constant_value_ids[first] == value);
+    return program->value_constants[first];
+}
+
 static int
 integer_constant_value(JITProgram *program, int value, Num *constant)
 {
@@ -2315,6 +2391,9 @@ append_materialized_value(MIRBuild *build, JITProgram *program, int value,
 			  MIR_reg_t deopt_values)
 {
     JITInstruction *definition = jit_value_definition(program, value);
+
+    if (jit_value_has_constant(program, value))
+	return;
 
     if (owner_slot >= 0) {
 	append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -3072,6 +3151,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     int i;
 
     memset(build, 0, sizeof(MIRBuild));
+    jit_build_constant_values(program);
     if (program->status_locations) {
 	myfree(program->status_locations, M_PROGRAM);
 	program->status_locations = 0;
@@ -7157,6 +7237,12 @@ jit_program_free(JITProgram *program)
 	myfree(program->value_types, M_PROGRAM);
     if (program->value_is_tagged)
 	myfree(program->value_is_tagged, M_PROGRAM);
+    if (program->value_constant_bits)
+	myfree(program->value_constant_bits, M_PROGRAM);
+    if (program->constant_value_ids)
+	myfree(program->constant_value_ids, M_PROGRAM);
+    if (program->value_constants)
+	myfree(program->value_constants, M_PROGRAM);
     if (program->value_tag_slots)
 	myfree(program->value_tag_slots, M_PROGRAM);
     if (program->value_ownership)
@@ -7206,6 +7292,12 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(var_type) * program->num_values;
     if (program->value_is_tagged)
 	bytes += sizeof(unsigned char) * program->num_values;
+    if (program->value_constant_bits)
+	bytes += (program->num_values + 7) / 8;
+    if (program->constant_value_ids)
+	bytes += sizeof(int) * program->num_constant_values;
+    if (program->value_constants)
+	bytes += sizeof(Num) * program->num_constant_values;
     if (program->value_tag_slots)
 	bytes += sizeof(int) * program->num_values;
     if (program->value_ownership)
@@ -7618,6 +7710,14 @@ materialize_deopt_value(var_type type, Num raw)
     return materialize_deopt_value_with_ownership(type, raw, 1);
 }
 
+static Num
+jit_deopt_raw_value(JITProgram *program, int value, Num *deopt_values)
+{
+    if (jit_value_has_constant(program, value))
+	return jit_constant_value(program, value);
+    return deopt_values[value];
+}
+
 static Var
 jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
 			      var_type type, Num *deopt_values,
@@ -7635,12 +7735,13 @@ jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
 	    panic("Invalid owner-home move at compact JIT boundary");
 	if (owned_values[owner].type == TYPE_NONE) {
 	    moved = materialize_deopt_value_with_ownership(type,
-		deopt_values[value], 0);
+		jit_deopt_raw_value(program, value, deopt_values), 0);
 	    deopt_values[value] = 0;
 	    return moved;
 	}
 	if (owned_values[owner].type != type
-	    || jit_rt_var_raw(&owned_values[owner]) != deopt_values[value])
+	    || jit_rt_var_raw(&owned_values[owner])
+	       != jit_deopt_raw_value(program, value, deopt_values))
 	    panic("Mismatched owner-home move at compact JIT boundary");
 	moved = owned_values[owner];
 	owned_values[owner].type = TYPE_NONE;
@@ -7652,12 +7753,13 @@ jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
     }
     if (ownership == JIT_BOUNDARY_VALUE_MOVED_RAW) {
 	Var moved = materialize_deopt_value_with_ownership(type,
-	    deopt_values[value], 0);
+	    jit_deopt_raw_value(program, value, deopt_values), 0);
 
 	deopt_values[value] = 0;
 	return moved;
     }
-    return materialize_deopt_value(type, deopt_values[value]);
+    return materialize_deopt_value(type,
+	jit_deopt_raw_value(program, value, deopt_values));
 }
 
 static JITResumeValue *
@@ -7716,7 +7818,7 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
     if (!jit_runtime_type_is_valid(type))
 	return 0;
     *materialized = materialize_deopt_value(type,
-	frame->deopt_values[value]);
+	jit_deopt_raw_value(frame->program, value, frame->deopt_values));
     return 1;
 }
 
@@ -7915,7 +8017,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	    : program->value_types[resume->value];
 	if (jit_resume_value_needs_capture(program, resume, type))
 	    new_values[captured_values++] = materialize_deopt_value(type,
-		deopt_values[resume->value]);
+		jit_deopt_raw_value(program, resume->value, deopt_values));
     }
     if (!frame) {
 	frame = mymalloc(sizeof(JITContinuationFrame), M_PROGRAM);
@@ -8269,9 +8371,11 @@ jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
     if (type == TYPE_ANY)
 	type = (var_type) deopt_values[jit_tag_index(program, value)];
     if (map->builtin_args == 1)
-	return type == TYPE_INT && deopt_values[value] == 0;
+	return type == TYPE_INT
+	    && jit_deopt_raw_value(program, value, deopt_values) == 0;
     if (map->builtin_args < 0 && type == TYPE_LIST) {
-	Var *args = (Var *) (intptr_t) deopt_values[value];
+	Var *args = (Var *) (intptr_t)
+	    jit_deopt_raw_value(program, value, deopt_values);
 
 	return args && args[0].v.num == 1 && args[1].type == TYPE_INT
 	    && args[1].v.num == 0;
@@ -8554,7 +8658,7 @@ jit_program_execute_in_context(JITProgram *program,
 		    type = (var_type) deopt_values[jit_tag_index(program,
 			local_value)];
 		Var value = materialize_deopt_value(type,
-		    deopt_values[local_value]);
+		    jit_deopt_raw_value(program, local_value, deopt_values));
 
 		free_var(env[i]);
 		env[i] = value;

@@ -263,6 +263,7 @@ struct JITProgram {
     int num_deopt_maps;
     int num_reconstruction_states;
     int num_status_locations;
+    int num_constant_values;
     unsigned potential_exit_sites;
     unsigned elided_exit_sites;
     unsigned type_guard_sites;
@@ -282,6 +283,9 @@ struct JITProgram {
     JITProgram *pool_next;
     var_type *value_types;
     unsigned char *value_is_tagged;
+    unsigned char *value_constant_bits;
+    int *constant_value_ids;
+    Num *value_constants;
     int num_tag_slots;
     int *value_tag_slots;
     unsigned char *value_ownership;
