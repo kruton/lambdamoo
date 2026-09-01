@@ -598,6 +598,53 @@ free_activation(activation * ap, char data_too)
 	free_data(ap->bi_func_data);
     /* else bi_func_state will be later freed by bi_function */
 }
+
+vm
+checkpoint_clone_vm(vm source, int *shared_bi_data)
+{
+    vm copy = new_vm(source->task_id, source->top_activ_stack + 1);
+    unsigned i;
+
+    copy->max_stack_size = source->max_stack_size;
+    copy->top_activ_stack = source->top_activ_stack;
+    copy->root_activ_vector = source->root_activ_vector;
+    copy->func_id = source->func_id;
+    *shared_bi_data = 0;
+    for (i = 0; i <= source->top_activ_stack; i++) {
+	activation *from = &source->activ_stack[i];
+	activation *to = &copy->activ_stack[i];
+	ptrdiff_t used = from->top_rt_stack - from->base_rt_stack;
+	ptrdiff_t j;
+
+	*to = *from;
+	to->prog = program_ref(from->prog);
+	to->rt_env = copy_rt_env(from->rt_env, from->prog->num_var_names);
+	alloc_rt_stack(to, from->rt_stack_size);
+	for (j = 0; j < used; j++)
+	    to->base_rt_stack[j] = var_ref(from->base_rt_stack[j]);
+	to->top_rt_stack = to->base_rt_stack + used;
+	to->temp = var_ref(from->temp);
+#ifdef WAIF_CORE
+	to->THIS = var_ref(from->THIS);
+#endif
+	to->verb = str_ref(from->verb);
+	to->verbname = str_ref(from->verbname);
+	if (from->bi_func_data)
+	    *shared_bi_data = 1;
+    }
+    return copy;
+}
+
+void
+checkpoint_free_vm(vm the_vm)
+{
+    int i;
+
+    for (i = the_vm->top_activ_stack; i >= 0; i--)
+	free_activation(&the_vm->activ_stack[i], 0);
+    myfree(the_vm->activ_stack, M_VM);
+    myfree(the_vm, M_VM);
+}
 
 
 /** Set up another activation for calling a verb

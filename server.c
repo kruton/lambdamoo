@@ -340,6 +340,12 @@ checkpoint_timer(Timer_ID id UNUSED_, Timer_Data data UNUSED_)
     checkpoint_requested = CHKPT_TIMER;
 }
 
+void
+server_request_checkpoint(void)
+{
+    checkpoint_requested = CHKPT_FUNC;
+}
+
 static void
 set_checkpoint_timer(int first_time)
 {
@@ -466,7 +472,7 @@ main_loop(void)
 	    run_server_task(-1, SYSTEM_OBJECT, "checkpoint_started",
 			    new_list(0), "", 0);
 	    network_process_io(0);
-#ifdef UNFORKED_CHECKPOINTS
+#if CHECKPOINT_MODE == CPM_UNFORKED
 	    call_checkpoint_notifier(db_flush(FLUSH_ALL_NOW));
 #else
 	    if (!db_flush(FLUSH_ALL_NOW))
@@ -474,10 +480,17 @@ main_loop(void)
 #endif
 	    set_checkpoint_timer(0);
 	}
-#ifndef UNFORKED_CHECKPOINTS
+#if CHECKPOINT_MODE == CPM_FORKED
 	if (checkpoint_finished) {
 	    call_checkpoint_notifier(checkpoint_finished - 1);
 	    checkpoint_finished = 0;
+	}
+#elif CHECKPOINT_MODE == CPM_THREADED || CHECKPOINT_MODE == CPM_JOURNALED
+	{
+	    int successful;
+
+	    if (db_checkpoint_finished(&successful))
+		call_checkpoint_notifier(successful);
 	}
 #endif
 
@@ -902,6 +915,33 @@ emergency_mode(void)
 
 	    free_var(words);
 	}
+
+	/* Emergency-mode evaluations can call dump_database(), but this loop
+	 * does not pass through the normal server checkpoint dispatcher.
+	 */
+	if (checkpoint_requested != CHKPT_OFF) {
+	    checkpoint_requested = CHKPT_OFF;
+#if CHECKPOINT_MODE == CPM_UNFORKED
+	    call_checkpoint_notifier(db_flush(FLUSH_ALL_NOW));
+#else
+	    if (!db_flush(FLUSH_ALL_NOW))
+		call_checkpoint_notifier(0);
+#endif
+	}
+#if CHECKPOINT_MODE == CPM_FORKED
+	if (checkpoint_finished) {
+	    call_checkpoint_notifier(checkpoint_finished - 1);
+	    checkpoint_finished = 0;
+	}
+#elif CHECKPOINT_MODE == CPM_THREADED || CHECKPOINT_MODE == CPM_JOURNALED
+	{
+	    int successful;
+
+	    if (db_checkpoint_finished(&successful))
+		call_checkpoint_notifier(successful);
+	}
+#endif
+	db_flush(FLUSH_ONE_SECOND);
     }
 
     printf("Bye.  (%s)\n\n", start_ok ? "continuing" : "saving database");
@@ -1225,6 +1265,51 @@ write_active_connections(void)
 
     for (h = all_shandles; h; h = h->next)
 	dbio_printf("%"PRIdN" %"PRIdN"\n", h->player, h->listener);
+}
+
+Var
+active_connections_snapshot(void)
+{
+    int have_ckpted = (TYPE_LIST == checkpointed_connections.type);
+    int count = have_ckpted
+	? checkpointed_connections.v.list[0].v.num : 0;
+    Var snapshot;
+    shandle *h;
+    int i = 0;
+
+    for (h = all_shandles; h; h = h->next)
+	count++;
+    snapshot = new_list(count);
+    if (have_ckpted) {
+	int j;
+
+	for (j = 1; j <= checkpointed_connections.v.list[0].v.num; j++)
+	    snapshot.v.list[++i] = var_ref(checkpointed_connections.v.list[j]);
+    }
+    for (h = all_shandles; h; h = h->next) {
+	Var pair = new_list(2);
+
+	pair.v.list[1].type = pair.v.list[2].type = TYPE_OBJ;
+	pair.v.list[1].v.obj = h->player;
+	pair.v.list[2].v.obj = h->listener;
+	snapshot.v.list[++i] = pair;
+    }
+    return snapshot;
+}
+
+void
+write_active_connections_snapshot(Var snapshot)
+{
+    int count = snapshot.v.list[0].v.num;
+    int i;
+
+    dbio_printf("%d active connections with listeners\n", count);
+    for (i = 1; i <= count; i++) {
+	Var pair = snapshot.v.list[i];
+
+	dbio_printf("%"PRIdN" %"PRIdN"\n",
+		    pair.v.list[1].v.obj, pair.v.list[2].v.obj);
+    }
 }
 
 int

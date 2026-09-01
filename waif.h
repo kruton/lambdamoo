@@ -19,7 +19,7 @@
 
 
 #ifndef Waif_H
-#define Waif_H
+#define Waif_H 1
 
 #include "config.h"
 #include "options.h"
@@ -207,7 +207,10 @@ extern  int waif_bytes(Waif *);
 extern void dbio_write_waif(Var);
 extern  int dbio_read_waif(Var *);
 extern void free_waif_propdefs(WaifPropdefs *);
+extern WaifPropdefs *ref_waif_propdefs(WaifPropdefs *);
 extern void waif_rename_propdef(Object *, const char *, const char *);
+extern void waif_checkpoint_begin(void);
+extern void waif_checkpoint_merge(void);
 
 #endif		/* WAIF_CORE */
 

@@ -81,6 +81,9 @@ typedef struct {
 
 typedef vmstruct *vm;
 
+extern vm checkpoint_clone_vm(vm, int *shared_bi_data);
+extern void checkpoint_free_vm(vm);
+
 #define alloc_data(size)   mymalloc(size, M_BI_FUNC_DATA)
 #define free_data(ptr)     myfree((void *) ptr, M_BI_FUNC_DATA)
 

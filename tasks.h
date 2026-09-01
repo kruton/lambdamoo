@@ -78,6 +78,10 @@ typedef task_enum_action(*task_closure) (vm, const char *, void *);
 typedef task_enum_action(*task_enumerator) (task_closure, void *);
 extern void register_task_queue(task_enumerator);
 
+extern void tasks_checkpoint_begin(void);
+extern void tasks_checkpoint_write(void);
+extern void tasks_checkpoint_end(void);
+
 extern Var read_input_now(Objid connection);
 
 extern int next_task_start(void);

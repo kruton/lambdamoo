@@ -50,6 +50,18 @@ dbpriv_count_properties(Objid oid)
     return nprops;
 }
 
+int
+dbpriv_count_frozen_properties(Objid oid)
+{
+    Object *o;
+    int nprops = 0;
+
+    for (o = dbpriv_find_frozen_object(oid); o;
+	 o = dbpriv_find_frozen_object(o->parent))
+	nprops += o->propdefs.cur_length;
+    return nprops;
+}
+
 static int
 property_defined_at_or_below(const char *pname, int phash, Objid oid)
 {
@@ -138,6 +150,8 @@ db_add_propdef(Objid oid, const char *pname, Var value, Objid owner,
     if (h.ptr || property_defined_at_or_below(pname, str_hash(pname), oid))
 	return 0;
 
+    db_checkpoint_barrier("adding a property");
+
     o = dbpriv_find_object(oid);
     if (o->propdefs.cur_length == o->propdefs.max_length) {
 	Propdef *old_props = o->propdefs.l;
@@ -199,6 +213,8 @@ db_rename_propdef(Objid oid, const char *old, const char *new)
 		|| property_defined_at_or_below(new, str_hash(new), oid))
 		    return 0;
 	    }
+	    db_checkpoint_barrier("renaming a property");
+	    props = &dbpriv_find_object(oid)->propdefs;
 #ifdef WAIF_CORE
 	    rename_prop_recursively(oid, props->l[i].name, new);
 #endif
@@ -273,6 +289,10 @@ db_delete_propdef(Objid oid, const char *pname)
 
 	p = props->l[i];
 	if (p.hash == hash && !mystrcasecmp(p.name, pname)) {
+	    db_checkpoint_barrier("deleting a property");
+	    props = &dbpriv_find_object(oid)->propdefs;
+	    count = props->cur_length;
+	    max = props->max_length;
 	    if (p.name)
 		free_str(p.name);
 
@@ -419,6 +439,8 @@ db_find_property(Objid oid, const char *name, Var * value)
 	ptable_init = 1;
     }
     h.definer = NOTHING;
+    h.oid = oid;
+    h.index = -1;
     for (i = 0; i < (int)Arraysize(ptable); i++) {
 	if (ptable[i].hash == hash && !mystrcasecmp(name, ptable[i].name)) {
 	    static Objid ret;
@@ -447,6 +469,7 @@ db_find_property(Objid oid, const char *name, Var * value)
 		h.definer = o->id;
 		o = dbpriv_find_object(oid);
 		prop = h.ptr = o->propval + n;
+		h.index = n;
 
 		if (value) {
 		    while (prop->var.type == TYPE_CLEAR) {
@@ -485,7 +508,11 @@ void
 db_set_property_value(db_prop_handle h, Var value)
 {
     if (!h.built_in) {
-	Pval *prop = h.ptr;
+	Pval *prop;
+
+	if (h.index < 0)
+	    panic("DB_SET_PROPERTY_VALUE: Invalid property handle!");
+	prop = dbpriv_checkpoint_touch_object(h.oid)->propval + h.index;
 
 	free_var(prop->var);
 	prop->var = value;
@@ -553,7 +580,11 @@ db_set_property_owner(db_prop_handle h, Objid oid)
     if (h.built_in)
 	panic("Built-in property in DB_SET_PROPERTY_OWNER!");
     else {
-	Pval *prop = h.ptr;
+	Pval *prop;
+
+	if (h.index < 0)
+	    panic("DB_SET_PROPERTY_OWNER: Invalid property handle!");
+	prop = dbpriv_checkpoint_touch_object(h.oid)->propval + h.index;
 
 	prop->owner = oid;
     }
@@ -577,7 +608,11 @@ db_set_property_flags(db_prop_handle h, unsigned flags)
     if (h.built_in)
 	panic("Built-in property in DB_SET_PROPERTY_FLAGS!");
     else {
-	Pval *prop = h.ptr;
+	Pval *prop;
+
+	if (h.index < 0)
+	    panic("DB_SET_PROPERTY_FLAGS: Invalid property handle!");
+	prop = dbpriv_checkpoint_touch_object(h.oid)->propval + h.index;
 
 	prop->perms = flags;
     }
