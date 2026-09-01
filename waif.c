@@ -36,7 +36,26 @@
 #include "structures.h"
 #include "utils.h"
 
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
+
 static waif_count_type waif_count = 0;
+
+typedef struct Waif_Delta Waif_Delta;
+
+struct Waif_Delta {
+    Waif *identity;
+    Waif *body;
+    Waif_Delta *next;
+};
+
+static Waif_Delta *waif_deltas = NULL;
+static int waif_checkpoint_active = 0;
+
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_mutex_t waif_update_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 #define PROP_MAPPED(Mmap, Mbit)	((Mmap)[(Mbit) / 32] & (1 << ((Mbit) % 32)))
 #define MAP_PROP(Mmap, Mbit) (Mmap)[(Mbit) / 32] |= 1 << ((Mbit) % 32)
@@ -73,7 +92,7 @@ free_waif_propdefs(WaifPropdefs *wpd)
     myfree(wpd, M_WAIF_XTRA);
 }
 
-static WaifPropdefs *
+WaifPropdefs *
 ref_waif_propdefs(WaifPropdefs *wpd)
 {
     ++wpd->refcount;
@@ -581,12 +600,136 @@ update_waif_propdefs(Waif *waif)
     free_waif_propdefs(old);
 }
 
+static void
+update_waif_propdefs_locked(Waif *waif)
+{
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_lock(&waif_update_mutex);
+#endif
+    update_waif_propdefs(waif);
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_unlock(&waif_update_mutex);
+#endif
+}
+
+static Waif_Delta *
+find_waif_delta(Waif *identity)
+{
+    Waif_Delta *delta;
+
+    for (delta = waif_deltas; delta; delta = delta->next)
+	if (delta->identity == identity)
+	    return delta;
+    return NULL;
+}
+
+static void
+free_waif_body(Waif *waif)
+{
+    int i, count = count_waif_propvals(waif);
+
+    free_waif_propdefs(waif->propdefs);
+    for (i = 0; i < count; i++)
+	free_var(waif->propvals[i]);
+    if (waif->propvals)
+	myfree(waif->propvals, M_WAIF_XTRA);
+}
+
+static Waif *
+clone_waif_body(Waif *identity)
+{
+    Waif *body;
+    Waif_Delta *delta;
+    int i, count;
+
+    delta = find_waif_delta(identity);
+    if (delta)
+	return delta->body;
+
+    update_waif_propdefs_locked(identity);
+    body = mymalloc(sizeof(*body), M_WAIF);
+    *body = *identity;
+    body->propdefs = identity->propdefs
+	? ref_waif_propdefs(identity->propdefs) : NULL;
+    count = count_waif_propvals(identity);
+    body->propvals = NULL;
+    if (count) {
+	body->propvals = mymalloc(count * sizeof(Var), M_WAIF_XTRA);
+	for (i = 0; i < count; i++)
+	    body->propvals[i] = var_ref(identity->propvals[i]);
+    }
+    delta = mymalloc(sizeof(*delta), M_WAIF_XTRA);
+    delta->identity = identity;
+    delta->body = body;
+    delta->next = waif_deltas;
+    waif_deltas = delta;
+    return body;
+}
+
+static Waif *
+live_waif(Waif *identity, int writing)
+{
+    Waif_Delta *delta;
+
+    if (!waif_checkpoint_active)
+	return identity;
+    delta = find_waif_delta(identity);
+    if (delta)
+	return delta->body;
+    return writing ? clone_waif_body(identity) : identity;
+}
+
+void
+waif_checkpoint_begin(void)
+{
+    if (waif_checkpoint_active)
+	panic("WAIF_CHECKPOINT_BEGIN: Checkpoint already active");
+    waif_checkpoint_active = 1;
+}
+
+void
+waif_checkpoint_merge(void)
+{
+    Waif_Delta *delta, *next;
+
+    for (delta = waif_deltas; delta; delta = next) {
+	Waif *identity = delta->identity;
+	Waif *body = delta->body;
+
+	next = delta->next;
+	free_waif_body(identity);
+	identity->class = body->class;
+	identity->owner = body->owner;
+	identity->propdefs = body->propdefs;
+	identity->propvals = body->propvals;
+	memcpy(identity->u.pmap, body->u.pmap, sizeof(identity->u.pmap));
+	body->propdefs = NULL;
+	body->propvals = NULL;
+	myfree(body, M_WAIF);
+	myfree(delta, M_WAIF_XTRA);
+    }
+    waif_deltas = NULL;
+    waif_checkpoint_active = 0;
+}
+
 /* Called from complex_free_var()
  */
 void
 free_waif(Waif *waif)
 {
+    Waif_Delta **link;
     int i, cnt;
+
+    for (link = &waif_deltas; *link; link = &(*link)->next)
+	if ((*link)->identity == waif) {
+	    Waif_Delta *delta = *link;
+
+	    *link = delta->next;
+	    free_waif_body(delta->body);
+	    myfree(delta->body, M_WAIF);
+	    myfree(delta, M_WAIF_XTRA);
+	    break;
+	}
 
     /* assert(refcount(waif) == 0) */
     cnt = count_waif_propvals(waif);
@@ -606,7 +749,8 @@ free_waif(Waif *waif)
 Waif *
 dup_waif(Waif *waif)
 {
-    update_waif_propdefs(waif);
+    waif = live_waif(waif, 0);
+    update_waif_propdefs_locked(waif);
     panic("can't dup waif yet");
     return NULL;
 }
@@ -648,7 +792,8 @@ waif_get_prop(Waif *w, const char *name, Var *prop, Objid progr)
     static Stream *s;
     int idx;
 
-    update_waif_propdefs(w);
+    w = live_waif(w, 0);
+    update_waif_propdefs_locked(w);
 
     if (!mystrcasecmp(name, "owner")) {
 	prop->type = TYPE_OBJ;
@@ -717,7 +862,8 @@ waif_put_prop(Waif *w, const char *name, Var val, Objid progr)
     int idx, pdef_idx;
     Var *dest;
 
-    update_waif_propdefs(w);
+    w = live_waif(w, 1);
+    update_waif_propdefs_locked(w);
 
     if (!mystrcasecmp(name, "owner") || !mystrcasecmp(name, "class"))
 	/* FYI, allowing these assignments would work, because
@@ -808,7 +954,8 @@ waif_bytes(Waif *w)
     int len;
     int cnt;
 
-    update_waif_propdefs(w);
+    w = live_waif(w, 0);
+    update_waif_propdefs_locked(w);
 
     /* never need to count the propdefs becuase we're now guaranteed to
      * be sharing that with the class object which is billed for that
@@ -823,12 +970,16 @@ waif_bytes(Waif *w)
 
 static Waif **saved_waifs;
 static waif_count_type n_saved_waifs;
+static waif_count_type saved_waif_limit;
 
 static void
 waif_before_saving(void)
 {
     size_t size = sizeof(Waif *) * waif_count;
+    saved_waif_limit = waif_count;
     saved_waifs = (Waif **) mymalloc(size, M_WAIF_XTRA);
+    if (!saved_waifs && size)
+	panic("WAIF_BEFORE_SAVING: Out of memory");
     memset(saved_waifs, 0, size);
     n_saved_waifs = 0;
 }
@@ -846,7 +997,7 @@ dbio_write_waif(Var v)
      * mapping will be wrong and we'll just ignore the index.
      */
     index = w->u.save_index;
-    if (index < waif_count && saved_waifs[index] == w) {
+    if (index < saved_waif_limit && saved_waifs[index] == w) {
 	/* just refer to an old one */
 	dbio_printf("r %"PRIuWCT"\n.\n", index);	/* XXX 1.9 terminator*/
 	return;
@@ -856,7 +1007,7 @@ dbio_write_waif(Var v)
      * the saved waif will be trashed.  Has to be before the next
      * bit because that's where we trash it!
      */
-    update_waif_propdefs(w);
+    update_waif_propdefs_locked(w);
 
     /* Save the propval map info (for forked checkpoints we'll have to
      * clobber it before saving to stash the index).  Then allocate a
@@ -902,8 +1053,8 @@ static void
 waif_after_saving(int success UNUSED_)
 {
     myfree(saved_waifs, M_WAIF_XTRA);
-    if (n_saved_waifs != waif_count)
-	errlog("WARN: waif_count != n_saved_waifs!\n");
+    saved_waifs = NULL;
+    saved_waif_limit = 0;
 }
 
 static void

@@ -17,8 +17,15 @@
 
 #include "unparse.h"
 
+#include "config.h"
+#include "options.h"
+
 #include "my-ctype.h"
 #include "my-stdio.h"
+
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
 
 #include "ast.h"
 #include "decompile.h"
@@ -35,6 +42,10 @@
 #include "utils.h"
 
 static Program *prog;
+
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_mutex_t unparse_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 const char *
 unparse_error(enum error e)
@@ -677,6 +688,9 @@ void
 unparse_program(Program * p, Unparser_Receiver r, void *data,
 		int fully_parenthesize, int indent_lines, int f_index)
 {
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_lock(&unparse_mutex);
+#endif
     Stmt *stmt = decompile_program(p, f_index);
 
     prog = p;
@@ -684,6 +698,9 @@ unparse_program(Program * p, Unparser_Receiver r, void *data,
     receiver_data = data;
     list_prg(stmt, fully_parenthesize, indent_lines);
     free_stmt(stmt);
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_unlock(&unparse_mutex);
+#endif
 }
 
 static void

@@ -118,9 +118,12 @@ AC_CHECK_HEADERS([pthread.h stdatomic.h])
 AC_CHECK_FUNCS([remove rename poll select strerror strftime strtoul matherr])
 AC_CHECK_FUNCS([random lrand48 wait3 wait2 sigsetmask sigprocmask sigrelse])
 AC_CHECK_FUNCS([strtoimax])
-AS_IF([test "x$enable_def_NETWORK_IO_MODE" = xNIM_THREADED], [
+AS_IF([test "x$enable_def_NETWORK_IO_MODE" = xNIM_THREADED ||
+       test "x$enable_def_CHECKPOINT_MODE" = xCPM_THREADED], [
   AC_SEARCH_LIBS([pthread_create], [pthread], [],
-    [AC_MSG_ERROR([threaded network I/O requires pthreads])])
+    [AC_MSG_ERROR([threaded I/O or checkpoints require pthreads])])
+])
+AS_IF([test "x$enable_def_NETWORK_IO_MODE" = xNIM_THREADED], [
   AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
 #include <stdatomic.h>
 #if ATOMIC_INT_LOCK_FREE != 2

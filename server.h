@@ -252,7 +252,13 @@ extern void notify(Objid player, const char *message);
 extern void boot_player(Objid player);
 
 extern void write_active_connections(void);
+extern Var active_connections_snapshot(void);
+extern void write_active_connections_snapshot(Var);
 extern int read_active_connections(void);
+extern void server_request_checkpoint(void);
+				/* Queue a replacement checkpoint after an active
+				 * overlay checkpoint stops at a barrier.
+				 */
 
 
 

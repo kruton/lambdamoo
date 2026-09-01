@@ -27,12 +27,20 @@
 #include "my-string.h"
 #include "my-time.h"
 
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
+
 #include "functions.h"
 #include "storage.h"
 #include "streams.h"
 #include "utils.h"
 
 static FILE *log_file = 0;
+
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 void
 set_log_file(FILE * f)
@@ -42,6 +50,7 @@ set_log_file(FILE * f)
 
 int log_pcount = 5000;
 static time_t log_prev = 0;
+
 int log_report_progress_cktime(void)
 {
     time_t now = time(0);
@@ -49,11 +58,28 @@ int log_report_progress_cktime(void)
     return ((now >= log_prev + 2) && (log_prev = now, 1));
 }
 
+#if CHECKPOINT_MODE == CPM_THREADED
+int
+log_report_progress_threadsafe(void)
+{
+    int report = 0;
+
+    pthread_mutex_lock(&log_mutex);
+    if (--log_pcount <= 0)
+	report = log_report_progress_cktime();
+    pthread_mutex_unlock(&log_mutex);
+    return report;
+}
+#endif
+
 static void
 do_log(const char *prefix, const char *fmt, va_list args)
 {
     FILE *f;
 
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_lock(&log_mutex);
+#endif
     log_prev = time(0);
     log_pcount = 5000;
     if (log_file) {
@@ -67,6 +93,9 @@ do_log(const char *prefix, const char *fmt, va_list args)
 
     vfprintf(f, fmt, args);
     fflush(f);
+#if CHECKPOINT_MODE == CPM_THREADED
+    pthread_mutex_unlock(&log_mutex);
+#endif
 }
 
 void

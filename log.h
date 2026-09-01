@@ -19,6 +19,7 @@
 #define Log_H 1
 
 #include "config.h"
+#include "options.h"
 
 #include "my-stdio.h"
 
@@ -35,7 +36,12 @@ extern void log_command_history(void);
 extern void add_command_to_history(Objid player, const char *command);
 
 
-#define log_report_progress()  ((--log_pcount <= 0) && log_report_progress_cktime())
+#if CHECKPOINT_MODE == CPM_THREADED
+#  define log_report_progress() log_report_progress_threadsafe()
+extern int log_report_progress_threadsafe(void);
+#else
+#  define log_report_progress()  ((--log_pcount <= 0) && log_report_progress_cktime())
+#endif
 
 extern int log_pcount;
 extern int log_report_progress_cktime(void);

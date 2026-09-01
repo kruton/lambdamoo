@@ -177,6 +177,19 @@ TaskID current_task_id;
 static tqueue *idle_tqueues = 0, *active_tqueues = 0;
 static task *waiting_tasks = 0;	/* forked and suspended tasks */
 static ext_queue *external_queues = 0;
+static task *checkpoint_tasks = NULL;
+static int checkpoint_tasks_active = 0;
+
+typedef struct checkpoint_shared_task checkpoint_shared_task;
+
+struct checkpoint_shared_task {
+    TaskID id;
+    checkpoint_shared_task *next;
+};
+
+static checkpoint_shared_task *checkpoint_shared_tasks = NULL;
+
+static int checkpoint_task_shares_data(TaskID id);
 
 #define GET_START_TIME(ttt) \
     (ttt->kind == TASK_FORKED \
@@ -1298,6 +1311,9 @@ run_ready_tasks(void)
 		    }
 		    break;
 		case TASK_SUSPENDED:
+		    if (checkpoint_task_shares_data(
+			t->t.suspended.the_vm->task_id))
+			db_checkpoint_barrier("resuming a suspended task");
 		    current_task_id = t->t.suspended.the_vm->task_id;
 		    resume_from_previous_vm(t->t.suspended.the_vm,
 					    t->t.suspended.value);
@@ -1386,6 +1402,112 @@ register_task_queue(task_enumerator enumerator)
     external_queues = eq;
 }
 
+static task *
+clone_checkpoint_task(task *source)
+{
+    task *copy = mymalloc(sizeof(*copy), M_TASK);
+
+    copy->kind = source->kind;
+    copy->next = NULL;
+    if (source->kind == TASK_FORKED) {
+	unsigned count = source->t.forked.program->num_var_names;
+
+	copy->t.forked = source->t.forked;
+	copy->t.forked.program = program_ref(source->t.forked.program);
+	copy->t.forked.rt_env = copy_rt_env(source->t.forked.rt_env, count);
+	copy->t.forked.a.prog = copy->t.forked.program;
+	copy->t.forked.a.rt_env = copy->t.forked.rt_env;
+	copy->t.forked.a.verb = str_ref(source->t.forked.a.verb);
+	copy->t.forked.a.verbname = str_ref(source->t.forked.a.verbname);
+#ifdef WAIF_CORE
+	copy->t.forked.a.THIS = var_ref(source->t.forked.a.THIS);
+#endif
+    } else {
+	checkpoint_shared_task *shared;
+	int has_shared_data;
+
+	copy->t.suspended = source->t.suspended;
+	copy->t.suspended.value = var_ref(source->t.suspended.value);
+	copy->t.suspended.the_vm =
+	    checkpoint_clone_vm(source->t.suspended.the_vm, &has_shared_data);
+	if (has_shared_data) {
+	    shared = mymalloc(sizeof(*shared), M_TASK);
+	    shared->id = source->t.suspended.the_vm->task_id;
+	    shared->next = checkpoint_shared_tasks;
+	    checkpoint_shared_tasks = shared;
+	}
+    }
+    return copy;
+}
+
+static void
+append_checkpoint_task(task ***tail, task *source)
+{
+    task *copy;
+
+    if (source->kind != TASK_FORKED && source->kind != TASK_SUSPENDED)
+	return;
+    copy = clone_checkpoint_task(source);
+    **tail = copy;
+    *tail = &copy->next;
+}
+
+void
+tasks_checkpoint_begin(void)
+{
+    task **tail = &checkpoint_tasks;
+    task *t;
+    tqueue *tq;
+
+    if (checkpoint_tasks_active)
+	panic("TASKS_CHECKPOINT_BEGIN: Checkpoint already active");
+    checkpoint_tasks = NULL;
+    checkpoint_shared_tasks = NULL;
+    for (t = waiting_tasks; t; t = t->next)
+	append_checkpoint_task(&tail, t);
+    for (tq = active_tqueues; tq; tq = tq->next)
+	for (t = tq->first_bg; t; t = t->next)
+	    append_checkpoint_task(&tail, t);
+    checkpoint_tasks_active = 1;
+}
+
+static int
+checkpoint_task_shares_data(TaskID id)
+{
+    checkpoint_shared_task *shared;
+
+    if (!checkpoint_tasks_active)
+	return 0;
+    for (shared = checkpoint_shared_tasks; shared; shared = shared->next)
+	if (shared->id == id)
+	    return 1;
+    return 0;
+}
+
+void
+tasks_checkpoint_end(void)
+{
+    task *t, *next;
+    checkpoint_shared_task *shared, *shared_next;
+
+    for (t = checkpoint_tasks; t; t = next) {
+	next = t->next;
+	if (t->kind == TASK_SUSPENDED) {
+	    checkpoint_free_vm(t->t.suspended.the_vm);
+	    free_var(t->t.suspended.value);
+	    myfree(t, M_TASK);
+	} else
+	    free_task(t, 1);
+    }
+    for (shared = checkpoint_shared_tasks; shared; shared = shared_next) {
+	shared_next = shared->next;
+	myfree(shared, M_TASK);
+    }
+    checkpoint_tasks = NULL;
+    checkpoint_shared_tasks = NULL;
+    checkpoint_tasks_active = 0;
+}
+
 static void
 write_forked_task(forked_task ft)
 {
@@ -1450,6 +1572,29 @@ write_task_queue(void)
 	for (t = tq->first_bg; t; t = t->next)
 	    if (t->kind == TASK_SUSPENDED)
 		write_suspended_task(t->t.suspended);
+}
+
+void
+tasks_checkpoint_write(void)
+{
+    int forked_count = 0;
+    int suspended_count = 0;
+    task *t;
+
+    dbio_printf("0 clocks\n");
+    for (t = checkpoint_tasks; t; t = t->next)
+	if (t->kind == TASK_FORKED)
+	    forked_count++;
+	else
+	    suspended_count++;
+    dbio_printf("%d queued tasks\n", forked_count);
+    for (t = checkpoint_tasks; t; t = t->next)
+	if (t->kind == TASK_FORKED)
+	    write_forked_task(t->t.forked);
+    dbio_printf("%d suspended tasks\n", suspended_count);
+    for (t = checkpoint_tasks; t; t = t->next)
+	if (t->kind == TASK_SUSPENDED)
+	    write_suspended_task(t->t.suspended);
 }
 
 int
@@ -2025,6 +2170,9 @@ kill_task(TaskID id, Objid owner)
 
 	if (!is_wizard(owner) && owner != progr)
 	    return E_PERM;
+	if (t->kind == TASK_SUSPENDED
+	    && checkpoint_task_shares_data(t->t.suspended.the_vm->task_id))
+	    db_checkpoint_barrier("killing a suspended task");
 	tq = find_tqueue(progr, 0);
 	if (tq)
 	    tq->num_bg_tasks--;
@@ -2060,6 +2208,10 @@ kill_task(TaskID id, Objid owner)
 		    && t->t.suspended.the_vm->task_id == id)) {
 		if (!is_wizard(owner) && owner != tq->player)
 		    return E_PERM;
+		if (t->kind == TASK_SUSPENDED
+		    && checkpoint_task_shares_data(
+			t->t.suspended.the_vm->task_id))
+		    db_checkpoint_barrier("killing a suspended task");
 		*tt = t->next;
 		if (t->next == 0)
 		    tq->last_bg = tt;
