@@ -198,7 +198,7 @@ int
 db_add_verb(Objid oid, const char *vnames, Objid owner, unsigned flags,
 	    db_arg_spec dobj, db_prep_spec prep, db_arg_spec iobj)
 {
-    Object *o = dbpriv_find_object(oid);
+    Object *o = dbpriv_checkpoint_touch_object(oid);
     Verbdef *v, *newv;
     int count;
 
@@ -267,16 +267,38 @@ typedef struct {		/* Non-null db_verb_handles point to these */
     Verbdef *verbdef;
 } handle;
 
+static Verbdef *
+mutable_verbdef(handle *h)
+{
+    Object *old = dbpriv_find_object(h->definer);
+    Object *current;
+    Verbdef *v;
+    int index = 0;
+
+    for (v = old->verbdefs; v && v != h->verbdef; v = v->next)
+	index++;
+    if (!v)
+	panic("MUTABLE_VERBDEF: Invalid verb handle!");
+    current = dbpriv_checkpoint_touch_object(h->definer);
+    for (v = current->verbdefs; index > 0; index--)
+	v = v->next;
+    h->verbdef = v;
+    return v;
+}
+
 void
 db_delete_verb(db_verb_handle vh)
 {
     handle *h = (handle *) vh.ptr;
     Objid oid = h->definer;
-    Verbdef *v = h->verbdef;
-    Object *o = dbpriv_find_object(oid);
+    Verbdef *v;
+    Object *o;
     Verbdef *vv;
 
     db_priv_affected_callable_verb_lookup();
+
+    v = mutable_verbdef(h);
+    o = dbpriv_find_object(oid);
 
     vv = o->verbdefs;
     if (vv == v)
@@ -627,16 +649,19 @@ void
 db_set_verb_names(db_verb_handle vh, const char *names)
 {
     handle *h = (handle *) vh.ptr;
+    Verbdef *v;
 
     db_priv_affected_callable_verb_lookup();
 
     if (!h)
 	panic("DB_SET_VERB_NAMES: Null handle!");
 
-    if (h->verbdef->name)
-	free_str(h->verbdef->name);
+    v = mutable_verbdef(h);
 
-    h->verbdef->name = names;
+    if (v->name)
+	free_str(v->name);
+
+    v->name = names;
 }
 
 Objid
@@ -658,7 +683,7 @@ db_set_verb_owner(db_verb_handle vh, Objid owner)
     if (!h)
 	panic("DB_SET_VERB_OWNER: Null handle!");
 
-    h->verbdef->owner = owner;
+    mutable_verbdef(h)->owner = owner;
 }
 
 unsigned
@@ -676,14 +701,17 @@ void
 db_set_verb_flags(db_verb_handle vh, unsigned flags)
 {
     handle *h = (handle *) vh.ptr;
+    Verbdef *v;
 
     db_priv_affected_callable_verb_lookup();
 
     if (!h)
 	panic("DB_SET_VERB_FLAGS: Null handle!");
 
-    h->verbdef->perms &= ~PERMMASK;
-    h->verbdef->perms |= flags;
+    v = mutable_verbdef(h);
+
+    v->perms &= ~PERMMASK;
+    v->perms |= flags;
 }
 
 Program *
@@ -702,6 +730,7 @@ void
 db_set_verb_program(db_verb_handle vh, Program * program)
 {
     handle *h = (handle *) vh.ptr;
+    Verbdef *v;
 
     /* Not necessary, since this was only here to cope with nonprogrammed verbs, and that turns out to be handled properly in modern servers. */
 
@@ -710,9 +739,11 @@ db_set_verb_program(db_verb_handle vh, Program * program)
     if (!h)
 	panic("DB_SET_VERB_PROGRAM: Null handle!");
 
-    if (h->verbdef->program)
-	free_program(h->verbdef->program);
-    h->verbdef->program = program;
+    v = mutable_verbdef(h);
+
+    if (v->program)
+	free_program(v->program);
+    v->program = program;
 }
 
 void
@@ -734,16 +765,19 @@ db_set_verb_arg_specs(db_verb_handle vh,
 		   db_arg_spec dobj, db_prep_spec prep, db_arg_spec iobj)
 {
     handle *h = (handle *) vh.ptr;
+    Verbdef *v;
 
     db_priv_affected_callable_verb_lookup();
 
     if (!h)
 	panic("DB_SET_VERB_ARG_SPECS: Null handle!");
 
-    h->verbdef->perms = ((h->verbdef->perms & PERMMASK)
-			 | (dobj << DOBJSHIFT)
-			 | (iobj << IOBJSHIFT));
-    h->verbdef->prep = prep;
+    v = mutable_verbdef(h);
+
+    v->perms = ((v->perms & PERMMASK)
+		| (dobj << DOBJSHIFT)
+		| (iobj << IOBJSHIFT));
+    v->prep = prep;
 }
 
 int

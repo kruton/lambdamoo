@@ -30,25 +30,87 @@
 #include "my-stdlib.h"
 #include "my-string.h"
 
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
+
 #include "db_io.h"
 #include "db_private.h"
 #include "exceptions.h"
 #include "list.h"
 #include "log.h"
+#include "ref_count.h"
 #include "server.h"
 #include "storage.h"
 #include "streams.h"
 #include "str_intern.h"
 #include "tasks.h"
 #include "timers.h"
+#include "utils.h"
 #include "version.h"
+#include "waif.h"
 
 static char *input_db_name, *dump_db_name;
 static int dump_generation = 0;
+static Var checkpoint_users = { .type = TYPE_NONE };
+static Var checkpoint_connections = { .type = TYPE_NONE };
 static const char *header_format_string
 = "** LambdaMOO Database, Format Version %u **";
 
 DB_Version dbio_input_version;
+
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_t checkpoint_thread;
+static pthread_mutex_t checkpoint_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int checkpoint_thread_running = 0;
+static int checkpoint_thread_done = 0;
+static int checkpoint_thread_success = 0;
+static int checkpoint_stop_requested = 0;
+static char *checkpoint_temp_name = NULL;
+#endif
+
+static int checkpoint_result_pending = 0;
+static int checkpoint_result_success = 0;
+
+#if CHECKPOINT_MODE == CPM_THREADED || CHECKPOINT_MODE == CPM_JOURNALED
+#  define CHECKPOINT_BARRIER_ABORT_LIMIT 2
+static unsigned checkpoint_barrier_aborts = 0;
+#endif
+
+#if CHECKPOINT_MODE == CPM_JOURNALED
+#  define JOURNALED_OBJECT_BATCH 64
+#  define JOURNALED_PROGRAM_BATCH 16
+
+typedef enum {
+    JOURNALED_IDLE, JOURNALED_OBJECTS, JOURNALED_PROGRAMS,
+    JOURNALED_ROOTS
+} Journaled_Phase;
+
+static Journaled_Phase journaled_phase = JOURNALED_IDLE;
+static FILE *journaled_file = NULL;
+static char *journaled_temp_name = NULL;
+static Objid journaled_max_oid;
+static Objid journaled_oid;
+static Verbdef *journaled_verb;
+static int journaled_verb_index;
+static int journaled_nprogs;
+static int journaled_written_progs;
+#endif
+
+static int
+checkpoint_should_stop(void)
+{
+#if CHECKPOINT_MODE == CPM_THREADED
+    int stop;
+
+    pthread_mutex_lock(&checkpoint_mutex);
+    stop = checkpoint_stop_requested;
+    pthread_mutex_unlock(&checkpoint_mutex);
+    return stop;
+#else
+    return 0;
+#endif
+}
 
 
 /*********** Verb and property I/O ***********/
@@ -209,11 +271,14 @@ write_object(Objid oid)
     int i;
     int nverbdefs, nprops;
 
-    if (!valid(oid)) {
+    if (dbpriv_checkpoint_active())
+	o = dbpriv_find_frozen_object(oid);
+    else
+	o = dbpriv_find_object(oid);
+    if (!o) {
 	dbio_printf("#%"PRIdN" recycled\n", oid);
 	return;
     }
-    o = dbpriv_find_object(oid);
 
     dbio_printf("#%"PRIdN"\n", oid);
     dbio_write_string(o->name);
@@ -241,7 +306,9 @@ write_object(Objid oid)
     for (i = 0; i < o->propdefs.cur_length; i++)
 	write_propdef(&o->propdefs.l[i]);
 
-    nprops = dbpriv_count_properties(oid);
+    nprops = dbpriv_checkpoint_active()
+	? dbpriv_count_frozen_properties(oid)
+	: dbpriv_count_properties(oid);
 
     dbio_write_intmax(nprops);
     for (i = 0; i < nprops; i++)
@@ -648,7 +715,9 @@ static int
 write_db_file(const char *reason)
 {
     Objid oid;
-    Objid max_oid = db_last_used_objid();
+    Objid max_oid = dbpriv_checkpoint_active()
+	? dbpriv_frozen_last_used_objid()
+	: db_last_used_objid();
     Verbdef *v;
     Var user_list;
     int i;
@@ -658,13 +727,17 @@ write_db_file(const char *reason)
     db_run_before_save_hooks();
 
     for (oid = 0; oid <= max_oid; oid++) {
-	if (valid(oid))
-	    for (v = dbpriv_find_object(oid)->verbdefs; v; v = v->next)
+	Object *o = dbpriv_checkpoint_active()
+	    ? dbpriv_find_frozen_object(oid) : dbpriv_find_object(oid);
+
+	if (o)
+	    for (v = o->verbdefs; v; v = v->next)
 		if (v->program)
 		    nprogs++;
     }
 
-    user_list = db_all_users();
+    user_list = checkpoint_users.type == TYPE_LIST
+	? checkpoint_users : db_all_users();
 
     TRY {
 	dbio_printf(header_format_string, current_db_version);
@@ -674,16 +747,24 @@ write_db_file(const char *reason)
 	    dbio_write_objid(user_list.v.list[i].v.obj);
 	oklog("%s: Writing %"PRIdN" objects...\n", reason, max_oid + 1);
 	for (oid = 0; oid <= max_oid; oid++) {
+	    if (checkpoint_should_stop())
+		RAISE(dbpriv_dbio_failed, 0);
 	    write_object(oid);
 	    if (oid == max_oid || log_report_progress())
 		oklog("%s: Done writing %"PRIdN" objects...\n", reason, oid + 1);
 	}
 	oklog("%s: Writing %d MOO verb programs...\n", reason, nprogs);
-	for (i = 0, oid = 0; oid <= max_oid; oid++)
-	    if (valid(oid)) {
+	for (i = 0, oid = 0; oid <= max_oid; oid++) {
+	    Object *o = dbpriv_checkpoint_active()
+		? dbpriv_find_frozen_object(oid) : dbpriv_find_object(oid);
+
+	    if (checkpoint_should_stop())
+		RAISE(dbpriv_dbio_failed, 0);
+
+	    if (o) {
 		int vcount = 0;
 
-		for (v = dbpriv_find_object(oid)->verbdefs; v; v = v->next) {
+		for (v = o->verbdefs; v; v = v->next) {
 		    if (v->program) {
 			dbio_printf("#%"PRIdN":%d\n", oid, vcount);
 			dbio_write_program(v->program);
@@ -694,10 +775,19 @@ write_db_file(const char *reason)
 		    vcount++;
 		}
 	    }
+	}
+	if (checkpoint_should_stop())
+	    RAISE(dbpriv_dbio_failed, 0);
 	oklog("%s: Writing forked and suspended tasks...\n", reason);
-	write_task_queue();
+	if (dbpriv_checkpoint_active())
+	    tasks_checkpoint_write();
+	else
+	    write_task_queue();
 	oklog("%s: Writing list of formerly active connections...\n", reason);
-	write_active_connections();
+	if (checkpoint_connections.type == TYPE_LIST)
+	    write_active_connections_snapshot(checkpoint_connections);
+	else
+	    write_active_connections();
     }
     EXCEPT(dbpriv_dbio_failed)
 	success = 0;
@@ -716,11 +806,279 @@ const char *reason_names[] =
 {"DUMPING", "CHECKPOINTING", "PANIC-DUMPING"};
 
 static int
+write_dump_path(const char *temp_name, Dump_Reason reason)
+{
+    FILE *f;
+    int success = 1;
+
+    if ((f = fopen(temp_name, "w")) != 0) {
+	dbpriv_set_dbio_output(f);
+	if (!write_db_file(reason_names[reason])) {
+	    log_perror("Trying to dump database");
+	    fclose(f);
+	    remove(temp_name);
+	    success = 0;
+	} else {
+	    fflush(f);
+	    fsync(fileno(f));
+	    fclose(f);
+	    oklog("%s on %s finished\n", reason_names[reason], temp_name);
+	    if (reason != DUMP_PANIC) {
+		if (rename(temp_name, dump_db_name) != 0) {
+		    log_perror("Renaming temporary dump file");
+		    success = 0;
+		}
+	    }
+	}
+    } else {
+	log_perror("Opening temporary dump file");
+	success = 0;
+    }
+
+    return success;
+}
+
+#if CHECKPOINT_MODE == CPM_JOURNALED
+
+static void
+finish_journaled_checkpoint(int success)
+{
+    db_run_after_save_hooks(success);
+    dbpriv_dbio_output_finished();
+    if (journaled_file) {
+	if (success) {
+	    fflush(journaled_file);
+	    fsync(fileno(journaled_file));
+	}
+	fclose(journaled_file);
+	journaled_file = NULL;
+    }
+    if (success && rename(journaled_temp_name, dump_db_name) != 0) {
+	log_perror("Renaming temporary dump file");
+	success = 0;
+    }
+    if (!success)
+	remove(journaled_temp_name);
+
+    dbpriv_checkpoint_merge();
+#if WAIF_CORE
+    waif_checkpoint_merge();
+#endif
+    tasks_checkpoint_end();
+    free_var(checkpoint_users);
+    checkpoint_users.type = TYPE_NONE;
+    free_var(checkpoint_connections);
+    checkpoint_connections.type = TYPE_NONE;
+    free_str(journaled_temp_name);
+    journaled_temp_name = NULL;
+    journaled_phase = JOURNALED_IDLE;
+    checkpoint_result_success = success;
+    checkpoint_result_pending = 1;
+}
+
+static int
+start_journaled_checkpoint(const char *temp_name)
+{
+    Objid oid;
+    Verbdef *v;
+    Var user_list;
+    int i;
+    volatile int success = 1;
+
+    if (journaled_phase != JOURNALED_IDLE)
+	return 1;
+    if (!dbpriv_checkpoint_begin())
+	return 0;
+#if WAIF_CORE
+    waif_checkpoint_begin();
+#endif
+    tasks_checkpoint_begin();
+    checkpoint_users = var_ref(db_all_users());
+    checkpoint_connections = active_connections_snapshot();
+    journaled_temp_name = str_dup(temp_name);
+    journaled_max_oid = dbpriv_frozen_last_used_objid();
+    journaled_nprogs = 0;
+    for (oid = 0; oid <= journaled_max_oid; oid++) {
+	Object *o = dbpriv_find_frozen_object(oid);
+
+	if (o)
+	    for (v = o->verbdefs; v; v = v->next)
+		if (v->program)
+		    journaled_nprogs++;
+    }
+
+    db_run_before_save_hooks();
+    journaled_file = fopen(temp_name, "w");
+    if (!journaled_file) {
+	log_perror("Opening temporary dump file");
+	finish_journaled_checkpoint(0);
+	checkpoint_result_pending = 0;
+	return 0;
+    }
+    dbpriv_set_dbio_output(journaled_file);
+    user_list = checkpoint_users;
+    TRY {
+	dbio_printf(header_format_string, current_db_version);
+	dbio_printf("\n%"PRIdN"\n%d\n%d\n%"PRIdN"\n",
+		    journaled_max_oid + 1, journaled_nprogs, 0,
+		    user_list.v.list[0].v.num);
+	for (i = 1; i <= user_list.v.list[0].v.num; i++)
+	    dbio_write_objid(user_list.v.list[i].v.obj);
+    }
+    EXCEPT(dbpriv_dbio_failed)
+	success = 0;
+    ENDTRY;
+    if (!success) {
+	finish_journaled_checkpoint(0);
+	checkpoint_result_pending = 0;
+	return 0;
+    }
+
+    journaled_oid = 0;
+    journaled_verb = NULL;
+    journaled_verb_index = 0;
+    journaled_written_progs = 0;
+    journaled_phase = JOURNALED_OBJECTS;
+    oklog("CHECKPOINTING: Writing %"PRIdN" objects cooperatively...\n",
+	  journaled_max_oid + 1);
+    reset_command_history();
+    return 1;
+}
+
+static void
+advance_journaled_checkpoint(void)
+{
+    int work = 0;
+    volatile int success = 1;
+
+    if (journaled_phase == JOURNALED_IDLE)
+	return;
+    TRY {
+	while (journaled_phase == JOURNALED_OBJECTS
+	       && work++ < JOURNALED_OBJECT_BATCH) {
+	    if (journaled_oid <= journaled_max_oid)
+		write_object(journaled_oid++);
+	    else {
+		journaled_phase = JOURNALED_PROGRAMS;
+		journaled_oid = 0;
+		work = 0;
+		oklog("CHECKPOINTING: Writing %d MOO verb programs cooperatively...\n",
+		      journaled_nprogs);
+	    }
+	}
+	while (journaled_phase == JOURNALED_PROGRAMS
+	       && work++ < JOURNALED_PROGRAM_BATCH) {
+	    while (!journaled_verb && journaled_oid <= journaled_max_oid) {
+		Object *o = dbpriv_find_frozen_object(journaled_oid);
+
+		journaled_verb = o ? o->verbdefs : NULL;
+		journaled_verb_index = 0;
+		if (!journaled_verb)
+		    journaled_oid++;
+	    }
+	    if (!journaled_verb) {
+		journaled_phase = JOURNALED_ROOTS;
+		break;
+	    }
+	    if (journaled_verb->program) {
+		dbio_printf("#%"PRIdN":%d\n", journaled_oid,
+			    journaled_verb_index);
+		dbio_write_program(journaled_verb->program);
+		journaled_written_progs++;
+	    }
+	    journaled_verb = journaled_verb->next;
+	    journaled_verb_index++;
+	    if (!journaled_verb)
+		journaled_oid++;
+	}
+	if (journaled_phase == JOURNALED_ROOTS) {
+	    oklog("CHECKPOINTING: Writing forked and suspended tasks...\n");
+	    tasks_checkpoint_write();
+	    oklog("CHECKPOINTING: Writing list of formerly active connections...\n");
+	    write_active_connections_snapshot(checkpoint_connections);
+	}
+    }
+    EXCEPT(dbpriv_dbio_failed)
+	success = 0;
+    ENDTRY;
+
+    if (!success) {
+	errlog("Abandoning checkpoint attempt...\n");
+	finish_journaled_checkpoint(0);
+    } else if (journaled_phase == JOURNALED_ROOTS) {
+	oklog("CHECKPOINTING on %s finished\n", journaled_temp_name);
+	finish_journaled_checkpoint(1);
+    }
+}
+
+#endif /* CHECKPOINT_MODE == CPM_JOURNALED */
+
+#if CHECKPOINT_MODE == CPM_THREADED
+
+static void *
+checkpoint_thread_main(void *unused UNUSED_)
+{
+#ifdef CHECKPOINT_TEST_DELAY
+    /* Test builds use this delay to make the snapshot/mutation race
+     * deterministic; production builds do not define it.
+     */
+    sleep(CHECKPOINT_TEST_DELAY);
+#endif
+    int success = write_dump_path(checkpoint_temp_name, DUMP_CHECKPOINT);
+
+    pthread_mutex_lock(&checkpoint_mutex);
+    checkpoint_thread_success = success;
+    checkpoint_thread_done = 1;
+    pthread_mutex_unlock(&checkpoint_mutex);
+    return NULL;
+}
+
+static void
+finish_checkpoint_thread(int wait, int stop)
+{
+    int done;
+
+    pthread_mutex_lock(&checkpoint_mutex);
+    if (!checkpoint_thread_running) {
+	pthread_mutex_unlock(&checkpoint_mutex);
+	return;
+    }
+    if (stop)
+	checkpoint_stop_requested = 1;
+    done = checkpoint_thread_done;
+    pthread_mutex_unlock(&checkpoint_mutex);
+    if (!wait && !done)
+	return;
+
+    pthread_join(checkpoint_thread, NULL);
+    pthread_mutex_lock(&checkpoint_mutex);
+    checkpoint_result_success = checkpoint_thread_success;
+    checkpoint_result_pending = 1;
+    checkpoint_thread_running = 0;
+    checkpoint_thread_done = 0;
+    checkpoint_stop_requested = 0;
+    pthread_mutex_unlock(&checkpoint_mutex);
+
+    dbpriv_checkpoint_merge();
+#if WAIF_CORE
+    waif_checkpoint_merge();
+#endif
+    tasks_checkpoint_end();
+    free_var(checkpoint_users);
+    checkpoint_users.type = TYPE_NONE;
+    free_var(checkpoint_connections);
+    checkpoint_connections.type = TYPE_NONE;
+    free_str(checkpoint_temp_name);
+    checkpoint_temp_name = NULL;
+}
+
+#endif /* CHECKPOINT_MODE == CPM_THREADED */
+
+static int
 dump_database(Dump_Reason reason)
 {
     Stream *s = new_stream(100);
     char *temp_name;
-    FILE *f;
     int success;
 
   retryDumping:
@@ -738,9 +1096,7 @@ dump_database(Dump_Reason reason)
 
     oklog("%s on %s ...\n", reason_names[reason], temp_name);
 
-#ifdef UNFORKED_CHECKPOINTS
-    reset_command_history();
-#else
+#if CHECKPOINT_MODE == CPM_FORKED
     if (reason == DUMP_CHECKPOINT) {
 	switch (fork_server("checkpointer")) {
 	case FORK_PARENT:
@@ -755,47 +1111,76 @@ dump_database(Dump_Reason reason)
 	    break;
 	}
     }
+#elif CHECKPOINT_MODE == CPM_THREADED
+    if (reason == DUMP_CHECKPOINT) {
+	if (checkpoint_thread_running) {
+	    free_stream(s);
+	    return 1;
+	}
+	if (!dbpriv_checkpoint_begin()) {
+	    free_stream(s);
+	    return 0;
+	}
+#if WAIF_CORE
+	waif_checkpoint_begin();
+#endif
+	tasks_checkpoint_begin();
+	checkpoint_users = var_ref(db_all_users());
+	checkpoint_connections = active_connections_snapshot();
+	checkpoint_temp_name = str_dup(temp_name);
+	checkpoint_thread_done = 0;
+	checkpoint_thread_success = 0;
+	checkpoint_result_success = 0;
+	checkpoint_stop_requested = 0;
+	if (pthread_create(&checkpoint_thread, NULL,
+			   checkpoint_thread_main, NULL) != 0) {
+	    free_str(checkpoint_temp_name);
+	    checkpoint_temp_name = NULL;
+	    free_var(checkpoint_users);
+	    checkpoint_users.type = TYPE_NONE;
+	    free_var(checkpoint_connections);
+	    checkpoint_connections.type = TYPE_NONE;
+	    dbpriv_checkpoint_merge();
+#if WAIF_CORE
+	    waif_checkpoint_merge();
+#endif
+	    tasks_checkpoint_end();
+	    free_stream(s);
+	    return 0;
+	}
+	checkpoint_thread_running = 1;
+	reset_command_history();
+	free_stream(s);
+	return 1;
+    }
+#elif CHECKPOINT_MODE == CPM_JOURNALED
+    if (reason == DUMP_CHECKPOINT) {
+	success = start_journaled_checkpoint(temp_name);
+	free_stream(s);
+	return success;
+    }
 #endif
 
-    success = 1;
-    if ((f = fopen(temp_name, "w")) != 0) {
-	dbpriv_set_dbio_output(f);
-	if (!write_db_file(reason_names[reason])) {
-	    log_perror("Trying to dump database");
-	    fclose(f);
-	    remove(temp_name);
-	    if (reason == DUMP_CHECKPOINT) {
-		errlog("Abandoning checkpoint attempt...\n");
-		success = 0;
-	    } else {
-		int retry_interval = 60;
+#if CHECKPOINT_MODE == CPM_UNFORKED
+    reset_command_history();
+#endif
 
-		errlog("Waiting %d seconds and retrying dump...\n",
-		       retry_interval);
-		timer_sleep(retry_interval);
-		goto retryDumping;
-	    }
-	} else {
-	    fflush(f);
-	    fsync(fileno(f));
-	    fclose(f);
-	    oklog("%s on %s finished\n", reason_names[reason], temp_name);
-	    if (reason != DUMP_PANIC) {
-		remove(dump_db_name);
-		if (rename(temp_name, dump_db_name) != 0) {
-		    log_perror("Renaming temporary dump file");
-		    success = 0;
-		}
-	    }
-	}
-    } else {
-	log_perror("Opening temporary dump file");
-	success = 0;
+    success = write_dump_path(temp_name, reason);
+
+    if (!success && reason != DUMP_CHECKPOINT) {
+	int retry_interval = 60;
+
+	errlog("Waiting %d seconds and retrying dump...\n", retry_interval);
+	timer_sleep(retry_interval);
+	goto retryDumping;
     }
+
+    if (!success && reason == DUMP_CHECKPOINT)
+	errlog("Abandoning checkpoint attempt...\n");
 
     free_stream(s);
 
-#ifndef UNFORKED_CHECKPOINTS
+#if CHECKPOINT_MODE == CPM_FORKED
     if (reason == DUMP_CHECKPOINT)
 	/* We're a child, so we'd better go away. */
 	exit(!success);
@@ -868,6 +1253,13 @@ db_flush(enum db_flush_type type)
 {
     int success = 0;
 
+#if CHECKPOINT_MODE == CPM_THREADED
+    finish_checkpoint_thread(0, 0);
+#elif CHECKPOINT_MODE == CPM_JOURNALED
+    if (type == FLUSH_IF_FULL || type == FLUSH_ONE_SECOND)
+	advance_journaled_checkpoint();
+#endif
+
     switch (type) {
     case FLUSH_IF_FULL:
     case FLUSH_ONE_SECOND:
@@ -886,6 +1278,84 @@ db_flush(enum db_flush_type type)
     return success;
 }
 
+#if CHECKPOINT_MODE == CPM_THREADED || CHECKPOINT_MODE == CPM_JOURNALED
+static void
+checkpoint_barrier_aborted(const char *operation)
+{
+    checkpoint_barrier_aborts++;
+    errlog("CHECKPOINTING: blocked by %s (%u/%u); retrying checkpoint...\n",
+	   operation, checkpoint_barrier_aborts,
+	   CHECKPOINT_BARRIER_ABORT_LIMIT);
+}
+#endif
+
+void
+db_checkpoint_barrier(const char *operation)
+{
+#if CHECKPOINT_MODE == CPM_THREADED
+    int active = dbpriv_checkpoint_active();
+
+    if (!active)
+	return;
+    if (checkpoint_barrier_aborts >= CHECKPOINT_BARRIER_ABORT_LIMIT) {
+	errlog("CHECKPOINTING: blocked repeatedly by %s; waiting for checkpoint to finish...\n",
+	       operation);
+	finish_checkpoint_thread(1, 0);
+	if (checkpoint_result_success)
+	    checkpoint_barrier_aborts = 0;
+	else
+	    errlog("CHECKPOINTING: checkpoint failed while %s was waiting.\n",
+		   operation);
+    } else {
+	finish_checkpoint_thread(1, 1);
+	if (!checkpoint_result_success) {
+	    checkpoint_barrier_aborted(operation);
+	    server_request_checkpoint();
+	}
+    }
+#elif CHECKPOINT_MODE == CPM_JOURNALED
+    if (journaled_phase != JOURNALED_IDLE) {
+	if (checkpoint_barrier_aborts >= CHECKPOINT_BARRIER_ABORT_LIMIT) {
+	    errlog("CHECKPOINTING: blocked repeatedly by %s; finishing checkpoint before continuing...\n",
+		   operation);
+	    while (journaled_phase != JOURNALED_IDLE)
+		advance_journaled_checkpoint();
+	    if (checkpoint_result_success)
+		checkpoint_barrier_aborts = 0;
+	    else
+		errlog("CHECKPOINTING: checkpoint failed while %s was waiting.\n",
+		       operation);
+	} else {
+	    finish_journaled_checkpoint(0);
+	    checkpoint_barrier_aborted(operation);
+	    server_request_checkpoint();
+	}
+    }
+#else
+    if (dbpriv_checkpoint_active())
+	dbpriv_checkpoint_merge();
+#endif
+}
+
+int
+db_checkpoint_finished(int *success)
+{
+#if CHECKPOINT_MODE == CPM_THREADED
+    finish_checkpoint_thread(0, 0);
+#elif CHECKPOINT_MODE == CPM_JOURNALED
+    advance_journaled_checkpoint();
+#endif
+    if (!checkpoint_result_pending)
+	return 0;
+    *success = checkpoint_result_success;
+#if CHECKPOINT_MODE == CPM_THREADED || CHECKPOINT_MODE == CPM_JOURNALED
+    if (*success)
+	checkpoint_barrier_aborts = 0;
+#endif
+    checkpoint_result_pending = 0;
+    return 1;
+}
+
 int64_t
 db_disk_size(void)
 {
@@ -901,6 +1371,7 @@ db_disk_size(void)
 void
 db_shutdown(void)
 {
+    db_checkpoint_barrier("shutdown");
     dump_database(DUMP_SHUTDOWN);
 
     free_str(input_db_name);

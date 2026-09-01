@@ -121,7 +121,8 @@ struct ES_CtxBlock {
 };
 
 extern Exception ANY;
-extern ES_CtxBlock *ES_exceptionStack;
+extern ES_CtxBlock *ES_GetExceptionStack(void);
+extern void ES_SetExceptionStack(ES_CtxBlock *);
 extern void ES_RaiseException(Exception * exception, int value);
 
 #define RAISE(e, v)	ES_RaiseException(&e, v)
@@ -134,8 +135,8 @@ extern void ES_RaiseException(Exception * exception, int value);
 								\
 	    ES_ctx.nx = 0;					\
 	    ES_ctx.finally = 0;					\
-	    ES_ctx.link = ES_exceptionStack;			\
-	    ES_exceptionStack = &ES_ctx;			\
+	    ES_ctx.link = ES_GetExceptionStack();		\
+	    ES_SetExceptionStack(&ES_ctx);			\
 	    							\
 	    if (setjmp((void *) ES_ctx.jmp) != 0)		\
 		ES_es = ES_Exception;				\
@@ -148,7 +149,7 @@ extern void ES_RaiseException(Exception * exception, int value);
 #define EXCEPT(e)						\
 		    /* TRY body or handler goes here */		\
 		    if (ES_es == ES_EvalBody)			\
-			ES_exceptionStack = ES_ctx.link;	\
+			ES_SetExceptionStack(ES_ctx.link);	\
 		    break;					\
 		}						\
 		if (ES_es == ES_Initialize) {			\
@@ -158,7 +159,7 @@ extern void ES_RaiseException(Exception * exception, int value);
 		} else if (ES_ctx.id == &e  ||  &e == &ANY) {	\
 		    int	exception_value = ES_ctx.value;		\
 								\
-		    ES_exceptionStack = ES_ctx.link;		\
+		    ES_SetExceptionStack(ES_ctx.link);		\
 		    exception_value = exception_value;		\
 			/* avoid warnings */			\
 				/* handler goes here */
@@ -170,7 +171,7 @@ extern void ES_RaiseException(Exception * exception, int value);
 		if (ES_es == ES_Initialize)			\
 		    ES_ctx.finally = 1;				\
 		else {						\
-		    ES_exceptionStack = ES_ctx.link;		\
+		    ES_SetExceptionStack(ES_ctx.link);		\
 		    /* FINALLY body goes here */		\
 
 

@@ -25,6 +25,10 @@
 #include "my-string.h"
 #include "my-stdio.h"
 
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
+
 #include "exceptions.h"
 #include "log.h"
 #include "storage.h"
@@ -63,18 +67,60 @@ new_stream(size_t size)
 Exception stream_too_big;
 size_t stream_alloc_maximum = 0;
 
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_key_t stream_exceptions_key;
+static pthread_once_t stream_exceptions_once = PTHREAD_ONCE_INIT;
+
+static void
+make_stream_exceptions_key(void)
+{
+    if (pthread_key_create(&stream_exceptions_key, NULL) != 0)
+	panic("Can't create stream-exception thread key");
+}
+
+static int
+stream_exception_depth(void)
+{
+    void *depth;
+
+    pthread_once(&stream_exceptions_once, make_stream_exceptions_key);
+    depth = pthread_getspecific(stream_exceptions_key);
+    return (int) (long) depth;
+}
+
+static void
+set_stream_exception_depth(int depth)
+{
+    pthread_once(&stream_exceptions_once, make_stream_exceptions_key);
+    if (pthread_setspecific(stream_exceptions_key, (void *) (long) depth) != 0)
+	panic("Can't set stream-exception thread key");
+}
+#else
 static int allow_stream_exceptions = 0;
+
+static int
+stream_exception_depth(void)
+{
+    return allow_stream_exceptions;
+}
+
+static void
+set_stream_exception_depth(int depth)
+{
+    allow_stream_exceptions = depth;
+}
+#endif
 
 void
 enable_stream_exceptions(void)
 {
-    ++allow_stream_exceptions;
+    set_stream_exception_depth(stream_exception_depth() + 1);
 }
 
 void
 disable_stream_exceptions(void)
 {
-    --allow_stream_exceptions;
+    set_stream_exception_depth(stream_exception_depth() - 1);
 }
 
 static int
@@ -85,7 +131,7 @@ grew(Stream * s, size_t need)
 
     size_t newlen = s->current + need;
     NEXT_2_POWER(newlen);
-    if (allow_stream_exceptions > 0) {
+    if (stream_exception_depth() > 0) {
 	if (newlen > stream_alloc_maximum) {
 	    if (s->current + need < stream_alloc_maximum)
 		newlen = stream_alloc_maximum;
