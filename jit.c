@@ -41,6 +41,14 @@
 
 static int jit_runtime_value_slots(JITProgram *);
 
+static int
+jit_deopt_map_bridges_builtin(JITDeoptMap *map)
+{
+    return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
+	|| (jit_deopt_map_is_specialized_builtin(map)
+	    && builtin_function_is_protected((unsigned) map->builtin_func));
+}
+
 static inline double
 raw_to_double(int64_t raw)
 {
@@ -300,28 +308,38 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
 }
 
 Var *
-jit_rt_list_append_owned(Var *owned_values, int owner, Var *list,
+jit_rt_list_append_owned(Var *owned_values, unsigned *home_capacities,
+			 int owner, Var *list,
 			 int64_t elem_raw, int elem_type)
 {
     Var elem, res;
 
     assert(owned_values && owner >= 0);
-    assert(owned_values[owner].type == TYPE_LIST);
-    assert(owned_values[owner].v.list == list);
+    assert(owned_values[owner].type == TYPE_NONE
+	   || (owned_values[owner].type == TYPE_LIST
+	       && owned_values[owner].v.list == list));
     elem = var_ref(raw_to_var(elem_raw, elem_type));
-    res = owned_values[owner];
-    owned_values[owner].type = TYPE_NONE;
-    owned_values[owner].v.num = 0;
+    if (owned_values[owner].type == TYPE_LIST) {
+	res = owned_values[owner];
+	owned_values[owner].type = TYPE_NONE;
+	owned_values[owner].v.num = 0;
+    } else {
+	res.type = TYPE_LIST;
+	res.v.list = list;
+	res = var_ref(res);
+    }
     res = listappend(res, elem);
     owned_values[owner] = res;
+    home_capacities[owner] = 0;
     return res.v.list;
 }
 
 Var *
-jit_rt_fixed_list_append_owned(Var *owned_values, int owner, Var *list,
+jit_rt_fixed_list_append_owned(Var *owned_values, unsigned *home_capacities,
+			       int owner, Var *list,
 			       int index, int64_t elem_raw, int elem_type)
 {
-    Var elem;
+    Var elem, res;
 
     assert(owned_values && owner >= 0);
     /*
@@ -334,9 +352,26 @@ jit_rt_fixed_list_append_owned(Var *owned_values, int owner, Var *list,
 	       && owned_values[owner].v.list == list));
     assert(index > 1 && list[0].v.num == index - 1);
     elem = var_ref(raw_to_var(elem_raw, elem_type));
-    list[index] = elem;
-    list[0].v.num = index;
-    return list;
+
+    if (owned_values[owner].type == TYPE_LIST
+	&& home_capacities[owner] >= (unsigned) index) {
+	list[index] = elem;
+	list[0].v.num = index;
+	return list;
+    }
+    if (owned_values[owner].type == TYPE_LIST) {
+	res = owned_values[owner];
+	owned_values[owner].type = TYPE_NONE;
+	owned_values[owner].v.num = 0;
+	res = listappend(res, elem);
+	owned_values[owner] = res;
+    } else {
+	res.type = TYPE_LIST;
+	res.v.list = list;
+	res = listappend(var_ref(res), elem);
+    }
+    home_capacities[owner] = 0;
+    return res.v.list;
 }
 
 void
@@ -1048,13 +1083,15 @@ jit_native_frame_release_invocation(JITNativeFrame *frame)
 void
 jit_native_frame_bind_runtime(JITNativeFrame *frame, void *storage,
 			      size_t bytes, Var *homes, unsigned num_homes,
-			      unsigned char *home_states)
+			      unsigned char *home_states,
+			      unsigned *home_capacities)
 {
     frame->runtime_storage = storage;
     frame->runtime_bytes = bytes;
     frame->homes = homes;
     frame->num_homes = num_homes;
     frame->home_states = home_states;
+    frame->home_capacities = home_capacities;
 }
 
 void
@@ -1088,7 +1125,8 @@ jit_native_frame_adopt_continuation_runtime(JITNativeFrame *frame,
     }
     jit_native_frame_bind_runtime(frame, continuation->runtime_storage,
 	continuation->runtime_bytes, continuation->owned_values,
-	continuation->program->num_owned_slots, continuation->home_states);
+	continuation->program->num_owned_slots, continuation->home_states,
+	continuation->home_capacities);
     jit_native_frame_mark_runtime_owned(frame);
     frame->runtime_borrower = continuation;
     continuation->runtime_owner = frame;
@@ -1106,6 +1144,7 @@ jit_native_frame_return_continuation_runtime(
 	|| frame->runtime_storage != continuation->runtime_storage
 	|| frame->runtime_bytes != continuation->runtime_bytes
 	|| frame->homes != continuation->owned_values
+	|| frame->home_capacities != continuation->home_capacities
 	|| frame->home_states != continuation->home_states)
 	return 0;
     frame->runtime_borrower = 0;
@@ -1127,7 +1166,8 @@ jit_native_frame_continuation_matches(const JITNativeFrame *frame, int map_id)
 	&& continuation->runtime_owner == frame
 	&& !continuation->owns_runtime
 	&& frame->owns_runtime
-	&& continuation->runtime_storage == frame->runtime_storage;
+	&& continuation->runtime_storage == frame->runtime_storage
+	&& continuation->home_capacities == frame->home_capacities;
 }
 
 void
@@ -1170,6 +1210,7 @@ jit_native_frame_unbind_runtime(JITNativeFrame *frame)
     frame->homes = 0;
     frame->num_homes = 0;
     frame->home_states = 0;
+    frame->home_capacities = 0;
     frame->owns_runtime = 0;
 }
 
@@ -1339,11 +1380,15 @@ jit_native_frame_verify(const JITExecutionContext *context,
 	    || frame->runtime_borrower->runtime_storage
 	       != frame->runtime_storage
 	    || frame->runtime_borrower->owned_values != frame->homes
+	    || frame->runtime_borrower->home_capacities
+	       != frame->home_capacities
 	    || frame->runtime_borrower->home_states != frame->home_states
 	    || frame->runtime_borrower->runtime_bytes != frame->runtime_bytes))
 	return 0;
-    if ((frame->num_homes && (!frame->homes || !frame->home_states))
-	|| (!frame->num_homes && (frame->homes || frame->home_states)))
+    if ((frame->num_homes
+	 && (!frame->homes || !frame->home_states || !frame->home_capacities))
+	|| (!frame->num_homes
+	    && (frame->homes || frame->home_states || frame->home_capacities)))
 	return 0;
     for (i = 0; i < frame->num_homes; i++) {
 	unsigned j;
@@ -1564,6 +1609,30 @@ typedef struct JITPool {
 } JITPool;
 
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
+#define JIT_DEFAULT_HOT_THRESHOLD 32
+#define JIT_DEFAULT_MAX_POOL_BYTES ((size_t) 256 * 1024 * 1024)
+
+typedef enum {
+    JIT_ROTATION_NONE,
+    JIT_ROTATION_MEMORY_LIMIT,
+    JIT_ROTATION_MANUAL,
+    JIT_ROTATION_POLICY_CHANGE,
+    JIT_ROTATION_PROTECTION_CHANGE
+} JITRotationReason;
+
+typedef struct {
+    size_t max_pool_bytes;
+    time_t generation_started_at;
+    uint64_t rotations;
+    unsigned hot_threshold;
+    JITRotationReason pending_reason;
+    JITRotationReason last_reason;
+} JITPoolPolicy;
+
+static JITPoolPolicy jit_pool_policy = {
+    JIT_DEFAULT_MAX_POOL_BYTES, 0, 0, JIT_DEFAULT_HOT_THRESHOLD,
+    JIT_ROTATION_NONE, JIT_ROTATION_NONE
+};
 static uint64_t next_module_serial = 0;
 static FILE *jit_perf_map_file = 0;
 static char jit_perf_map_filename[64];
@@ -1586,6 +1655,43 @@ jit_perf_map_write_program(JITProgram *program)
 	    (unsigned long) (uintptr_t) program->machine_code,
 	    (unsigned long) program->machine_code_len, name);
     fflush(jit_perf_map_file);
+}
+
+static const char *
+jit_rotation_reason_name(JITRotationReason reason)
+{
+    switch (reason) {
+    case JIT_ROTATION_MEMORY_LIMIT:
+	return "memory-limit";
+    case JIT_ROTATION_MANUAL:
+	return "manual";
+    case JIT_ROTATION_POLICY_CHANGE:
+	return "policy-change";
+    case JIT_ROTATION_PROTECTION_CHANGE:
+	return "protection-change";
+    case JIT_ROTATION_NONE:
+    default:
+	return "none";
+    }
+}
+
+static size_t
+jit_pool_reclaimable_bytes(void)
+{
+    size_t bytes = 0;
+
+    if (jit_shared_pool.context)
+	bytes += _MIR_code_allocated_size(jit_shared_pool.context);
+    if (jit_shared_pool.allocator)
+	bytes += jit_shared_pool.allocator->live_bytes;
+    return bytes;
+}
+
+static void
+jit_pool_request_rotation_reason(JITRotationReason reason)
+{
+    if (jit_pool_policy.pending_reason == JIT_ROTATION_NONE)
+	jit_pool_policy.pending_reason = reason;
 }
 
 int
@@ -1684,6 +1790,8 @@ jit_ensure_shared_context(void)
 	return 0;
     }
     jit_load_externals(jit_shared_pool.context);
+    if (jit_pool_policy.generation_started_at == 0)
+	jit_pool_policy.generation_started_at = time(0);
     return 1;
 }
 
@@ -1703,6 +1811,9 @@ jit_pool_register(JITProgram *program)
     jit_shared_pool.compiled_count++;
     jit_shared_pool.total_machine_code_bytes += program->machine_code_len;
     jit_perf_map_write_program(program);
+    if (jit_pool_policy.max_pool_bytes
+	&& jit_pool_reclaimable_bytes() >= jit_pool_policy.max_pool_bytes)
+	jit_pool_request_rotation_reason(JIT_ROTATION_MEMORY_LIMIT);
 }
 
 static void
@@ -1735,12 +1846,23 @@ jit_pool_unregister(JITProgram *program)
     program->pool_next = 0;
 }
 
-void
-jit_pool_reset(void)
+static void
+jit_pool_rotate(JITRotationReason reason, int log_rotation)
 {
     JITProgram *current = jit_shared_pool.active_head;
+    JITPoolStats before;
+    time_t now = time(0);
+    time_t elapsed = 0;
 
+    jit_pool_stats(&before);
+    if (jit_pool_policy.generation_started_at > 0
+	&& now >= jit_pool_policy.generation_started_at)
+	elapsed = now - jit_pool_policy.generation_started_at;
     jit_continuation_materialize_all();
+
+    jit_pool_stats(&before);
+    if (before.native_chain_active_frames != 0)
+	panic("Rotating JIT pool with active native frames");
 
     while (current) {
 	JITProgram *next = current->pool_next;
@@ -1749,6 +1871,7 @@ jit_pool_reset(void)
 	current->machine_code = 0;
 	current->machine_code_len = 0;
 	current->pool_generation = 0;
+	current->warmup_count = 0;
 	current->pool_prev = 0;
 	current->pool_next = 0;
 	current = next;
@@ -1768,12 +1891,98 @@ jit_pool_reset(void)
     jit_shared_pool.generation++;
     if (jit_shared_pool.generation == 0)
 	jit_shared_pool.generation = 1;
+    jit_pool_policy.generation_started_at = now;
+    jit_pool_policy.pending_reason = JIT_ROTATION_NONE;
+    if (log_rotation) {
+	jit_pool_policy.rotations++;
+	jit_pool_policy.last_reason = reason;
+	oklog("JIT_POOL_ROTATE: reason=%s generation=%"PRIu64"->%"PRIu64
+	      " elapsed=%lds active=%"PRIu64" machine=%lu native=%lu"
+	      " mir_heap=%lu reclaimable=%lu max=%lu hot_threshold=%u\n",
+	      jit_rotation_reason_name(reason), before.generation,
+	      jit_shared_pool.generation, (long) elapsed,
+	      before.active_programs,
+	      (unsigned long) before.total_machine_code_bytes,
+	      (unsigned long) before.total_native_allocated_bytes,
+	      (unsigned long) before.total_mir_heap_bytes,
+	      (unsigned long) (before.total_native_allocated_bytes
+			       + before.total_mir_heap_bytes),
+	      (unsigned long) jit_pool_policy.max_pool_bytes,
+	      jit_pool_policy.hot_threshold);
+    }
+}
+
+void
+jit_pool_reset(void)
+{
+    jit_pool_rotate(JIT_ROTATION_MANUAL, 1);
+}
+
+void
+jit_pool_request_rotation(void)
+{
+    jit_pool_request_rotation_reason(JIT_ROTATION_MANUAL);
+}
+
+void
+jit_pool_maintain(void)
+{
+    JITRotationReason reason = jit_pool_policy.pending_reason;
+
+    if (reason != JIT_ROTATION_NONE)
+	jit_pool_rotate(reason, 1);
+}
+
+int
+jit_pool_set_policy(unsigned hot_threshold, size_t max_pool_bytes)
+{
+    size_t current_bytes = jit_pool_reclaimable_bytes();
+
+    if (hot_threshold < 1 || hot_threshold > UCHAR_MAX)
+	return 0;
+    if (hot_threshold != jit_pool_policy.hot_threshold
+	&& (jit_shared_pool.context || jit_shared_pool.compiled_count))
+	jit_pool_request_rotation_reason(JIT_ROTATION_POLICY_CHANGE);
+    jit_pool_policy.hot_threshold = hot_threshold;
+    jit_pool_policy.max_pool_bytes = max_pool_bytes;
+    if (max_pool_bytes && current_bytes >= max_pool_bytes)
+	jit_pool_request_rotation_reason(JIT_ROTATION_POLICY_CHANGE);
+    return 1;
+}
+
+void
+jit_pool_policy_stats(JITPoolPolicyStats *stats)
+{
+    JITPoolStats pool;
+    time_t now = time(0);
+
+    if (!stats)
+	return;
+    jit_pool_stats(&pool);
+    memset(stats, 0, sizeof(*stats));
+    stats->generation = pool.generation;
+    stats->rotations = jit_pool_policy.rotations;
+    stats->active_programs = pool.active_programs;
+    stats->max_pool_bytes = jit_pool_policy.max_pool_bytes;
+    stats->machine_code_bytes = pool.total_machine_code_bytes;
+    stats->native_allocated_bytes = pool.total_native_allocated_bytes;
+    stats->mir_heap_bytes = pool.total_mir_heap_bytes;
+    stats->reclaimable_bytes = pool.total_native_allocated_bytes
+	+ pool.total_mir_heap_bytes;
+    stats->generation_started_at = jit_pool_policy.generation_started_at;
+    if (stats->generation_started_at > 0 && now >= stats->generation_started_at)
+	stats->generation_age = now - stats->generation_started_at;
+    stats->hot_threshold = jit_pool_policy.hot_threshold;
+    stats->rotation_pending
+	= jit_pool_policy.pending_reason != JIT_ROTATION_NONE;
+    stats->last_rotation_reason
+	= jit_rotation_reason_name(jit_pool_policy.last_reason);
 }
 
 void
 jit_shutdown(void)
 {
-    jit_pool_reset();
+    jit_pool_rotate(JIT_ROTATION_NONE, 0);
     jit_perf_map_stop();
 }
 
@@ -1815,6 +2024,7 @@ typedef struct {
     MIR_reg_t execution_context;
     MIR_reg_t native_frame;
     MIR_reg_t owned_values;
+    MIR_reg_t home_capacities;
     MIR_item_t proto_is_true;
     MIR_item_t import_is_true;
     MIR_item_t proto_equality;
@@ -1887,6 +2097,26 @@ struct JITStatusExit {
     unsigned bytecode_pc;
     unsigned source_lineno;
     JITStatusExit *next;
+};
+
+typedef struct JITTickBatchExit JITTickBatchExit;
+
+struct JITTickBatchExit {
+    MIR_label_t label;
+    MIR_label_t tick_abort;
+    MIR_label_t seconds_abort;
+    JITTickBatchExit *next;
+};
+
+typedef struct JITNegativeModExit JITNegativeModExit;
+
+struct JITNegativeModExit {
+    MIR_label_t label;
+    MIR_label_t continuation;
+    MIR_reg_t source;
+    MIR_reg_t destination;
+    UNum mask;
+    JITNegativeModExit *next;
 };
 
 static int
@@ -2665,6 +2895,51 @@ jit_fixed_list_tail_index(JITProgram *program, JITInstruction *tail)
     return 0;
 }
 
+static int
+jit_fixed_list_tail_has_fresh_capacity(JITProgram *program,
+				       JITInstruction *tail)
+{
+    JITInstruction *head = tail;
+    JITInstruction *definition;
+    JITInstruction *instr;
+    int value;
+    int owner;
+
+    while ((definition = jit_value_definition(program, head->src1)) != 0) {
+	if (definition->kind == HIR_TAC_UNARY
+	    && definition->op == HIR_OP_MAKE_SINGLETON_LIST) {
+	    head = definition;
+	    break;
+	}
+	if (definition->kind != HIR_TAC_BINARY
+	    || definition->op != HIR_OP_LIST_ADD_TAIL)
+	    return 0;
+	head = definition;
+    }
+    if (!definition || !program->value_owned_slots
+	|| head->value <= 0 || head->value >= program->num_values)
+	return 0;
+    owner = program->value_owned_slots[head->value];
+    if (owner < 0)
+	return 0;
+    value = head->value;
+    for (instr = head->next; instr && instr != tail; instr = instr->next) {
+	if (instr->exit_mask != JIT_EXIT_NONE)
+	    return 0;
+	if (instr->kind == HIR_TAC_CONST)
+	    continue;
+	if (instr->kind != HIR_TAC_BINARY
+	    || instr->op != HIR_OP_LIST_ADD_TAIL
+	    || instr->src1 != value || instr->value <= 0
+	    || instr->value >= program->num_values
+	    || program->value_owned_slots[instr->value] != owner)
+	    return 0;
+	value = instr->value;
+    }
+    return instr == tail && tail->src1 == value
+	&& program->value_owned_slots[tail->value] == owner;
+}
+
 typedef enum {
     JIT_LIST_APPEND_BORROWED,
     JIT_LIST_APPEND_CONSUME_HOME
@@ -3132,6 +3407,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     MIR_label_t common_return;
     JITStatusExit *status_exits = 0;
     JITStatusExit *last_status_exit = 0;
+    JITTickBatchExit *tick_batch_exits = 0;
+    JITTickBatchExit *last_tick_batch_exit = 0;
+    JITNegativeModExit *negative_mod_exits = 0;
+    JITNegativeModExit *last_negative_mod_exit = 0;
     JITBlock *block;
     char module_name[64];
     char func_name[64];
@@ -3210,15 +3489,16 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     MIR_T_I32, "elem_type");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
     build->proto_list_append_owned = MIR_new_proto(build->context,
-	"proto_list_append_owned", 1, &res_p, 5, MIR_T_P, "owned_values",
-	MIR_T_I32, "owner", MIR_T_P, "l", MIR_T_I64, "elem_raw",
-	MIR_T_I32, "elem_type");
+	"proto_list_append_owned", 1, &res_p, 6, MIR_T_P, "owned_values",
+	MIR_T_P, "home_capacities", MIR_T_I32, "owner", MIR_T_P, "l",
+	MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
     build->import_list_append_owned = MIR_new_import(build->context,
 	"jit_rt_list_append_owned");
     build->proto_fixed_list_append_owned = MIR_new_proto(build->context,
-	"proto_fixed_list_append_owned", 1, &res_p, 6, MIR_T_P,
-	"owned_values", MIR_T_I32, "owner", MIR_T_P, "l", MIR_T_I32,
-	"index", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+	"proto_fixed_list_append_owned", 1, &res_p, 7, MIR_T_P,
+	"owned_values", MIR_T_P, "home_capacities", MIR_T_I32, "owner",
+	MIR_T_P, "l", MIR_T_I32, "index", MIR_T_I64, "elem_raw",
+	MIR_T_I32, "elem_type");
     build->import_fixed_list_append_owned = MIR_new_import(build->context,
 	"jit_rt_fixed_list_append_owned");
 
@@ -3336,6 +3616,11 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     owned_values = MIR_reg(build->context, "owned_values",
 			  build->function->u.func);
     build->owned_values = owned_values;
+    build->home_capacities = new_reg(build, "home_capacities");
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_mem_op(build->context, MIR_T_P,
+	    offsetof(JITNativeFrame, home_capacities), build->native_frame, 0, 1)));
     tick_result = new_reg(build, "tick_result");
     timeout_value = new_reg(build, "timeout_value");
     status = new_reg(build, "status");
@@ -3538,6 +3823,48 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				       0, error_out, 0, 1)));
 		    break;
 		case HIR_TAC_TICK:
+		    if (instr->tick_batch_count == (unsigned char) -1)
+			break;
+		    if (instr->tick_batch_count > 1) {
+			JITTickBatchExit *batch_exit
+			    = mymalloc(sizeof(JITTickBatchExit), M_PROGRAM);
+
+			tick_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
+			    -1, instr->bytecode_pc, instr->source_lineno);
+			seconds_abort = new_status_exit(build, &status_exits,
+			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
+			    -1, instr->bytecode_pc, instr->source_lineno);
+			batch_exit->label = MIR_new_label(build->context);
+			batch_exit->tick_abort = tick_abort;
+			batch_exit->seconds_abort = seconds_abort;
+			batch_exit->next = 0;
+			if (last_tick_batch_exit)
+			    last_tick_batch_exit->next = batch_exit;
+			else
+			    tick_batch_exits = batch_exit;
+			last_tick_batch_exit = batch_exit;
+			if (!ticks_since_timeout_check)
+			    append(build, MIR_new_insn(build->context, MIR_BT,
+				MIR_new_label_op(build->context, batch_exit->label),
+				MIR_new_mem_op(build->context, MIR_T_I32, 0,
+				    timed_out, 0, 1)));
+			append(build, MIR_new_insn(build->context, MIR_BLE,
+			    MIR_new_label_op(build->context, batch_exit->label),
+			    MIR_new_reg_op(build->context, tick_result),
+			    MIR_new_int_op(build->context,
+				instr->tick_batch_count)));
+			append(build, MIR_new_insn(build->context, MIR_SUB,
+			    MIR_new_reg_op(build->context, tick_result),
+			    MIR_new_reg_op(build->context, tick_result),
+			    MIR_new_int_op(build->context,
+				instr->tick_batch_count)));
+			ticks_since_timeout_check += instr->tick_batch_count;
+			if (ticks_since_timeout_check
+			    >= JIT_TIMEOUT_CHECK_TICK_INTERVAL)
+			    ticks_since_timeout_check = 0;
+			break;
+		    }
 		    if (instr->op != HIR_OP_CHARGE_TICK) {
 			tick_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
@@ -3551,7 +3878,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 								 tick_result),
 						  MIR_new_reg_op(build->context,
 								 tick_result),
-						  MIR_new_int_op(build->context, 1)));
+						  MIR_new_int_op(build->context,
+							instr->tick_batch_count
+							? instr->tick_batch_count : 1)));
 		    if (instr->op == HIR_OP_CHARGE_TICK)
 			break;
 		    append(build, MIR_new_insn(build->context, MIR_BLE,
@@ -3569,7 +3898,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_new_label_op(build->context, seconds_abort),
 			    MIR_new_reg_op(build->context, timeout_value)));
 		    }
-		    ticks_since_timeout_check++;
+		    ticks_since_timeout_check += instr->tick_batch_count
+			? instr->tick_batch_count : 1;
 		    if (ticks_since_timeout_check
 			>= JIT_TIMEOUT_CHECK_TICK_INTERVAL)
 			ticks_since_timeout_check = 0;
@@ -4494,8 +4824,82 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			raw_value = append_raw_value(build, program, values,
 				instr->src2, deopt_values, &copy_serial);
 			if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME
-			    && fixed_index > 0)
-			    append(build, MIR_new_call_insn(build->context, 9,
+			    && fixed_index > 0
+			    && program->value_types && instr->src2 > 0
+			    && instr->src2 < program->num_values
+			    && !(program->value_is_tagged
+				 && program->value_is_tagged[instr->src2])
+			    && program->value_types[instr->src2] == TYPE_INT
+			    && jit_fixed_list_tail_has_fresh_capacity(program,
+				instr)) {
+			    MIR_reg_t list = values[instr->src1];
+
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    fixed_index * sizeof(Var) + offsetof(Var, v.num),
+				    list, 0, 1),
+				MIR_new_reg_op(build->context, raw_value)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    fixed_index * sizeof(Var) + offsetof(Var, type),
+				    list, 0, 1),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), list, 0, 1),
+				MIR_new_int_op(build->context, fixed_index)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, list)));
+			} else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME
+			    && fixed_index > 0
+			    && program->value_types && instr->src2 > 0
+			    && instr->src2 < program->num_values
+			    && !(program->value_is_tagged
+				 && program->value_is_tagged[instr->src2])
+			    && program->value_types[instr->src2] == TYPE_INT) {
+			    MIR_reg_t list = values[instr->src1];
+			    MIR_reg_t capacity;
+			    MIR_label_t slow = MIR_new_label(build->context);
+			    MIR_label_t appended = MIR_new_label(build->context);
+
+			    sprintf(name, "tail_capacity%d", copy_serial++);
+			    capacity = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, capacity),
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    program->value_owned_slots[instr->src1]
+					* sizeof(unsigned),
+				    build->home_capacities, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BLT,
+				MIR_new_label_op(build->context, slow),
+				MIR_new_reg_op(build->context, capacity),
+				MIR_new_int_op(build->context, fixed_index)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    fixed_index * sizeof(Var) + offsetof(Var, v.num),
+				    list, 0, 1),
+				MIR_new_reg_op(build->context, raw_value)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    fixed_index * sizeof(Var) + offsetof(Var, type),
+				    list, 0, 1),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context,
+				    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+				    offsetof(Var, v.num), list, 0, 1),
+				MIR_new_int_op(build->context, fixed_index)));
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, list)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, appended)));
+			    append(build, slow);
+			    append(build, MIR_new_call_insn(build->context, 10,
 				MIR_new_ref_op(build->context,
 				    build->proto_fixed_list_append_owned),
 				MIR_new_ref_op(build->context,
@@ -4503,6 +4907,28 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context,
 				    values[instr->value]),
 				MIR_new_reg_op(build->context, owned_values),
+				MIR_new_reg_op(build->context,
+				    build->home_capacities),
+				MIR_new_int_op(build->context,
+				    program->value_owned_slots[instr->src1]),
+				MIR_new_reg_op(build->context,
+				    values[instr->src1]),
+				MIR_new_int_op(build->context, fixed_index),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, type_reg)));
+			    append(build, appended);
+			} else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME
+			    && fixed_index > 0)
+			    append(build, MIR_new_call_insn(build->context, 10,
+				MIR_new_ref_op(build->context,
+				    build->proto_fixed_list_append_owned),
+				MIR_new_ref_op(build->context,
+				    build->import_fixed_list_append_owned),
+				MIR_new_reg_op(build->context,
+				    values[instr->value]),
+				MIR_new_reg_op(build->context, owned_values),
+				MIR_new_reg_op(build->context,
+				    build->home_capacities),
 				MIR_new_int_op(build->context,
 				    program->value_owned_slots[instr->src1]),
 				MIR_new_reg_op(build->context,
@@ -4511,7 +4937,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context, raw_value),
 				MIR_new_reg_op(build->context, type_reg)));
 			else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME)
-			    append(build, MIR_new_call_insn(build->context, 8,
+			    append(build, MIR_new_call_insn(build->context, 9,
 				MIR_new_ref_op(build->context,
 				    build->proto_list_append_owned),
 				MIR_new_ref_op(build->context,
@@ -4519,6 +4945,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_reg_op(build->context,
 				    values[instr->value]),
 				MIR_new_reg_op(build->context, owned_values),
+				MIR_new_reg_op(build->context,
+				    build->home_capacities),
 				MIR_new_int_op(build->context,
 				    program->value_owned_slots[instr->src1]),
 				MIR_new_reg_op(build->context,
@@ -5418,6 +5846,39 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			append(build, done);
 			break;
 		    }
+		    if (instr->op == HIR_OP_ROTL32) {
+			MIR_reg_t left, right;
+			Num count;
+			char name[32];
+
+			if (sizeof(Num) * CHAR_BIT <= 32
+			    || !integer_constant_value(program, instr->src2, &count)
+			    || count <= 0 || count >= 32) {
+			    append_deopt_exit(build, program, instr, values,
+				deopt_map_out, deopt_values, status, common_return);
+			    break;
+			}
+			sprintf(name, "rotl_left%d", copy_serial++);
+			left = new_reg(build, name);
+			sprintf(name, "rotl_right%d", copy_serial++);
+			right = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_LSHS,
+			    MIR_new_reg_op(build->context, left),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_int_op(build->context, count)));
+			append(build, MIR_new_insn(build->context, MIR_URSHS,
+			    MIR_new_reg_op(build->context, right),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_int_op(build->context, 32 - count)));
+			append(build, MIR_new_insn(build->context, MIR_ORS,
+			    MIR_new_reg_op(build->context, left),
+			    MIR_new_reg_op(build->context, left),
+			    MIR_new_reg_op(build->context, right)));
+			append(build, MIR_new_insn(build->context, MIR_UEXT32,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, left)));
+			break;
+		    }
 		    {
 			MIR_label_t arithmetic_error = 0;
 			MIR_label_t invalid_argument = 0;
@@ -5865,38 +6326,30 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				MIR_new_label_op(build->context, loop)));
 			append(build, done);
 		    } else if (instr->op == HIR_OP_MOD && modulus_shift >= 0) {
-			char name[32];
-			MIR_reg_t sign, bias, adjusted, multiple;
+			JITNegativeModExit *exit = mymalloc(
+			    sizeof(JITNegativeModExit), M_PROGRAM);
 			UNum mask = ((UNum) 1 << modulus_shift) - 1;
 
-			sprintf(name, "mod_sign%d", copy_serial++);
-			sign = new_reg(build, name);
-			sprintf(name, "mod_bias%d", copy_serial++);
-			bias = new_reg(build, name);
-			sprintf(name, "mod_adjust%d", copy_serial++);
-			adjusted = new_reg(build, name);
-			sprintf(name, "mod_multiple%d", copy_serial++);
-			multiple = new_reg(build, name);
-			append(build, MIR_new_insn(build->context, MIR_RSH,
-			    MIR_new_reg_op(build->context, sign),
+			exit->label = MIR_new_label(build->context);
+			exit->continuation = MIR_new_label(build->context);
+			exit->source = values[instr->src1];
+			exit->destination = values[instr->value];
+			exit->mask = mask;
+			exit->next = 0;
+			if (last_negative_mod_exit)
+			    last_negative_mod_exit->next = exit;
+			else
+			    negative_mod_exits = exit;
+			last_negative_mod_exit = exit;
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+			    MIR_new_label_op(build->context, exit->label),
 			    MIR_new_reg_op(build->context, values[instr->src1]),
-			    MIR_new_int_op(build->context, sizeof(Num) * CHAR_BIT - 1)));
+			    MIR_new_int_op(build->context, 0)));
 			append(build, MIR_new_insn(build->context, MIR_AND,
-			    MIR_new_reg_op(build->context, bias),
-			    MIR_new_reg_op(build->context, sign),
-			    MIR_new_int_op(build->context, (Num) mask)));
-			append(build, MIR_new_insn(build->context, MIR_ADD,
-			    MIR_new_reg_op(build->context, adjusted),
-			    MIR_new_reg_op(build->context, values[instr->src1]),
-			    MIR_new_reg_op(build->context, bias)));
-			append(build, MIR_new_insn(build->context, MIR_AND,
-			    MIR_new_reg_op(build->context, multiple),
-			    MIR_new_reg_op(build->context, adjusted),
-			    MIR_new_int_op(build->context, (Num) ~mask)));
-			append(build, MIR_new_insn(build->context, MIR_SUB,
 			    MIR_new_reg_op(build->context, values[instr->value]),
 			    MIR_new_reg_op(build->context, values[instr->src1]),
-			    MIR_new_reg_op(build->context, multiple)));
+			    MIR_new_int_op(build->context, (Num) mask)));
+			append(build, exit->continuation);
 		    } else if (instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD) {
 			MIR_label_t normal = MIR_new_label(build->context);
 			MIR_label_t done = MIR_new_label(build->context);
@@ -5936,6 +6389,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    } else {
 			if (instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
 			    || instr->op == HIR_OP_LSHR) {
+			    if (!instr->shift_count_proven_valid) {
 			    append(build, MIR_new_insn(build->context, MIR_BLT,
 				MIR_new_label_op(build->context,
 						 invalid_argument),
@@ -5949,6 +6403,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						 values[instr->src2]),
 				MIR_new_int_op(build->context,
 						 sizeof(Num) * CHAR_BIT)));
+			    }
 			}
 			if (values[instr->value] == values[instr->src1]
 			    && values[instr->value] == values[instr->src2]) {
@@ -6876,6 +7331,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    else
 			type = MIR_new_int_op(build->context,
 			    program->value_types[instr->value]);
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_mem_op(build->context, MIR_T_I32,
+			    program->value_owned_slots[instr->value]
+				* sizeof(unsigned),
+			    build->home_capacities, 0, 1),
+			MIR_new_int_op(build->context, 0)));
 		    append(build, MIR_new_call_insn(build->context, 6,
 			MIR_new_ref_op(build->context,
 			    build->proto_owned_replace),
@@ -6885,6 +7346,18 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			MIR_new_int_op(build->context,
 			    program->value_owned_slots[instr->value]),
 			MIR_new_reg_op(build->context, raw), type));
+		    if (instr->kind == HIR_TAC_UNARY
+			&& instr->op == HIR_OP_MAKE_SINGLETON_LIST) {
+			int capacity = jit_fixed_list_capacity(program, instr);
+
+			if (capacity > 1)
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, MIR_T_I32,
+				    program->value_owned_slots[instr->value]
+					* sizeof(unsigned),
+				    build->home_capacities, 0, 1),
+				MIR_new_int_op(build->context, capacity)));
+		    }
 		}
 		{
 		    int operands[3] = { instr->src1, instr->src2, instr->src3 };
@@ -6983,6 +7456,54 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     0, deopt_map_out, 0, 1),
 			      MIR_new_int_op(build->context, 0)));
     return_status(build, status, common_return, JIT_RUN_FALLBACK);
+    while (negative_mod_exits) {
+	JITNegativeModExit *next = negative_mod_exits->next;
+	MIR_reg_t magnitude, remainder;
+	char name[32];
+
+	sprintf(name, "cold_mod_magnitude%d", copy_serial++);
+	magnitude = new_reg(build, name);
+	sprintf(name, "cold_mod_remainder%d", copy_serial++);
+	remainder = new_reg(build, name);
+	append(build, negative_mod_exits->label);
+	append(build, MIR_new_insn(build->context, MIR_NEG,
+	    MIR_new_reg_op(build->context, magnitude),
+	    MIR_new_reg_op(build->context, negative_mod_exits->source)));
+	append(build, MIR_new_insn(build->context, MIR_AND,
+	    MIR_new_reg_op(build->context, remainder),
+	    MIR_new_reg_op(build->context, magnitude),
+	    MIR_new_int_op(build->context, (Num) negative_mod_exits->mask)));
+	append(build, MIR_new_insn(build->context, MIR_NEG,
+	    MIR_new_reg_op(build->context, negative_mod_exits->destination),
+	    MIR_new_reg_op(build->context, remainder)));
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+	    MIR_new_label_op(build->context, negative_mod_exits->continuation)));
+	myfree(negative_mod_exits, M_PROGRAM);
+	negative_mod_exits = next;
+    }
+    while (tick_batch_exits) {
+	JITTickBatchExit *next = tick_batch_exits->next;
+
+	append(build, tick_batch_exits->label);
+	append(build, MIR_new_insn(build->context, MIR_SUB,
+	    MIR_new_reg_op(build->context, tick_result),
+	    MIR_new_reg_op(build->context, tick_result),
+	    MIR_new_int_op(build->context, 1)));
+	append(build, MIR_new_insn(build->context, MIR_BLE,
+	    MIR_new_label_op(build->context, tick_batch_exits->tick_abort),
+	    MIR_new_reg_op(build->context, tick_result),
+	    MIR_new_int_op(build->context, 0)));
+	append(build, MIR_new_insn(build->context, MIR_BT,
+	    MIR_new_label_op(build->context, tick_batch_exits->seconds_abort),
+	    MIR_new_mem_op(build->context, MIR_T_I32, 0, timed_out, 0, 1)));
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_reg_op(build->context, tick_result),
+	    MIR_new_int_op(build->context, 0)));
+	append(build, MIR_new_insn(build->context, MIR_JMP,
+	    MIR_new_label_op(build->context, tick_batch_exits->tick_abort)));
+	myfree(tick_batch_exits, M_PROGRAM);
+	tick_batch_exits = next;
+    }
     append_status_exits(build, status_exits, program, values, labels, source_location,
 			deopt_map_out, deopt_values, error_out, status,
 			common_return);
@@ -7561,6 +8082,68 @@ jit_program_is_direct_leaf(JITProgram *program)
     return direct_leaf;
 }
 
+static void
+jit_program_sync_warmup(JITProgram *program)
+{
+    if (program->state == JIT_STATE_PENDING
+	&& program->pool_generation != jit_shared_pool.generation) {
+	program->pool_generation = jit_shared_pool.generation;
+	program->warmup_count = 0;
+    }
+}
+
+int
+jit_program_admit_interpreter_entry(JITProgram *program)
+{
+    if (!program || !program->eligible)
+	return 0;
+    if (program->state == JIT_STATE_COMPILED)
+	return 1;
+    if (program->state != JIT_STATE_PENDING)
+	return 0;
+    jit_program_sync_warmup(program);
+    if (program->warmup_count < jit_pool_policy.hot_threshold)
+	program->warmup_count++;
+    return program->warmup_count >= jit_pool_policy.hot_threshold
+	&& jit_pool_policy.pending_reason == JIT_ROTATION_NONE;
+}
+
+int
+jit_program_claim_native_entry(JITProgram *program)
+{
+    if (!program || !program->eligible)
+	return 0;
+    if (program->state == JIT_STATE_COMPILED)
+	return 1;
+    if (program->state != JIT_STATE_PENDING
+	|| jit_pool_policy.pending_reason != JIT_ROTATION_NONE)
+	return 0;
+    jit_program_sync_warmup(program);
+    if ((unsigned) program->warmup_count + 1
+	< jit_pool_policy.hot_threshold)
+	return 0;
+    program->warmup_count = jit_pool_policy.hot_threshold;
+    return 1;
+}
+
+unsigned
+jit_program_warmup_count(JITProgram *program)
+{
+    if (!program || program->state == JIT_STATE_COMPILED)
+	return 0;
+    jit_program_sync_warmup(program);
+    return program->warmup_count;
+}
+
+uint64_t
+jit_program_warmup_generation(JITProgram *program)
+{
+    if (!program)
+	return 0;
+    jit_program_sync_warmup(program);
+    return program->pool_generation;
+}
+
 int
 jit_program_anchor_count(JITProgram *program)
 {
@@ -7622,7 +8205,7 @@ jit_program_compile(JITProgram *program)
     generation = builtin_protection_generation();
     if (program->state == JIT_STATE_COMPILED
 	&& program->protection_generation != generation) {
-	jit_pool_reset();
+	jit_pool_rotate(JIT_ROTATION_PROTECTION_CHANGE, 1);
     }
     if (program->state == JIT_STATE_COMPILED
 	&& program->pool_generation != jit_shared_pool.generation) {
@@ -7676,6 +8259,8 @@ jit_program_compile(JITProgram *program)
     MIR_gen_finish(jit_shared_pool.context);
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
+    program->pool_generation = 0;
+    program->warmup_count = 0;
     jit_pool_register(program);
     gettimeofday(&finished, 0);
     program->compile_time_us += elapsed_us(&started, &finished);
@@ -7887,6 +8472,39 @@ jit_resume_value_needs_capture(JITResumeValue *resume, var_type type)
 }
 
 static int
+jit_continuation_boundary_operand(JITContinuationFrame *frame, int value,
+				  Var *boundary, unsigned boundary_depth,
+				  Var *materialized)
+{
+    JITDeoptMap *map = &frame->program->deopt_maps[frame->map_id];
+    int operands = jit_call_stack_operands(map);
+    unsigned outer_depth;
+    int unpack_builtin;
+    int i;
+
+    if (operands < 0 || (unsigned) operands > map->stack_depth)
+	return 0;
+    outer_depth = map->stack_depth - operands;
+    unpack_builtin = jit_deopt_map_is_specialized_builtin(map);
+    for (i = 0; i < operands; i++) {
+	if (map->stack_values[outer_depth + i] != value)
+	    continue;
+	if (unpack_builtin) {
+	    if (boundary_depth != 1 || boundary[0].type != TYPE_LIST
+		|| i >= boundary[0].v.list[0].v.num)
+		return 0;
+	    *materialized = var_ref(boundary[0].v.list[i + 1]);
+	} else {
+	    if ((unsigned) i >= boundary_depth)
+		return 0;
+	    *materialized = var_ref(boundary[i]);
+	}
+	return 1;
+    }
+    return 0;
+}
+
+static int
 jit_continuation_prepare_boundary_activation(JITContinuationFrame *frame,
 					     activation *a, Var *boundary,
 					     unsigned boundary_depth)
@@ -7933,8 +8551,11 @@ jit_continuation_prepare_boundary_activation(JITContinuationFrame *frame,
 	int value = jit_deopt_map_local_value(program, map, i);
 	Var saved;
 
-	if (value > 0
-	    && jit_continuation_materialized_value(frame, value, &saved)) {
+	if (value <= 0)
+	    continue;
+	if (jit_continuation_materialized_value(frame, value, &saved)
+	    || jit_continuation_boundary_operand(frame, value, boundary,
+		boundary_depth, &saved)) {
 	    free_var(a->rt_env[i]);
 	    a->rt_env[i] = saved;
 	}
@@ -7973,6 +8594,7 @@ static JITContinuationFrame *
 jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 			 void *runtime_storage, Var *borrowed_locals,
 			 Var *owned_values, unsigned char *home_states,
+			 unsigned *home_capacities,
 			 size_t runtime_bytes,
 			 JITContinuationFrame *frame)
 {
@@ -8100,6 +8722,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     frame->deopt_values = deopt_values;
     frame->borrowed_locals = borrowed_locals;
     frame->owned_values = owned_values;
+    frame->home_capacities = home_capacities;
     frame->home_states = home_states;
     frame->runtime_bytes = runtime_bytes;
     if (program->usage)
@@ -8122,7 +8745,7 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
     unsigned stack_depth;
 
     if (!native_frame || !a || !(program = native_frame->program)
-	|| a->jit_continuation || map_id <= 0
+	|| a->jit_continuation || map_id < 0
 	|| map_id >= program->num_deopt_maps
 	|| (native_frame->owns_boundary_stack && dispatched))
 	return 0;
@@ -8133,6 +8756,16 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
 	|| a->top_rt_stack < a->base_rt_stack
 	|| a->top_rt_stack > a->base_rt_stack + a->rt_stack_size)
 	return 0;
+    if (map_id == 0) {
+	if (dispatched || native_frame->owns_boundary_stack
+	    || native_frame->runtime_borrower
+	    || a->top_rt_stack != a->base_rt_stack)
+	    return 0;
+	a->pc = map->bytecode_pc;
+	a->error_pc = map->error_pc;
+	a->resume_key = invalid_resume_key();
+	return 1;
+    }
     if (native_frame->owns_boundary_stack) {
 	unsigned i;
 
@@ -8176,8 +8809,8 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
 	borrowed_locals = (Var *) ((char *) native_frame->runtime_storage
 	    + deopt_storage_bytes);
     continuation = jit_continuation_capture(program, map_id, deopt_values,
-	0, borrowed_locals, native_frame->homes, native_frame->home_states, 0,
-	0);
+	0, borrowed_locals, native_frame->homes, native_frame->home_states,
+	native_frame->home_capacities, 0, 0);
     if (!continuation)
 	return 0;
     jit_continuation_attach(continuation, a);
@@ -8370,6 +9003,26 @@ jit_continuation_materialize(activation *a)
     return 1;
 }
 
+int
+jit_continuation_materialize_boundary(activation *a, Var *boundary,
+				      unsigned boundary_depth)
+{
+    JITContinuationFrame *frame;
+
+    if (!a || !(frame = a->jit_continuation))
+	return 1;
+    if (!jit_continuation_prepare_boundary_activation(frame, a, boundary,
+	    boundary_depth))
+	return 0;
+    if (frame->program->usage)
+	frame->program->usage->continuation_materializations++;
+    free_var(a->temp);
+    a->temp.type = TYPE_NONE;
+    a->temp.v.num = 0;
+    jit_continuation_free(frame);
+    return 1;
+}
+
 void
 jit_continuation_materialize_all(void)
 {
@@ -8520,6 +9173,7 @@ jit_program_execute_in_context(JITProgram *program,
     Num *deopt_values;
     Var *borrowed_locals = 0;
     Var *owned_values = 0;
+    unsigned *home_capacities = 0;
     unsigned char *home_states = 0;
     void *runtime_storage;
     size_t deopt_bytes;
@@ -8598,12 +9252,14 @@ jit_program_execute_in_context(JITProgram *program,
     runtime_bytes = deopt_storage_bytes
 	+ sizeof(Var) * (program->num_borrowed_locals
 			 + program->num_owned_slots)
+	+ sizeof(unsigned) * program->num_owned_slots
 	+ program->num_owned_slots;
     if (runtime_from_continuation) {
 	runtime_storage = continuation_in->runtime_storage;
 	deopt_values = continuation_in->deopt_values;
 	borrowed_locals = continuation_in->borrowed_locals;
 	owned_values = continuation_in->owned_values;
+	home_capacities = continuation_in->home_capacities;
 	home_states = continuation_in->home_states;
     } else {
 	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
@@ -8628,17 +9284,21 @@ jit_program_execute_in_context(JITProgram *program,
 	    owned_values = program->num_owned_slots
 		? (Var *) ((char *) runtime_storage + deopt_storage_bytes
 		    + sizeof(Var) * program->num_borrowed_locals) : 0;
+	    home_capacities = program->num_owned_slots
+		? (unsigned *) (owned_values + program->num_owned_slots) : 0;
 	    home_states = program->num_owned_slots
-		? (unsigned char *) (owned_values + program->num_owned_slots) : 0;
+		? (unsigned char *) (home_capacities
+		    + program->num_owned_slots) : 0;
 	    for (i = 0; i < program->num_owned_slots; i++) {
 		owned_values[i].type = TYPE_NONE;
+		home_capacities[i] = 0;
 		home_states[i] = JIT_HOME_EMPTY;
 	    }
 	}
 	program->active_runtime_bytes += runtime_bytes;
     }
     jit_native_frame_bind_runtime(native_frame, runtime_storage, runtime_bytes,
-	owned_values, program->num_owned_slots, home_states);
+	owned_values, program->num_owned_slots, home_states, home_capacities);
     if (!runtime_from_continuation)
 	jit_native_frame_mark_runtime_owned(native_frame);
     function = (NativeFunction) program->native_function;
@@ -8700,7 +9360,8 @@ jit_program_execute_in_context(JITProgram *program,
 	    if (operands >= 0 && (unsigned) operands <= map->stack_depth)
 		frame = jit_continuation_capture(program, deopt_map,
 		    deopt_values, runtime_storage, borrowed_locals,
-		    owned_values, home_states, runtime_bytes, continuation_in);
+		    owned_values, home_states, home_capacities, runtime_bytes,
+		    continuation_in);
 
 	    if (frame) {
 		*continuation_out = frame;
@@ -8935,7 +9596,7 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 			!= JIT_BOUNDARY_VALUE_RETAINED;
 	    }
 	    snprintf(line, sizeof(line),
-		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d guard-mask=%u guarded=%u exits=%u deopt=%d resume=%d/%d locals=%d/%d stack=%u tags=%d state=%d owner-homes=%d boundary-moves=%d last-use=%u direct-int-list=%d",
+		     "  pc %-5u line %-5u kind=%d op=%d func=%u/%s v%d <- v%d,v%d,v%d type=%d tagged=%d local=%d guard-mask=%u guarded=%u exits=%u deopt=%d resume=%d/%d locals=%d/%d stack=%u tags=%d state=%d owner-homes=%d boundary-moves=%d last-use=%u direct-int-list=%d tick-batch=%u shift-count-proven=%d",
 		     instr->bytecode_pc, instr->source_lineno, instr->kind,
 		     instr->op, instr->func, func_name, instr->value,
 		     instr->src1, instr->src2,
@@ -8962,7 +9623,10 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		     instr->deopt_map > 0
 		     ? program->deopt_maps[instr->deopt_map].reconstruction_state : -1,
 		     owner_homes, boundary_moves, instr->owned_last_use,
-		     instr->direct_int_list_index_set);
+		     instr->direct_int_list_index_set,
+		     instr->tick_batch_count == (unsigned char) -1
+		     ? 0 : instr->tick_batch_count,
+		     instr->shift_count_proven_valid);
 	    add_line(line, data);
 	    if (instr->deopt_map > 0
 		&& program->deopt_maps[instr->deopt_map].native_resume) {

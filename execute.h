@@ -73,7 +73,8 @@ typedef struct activation {
     int debug;
     struct JITContinuationFrame *jit_continuation;
 } activation;
-#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (18 * V) + X(WAIF_CORE, B(Var)))
+/* Resume and JIT continuation state is server-owned, not user quota. */
+#define BQM_DESCRIBE_activation(B,F,V,X)   ((4 * F) + (14 * V) + X(WAIF_CORE, B(Var)))
 
 typedef struct PreparedVerbCall {
     Program *program;

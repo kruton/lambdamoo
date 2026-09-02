@@ -51,6 +51,21 @@ typedef struct {
 } Bytecodes;
 #define BQM_DESCRIBE_Bytecodes(B,F,V,X)   ((4 * F) + V)
 
+typedef struct {
+    unsigned pc;
+    Num value;
+    Byte pop_count;
+    Byte skip_count;
+} OptimizedBytecodeReplacement;
+#define BQM_DESCRIBE_OptimizedBytecodeReplacement(B,F,V,X) ((2 * F) + V)
+
+typedef struct {
+    Bytecodes main_vector;
+    unsigned num_replacements;
+    OptimizedBytecodeReplacement *replacements;
+} OptimizedBytecode;
+#define BQM_DESCRIBE_OptimizedBytecode(B,F,V,X) (B(Bytecodes) + F + V)
+
 typedef enum {
     RP_CALL,
     RP_BUILTIN
@@ -117,11 +132,14 @@ typedef struct {
     ResumePoint *resume_points;
     unsigned num_resume_loops;
     ResumeLoop *resume_loops;
+
+    OptimizedBytecode *optimized;
 #ifdef ENABLE_JIT
     JITProgram *jit;
 #endif
 } Program;
-#define BQM_DESCRIBE_Program(B,F,V,X)   ((9 * F) + (12 * V))
+/* Exclude derived resume, optimized-bytecode, and JIT state from user quota. */
+#define BQM_DESCRIBE_Program(B,F,V,X)   ((8 * F) + (9 * V))
 
 #define MAIN_VECTOR 	-1	/* As opposed to an index into fork_vectors */
 
@@ -135,6 +153,8 @@ extern const ResumePoint *resume_point_for_program_pc(Program *, int,
 						       unsigned);
 extern const ResumePoint *resume_point_for_program_location(Program *, int,
 						     unsigned, unsigned);
+extern const OptimizedBytecodeReplacement *optimized_bytecode_replacement(
+							Program *, unsigned);
 extern int validate_program_resume_points(Program *);
 extern int program_bytes(Program *);
 extern void free_program(Program *);

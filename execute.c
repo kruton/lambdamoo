@@ -1132,6 +1132,8 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
 	return 0;
     jit_program_note_location(program, prepared->vloc,
 	prepared->verb_index);
+    if (!jit_program_claim_native_entry(program))
+	return 0;
     if (!jit_program_compile(program))
 	return 0;
     if (!jit_execution_context_push_compact(context, frame, program,
@@ -1193,7 +1195,7 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 #endif
 	caller->this, caller->player, caller->progr, &resolved, *args);
     if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
-	&native_call->resume, &prepared, -1)) {
+	&native_call->resume, &prepared, 0)) {
 	prepared.env[SLOT_ARGS].type = TYPE_NONE;
 	prepared.env[SLOT_ARGS].v.num = 0;
 	discard_prepared_verb_call(&prepared);
@@ -1414,7 +1416,12 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	if (active_call) {
 	    struct JITActivationPromotion *promotion;
 
-	    if (out->deopt.map_id <= 0)
+	    if (out->deopt.map_id < 0 && out->result == JIT_RUN_FALLBACK
+		&& active->current_map == 0) {
+		out->deopt.map_id = 0;
+		out->deopt.stack_depth = 0;
+		out->deopt.materialized = 1;
+	    } else if (out->deopt.map_id <= 0)
 		panic("Native chain reached a boundary without a deopt map");
 	    active->current_map = out->deopt.map_id;
 	    if (continuation
@@ -1432,7 +1439,8 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    } else
 		materialized_depth = out->deopt.materialized || continuation
 		    ? out->deopt.stack_depth : 0;
-	    if (!jit_native_frame_capture_boundary(active, stack,
+	    if (out->deopt.map_id > 0
+		&& !jit_native_frame_capture_boundary(active, stack,
 		    materialized_depth, out->deopt.map_id))
 		panic("Native boundary capture failed before promotion");
 	    promotion = execute_jit_prepare_promotion(context);
@@ -1582,6 +1590,8 @@ execute_jit_direct_verb_call(JITExecutionContext *execution_context,
     callee = call.program;
     if (!callee->jit || !jit_program_is_direct_leaf(callee->jit))
 	return 0;
+    if (!jit_program_claim_native_entry(callee->jit))
+	return 0;
 
     call_args = var_ref(args);
     call_error = commit_verb_activation(&call, call_args);
@@ -1693,6 +1703,7 @@ run(char raise, enum error resumption_error, Var * result)
     Byte *bv, *error_bv;
     Var *rts;			/* next empty slot */
     enum Opcode op;
+    const OptimizedBytecodeReplacement *optimized_value;
     Var error_var;
     enum outcome outcome;
 
@@ -1723,6 +1734,8 @@ do {  								\
     bc = ( (top_activ_stack != 0 || root_activ_vector == MAIN_VECTOR) \
 	   ? RUN_ACTIV.prog->main_vector 			\
 	   : RUN_ACTIV.prog->fork_vectors[root_activ_vector]); 	\
+    if (current_activ_vector() == MAIN_VECTOR && RUN_ACTIV.prog->optimized) \
+	bc = RUN_ACTIV.prog->optimized->main_vector; 		\
     bv = bc.vector + RUN_ACTIV.pc;  				\
     error_bv = bc.vector + RUN_ACTIV.error_pc;			\
     rts = RUN_ACTIV.top_rt_stack; /* next empty slot */        	\
@@ -1814,7 +1827,12 @@ do {								\
 	    && RUN_ACTIV.prog->jit
 	    && jit_program_is_eligible(RUN_ACTIV.prog->jit)
 	    && (RUN_ACTIV.debug
-		|| !jit_program_may_error(RUN_ACTIV.prog->jit))) {
+		|| !jit_program_may_error(RUN_ACTIV.prog->jit))
+	    && ((at_entry
+		 && jit_program_admit_interpreter_entry(RUN_ACTIV.prog->jit))
+		|| (!at_entry
+		    && jit_program_state(RUN_ACTIV.prog->jit)
+		       == JIT_STATE_COMPILED))) {
 	    Var ret_val;
 	    JITRunResult jit_result;
 	    JITSourceLocation source_location;
@@ -2037,19 +2055,29 @@ do {								\
 			err = call_verb2(class, verb.v.str
 				 WAIF_COMMA_ARG(obj), args, 0);
 		    }
-		    free_var(obj);
-		    free_var(verb);
 		    if (err == E_NONE) {
+			free_var(obj);
+			free_var(verb);
 			jit_continuation_attach(continuation, caller);
 			jit_continuation_mark_dispatched(continuation);
 			jit_profile_record_vm_call(caller->prog->jit);
 			LOAD_STATE_VARIABLES();
 			goto next_opcode;
 		    }
-		    free_var(args);
 		    jit_continuation_attach(continuation, caller);
-		    if (!jit_continuation_materialize(caller))
-			panic("JIT verb-call continuation materialization failed");
+		    {
+			Var boundary[3];
+
+			boundary[0] = obj;
+			boundary[1] = verb;
+			boundary[2] = args;
+			if (!jit_continuation_materialize_boundary(caller,
+				boundary, 3))
+			    panic("JIT verb-call continuation materialization failed");
+		    }
+		    free_var(obj);
+		    free_var(verb);
+		    free_var(args);
 		    ticks_remaining += deopt.ticks_charged;
 		    jit_profile_record_vm_call(caller->prog->jit);
 		    LOAD_STATE_VARIABLES();
@@ -2076,6 +2104,16 @@ do {								\
 #endif
 	error_bv = bv;
 	op = *bv++;
+	optimized_value = 0;
+	if (op == OP_OPTIMIZED_VALUE) {
+	    unsigned pc = (unsigned) (bv - bc.vector - 1);
+
+	    optimized_value = optimized_bytecode_replacement(RUN_ACTIV.prog,
+							 pc);
+	    if (!optimized_value)
+		panic("Missing optimized bytecode replacement");
+	    bv += optimized_value->skip_count;
+	}
 
 	if (COUNT_TICK(op)) {
 	    if (--ticks_remaining <= 0) {
@@ -2092,6 +2130,19 @@ do {								\
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch"
 	switch (op) {
+
+	case OP_OPTIMIZED_VALUE:
+	    {
+		Byte count = optimized_value->pop_count;
+		Var value;
+
+		while (count--)
+		    free_var(POP());
+		value.type = TYPE_INT;
+		value.v.num = optimized_value->value;
+		PUSH(value);
+	    }
+	    break;
 
 	case OP_IF_QUES:
 	case OP_IF:

@@ -111,6 +111,10 @@ test_boundary_tick_refunds(void)
 	check_int("index-store boundary has no tick to refund",
 		  hir_test_boundary_ticks_charged(HIR_TAC_DEOPT,
 					  HIR_OP_INDEX), 0);
+	check_int("batched deopt refunds current and future ticks",
+		  hir_test_tick_batch_deopt_ticks_charged(1, 3), 4);
+	check_int("batched deopt without current tick refunds future ticks",
+		  hir_test_tick_batch_deopt_ticks_charged(0, 3), 3);
 }
 
 static void
@@ -330,7 +334,11 @@ test_arithmetic_and_local_tac(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRValueAnalysis *analysis;
+    HIROptimizationPlan *optimization_plan;
     HIRTacProgram *tac;
+    OptimizedBytecode *optimized;
+    Program bytecode_program;
+    Byte vector[11];
     Expr one = int_expr(1, 10);
     Expr two = int_expr(2, 10);
     Expr three = int_expr(3, 11);
@@ -394,11 +402,39 @@ test_arithmetic_and_local_tac(void)
 	      HIR_VALUE_INT_CONSTANT);
     check_int("arith return constant",
 	      (int) hir_ssa_return_constant(ssa, analysis), 9);
+    memset(&bytecode_program, 0, sizeof(bytecode_program));
+    memset(vector, OP_DONE, sizeof(vector));
+    vector[5] = OP_ADD;
+    vector[9] = OP_MULT;
+    bytecode_program.main_vector.vector = vector;
+    bytecode_program.main_vector.size = sizeof(vector);
+    optimization_plan = hir_optimize_ssa_for_backends(ctx, ssa);
     check_int("arith constant optimization changed",
-	      hir_optimize_ssa_constants(ctx, ssa), 2);
+	      hir_optimization_change_count(optimization_plan), 2);
+    optimized = hir_lower_optimized_bytecode(ctx, optimization_plan,
+					      &bytecode_program);
+    check_int("arith optimized bytecode produced", optimized != 0, 1);
+    check_int("arith optimized bytecode replacement count",
+	      optimized ? (int) optimized->num_replacements : 0, 2);
+    check_int("arith add lowered to optimized bytecode",
+	      optimized ? optimized->main_vector.vector[5] : 0,
+	      OP_OPTIMIZED_VALUE);
+    check_int("arith multiply lowered to optimized bytecode",
+	      optimized ? optimized->main_vector.vector[9] : 0,
+	      OP_OPTIMIZED_VALUE);
+    check_int("arith optimized add value",
+	      optimized ? (int) optimized->replacements[0].value : 0, 3);
+    check_int("arith optimized multiply value",
+	      optimized ? (int) optimized->replacements[1].value : 0, 9);
     check_int("arith optimized binary count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_BINARY), 0);
     check_int("arith optimized verify", hir_verify_ssa(ctx, ssa), 1);
+
+    if (optimized) {
+	myfree(optimized->main_vector.vector, M_BYTECODES);
+	myfree(optimized->replacements, M_PROGRAM);
+	myfree(optimized, M_PROGRAM);
+    }
 
     hir_context_free(ctx);
 }
@@ -2458,6 +2494,14 @@ test_for_list_loop_tac_ssa(void)
     check_int("for list body stack uses incremented index",
 	      hir_ssa_stack_value_at_bytecode_pc(ssa, 42, 1),
 	      hir_ssa_binary_value_at_bytecode_pc(ssa, 41, HIR_OP_ADD));
+
+    (void) hir_optimize_ssa_constants(ctx, ssa);
+    check_int("for list optimization keeps loop phis",
+	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
+    check_int("for list bound keeps loop index phi",
+	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_LE), 1);
+    check_int("for list lookup keeps loop index phi",
+	      hir_ssa_binary_uses_phi_count(ssa, HIR_OP_INDEX) >= 1, 1);
 
     check_int("for list destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);

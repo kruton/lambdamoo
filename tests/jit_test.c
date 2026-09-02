@@ -982,10 +982,19 @@ call_verb_program(void)
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
     map->native_resume->rehydratable = 1;
-    map->native_resume->num_values = 1;
-    map->native_resume->values = allocate(sizeof(JITResumeValue));
-    map->native_resume->values[0].value = 4;
-    map->native_resume->values[0].source = JIT_RESUME_RESULT;
+    map->native_resume->num_values = 4;
+    map->native_resume->values = allocate(sizeof(JITResumeValue) * 4);
+    map->native_resume->values[0].value = 1;
+    map->native_resume->values[0].source = JIT_RESUME_OPERAND;
+    map->native_resume->values[0].index = -1;
+    map->native_resume->values[1].value = 2;
+    map->native_resume->values[1].source = JIT_RESUME_OPERAND;
+    map->native_resume->values[1].index = -1;
+    map->native_resume->values[2].value = 3;
+    map->native_resume->values[2].source = JIT_RESUME_OPERAND;
+    map->native_resume->values[2].index = -1;
+    map->native_resume->values[3].value = 4;
+    map->native_resume->values[3].source = JIT_RESUME_RESULT;
     map->bytecode_pc = map->error_pc = 30;
     map->stack_depth = 3;
     map->ticks_charged = 1;
@@ -3628,6 +3637,7 @@ main(void)
 	JITNativeFrame root;
 	JITNativeFrame child;
 	Var homes[4];
+	unsigned home_capacities[4] = { 0 };
 	unsigned char home_states[4];
 	Var value;
 	Var taken;
@@ -3644,7 +3654,7 @@ main(void)
 	check(jit_native_frame_verify(&context, &root),
 	      "native root frame verification failed");
 	jit_native_frame_bind_runtime(&root, homes, sizeof(homes), homes, 4,
-	    home_states);
+	    home_states, home_capacities);
 	check(jit_native_frame_verify(&context, &root),
 	      "native frame runtime binding verification failed");
 
@@ -3738,6 +3748,8 @@ main(void)
 	JITCallerResume middle_resume;
 	Var root_home[1];
 	Var middle_home[1];
+	unsigned root_capacity[1] = { 0 };
+	unsigned middle_capacity[1] = { 0 };
 	unsigned char root_state[1];
 	unsigned char middle_state[1];
 	Var returned;
@@ -3749,7 +3761,7 @@ main(void)
 	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
 	    4, &ticks, &timed_out, &error, -1);
 	jit_native_frame_bind_runtime(&root, root_home, sizeof(root_home),
-	    root_home, 1, root_state);
+	    root_home, 1, root_state, root_capacity);
 	memset(&root_resume, 0, sizeof(root_resume));
 	root_resume.caller = &root;
 	root_resume.map_id = 1;
@@ -3759,7 +3771,7 @@ main(void)
 	    chain_program, deep_env, &root_resume, -1),
 	      "first compact native dispatch failed");
 	jit_native_frame_bind_runtime(&middle, middle_home,
-	    sizeof(middle_home), middle_home, 1, middle_state);
+	    sizeof(middle_home), middle_home, 1, middle_state, middle_capacity);
 
 	memset(&middle_resume, 0, sizeof(middle_resume));
 	middle_resume.caller = &middle;
@@ -3815,6 +3827,8 @@ main(void)
 	struct promotion_dump dump = {{0}, {0}, 0};
 	Var root_homes[2];
 	Var middle_home[1];
+	unsigned root_capacities[2] = { 0 };
+	unsigned middle_capacity[1] = { 0 };
 	unsigned char root_states[2];
 	unsigned char middle_state[1];
 	Var retained;
@@ -3828,7 +3842,7 @@ main(void)
 	jit_execution_context_init(&context, &root, chain_program, env, 0, 1,
 	    4, &ticks, &timed_out, &error, -1);
 	jit_native_frame_bind_runtime(&root, root_homes, sizeof(root_homes),
-	    root_homes, 2, root_states);
+	    root_homes, 2, root_states, root_capacities);
 	retained.type = TYPE_STR;
 	retained.v.str = str_dup("retained through promotion");
 	check(jit_native_frame_home_move(&root, 1, &retained),
@@ -3843,7 +3857,7 @@ main(void)
 	    chain_program, deep_env, &root_resume, -1),
 	      "promotion middle dispatch failed");
 	jit_native_frame_bind_runtime(&middle, middle_home,
-	    sizeof(middle_home), middle_home, 1, middle_state);
+	    sizeof(middle_home), middle_home, 1, middle_state, middle_capacity);
 	memset(&middle_resume, 0, sizeof(middle_resume));
 	middle_resume.caller = &middle;
 	middle_resume.map_id = 1;
@@ -3902,10 +3916,12 @@ main(void)
 	activation owner;
 	Var owner_stack[2];
 	Var owner_home[1];
+	unsigned owner_capacity[1] = { 0 };
 	unsigned char home_state[1];
 	Num stale_values[6] = { 0, 0, 0, 0, 0, 0 };
 	void *owned_storage;
 	Var *owned_home;
+	unsigned *owned_capacity;
 	unsigned char *owned_state;
 	size_t owned_bytes;
 
@@ -3931,7 +3947,7 @@ main(void)
 	home_state[0] = JIT_HOME_OWNED;
 	native_frame.program = owner_program;
 	jit_native_frame_bind_runtime(&native_frame, stale_values,
-	    sizeof(stale_values), owner_home, 1, home_state);
+	    sizeof(stale_values), owner_home, 1, home_state, owner_capacity);
 	owner.base_rt_stack = owner.top_rt_stack = owner_stack;
 	owner.rt_stack_size = 2;
 	native_frame.runtime_bytes--;
@@ -3955,17 +3971,18 @@ main(void)
 	free_var(*--owner.top_rt_stack);
 	jit_native_frame_unbind_runtime(&native_frame);
 	free_var(owner_home[0]);
-	owned_bytes = sizeof(stale_values) + sizeof(Var) + 1;
+	owned_bytes = sizeof(stale_values) + sizeof(Var) + sizeof(unsigned) + 1;
 	owned_storage = mymalloc(owned_bytes, M_PROGRAM);
 	memset(owned_storage, 0, owned_bytes);
 	owned_home = (Var *) ((char *) owned_storage + sizeof(stale_values));
-	owned_state = (unsigned char *) (owned_home + 1);
+	owned_capacity = (unsigned *) (owned_home + 1);
+	owned_state = (unsigned char *) (owned_capacity + 1);
 	owned_home[0].type = TYPE_STR;
 	owned_home[0].v.str = str_dup("released native runtime");
 	owned_state[0] = JIT_HOME_OWNED;
 	owner_program->active_runtime_bytes = owned_bytes;
 	jit_native_frame_bind_runtime(&native_frame, owned_storage, owned_bytes,
-	    owned_home, 1, owned_state);
+	    owned_home, 1, owned_state, owned_capacity);
 	jit_native_frame_mark_runtime_owned(&native_frame);
 	jit_native_frame_release_runtime(&native_frame);
 	check(!native_frame.runtime_storage && !native_frame.owns_runtime
@@ -4648,6 +4665,54 @@ main(void)
 	      "call_verb continuation returned the wrong value");
 	free_var(result);
 	free_var(deopt_stack[0]);
+	{
+	    JITContinuationFrame *continuation = 0;
+	    activation owner = { 0 };
+	    Var owner_env[3];
+	    Var owner_stack[4];
+	    int i;
+
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		  "failed-call boundary did not capture a continuation");
+	    for (i = 0; i < 3; i++) {
+		owner_env[i].type = TYPE_INT;
+		owner_env[i].v.num = 99;
+	    }
+	    owner.rt_env = owner_env;
+	    owner.base_rt_stack = owner_stack;
+	    owner.top_rt_stack = owner_stack;
+	    owner.rt_stack_size = 4;
+	    owner.temp.type = TYPE_NONE;
+	    jit_continuation_attach(continuation, &owner);
+	    check(jit_continuation_materialize_boundary(&owner, deopt_stack, 3),
+		  "failed-call boundary continuation did not materialize");
+	    check(!owner.jit_continuation
+		  && owner.top_rt_stack == owner.base_rt_stack + 3,
+		  "failed-call boundary produced the wrong stack depth");
+	    check(owner_stack[0].type == TYPE_OBJ
+		  && owner_stack[0].v.obj == 0
+		  && owner_stack[1].type == TYPE_STR
+		  && !strcmp(owner_stack[1].v.str, "test")
+		  && owner_stack[2].type == TYPE_LIST
+		  && owner_stack[2].v.list[0].v.num == 0,
+		  "failed-call boundary reconstructed the wrong operands");
+	    check(owner_env[0].type == TYPE_OBJ && owner_env[0].v.obj == 0
+		  && owner_env[1].type == TYPE_STR
+		  && !strcmp(owner_env[1].v.str, "test")
+		  && owner_env[2].type == TYPE_LIST
+		  && owner_env[2].v.list[0].v.num == 0,
+		  "failed-call boundary did not restore operand-backed locals");
+	    while (owner.top_rt_stack > owner.base_rt_stack)
+		free_var(*--owner.top_rt_stack);
+	    for (i = 0; i < 3; i++) {
+		free_var(owner_env[i]);
+		free_var(deopt_stack[i]);
+	    }
+	}
 	{
 	    JITContinuationFrame *continuation = 0;
 	    activation owner = { 0 };
@@ -6337,12 +6402,13 @@ main(void)
 	free_var(lapp_var);
 	{
 	    Var homes[1];
+	    unsigned capacities[1] = { 0 };
 	    Var *owned_result;
 
 	    homes[0] = new_list(1);
 	    homes[0].v.list[1].type = TYPE_INT;
 	    homes[0].v.list[1].v.num = 666;
-	    owned_result = jit_rt_list_append_owned(homes, 0,
+	    owned_result = jit_rt_list_append_owned(homes, capacities, 0,
 		homes[0].v.list, 777, TYPE_INT);
 	    check(owned_result == homes[0].v.list
 		  && homes[0].v.list[0].v.num == 2
@@ -6354,13 +6420,14 @@ main(void)
 	}
 	{
 	    Var homes[1];
+	    unsigned capacities[1] = { 3 };
 	    Var *fixed_result;
 
 	    homes[0].type = TYPE_LIST;
 	    homes[0].v.list = jit_rt_make_fixed_list_head(111, TYPE_INT, 3);
-	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, capacities, 0,
 		homes[0].v.list, 2, 222, TYPE_INT);
-	    fixed_result = jit_rt_fixed_list_append_owned(homes, 0,
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, capacities, 0,
 		fixed_result, 3, 333, TYPE_INT);
 	    check(fixed_result == homes[0].v.list
 		  && fixed_result[0].v.num == 3
@@ -6371,6 +6438,26 @@ main(void)
 	    check(var_refcount(homes[0]) == 1,
 		  "fixed list construction remains exclusive");
 	    free_var(homes[0]);
+	}
+	{
+	    Var homes[1];
+	    unsigned capacities[1] = { 0 };
+	    Var partial = new_list(1);
+	    Var *fixed_result;
+
+	    partial.v.list[1].type = TYPE_INT;
+	    partial.v.list[1].v.num = 111;
+	    homes[0].type = TYPE_NONE;
+	    homes[0].v.num = 0;
+	    fixed_result = jit_rt_fixed_list_append_owned(homes, capacities, 0,
+		partial.v.list, 2, 222, TYPE_INT);
+	    check(fixed_result[0].v.num == 2
+		  && fixed_result[1].v.num == 111
+		  && fixed_result[2].v.num == 222,
+		  "resumed fixed list construction grows a canonical list");
+	    free_var(partial);
+	    partial.v.list = fixed_result;
+	    free_var(partial);
 	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */
@@ -6573,11 +6660,27 @@ main(void)
     }
     {
 	JITPoolStats pool_stats;
+	JITPoolPolicyStats policy_stats;
 	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
+	JITProgram *cold = binary_program(10, 2, HIR_OP_DIV);
 	JITNativeFrame frame = { 0 };
 
 	check(prog != 0, "failed to create test program for pool verification");
+	check(cold != 0, "failed to create cold program for pool verification");
+	check(jit_pool_set_policy(3, 0), "failed to set JIT pool test policy");
+	jit_pool_maintain();
+	check(!jit_program_admit_interpreter_entry(prog)
+	      && jit_program_warmup_count(prog) == 1,
+	      "first pending invocation was not counted");
+	check(!jit_program_admit_interpreter_entry(prog)
+	      && jit_program_warmup_count(prog) == 2,
+	      "second pending invocation was not counted");
+	check(jit_program_claim_native_entry(prog)
+	      && jit_program_warmup_count(prog) == 3,
+	      "native threshold invocation was not claimed");
 	check(jit_program_compile(prog), "failed to compile program for pool test");
+	check(jit_program_warmup_count(prog) == 0,
+	      "compiled program retained its warmup count");
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs >= 1, "pool active program count is wrong");
 	check(pool_stats.total_machine_code_bytes >= prog->machine_code_len,
@@ -6593,9 +6696,15 @@ main(void)
 	jit_profile_native_frame_released(&frame, 256);
 
 	/* Reset pool and verify invalidation of active programs */
+	check(!jit_program_admit_interpreter_entry(cold)
+	      && jit_program_warmup_count(cold) == 1,
+	      "cold program invocation was not counted");
 	jit_pool_reset();
 	check(jit_program_state(prog) == JIT_STATE_PENDING,
 	      "jit_pool_reset did not return program to pending state");
+	check(jit_program_warmup_count(prog) == 0
+	      && jit_program_warmup_count(cold) == 0,
+	      "pool rotation did not reset pending warmup counts");
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs == 0, "pool has remaining active programs after reset");
 	check(pool_stats.total_machine_code_bytes == 0, "pool machine code bytes not zeroed");
@@ -6604,8 +6713,19 @@ main(void)
 	check(jit_program_compile(prog), "failed to recompile program after pool reset");
 	check(jit_program_state(prog) == JIT_STATE_COMPILED,
 	      "program did not compile after pool reset");
+	check(jit_pool_set_policy(3, 1), "failed to lower JIT pool limit");
+	jit_pool_policy_stats(&policy_stats);
+	check(policy_stats.rotation_pending,
+	      "lowered JIT pool limit did not request rotation");
+	jit_pool_maintain();
+	jit_pool_policy_stats(&policy_stats);
+	check(!policy_stats.rotation_pending && policy_stats.active_programs == 0,
+	      "JIT pool maintenance did not complete rotation");
+	check(jit_pool_set_policy(32, (size_t) 256 * 1024 * 1024),
+	      "failed to restore default JIT pool policy");
 
 	jit_program_free(prog);
+	jit_program_free(cold);
 	jit_shutdown();
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");

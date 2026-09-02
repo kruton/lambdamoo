@@ -108,6 +108,28 @@ resume_point_for_program_location(Program * p, int vector, unsigned pc,
     return 0;
 }
 
+const OptimizedBytecodeReplacement *
+optimized_bytecode_replacement(Program *p, unsigned pc)
+{
+    OptimizedBytecode *optimized = p ? p->optimized : 0;
+    unsigned first = 0;
+    unsigned last = optimized ? optimized->num_replacements : 0;
+
+    while (first < last) {
+	unsigned middle = first + (last - first) / 2;
+	OptimizedBytecodeReplacement *replacement
+	    = &optimized->replacements[middle];
+
+	if (replacement->pc < pc)
+	    first = middle + 1;
+	else if (replacement->pc > pc)
+	    last = middle;
+	else
+	    return replacement;
+    }
+    return 0;
+}
+
 int
 validate_program_resume_points(Program * p)
 {
@@ -228,16 +250,7 @@ program_bytes(Program * p)
     for (i = 0; i < p->num_var_names; i++)
 	count += memo_strlen(p->var_names[i]) + 1;
 
-    count += BQM_SIZEOF(ResumeLoop) * p->num_resume_loops;
-    count += BQM_SIZEOF(ResumePoint) * p->num_resume_points;
-    for (i = 0; i < p->num_resume_points; i++)
-	count += BQM_SIZEOF(ResumeStackSlot)
-	    * p->resume_points[i].stack_depth;
-
-#ifdef ENABLE_JIT
-    count += jit_program_bytes(p->jit);
-#endif
-
+    /* Derived resume, optimized-bytecode, and JIT storage is server-owned. */
     return count;
 }
 
@@ -273,6 +286,12 @@ free_program(Program * p)
 	    myfree(p->resume_loops, M_PROGRAM);
 	if (p->resume_points)
 	    myfree(p->resume_points, M_PROGRAM);
+
+	if (p->optimized) {
+	    myfree(p->optimized->main_vector.vector, M_BYTECODES);
+	    myfree(p->optimized->replacements, M_PROGRAM);
+	    myfree(p->optimized, M_PROGRAM);
+	}
 
 #ifdef ENABLE_JIT
 	jit_program_free(p->jit);

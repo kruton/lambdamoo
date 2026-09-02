@@ -14,6 +14,7 @@ typedef struct HIRDominatorTree HIRDominatorTree;
 typedef struct HIRBlockList HIRBlockList;
 typedef struct HIRSSAProgram HIRSSAProgram;
 typedef struct HIRValueAnalysis HIRValueAnalysis;
+typedef struct HIROptimizationPlan HIROptimizationPlan;
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
 typedef struct JITProgram JITProgram;
 #endif
@@ -113,7 +114,8 @@ typedef enum {
     HIR_OP_VALID,
     HIR_OP_PARENT,
     HIR_OP_SUBLIST_FROM,
-    HIR_OP_FORK
+    HIR_OP_FORK,
+    HIR_OP_ROTL32
 } HIROp;
 
 typedef enum {
@@ -175,6 +177,11 @@ extern HIRValueAnalysis *hir_analyze_ssa_values(HIRContext *, HIRSSAProgram *);
 extern HIRValueKind hir_value_kind(HIRValueAnalysis *, int);
 extern Num hir_value_constant(HIRValueAnalysis *, int);
 extern enum error hir_value_error(HIRValueAnalysis *, int);
+extern HIROptimizationPlan *hir_optimize_ssa_for_backends(HIRContext *,
+						   HIRSSAProgram *);
+extern int hir_optimization_change_count(HIROptimizationPlan *);
+extern OptimizedBytecode *hir_lower_optimized_bytecode(HIRContext *,
+						HIROptimizationPlan *, Program *);
 extern int hir_optimize_ssa_constants(HIRContext *, HIRSSAProgram *);
 extern int hir_destroy_ssa(HIRContext *, HIRSSAProgram *);
 extern int hir_verify_out_of_ssa(HIRContext *, HIRSSAProgram *);
@@ -196,6 +203,7 @@ extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
 extern int hir_test_resume_stack_matches_point(ResumeStackSlot *, unsigned,
 					       const ResumePoint *, int);
 extern int hir_test_boundary_ticks_charged(HIRTacKind, HIROp);
+extern int hir_test_tick_batch_deopt_ticks_charged(int, int);
 extern int hir_tac_count_kind(HIRTacProgram *, HIRTacKind);
 extern int hir_tac_count_unary_op(HIRTacProgram *, HIROp);
 extern int hir_tac_count_binary_op(HIRTacProgram *, HIROp);

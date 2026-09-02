@@ -77,6 +77,7 @@ struct JITNativeFrame {
     JITContinuationFrame *runtime_borrower;
     void *runtime_storage;
     Var *homes;
+    unsigned *home_capacities;
     unsigned char *home_states;
     Var *boundary_stack;
     size_t runtime_bytes;
@@ -225,6 +226,22 @@ typedef struct {
     size_t native_chain_frame_bytes;
 } JITPoolStats;
 
+typedef struct {
+    uint64_t generation;
+    uint64_t rotations;
+    uint64_t active_programs;
+    size_t max_pool_bytes;
+    size_t machine_code_bytes;
+    size_t native_allocated_bytes;
+    size_t mir_heap_bytes;
+    size_t reclaimable_bytes;
+    time_t generation_started_at;
+    time_t generation_age;
+    unsigned hot_threshold;
+    int rotation_pending;
+    const char *last_rotation_reason;
+} JITPoolPolicyStats;
+
 extern const char *jit_deopt_reason_name(JITDeoptReason);
 extern void jit_profile_record_entry(JITProgram *);
 extern void jit_profile_record_completed(JITProgram *);
@@ -241,6 +258,10 @@ extern void jit_profile_report(void);
 extern void jit_profile_reset(void);
 extern void jit_pool_stats(JITPoolStats *);
 extern void jit_pool_reset(void);
+extern void jit_pool_maintain(void);
+extern void jit_pool_request_rotation(void);
+extern int jit_pool_set_policy(unsigned, size_t);
+extern void jit_pool_policy_stats(JITPoolPolicyStats *);
 extern int jit_perf_map_start(void);
 extern void jit_perf_map_stop(void);
 extern int jit_perf_map_active(void);
@@ -278,7 +299,8 @@ extern int jit_native_frame_take_prepared_invocation(
 	JITNativeFrame *, struct PreparedVerbCall *);
 extern void jit_native_frame_release_invocation(JITNativeFrame *);
 extern void jit_native_frame_bind_runtime(JITNativeFrame *, void *, size_t,
-					  Var *, unsigned, unsigned char *);
+					  Var *, unsigned, unsigned char *,
+					  unsigned *);
 extern void jit_native_frame_mark_runtime_owned(JITNativeFrame *);
 extern int jit_native_frame_adopt_continuation_runtime(
 	JITNativeFrame *, JITContinuationFrame *);
@@ -315,6 +337,10 @@ extern const char *jit_program_diagnostic(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
 extern int jit_program_is_direct_leaf(JITProgram *);
+extern int jit_program_admit_interpreter_entry(JITProgram *);
+extern int jit_program_claim_native_entry(JITProgram *);
+extern unsigned jit_program_warmup_count(JITProgram *);
+extern uint64_t jit_program_warmup_generation(JITProgram *);
 extern int jit_program_anchor_count(JITProgram *);
 extern int jit_program_deopt_map_count(JITProgram *);
 extern void jit_program_stats(JITProgram *, JITProgramStats *);
@@ -340,6 +366,8 @@ extern void jit_continuation_mark_dispatched(JITContinuationFrame *);
 extern void jit_continuation_attach(JITContinuationFrame *, struct activation *);
 extern void jit_continuation_relocate(JITContinuationFrame *, struct activation *);
 extern int jit_continuation_materialize(struct activation *);
+extern int jit_continuation_materialize_boundary(struct activation *, Var *,
+						 unsigned);
 extern void jit_continuation_free(JITContinuationFrame *);
 extern void jit_continuation_materialize_all(void);
 extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),

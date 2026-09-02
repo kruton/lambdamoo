@@ -504,6 +504,10 @@ main_loop(void)
 
 	run_ready_tasks();
 
+#ifdef ENABLE_JIT
+	jit_pool_maintain();
+#endif
+
 	{			/* Get rid of old un-logged-in or useless connections */
 	    int now = time(0);
 

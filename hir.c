@@ -601,6 +601,22 @@ struct HIRValueAnalysis {
     int num_facts;
 };
 
+typedef struct HIROptimizedValue HIROptimizedValue;
+
+struct HIROptimizedValue {
+    unsigned bytecode_pc;
+    HIRTacKind kind;
+    HIROp op;
+    Num value;
+    HIROptimizedValue *next;
+};
+
+struct HIROptimizationPlan {
+    int changes;
+    HIROptimizedValue *values;
+    HIROptimizedValue *last_value;
+};
+
 typedef struct HIRLoopContext HIRLoopContext;
 typedef struct HIRFinallyContext HIRFinallyContext;
 
@@ -2959,6 +2975,7 @@ HIRValueAnalysis *
 hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 {
     HIRValueAnalysis *analysis;
+    HIRDominatorTree *dominators;
     HIRSSABlock *block;
     HIRBasicBlock *cfg_block;
     unsigned char *reachable;
@@ -2967,6 +2984,9 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
     int changed = 1;
 
     if (!ctx || !ssa || !ssa->cfg || ssa->form != HIR_FORM_SSA)
+	return 0;
+    dominators = hir_build_dominator_tree(ctx, ssa->cfg);
+    if (!dominators)
 	return 0;
     for (cfg_block = ssa->cfg->blocks; cfg_block; cfg_block = cfg_block->next)
 	if (cfg_block->id > max_block_id)
@@ -3013,12 +3033,23 @@ hir_analyze_ssa_values(HIRContext *ctx, HIRSSAProgram *ssa)
 		case HIR_TAC_PHI:
 		    {
 			HIRPhiArg *arg;
+			int loop_carried = 0;
 
-			for (arg = instr->phi_args; arg; arg = arg->next)
+			for (arg = instr->phi_args; arg; arg = arg->next) {
+			    if (dom_block_dominates(dominators, block->id,
+					    arg->block_id))
+				loop_carried = 1;
 			    if (feasible_edges[arg->block_id
 				    * (max_block_id + 1) + block->id])
 				fact = join_value_fact(fact,
 					analysis->facts[arg->value]);
+			}
+			/* A loop exit can appear infeasible while its induction
+			   phi still has only its entry fact.  Do not let that
+			   circular fact turn the phi into an entry constant. */
+			if (loop_carried
+			    && fact.kind == HIR_VALUE_FACT_CONSTANT)
+			    fact = integer_fact();
 		    }
 		    break;
 		case HIR_TAC_CALL:
@@ -3243,18 +3274,230 @@ ssa_block_normalize_phi_order(HIRSSABlock *block)
     }
 }
 
-int
-hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
+static void
+record_optimized_value(HIRContext *ctx, HIROptimizationPlan *plan,
+		       HIRSSAInstr *instr, Num value)
 {
+    HIROptimizedValue *optimized;
+
+    if (instr->bytecode_pc == NO_BYTECODE_PC
+	|| (instr->kind != HIR_TAC_UNARY
+	    && instr->kind != HIR_TAC_BINARY))
+	return;
+
+    optimized = hir_alloc(ctx, sizeof(HIROptimizedValue));
+    optimized->bytecode_pc = instr->bytecode_pc;
+    optimized->kind = instr->kind;
+    optimized->op = instr->op;
+    optimized->value = value;
+    optimized->next = 0;
+    if (plan->last_value)
+	plan->last_value->next = optimized;
+    else
+	plan->values = optimized;
+    plan->last_value = optimized;
+}
+
+static void
+count_ssa_value_use(unsigned *uses, int num_values, int value)
+{
+    if (value > 0 && value < num_values)
+	uses[value]++;
+}
+
+static void
+replace_ssa_value_uses(HIRSSAProgram *ssa, int old_value, int new_value)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    HIRPhiArg *phi;
+	    HIRParallelCopy *copy;
+	    int i;
+
+	    if (instr->src1 == old_value)
+		instr->src1 = new_value;
+	    if (instr->src2 == old_value)
+		instr->src2 = new_value;
+	    if (instr->src3 == old_value)
+		instr->src3 = new_value;
+	    for (i = 0; i < instr->num_stack_values; i++)
+		if (instr->stack_values[i] == old_value)
+		    instr->stack_values[i] = new_value;
+	    for (i = 0; i < instr->num_local_values; i++)
+		if (instr->local_values[i] == old_value)
+		    instr->local_values[i] = new_value;
+	    for (phi = instr->phi_args; phi; phi = phi->next)
+		if (phi->value == old_value)
+		    phi->value = new_value;
+	    for (copy = instr->copies; copy; copy = copy->next)
+		if (copy->src == old_value)
+		    copy->src = new_value;
+	    if (instr == block->last)
+		break;
+	}
+    }
+}
+
+static void
+replace_with_dead_integer_definition(HIRSSAInstr *instr)
+{
+    instr->kind = HIR_TAC_CONST;
+    instr->literal.type = TYPE_INT;
+    instr->literal.v.num = 0;
+    instr->src1 = instr->src2 = instr->src3 = 0;
+    instr->phi_args = 0;
+}
+
+static int
+match_rotate32_and(HIRValueAnalysis *analysis, HIRSSAInstr **definitions,
+		   int num_values, HIRSSAInstr *instr,
+		   HIRSSAInstr **shift_right, Num *mask)
+{
+    HIRSSAInstr *left;
+    HIRSSAInstr *right;
+
+    if (!instr || instr->kind != HIR_TAC_BINARY
+	|| instr->op != HIR_OP_BITAND)
+	return 0;
+    if (instr->src1 <= 0 || instr->src1 >= num_values
+	|| instr->src2 <= 0 || instr->src2 >= num_values)
+	return 0;
+    left = definitions[instr->src1];
+    right = definitions[instr->src2];
+    if (left && left->kind == HIR_TAC_CONST
+	&& left->literal.type == TYPE_INT) {
+	*mask = left->literal.v.num;
+	*shift_right = right;
+    } else if (right && right->kind == HIR_TAC_CONST
+	       && right->literal.type == TYPE_INT) {
+	*mask = right->literal.v.num;
+	*shift_right = left;
+    } else
+	return 0;
+    return *shift_right && (*shift_right)->kind == HIR_TAC_BINARY
+	&& (*shift_right)->op == HIR_OP_SHR
+	&& hir_value_kind(analysis, (*shift_right)->src2)
+	   == HIR_VALUE_INT_CONSTANT;
+}
+
+static int
+optimize_ssa_rotate32(HIRContext *ctx, HIRSSAProgram *ssa,
+		      HIRValueAnalysis *analysis)
+{
+    HIRSSAInstr **definitions;
+    unsigned *uses;
+    HIRSSABlock *block;
+    int changes = 0;
+
+    if (sizeof(Num) * CHAR_BIT <= 32)
+	return 0;
+
+    definitions = hir_calloc(ctx, ssa->num_values, sizeof(HIRSSAInstr *));
+    uses = hir_calloc(ctx, ssa->num_values, sizeof(unsigned));
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    HIRPhiArg *phi;
+	    HIRParallelCopy *copy;
+
+	    if (instr->value > 0 && instr->value < ssa->num_values)
+		definitions[instr->value] = instr;
+	    count_ssa_value_use(uses, ssa->num_values, instr->src1);
+	    count_ssa_value_use(uses, ssa->num_values, instr->src2);
+	    count_ssa_value_use(uses, ssa->num_values, instr->src3);
+	    for (phi = instr->phi_args; phi; phi = phi->next)
+		count_ssa_value_use(uses, ssa->num_values, phi->value);
+	    for (copy = instr->copies; copy; copy = copy->next)
+		count_ssa_value_use(uses, ssa->num_values, copy->src);
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *modulus;
+
+	for (modulus = block->first; modulus; modulus = modulus->next) {
+	    HIRSSAInstr *bit_or;
+	    HIRSSAInstr *shift_left;
+	    HIRSSAInstr *bit_and;
+	    HIRSSAInstr *shift_right;
+	    HIRSSAInstr *candidate;
+	    Num modulus_value, left_count, right_count, mask;
+	    int source;
+
+	    if (modulus->kind != HIR_TAC_BINARY || modulus->op != HIR_OP_MOD
+		|| hir_value_kind(analysis, modulus->src2)
+		   != HIR_VALUE_INT_CONSTANT
+		|| (modulus_value = hir_value_constant(analysis, modulus->src2))
+		   != (Num) ((UNum) 1 << 32))
+		goto next_modulus;
+	    if (modulus->src1 <= 0 || modulus->src1 >= ssa->num_values)
+		goto next_modulus;
+	    bit_or = definitions[modulus->src1];
+	    if (!bit_or || bit_or->kind != HIR_TAC_BINARY
+		|| bit_or->op != HIR_OP_BITOR)
+		goto next_modulus;
+	    if (bit_or->src1 <= 0 || bit_or->src1 >= ssa->num_values
+		|| bit_or->src2 <= 0 || bit_or->src2 >= ssa->num_values)
+		goto next_modulus;
+	    shift_left = definitions[bit_or->src1];
+	    bit_and = definitions[bit_or->src2];
+	    if (!shift_left || shift_left->kind != HIR_TAC_BINARY
+		|| shift_left->op != HIR_OP_SHL) {
+		candidate = shift_left;
+		shift_left = bit_and;
+		bit_and = candidate;
+	    }
+	    if (!shift_left || shift_left->kind != HIR_TAC_BINARY
+		|| shift_left->op != HIR_OP_SHL
+		|| !match_rotate32_and(analysis, definitions, ssa->num_values,
+		    bit_and,
+		    &shift_right, &mask)
+		|| hir_value_kind(analysis, shift_left->src2)
+		   != HIR_VALUE_INT_CONSTANT)
+		goto next_modulus;
+	    left_count = hir_value_constant(analysis, shift_left->src2);
+	    right_count = hir_value_constant(analysis, shift_right->src2);
+	    source = shift_left->src1;
+	    if (source != shift_right->src1 || left_count <= 0
+		|| left_count >= 32 || right_count != 32 - left_count
+		|| mask != (Num) (((UNum) 1 << left_count) - 1)
+		|| uses[shift_left->value] != 1 || uses[shift_right->value] != 1
+		|| uses[bit_and->value] != 1 || uses[bit_or->value] != 1)
+		goto next_modulus;
+	    shift_left->op = HIR_OP_ROTL32;
+	    replace_ssa_value_uses(ssa, modulus->value, shift_left->value);
+	    replace_with_dead_integer_definition(shift_right);
+	    replace_with_dead_integer_definition(bit_and);
+	    replace_with_dead_integer_definition(bit_or);
+	    replace_with_dead_integer_definition(modulus);
+	    changes++;
+next_modulus:
+	    if (modulus == block->last)
+		break;
+	}
+    }
+    return changes;
+}
+
+HIROptimizationPlan *
+hir_optimize_ssa_for_backends(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIROptimizationPlan *plan;
     HIRValueAnalysis *analysis;
     HIRSSABlock *block;
     HIRBasicBlock *cfg_block;
     unsigned char *reachable;
     int max_block_id = 0;
-    int changes = 0;
 
     if (!ctx || !ssa || !ssa->cfg || ssa->form != HIR_FORM_SSA)
 	return 0;
+    plan = hir_calloc(ctx, 1, sizeof(HIROptimizationPlan));
     analysis = hir_analyze_ssa_values(ctx, ssa);
     if (!analysis)
 	return 0;
@@ -3268,13 +3511,15 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 		 || instr->kind == HIR_TAC_PHI)
 		&& hir_value_kind(analysis, instr->value)
 		== HIR_VALUE_INT_CONSTANT) {
+		Num value = hir_value_constant(analysis, instr->value);
+
+		record_optimized_value(ctx, plan, instr, value);
 		instr->kind = HIR_TAC_CONST;
 		instr->literal.type = TYPE_INT;
-		instr->literal.v.num = hir_value_constant(analysis,
-							  instr->value);
+		instr->literal.v.num = value;
 		instr->src1 = instr->src2 = instr->src3 = 0;
 		instr->phi_args = 0;
-		changes++;
+		plan->changes++;
 	    }
 	    if (instr == block->last)
 		break;
@@ -3302,10 +3547,12 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
 			&& successor->first->kind == HIR_TAC_LABEL
 			? successor->first->label : 0;
 		}
-		changes++;
+		plan->changes++;
 	    }
 	}
     }
+
+    plan->changes += optimize_ssa_rotate32(ctx, ssa, analysis);
 
     for (cfg_block = ssa->cfg->blocks; cfg_block; cfg_block = cfg_block->next)
 	if (cfg_block->id > max_block_id)
@@ -3315,7 +3562,172 @@ hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
     prune_cfg_blocks(ssa->cfg, reachable);
     prune_ssa_blocks(ssa, reachable);
     prune_phi_arguments(ssa, reachable);
-    return changes;
+    return plan;
+}
+
+int
+hir_optimization_change_count(HIROptimizationPlan *plan)
+{
+    return plan ? plan->changes : 0;
+}
+
+int
+hir_optimize_ssa_constants(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    return hir_optimization_change_count(
+	    hir_optimize_ssa_for_backends(ctx, ssa));
+}
+
+static int
+optimized_bytecode_shape(Bytecodes *bc, HIROptimizedValue *value,
+			 Byte *pop_count, Byte *skip_count)
+{
+    Byte opcode;
+
+    if (!bc || value->bytecode_pc >= bc->size)
+	return 0;
+    opcode = bc->vector[value->bytecode_pc];
+    *pop_count = value->kind == HIR_TAC_BINARY ? 2 : 1;
+    *skip_count = 0;
+
+    if (value->kind == HIR_TAC_UNARY) {
+	if (value->op == HIR_OP_NEGATE)
+	    return opcode == OP_UNARY_MINUS;
+	if (value->op == HIR_OP_NOT)
+	    return opcode == OP_NOT;
+	if (value->op == HIR_OP_COMPLEMENT
+	    && value->bytecode_pc + 1 < bc->size
+	    && opcode == OP_EXTENDED
+	    && bc->vector[value->bytecode_pc + 1] == EOP_COMPLEMENT) {
+	    *skip_count = 1;
+	    return 1;
+	}
+	return 0;
+    }
+
+    switch (value->op) {
+    case HIR_OP_ADD: return opcode == OP_ADD;
+    case HIR_OP_SUB: return opcode == OP_MINUS;
+    case HIR_OP_MUL: return opcode == OP_MULT;
+    case HIR_OP_DIV: return opcode == OP_DIV;
+    case HIR_OP_MOD: return opcode == OP_MOD;
+    case HIR_OP_EQ: return opcode == OP_EQ;
+    case HIR_OP_NE: return opcode == OP_NE;
+    case HIR_OP_LT: return opcode == OP_LT;
+    case HIR_OP_LE: return opcode == OP_LE;
+    case HIR_OP_GT: return opcode == OP_GT;
+    case HIR_OP_GE: return opcode == OP_GE;
+    case HIR_OP_EXP:
+	if (value->bytecode_pc + 1 < bc->size
+	    && opcode == OP_EXTENDED
+	    && bc->vector[value->bytecode_pc + 1] == EOP_EXP) {
+	    *skip_count = 1;
+	    return 1;
+	}
+	return 0;
+    case HIR_OP_BITOR:
+    case HIR_OP_BITXOR:
+    case HIR_OP_BITAND:
+    case HIR_OP_SHL:
+    case HIR_OP_SHR:
+    case HIR_OP_LSHR:
+    case HIR_OP_ROTL32:
+	{
+	    Extended_Opcode expected;
+
+	    switch (value->op) {
+	    case HIR_OP_BITOR: expected = EOP_BITOR; break;
+	    case HIR_OP_BITXOR: expected = EOP_BITXOR; break;
+	    case HIR_OP_BITAND: expected = EOP_BITAND; break;
+	    case HIR_OP_SHL: expected = EOP_SHL; break;
+	    case HIR_OP_SHR: expected = EOP_SHR; break;
+	    default: expected = EOP_LSHR; break;
+	    }
+	    if (value->bytecode_pc + 1 < bc->size
+		&& opcode == OP_EXTENDED
+		&& bc->vector[value->bytecode_pc + 1] == expected) {
+		*skip_count = 1;
+		return 1;
+	    }
+	    return 0;
+	}
+    default:
+	return 0;
+    }
+}
+
+OptimizedBytecode *
+hir_lower_optimized_bytecode(HIRContext *ctx UNUSED_,
+			     HIROptimizationPlan *plan, Program *program)
+{
+    OptimizedBytecode *optimized;
+    HIROptimizedValue *value;
+    unsigned count = 0;
+    unsigned index = 0;
+
+    if (!plan || !program || !program->main_vector.vector)
+	return 0;
+    for (value = plan->values; value; value = value->next) {
+	Byte pop_count, skip_count;
+
+	if (optimized_bytecode_shape(&program->main_vector, value,
+		&pop_count, &skip_count))
+	    count++;
+    }
+    if (!count)
+	return 0;
+
+    optimized = mymalloc(sizeof(OptimizedBytecode), M_PROGRAM);
+    memset(optimized, 0, sizeof(OptimizedBytecode));
+    optimized->main_vector = program->main_vector;
+    optimized->main_vector.vector = mymalloc(program->main_vector.size,
+					      M_BYTECODES);
+    memcpy(optimized->main_vector.vector, program->main_vector.vector,
+	   program->main_vector.size);
+    optimized->num_replacements = count;
+    optimized->replacements = mymalloc(
+	    sizeof(OptimizedBytecodeReplacement) * count, M_PROGRAM);
+
+    for (value = plan->values; value; value = value->next) {
+	OptimizedBytecodeReplacement *replacement;
+	Byte pop_count, skip_count;
+
+	if (!optimized_bytecode_shape(&program->main_vector, value,
+		&pop_count, &skip_count))
+	    continue;
+	replacement = &optimized->replacements[index++];
+	replacement->pc = value->bytecode_pc;
+	replacement->value = value->value;
+	replacement->pop_count = pop_count;
+	replacement->skip_count = skip_count;
+    }
+
+    for (index = 1; index < count; index++) {
+	OptimizedBytecodeReplacement replacement
+	    = optimized->replacements[index];
+	unsigned position = index;
+
+	while (position > 0
+	       && optimized->replacements[position - 1].pc > replacement.pc) {
+	    optimized->replacements[position]
+		= optimized->replacements[position - 1];
+	    position--;
+	}
+	optimized->replacements[position] = replacement;
+    }
+    for (index = 0; index < count; index++) {
+	if (index > 0
+	    && optimized->replacements[index - 1].pc
+	    == optimized->replacements[index].pc) {
+	    myfree(optimized->main_vector.vector, M_BYTECODES);
+	    myfree(optimized->replacements, M_PROGRAM);
+	    myfree(optimized, M_PROGRAM);
+	    return 0;
+	}
+	optimized->main_vector.vector[optimized->replacements[index].pc]
+	    = OP_OPTIMIZED_VALUE;
+    }
+    return optimized;
 }
 
 static HIRSSABlock *
@@ -3834,6 +4246,12 @@ jit_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 	    || (kind == HIR_TAC_DEOPT && op == HIR_OP_SCATTER);
 }
 
+static int
+jit_tick_batch_deopt_ticks_charged(int ticks_charged, int remaining)
+{
+    return ticks_charged + remaining;
+}
+
 #if defined(ENABLE_JIT) && !defined(HIR_TESTING)
 static int
 jit_resume_stack_is_safe(JITDeoptMap *map, int call_operands)
@@ -3870,6 +4288,7 @@ jit_op_is_supported(HIROp op)
     case HIR_OP_SHL:
     case HIR_OP_SHR:
     case HIR_OP_LSHR:
+    case HIR_OP_ROTL32:
     case HIR_OP_INDEX:
     case HIR_OP_MAKE_SINGLETON_LIST:
     case HIR_OP_CHECK_LIST_FOR_SPLICE:
@@ -4124,6 +4543,8 @@ jit_operation_anchor_matches(Bytecodes *bc, HIRSSAInstr *instr)
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_SHR);
 	case HIR_OP_LSHR:
 	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_LSHR);
+	case HIR_OP_ROTL32:
+	    return jit_extended_anchor_matches(bc, instr->bytecode_pc, EOP_SHL);
 	default: return 0;
 	}
     }
@@ -4357,6 +4778,7 @@ jit_consumer_contract(HIRSSAInstr *instr)
     case HIR_OP_SHL:
     case HIR_OP_SHR:
     case HIR_OP_LSHR:
+    case HIR_OP_ROTL32:
 	contract.operands[0] = contract.operands[1] = JIT_TYPE_MASK(TYPE_INT);
 	contract.tagged_dispatch = 1;
 	break;
@@ -4678,7 +5100,8 @@ jit_guarded_consumer_is_non_exiting(JITInstruction *instr)
 	    && instr->guarded_type_masks[1] == JIT_TYPE_MASK(TYPE_INT);
     return instr->op == HIR_OP_INDEX_BF || instr->op == HIR_OP_RINDEX_BF
 	|| instr->op == HIR_OP_BITOR || instr->op == HIR_OP_BITXOR
-	|| instr->op == HIR_OP_BITAND || instr->op == HIR_OP_LT
+	|| instr->op == HIR_OP_BITAND || instr->op == HIR_OP_ROTL32
+	|| instr->op == HIR_OP_LT
 	|| instr->op == HIR_OP_LE || instr->op == HIR_OP_GT
 	|| instr->op == HIR_OP_GE;
 }
@@ -4763,6 +5186,13 @@ jit_instruction_exit_mask(JITInstruction *instr, int16_t *value_types,
 		|| instr->op == HIR_OP_GE || instr->op == HIR_OP_BITOR
 		|| instr->op == HIR_OP_BITXOR || instr->op == HIR_OP_BITAND
 		|| instr->op == HIR_OP_MIN || instr->op == HIR_OP_MAX))
+	    return JIT_EXIT_NONE;
+	if (t1 == TYPE_INT && t2 == TYPE_INT
+	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
+		value_is_tagged, num_values)
+	    && instr->shift_count_proven_valid
+	    && (instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
+		|| instr->op == HIR_OP_LSHR || instr->op == HIR_OP_ROTL32))
 	    return JIT_EXIT_NONE;
 	if (t1 == TYPE_FLOAT && t2 == TYPE_FLOAT
 	    && jit_value_has_static_type(instr->value, TYPE_INT, value_types,
@@ -5106,6 +5536,97 @@ next_instruction:
 invalid:
 	myfree(seen, M_PROGRAM);
 	return 0;
+}
+
+#define JIT_MAX_TICK_BATCH 16
+
+static int
+jit_tick_batch_barrier(JITInstruction *instr)
+{
+    if (instr->exit_mask & ~JIT_EXIT_DEOPT)
+	return 1;
+    if (instr->kind == HIR_TAC_UNARY
+	&& (instr->op == HIR_OP_TICKS_LEFT
+	    || instr->op == HIR_OP_SECONDS_LEFT || instr->op == HIR_OP_TIME))
+	return 1;
+    return instr->kind == HIR_TAC_TICK
+	&& instr->op == HIR_OP_CHARGE_TICK;
+}
+
+static void
+jit_coalesce_tick_checks(JITProgram *program)
+{
+    JITBlock *block;
+
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *batch = 0;
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (jit_tick_batch_barrier(instr)) {
+		if (instr->kind == HIR_TAC_TICK)
+		    instr->tick_batch_count = 1;
+		batch = 0;
+		continue;
+	    }
+	    if (instr->kind != HIR_TAC_TICK)
+		continue;
+	    if (!batch || batch->source_lineno != instr->source_lineno
+		|| batch->tick_batch_count >= JIT_MAX_TICK_BATCH) {
+		instr->tick_batch_count = 1;
+		batch = instr;
+	    } else {
+		batch->tick_batch_count++;
+		instr->tick_batch_count = (unsigned char) -1;
+	    }
+	}
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITInstruction *member;
+	    int remaining;
+
+	    if (instr->kind != HIR_TAC_TICK || instr->tick_batch_count <= 1
+		|| instr->tick_batch_count == (unsigned char) -1)
+		continue;
+	    remaining = instr->tick_batch_count - 1;
+	    for (member = instr->next; member && remaining > 0;
+		 member = member->next) {
+		if (member->kind == HIR_TAC_TICK
+		    && member->tick_batch_count == (unsigned char) -1) {
+		    remaining--;
+		    continue;
+		}
+		if (member->exit_mask == JIT_EXIT_DEOPT
+		    && member->deopt_map > 0)
+		    program->deopt_maps[member->deopt_map].ticks_charged =
+			jit_tick_batch_deopt_ticks_charged(
+			program->deopt_maps[member->deopt_map].ticks_charged,
+			remaining);
+		if (member == block->last)
+		    break;
+	    }
+	}
+    }
+}
+
+static int
+ssa_integer_constant(HIRSSAProgram *ssa, int value, Num *constant)
+{
+    HIRSSABlock *block;
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->value == value && instr->kind == HIR_TAC_CONST
+		&& instr->literal.type == TYPE_INT) {
+		*constant = instr->literal.v.num;
+		return 1;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 0;
 }
 
 #define JIT_LOCAL_BASE_WINDOW 32
@@ -7212,6 +7733,39 @@ jit_eliminate_dominated_guards(JITProgram *program, HIRDominatorTree *dom)
     }
 }
 
+typedef enum {
+    JIT_METADATA_VALID,
+    JIT_METADATA_INVALID_DEOPT,
+    JIT_METADATA_INVALID_RECONSTRUCTION
+} JITMetadataOptimizationResult;
+
+static JITMetadataOptimizationResult
+jit_optimize_native_metadata(HIRContext *ctx, JITProgram *program,
+			     Program *bytecode_program,
+			     HIRDominatorTree *dominators)
+{
+    jit_build_tag_slots(program);
+    jit_build_ownership_escape_analysis(program);
+    jit_build_value_ownership(program);
+    jit_analyze_owned_last_uses(program);
+    jit_build_string_concat_owner_slots(program);
+    jit_build_deopt_owner_slots(program);
+    jit_build_int_list_values(program);
+    jit_build_direct_int_list_updates(program);
+    jit_prune_dead_deopt_locals(program);
+    jit_coalesce_deopt_locals(program);
+    if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program,
+				   dominators))
+	return JIT_METADATA_INVALID_DEOPT;
+    jit_build_deopt_tag_values(program);
+    jit_build_resume_liveness(program);
+    jit_prune_boundary_owner_moves_used_by_resume(program);
+    jit_intern_reconstruction_states(program);
+    if (!jit_reconstruction_states_are_valid(ctx, program))
+	return JIT_METADATA_INVALID_RECONSTRUCTION;
+    return JIT_METADATA_VALID;
+}
+
 JITProgram *
 hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		       Program *bytecode_program)
@@ -7226,6 +7780,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     const char *value_type_diagnostic = 0;
     int types_changed;
     int i;
+    JITMetadataOptimizationResult metadata_result;
 
     if (!ctx || ctx->error_count || !jit_ssa_is_supported(ctx, ssa)) {
 	const char *diag = ctx ? hir_context_error_message(ctx) : 0;
@@ -7331,7 +7886,7 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			       || si->op == HIR_OP_IN || si->op == HIR_OP_BITOR
 			       || si->op == HIR_OP_BITXOR || si->op == HIR_OP_BITAND
 			       || si->op == HIR_OP_SHL || si->op == HIR_OP_SHR
-			       || si->op == HIR_OP_LSHR
+			       || si->op == HIR_OP_LSHR || si->op == HIR_OP_ROTL32
 			       || si->op == HIR_OP_INDEX_BF
 			       || si->op == HIR_OP_RINDEX_BF) {
 			value_types[si->value] = TYPE_INT;
@@ -7821,6 +8376,16 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 	    instr->local_id = ssa_instr->local_id;
 	    instr->func = ssa_instr->func;
 	    instr->op = ssa_instr->op;
+	    if (ssa_instr->kind == HIR_TAC_BINARY
+		&& (ssa_instr->op == HIR_OP_SHL || ssa_instr->op == HIR_OP_SHR
+		    || ssa_instr->op == HIR_OP_LSHR
+		    || ssa_instr->op == HIR_OP_ROTL32)) {
+		Num shift;
+
+		instr->shift_count_proven_valid
+		    = ssa_integer_constant(ssa, ssa_instr->src2, &shift)
+		    && shift >= 0 && (UNum) shift < sizeof(Num) * CHAR_BIT;
+	    }
 	    if (((ssa_instr->src1 > 0
 		  && ssa_instr->src1 < program->num_values
 		  && value_types[ssa_instr->src1] == TYPE_NONE
@@ -7899,7 +8464,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    || ssa_instr->op == HIR_OP_GT || ssa_instr->op == HIR_OP_GE
 		    || ssa_instr->op == HIR_OP_BITOR || ssa_instr->op == HIR_OP_BITXOR
 		    || ssa_instr->op == HIR_OP_BITAND || ssa_instr->op == HIR_OP_SHL
-		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR)) {
+		    || ssa_instr->op == HIR_OP_SHR || ssa_instr->op == HIR_OP_LSHR
+		    || ssa_instr->op == HIR_OP_ROTL32)) {
 		int src1_known = ssa_instr->src1 > 0
 		    && ssa_instr->src1 < program->num_values
 		    && value_types_known[ssa_instr->src1];
@@ -8102,40 +8668,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
     }
 
     jit_eliminate_dominated_guards(program, dominators);
+    jit_coalesce_tick_checks(program);
     myfree(value_types_conflicted, M_PROGRAM);
     myfree(value_types_known, M_PROGRAM);
     program->value_types = value_types;
     program->value_is_tagged = value_is_tagged;
-    jit_build_tag_slots(program);
-    jit_build_ownership_escape_analysis(program);
-    jit_build_value_ownership(program);
-    jit_analyze_owned_last_uses(program);
-    jit_build_string_concat_owner_slots(program);
-    jit_build_deopt_owner_slots(program);
-    jit_build_int_list_values(program);
-    jit_build_direct_int_list_updates(program);
-    jit_prune_dead_deopt_locals(program);
-    jit_coalesce_deopt_locals(program);
-    if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program,
-				   dominators)) {
-	const char *diag = hir_context_error_message(ctx);
-	JITProgram *unsupported;
-
-	unsupported = jit_program_unsupported_with_diagnostic("invalid-deopt-map",
-							 diag);
-	jit_program_free(program);
-	return unsupported;
-    }
-    jit_build_deopt_tag_values(program);
-    jit_build_resume_liveness(program);
-    jit_prune_boundary_owner_moves_used_by_resume(program);
-    jit_intern_reconstruction_states(program);
-    if (!jit_reconstruction_states_are_valid(ctx, program)) {
+    metadata_result = jit_optimize_native_metadata(ctx, program,
+	bytecode_program, dominators);
+    if (metadata_result != JIT_METADATA_VALID) {
 	const char *diag = hir_context_error_message(ctx);
 	JITProgram *unsupported;
 
 	unsupported = jit_program_unsupported_with_diagnostic(
-	    "invalid-reconstruction-state", diag);
+	    metadata_result == JIT_METADATA_INVALID_DEOPT
+	    ? "invalid-deopt-map" : "invalid-reconstruction-state", diag);
 	jit_program_free(program);
 	return unsupported;
     }
@@ -8568,6 +9114,8 @@ op_name(HIROp op)
 	return ">>";
     case HIR_OP_LSHR:
 	return ">>>";
+    case HIR_OP_ROTL32:
+	return "ROTL32";
     case HIR_OP_INDEX:
 	return "INDEX";
     case HIR_OP_MAKE_SINGLETON_LIST:
@@ -11611,6 +12159,12 @@ int
 hir_test_boundary_ticks_charged(HIRTacKind kind, HIROp op)
 {
 	return jit_boundary_ticks_charged(kind, op);
+}
+
+int
+hir_test_tick_batch_deopt_ticks_charged(int ticks_charged, int remaining)
+{
+    return jit_tick_batch_deopt_ticks_charged(ticks_charged, remaining);
 }
 
 int

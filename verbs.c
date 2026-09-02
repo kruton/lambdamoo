@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(42);
+    Var metadata = new_list(44);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -400,6 +400,46 @@ jit_metadata(JITProgram *program)
 					       stats.eliminated_type_guard_sites);
     metadata.v.list[42] = jit_metadata_num_pair("reconstruction_states",
 					       stats.reconstruction_states);
+    metadata.v.list[43] = jit_metadata_num_pair("warmup_count",
+					       jit_program_warmup_count(program));
+    metadata.v.list[44] = jit_metadata_num_pair("warmup_generation",
+					       jit_program_warmup_generation(program));
+    return metadata;
+}
+
+static Var
+jit_pool_policy_metadata(void)
+{
+    JITPoolPolicyStats stats;
+    Var metadata = new_list(13);
+    Var value;
+
+    jit_pool_policy_stats(&stats);
+    metadata.v.list[1] = jit_metadata_num_pair("hot_threshold",
+					      stats.hot_threshold);
+    metadata.v.list[2] = jit_metadata_num_pair("max_pool_bytes",
+					      stats.max_pool_bytes);
+    metadata.v.list[3] = jit_metadata_num_pair("generation", stats.generation);
+    metadata.v.list[4] = jit_metadata_num_pair("active_programs",
+					      stats.active_programs);
+    metadata.v.list[5] = jit_metadata_num_pair("machine_code_bytes",
+					      stats.machine_code_bytes);
+    metadata.v.list[6] = jit_metadata_num_pair("native_allocated_bytes",
+					      stats.native_allocated_bytes);
+    metadata.v.list[7] = jit_metadata_num_pair("mir_heap_bytes",
+					      stats.mir_heap_bytes);
+    metadata.v.list[8] = jit_metadata_num_pair("reclaimable_bytes",
+					      stats.reclaimable_bytes);
+    metadata.v.list[9] = jit_metadata_num_pair("generation_started_at",
+					      stats.generation_started_at);
+    metadata.v.list[10] = jit_metadata_num_pair("generation_age",
+					       stats.generation_age);
+    metadata.v.list[11] = jit_metadata_num_pair("rotation_pending",
+					       stats.rotation_pending);
+    metadata.v.list[12] = jit_metadata_num_pair("rotations", stats.rotations);
+    value.type = TYPE_STR;
+    value.v.str = str_dup(stats.last_rotation_reason);
+    metadata.v.list[13] = jit_metadata_pair("last_rotation_reason", value);
     return metadata;
 }
 #endif
@@ -769,6 +809,85 @@ bf_jit_perf_map(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr
     result.v.list[2].v.str = str_dup(jit_perf_map_path());
     return make_var_pack(result);
 }
+
+static package
+bf_jit_pool_policy(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
+{
+    int nargs = arglist.v.list[0].v.num;
+    JITPoolPolicyStats current;
+    unsigned hot_threshold;
+    size_t max_pool_bytes;
+    int saw_hot_threshold = 0;
+    int saw_max_pool_bytes = 0;
+    enum error error = E_NONE;
+    int i;
+
+    if (!is_wizard(progr)) {
+	free_var(arglist);
+	return make_error_pack(E_PERM);
+    }
+    jit_pool_policy_stats(&current);
+    hot_threshold = current.hot_threshold;
+    max_pool_bytes = current.max_pool_bytes;
+    if (nargs) {
+	Var settings = arglist.v.list[1];
+
+	for (i = 1; i <= settings.v.list[0].v.num; i++) {
+	    Var pair = settings.v.list[i];
+	    Var value;
+
+	    if (pair.type != TYPE_LIST || pair.v.list[0].v.num != 2
+		|| pair.v.list[1].type != TYPE_STR
+		|| pair.v.list[2].type != TYPE_INT) {
+		error = E_INVARG;
+		break;
+	    }
+	    value = pair.v.list[2];
+	    if (!strcmp(pair.v.list[1].v.str, "hot_threshold")) {
+		if (saw_hot_threshold || value.v.num < 1
+		    || value.v.num > 255) {
+		    error = E_INVARG;
+		    break;
+		}
+		saw_hot_threshold = 1;
+		hot_threshold = value.v.num;
+	    } else if (!strcmp(pair.v.list[1].v.str, "max_pool_bytes")) {
+		size_t converted;
+
+		if (saw_max_pool_bytes || value.v.num < 0) {
+		    error = E_INVARG;
+		    break;
+		}
+		converted = (size_t) value.v.num;
+		if ((Num) converted != value.v.num) {
+		    error = E_INVARG;
+		    break;
+		}
+		saw_max_pool_bytes = 1;
+		max_pool_bytes = converted;
+	    } else {
+		error = E_INVARG;
+		break;
+	    }
+	}
+    }
+    free_var(arglist);
+    if (error != E_NONE)
+	return make_error_pack(error);
+    if (nargs && !jit_pool_set_policy(hot_threshold, max_pool_bytes))
+	return make_error_pack(E_INVARG);
+    return make_var_pack(jit_pool_policy_metadata());
+}
+
+static package
+bf_jit_pool_rotate(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
+{
+    free_var(arglist);
+    if (!is_wizard(progr))
+	return make_error_pack(E_PERM);
+    jit_pool_request_rotation();
+    return make_var_pack(jit_pool_policy_metadata());
+}
 #endif
 
 void
@@ -781,6 +900,8 @@ register_verbs(void)
     register_function("jit_compile", 2, 2, bf_jit_compile,
 		      TYPE_OBJ, TYPE_ANY);
     register_function("jit_perf_map", 0, 1, bf_jit_perf_map, TYPE_ANY);
+    register_function("jit_pool_policy", 0, 1, bf_jit_pool_policy, TYPE_LIST);
+    register_function("jit_pool_rotate", 0, 0, bf_jit_pool_rotate);
 #else
     register_function("verb_info", 2, 2, bf_verb_info, TYPE_OBJ, TYPE_ANY);
 #endif

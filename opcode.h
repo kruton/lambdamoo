@@ -65,6 +65,9 @@ enum Opcode {
     /* unary ops -- 1 tick: */
     OP_UNARY_MINUS, OP_NOT,
 
+    /* transient optimized bytecode; never emitted in canonical programs */
+    OP_OPTIMIZED_VALUE,
+
     /* assignments, 1 tick: */
     OP_PUT,
     OP_G_PUT = OP_PUT + NUM_READY_VARS,
