@@ -37,6 +37,7 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     HIRCFG *cfg;
     HIRDominatorTree *dom_tree;
     HIRSSAProgram *ssa_program;
+    HIROptimizationPlan *optimization_plan = 0;
     Program *program;
     int hir_valid;
     int hir_supported;
@@ -60,8 +61,11 @@ compile_ast_to_program(Stmt * ast, Names * var_names, DB_Version version)
     ssa_program = hir_build_ssa(hir_ctx, cfg);
     hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
     if (hir_valid) {
-	(void) hir_optimize_ssa_constants(hir_ctx, ssa_program);
+	optimization_plan = hir_optimize_ssa_for_backends(hir_ctx, ssa_program);
 	hir_valid = hir_verify_ssa(hir_ctx, ssa_program) && hir_valid;
+	if (hir_valid)
+	    program->optimized = hir_lower_optimized_bytecode(hir_ctx,
+		optimization_plan, program);
     }
     if (hir_valid)
 	hir_valid = hir_destroy_ssa(hir_ctx, ssa_program)

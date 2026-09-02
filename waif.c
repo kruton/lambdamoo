@@ -1058,6 +1058,8 @@ waif_after_saving(int success UNUSED_)
     myfree(saved_waifs, M_WAIF_XTRA);
     saved_waifs = NULL;
     saved_waif_limit = 0;
+    /* waif_count includes values held by active runtime state, while a
+       checkpoint visits only persistent database and task roots. */
 }
 
 static void

@@ -1297,6 +1297,15 @@ Only elide refcount operations when the compiler can prove:
 * all bailout paths transfer ownership correctly;
 * all error paths free owned values exactly once.
 
+SSA single-use is not by itself an ownership proof. In particular, a list
+append may consume its source only when the source is held in an exclusive
+owner home and the append atomically transfers that home to the result. An
+ownerless raw SSA value can still alias an argument, local, or caller-owned
+value even when it has one syntactic use, so that case must retain the borrowed
+append convention. The historical ownerless consume experiment introduced by
+`67a8344` corrupted list construction during `set_verb_code()` and is not part
+of the supported ownership model.
+
 ### 11.2 Deopt and Ownership Maps
 
 At every trapping or bailout-capable native instruction, the JIT must know how
@@ -1381,6 +1390,34 @@ reclaimed immediately via `MIR_gen_finish()`, eliminating duplicate per-verb
 context baselines. Whole-pool invalidation (`jit_pool_reset()`) cleanly reclaims
 executable memory and MIR modules when built-in protections change or the pool
 rotates, resetting active programs back to pending.
+
+The shared pool uses a pending-only hot-verb policy. A pending program has a
+one-byte saturating warmup counter stored in existing `JITProgram` padding;
+compiled programs clear it and native entries do not update it. The existing
+pool-generation field is also the counter epoch while a program is pending, so
+rotation lazily resets cold candidates without adding another generation field.
+The default threshold is 32 calls. Native call dispatch claims only the call
+which reaches the threshold; earlier calls fall back and are counted once by
+their interpreter activation. This keeps policy accounting out of generated
+MIR and leaves any future monomorphic call-site profiling as separate,
+site-specific state.
+
+The default pool limit is 256 MiB of reclaimable memory, defined as MIR heap
+plus executable allocation. Crossing it defers a whole-pool rotation to the
+safe server-loop boundary after ready tasks finish and prevents more automatic
+compilation in the meantime. `jit_pool_policy()` reads or atomically updates
+the runtime-only `hot_threshold` and `max_pool_bytes` settings;
+`jit_pool_rotate()` requests a manual rotation. Both are wizard-only. A zero
+byte limit disables automatic rotation, and an explicit `jit_compile()` remains
+a wizard override of hotness.
+
+Every completed non-shutdown rotation writes one `JIT_POOL_ROTATE` log line.
+It records the reason, old and new generations, seconds since the prior
+rotation or initial pool creation, active program count, machine-code, native,
+MIR-heap and total reclaimable bytes, and the effective limit and threshold.
+The policy result also exposes generation age, pending state, rotation count,
+and the last completed reason so administrators can tune the threshold and
+memory cap from observed workloads.
 
 All 6,319 verbs in the current testmoo.db eligibility census compile successfully.
 There are no remaining top-level `unsupported-program`,
@@ -1828,6 +1865,31 @@ Implement pool efficiency in this order:
    machine-code bytes, 74,111 pre-execution metadata bytes (74,271 after the
    warmed run), and 10.986 seconds as the newly established `#463:sha1`
    baseline for subsequent size and performance work.
+
+   The following compact-layout pass stores continuation constants in a sparse
+   literal side table, classifies the small prefix of resume recipes that may
+   require capture, stores sparse deopt local slot/value pairs as two 16-bit
+   indices, and removes padding from `JITDeoptMap`. Verbs exceeding 65,535 SSA
+   values or locals conservatively remain interpreted rather than truncating a
+   reconstruction index. Against the original 133,808-byte machine-code plus
+   93,049-byte metadata baseline (226,857 bytes combined), warmed
+   `#463:sha1` now uses 121,312 machine-code bytes plus 59,515 metadata bytes
+   (180,827 combined), a 20.29% reduction. Three warmed
+   `player:test(300000)` runs measured with `ftime()` were 11.1574, 10.4775,
+   and 10.2904 seconds (10.4775 median), with zero SHA1 deoptimizations across
+   900,000 calls. This is the current size and performance baseline.
+
+   Fixed-list construction must distinguish a freshly allocated, uninterrupted
+   owner chain from a chain resumed at a call boundary. The former may fill its
+   reserved integer slots directly only when every intervening instruction is
+   non-exiting and remains in the same single-owner append chain. Other fixed
+   appends test the recorded owner-home capacity and use the ordinary COW
+   append helper on a miss. Capacity is part of the continuation-owned runtime
+   allocation, so native frame adoption and return transfer it with the owner
+   homes instead of recreating frame-local state. With explicit
+   `jit_compile(#463, "sha1")`, this reduced warmed SHA1 machine code from
+   101,360 to 97,808 bytes. Three `ftime()` runs were 10.1301, 10.2362, and
+   10.3327 seconds (10.2362 median), with zero SHA1 deoptimizations.
 
 6. **Benchmark policy rather than assuming it.** Run stable interpreter/JIT
    workloads at several pool budgets. Record peak and steady-state bytes,

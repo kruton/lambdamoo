@@ -86,6 +86,7 @@ struct JITContinuationFrame {
     Num *deopt_values;
     Var *borrowed_locals;
     Var *owned_values;
+    unsigned *home_capacities;
     unsigned char *home_states;
     size_t runtime_bytes;
     JITNativeFrame *runtime_owner;
@@ -149,14 +150,6 @@ jit_deopt_map_can_bridge_builtin(JITDeoptMap *map)
 {
     return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
 	|| jit_deopt_map_is_specialized_builtin(map);
-}
-
-static inline int
-jit_deopt_map_bridges_builtin(JITDeoptMap *map)
-{
-    return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
-	|| (jit_deopt_map_is_specialized_builtin(map)
-	    && builtin_function_is_protected((unsigned) map->builtin_func));
 }
 
 static inline int
@@ -228,6 +221,8 @@ struct JITInstruction {
     JITCopy *copies;
     unsigned char direct_int_list_index_set;
     unsigned char owned_last_use;
+    unsigned char tick_batch_count;
+    unsigned char shift_count_proven_valid;
     JITInstruction *next;
 };
 
@@ -265,6 +260,7 @@ struct JITProgram {
     int eligible;
     int may_error;
     signed char direct_leaf;
+    unsigned char warmup_count;
     int num_values;
     int num_vars;
     int num_blocks;
@@ -388,9 +384,10 @@ extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
-extern Var *jit_rt_list_append_owned(Var *, int, Var *, int64_t, int);
-extern Var *jit_rt_fixed_list_append_owned(Var *, int, Var *, int, int64_t,
-					   int);
+extern Var *jit_rt_list_append_owned(Var *, unsigned *, int, Var *, int64_t,
+				     int);
+extern Var *jit_rt_fixed_list_append_owned(Var *, unsigned *, int, Var *, int,
+					   int64_t, int);
 extern void jit_rt_owned_replace(Var *, int, int64_t, int);
 extern void jit_rt_discard_owned(Var *, int, int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
