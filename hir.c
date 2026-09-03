@@ -5490,6 +5490,12 @@ jit_deopt_maps_are_valid(HIRContext *ctx, JITProgram *program,
 					== JIT_BOUNDARY_VALUE_MOVED_RAW
 					&& program->value_owned_slots[value] >= 0)
 				    || (map->stack_boundary_ownership[i]
+					== JIT_BOUNDARY_VALUE_RELEASE_AFTER_RESUME
+					&& (instr->kind != HIR_TAC_CALL_VERB
+					    || i != (int) map->stack_depth - 1
+					    || program->value_is_tagged[value]
+					    || type != TYPE_LIST))
+				    || (map->stack_boundary_ownership[i]
 					== JIT_BOUNDARY_VALUE_MOVED_OWNER
 					&& (!map->stack_owner_slots
 					    || map->stack_owner_slots[i] < 0

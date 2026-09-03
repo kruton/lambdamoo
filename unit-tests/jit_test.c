@@ -274,6 +274,40 @@ two_tick_program(void)
 }
 
 static JITProgram *
+many_tick_program(int count)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *constant = instruction(HIR_TAC_CONST);
+    JITInstruction *last = constant;
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    int i;
+
+    program->num_values = 2;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    constant->value = 1;
+    constant->literal = 42;
+    constant->literal_type = TYPE_INT;
+    for (i = 0; i < count; i++) {
+	JITInstruction *tick = instruction(HIR_TAC_TICK);
+
+	tick->source_lineno = 7 + i;
+	tick->bytecode_pc = 11 + i;
+	last->next = tick;
+	last = tick;
+    }
+    last->next = ret;
+    ret->src1 = 1;
+    ret->literal_type = TYPE_INT;
+    block->first = constant;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 duplicate_tick_exit_program(void)
 {
     JITProgram *program = two_tick_program();
@@ -282,6 +316,62 @@ duplicate_tick_exit_program(void)
 
     second_tick->source_lineno = first_tick->source_lineno;
     second_tick->bytecode_pc = first_tick->bytecode_pc;
+    return program;
+}
+
+static JITProgram *
+two_negative_modulus_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *first = instruction(HIR_TAC_CONST);
+    JITInstruction *divisor = instruction(HIR_TAC_CONST);
+    JITInstruction *first_mod = instruction(HIR_TAC_BINARY);
+    JITInstruction *second = instruction(HIR_TAC_CONST);
+    JITInstruction *second_mod = instruction(HIR_TAC_BINARY);
+    JITInstruction *sum = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    int i;
+
+    program->num_values = 7;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    for (i = 1; i < program->num_values; i++)
+	program->value_types[i] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    first->value = 1;
+    first->literal = -13;
+    first->literal_type = TYPE_INT;
+    first->next = divisor;
+    divisor->value = 2;
+    divisor->literal = 8;
+    divisor->literal_type = TYPE_INT;
+    divisor->next = first_mod;
+    first_mod->value = 3;
+    first_mod->src1 = 1;
+    first_mod->src2 = 2;
+    first_mod->op = HIR_OP_MOD;
+    first_mod->next = second;
+    second->value = 4;
+    second->literal = -9;
+    second->literal_type = TYPE_INT;
+    second->next = second_mod;
+    second_mod->value = 5;
+    second_mod->src1 = 4;
+    second_mod->src2 = 2;
+    second_mod->op = HIR_OP_MOD;
+    second_mod->next = sum;
+    sum->value = 6;
+    sum->src1 = 3;
+    sum->src2 = 5;
+    sum->op = HIR_OP_ADD;
+    sum->next = ret;
+    ret->src1 = 6;
+    ret->literal_type = TYPE_INT;
+    block->first = first;
+    block->last = ret;
     return program;
 }
 
@@ -1625,6 +1715,7 @@ duplicate_owned_string_program(void)
     program->num_values = 5;
     program->num_blocks = 1;
     program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
     program->value_types[1] = TYPE_STR;
     program->value_types[2] = TYPE_STR;
     program->value_types[3] = TYPE_STR;
@@ -1655,6 +1746,57 @@ duplicate_owned_string_program(void)
     duplicate->next = ret;
     ret->src1 = 4;
     ret->literal_type = TYPE_STR;
+    block->first = left;
+    block->last = ret;
+    jit_analyze_owned_last_uses(program);
+    return program;
+}
+
+static JITProgram *
+duplicate_discarded_owned_string_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *equal = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    char *ls = str_dup("a");
+    char *rs = str_dup("b");
+
+    program->num_values = 5;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_STR;
+    program->value_types[4] = TYPE_INT;
+    set_program_owned_home(program, 3, 0);
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    left->value = 1;
+    left->literal_type = TYPE_STR;
+    left->literal = (uintptr_t) ls;
+    left->next = right;
+    right->value = 2;
+    right->literal_type = TYPE_STR;
+    right->literal = (uintptr_t) rs;
+    right->next = concat;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->next = equal;
+    equal->value = 4;
+    equal->src1 = 3;
+    equal->src2 = 3;
+    equal->op = HIR_OP_EQ;
+    equal->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_INT;
     block->first = left;
     block->last = ret;
     jit_analyze_owned_last_uses(program);
@@ -1702,6 +1844,52 @@ string_index_program(const char *s, int idx)
     return_instr->src1 = 3;
     return_instr->literal_type = TYPE_STR;
     block->first = str_const;
+    block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+tagged_string_index_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_string = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_index = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *index_op = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_vars = 2;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * 4);
+    program->value_is_tagged = allocate(4);
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_ANY;
+    program->value_types[3] = TYPE_STR;
+    program->value_is_tagged[2] = 1;
+    program->value_is_tagged[3] = 1;
+    set_program_owned_value(program, 3);
+    use_compact_tag_slots(program);
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_string->value = 1;
+    load_string->local_id = 0;
+    load_string->literal_type = TYPE_STR;
+    load_string->next = load_index;
+    load_index->value = 2;
+    load_index->local_id = 1;
+    load_index->literal_type = TYPE_ANY;
+    load_index->next = index_op;
+    index_op->value = 3;
+    index_op->src1 = 1;
+    index_op->src2 = 2;
+    index_op->op = HIR_OP_INDEX;
+    index_op->next = return_instr;
+    return_instr->src1 = 3;
+    return_instr->literal_type = TYPE_STR;
+    block->first = load_string;
     block->last = return_instr;
     return program;
 }
@@ -2687,6 +2875,52 @@ float_singleton_program(void)
     ret->src1 = 2;
     ret->literal_type = TYPE_LIST;
     block->first = constant;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+dead_singleton_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *element = instruction(HIR_TAC_CONST);
+    JITInstruction *singleton = instruction(HIR_TAC_UNARY);
+    JITInstruction *returned = instruction(HIR_TAC_CONST);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_use_counts = allocate(sizeof(unsigned int)
+	* program->num_values);
+    program->value_escape_flags = allocate(program->num_values);
+    program->value_types[1] = TYPE_INT;
+    program->value_types[2] = TYPE_LIST;
+    program->value_types[3] = TYPE_INT;
+    program->value_use_counts[1] = 1;
+    program->value_use_counts[3] = 1;
+    program->value_escape_flags[3] = JIT_ESCAPE_RETURN;
+    set_program_owned_home(program, 2, 0);
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    element->value = 1;
+    element->literal = 7;
+    element->literal_type = TYPE_INT;
+    element->next = singleton;
+    singleton->value = 2;
+    singleton->src1 = 1;
+    singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
+    singleton->next = returned;
+    returned->value = 3;
+    returned->literal = 9;
+    returned->literal_type = TYPE_INT;
+    returned->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = TYPE_INT;
+    block->first = element;
     block->last = ret;
     return program;
 }
@@ -3767,6 +4001,9 @@ tagged_guard_instruction_program(void)
     memset(map, 0, sizeof(*map));
     map->reason = JIT_DEOPT_TYPE_GUARD;
     map->bytecode_pc = map->error_pc = 80;
+    map->num_tagged_values = 1;
+    map->tagged_values = allocate(sizeof(int));
+    map->tagged_values[0] = 1;
     program->num_deopt_maps = 2;
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -3778,6 +4015,9 @@ tagged_guard_instruction_program(void)
     guard->guarded_type_masks[0] = JIT_TYPE_MASK(TYPE_INT)
 	| JIT_TYPE_MASK(TYPE_FLOAT);
     guard->deopt_map = 1;
+    map->guard_value[0] = 1;
+    map->guard_local[0] = 0;
+    map->guard_expected[0] = guard->guarded_type_masks[0];
     guard->next = ret;
     ret->src1 = 1;
     ret->literal_type = TYPE_ANY;
@@ -3819,12 +4059,15 @@ index_set_program(int direct_int_list)
     block->id = 1;
     load->value = 1;
     load->local_id = 0;
+    load->literal_type = TYPE_LIST;
     load->next = index;
     index->value = 2;
     index->literal = 1;
+    index->literal_type = TYPE_INT;
     index->next = value;
     value->value = 3;
     value->literal = 42;
+    value->literal_type = TYPE_INT;
     value->next = set;
     set->value = 4;
     set->src1 = 1;
@@ -3837,6 +4080,67 @@ index_set_program(int direct_int_list)
     ret->src1 = 4;
     ret->literal_type = TYPE_LIST;
     block->first = load;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+tagged_index_set_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *load_base = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_index = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *load_value = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *set = instruction(HIR_TAC_INDEX_SET);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 5;
+    program->num_vars = 3;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_ANY;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_ANY;
+    program->value_types[4] = TYPE_LIST;
+    program->value_is_tagged[1] = 1;
+    program->value_is_tagged[3] = 1;
+    use_compact_tag_slots(program);
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    map->reason = JIT_DEOPT_RANGE_OP;
+    map->bytecode_pc = map->error_pc = 82;
+    program->num_deopt_maps = 2;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    load_base->value = 1;
+    load_base->local_id = 0;
+    load_base->literal_type = TYPE_ANY;
+    load_base->next = load_index;
+    load_index->value = 2;
+    load_index->local_id = 1;
+    load_index->literal_type = TYPE_INT;
+    load_index->next = load_value;
+    load_value->value = 3;
+    load_value->local_id = 2;
+    load_value->literal_type = TYPE_ANY;
+    load_value->next = set;
+    set->value = 4;
+    set->src1 = 1;
+    set->src2 = 2;
+    set->src3 = 3;
+    set->local_id = 0;
+    set->deopt_map = 1;
+    set->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_LIST;
+    block->first = load_base;
     block->last = ret;
     return program;
 }
@@ -4005,7 +4309,7 @@ typed_unary_lowering_program(HIROp op, var_type operand_type,
 }
 
 static JITProgram *
-owned_property_result_program(void)
+owned_property_result_program(int tagged_receiver)
 {
     JITProgram *program = typed_binary_lowering_program(HIR_OP_GET_PROP,
 	TYPE_OBJ, TYPE_STR, TYPE_ANY, 0, 0, 1);
@@ -4037,13 +4341,23 @@ owned_property_result_program(void)
     get->bytecode_pc = 72;
     set_program_owned_home(program, 3, 0);
     program->value_ownership[3] = JIT_OWNERSHIP_OWNED_PROPERTY;
+    if (tagged_receiver) {
+	program->value_types[1] = TYPE_ANY;
+	program->value_is_tagged[1] = 1;
+	program->blocks->first->literal_type = TYPE_ANY;
+	map->stack_types[0] = TYPE_ANY;
+	myfree(program->value_tag_slots, M_PROGRAM);
+	program->value_tag_slots = 0;
+	program->num_tag_slots = 0;
+	use_compact_tag_slots(program);
+    }
     return program;
 }
 
 static JITProgram *
 repeated_owned_property_program(void)
 {
-    JITProgram *program = owned_property_result_program();
+    JITProgram *program = owned_property_result_program(0);
     JITInstruction *first_get = program->blocks->first->next->next;
     JITInstruction *second_get = instruction(HIR_TAC_BINARY);
     JITInstruction *return_instr = program->blocks->last;
@@ -4078,7 +4392,7 @@ repeated_owned_property_program(void)
 }
 
 static JITProgram *
-fixed_list_chain_program(int interrupted_capacity)
+fixed_list_chain_program(int interrupted_capacity, var_type element_type)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -4101,7 +4415,7 @@ fixed_list_chain_program(int interrupted_capacity)
     program->value_escape_flags = allocate(program->num_values);
     for (i = 1; i < program->num_values; i++) {
 	program->value_types[i] = (i == 2 || i == 4 || i == 6)
-	    ? TYPE_LIST : TYPE_INT;
+	    ? TYPE_LIST : element_type;
 	program->value_owned_slots[i] = -1;
     }
     program->value_ownership[2] = JIT_OWNERSHIP_OWNED;
@@ -4121,14 +4435,26 @@ fixed_list_chain_program(int interrupted_capacity)
     program->blocks = program->last_block = block;
     block->id = 1;
     first->value = 1;
-    first->literal = 10;
+    if (element_type == TYPE_FLOAT) {
+	double value = 10.5;
+
+	memcpy(&first->literal, &value, sizeof(Num));
+    } else
+	first->literal = 10;
+    first->literal_type = element_type;
     first->next = head;
     head->value = 2;
     head->src1 = 1;
     head->op = HIR_OP_MAKE_SINGLETON_LIST;
     head->next = second;
     second->value = 3;
-    second->literal = 20;
+    if (element_type == TYPE_FLOAT) {
+	double value = 20.5;
+
+	memcpy(&second->literal, &value, sizeof(Num));
+    } else
+	second->literal = 20;
+    second->literal_type = element_type;
     second->next = tail1;
     tail1->value = 4;
     tail1->src1 = 2;
@@ -4138,7 +4464,13 @@ fixed_list_chain_program(int interrupted_capacity)
     tail1->exit_mask = interrupted_capacity ? JIT_EXIT_ERROR : JIT_EXIT_NONE;
     tail1->next = third;
     third->value = 5;
-    third->literal = 30;
+    if (element_type == TYPE_FLOAT) {
+	double value = 30.5;
+
+	memcpy(&third->literal, &value, sizeof(Num));
+    } else
+	third->literal = 30;
+    third->literal_type = element_type;
     third->next = tail2;
     tail2->value = 6;
     tail2->src1 = 4;
@@ -4150,6 +4482,98 @@ fixed_list_chain_program(int interrupted_capacity)
     ret->literal_type = TYPE_LIST;
     block->first = first;
     block->last = ret;
+    return program;
+}
+
+static JITProgram *
+spliced_list_tail_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *first = instruction(HIR_TAC_CONST);
+    JITInstruction *head = instruction(HIR_TAC_UNARY);
+    JITInstruction *second = instruction(HIR_TAC_CONST);
+    JITInstruction *spliced = instruction(HIR_TAC_UNARY);
+    JITInstruction *checked = instruction(HIR_TAC_UNARY);
+    JITInstruction *append = instruction(HIR_TAC_BINARY);
+    JITInstruction *third = instruction(HIR_TAC_CONST);
+    JITInstruction *tail = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    int i;
+
+    program->num_values = 9;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_ownership = allocate(program->num_values);
+    program->value_owner_root = allocate(sizeof(int) * program->num_values);
+    program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+    program->value_use_counts = allocate(sizeof(unsigned) * program->num_values);
+    program->value_escape_flags = allocate(program->num_values);
+    for (i = 1; i < program->num_values; i++) {
+	program->value_types[i] = (i == 2 || i == 4 || i == 5 || i == 6
+				   || i == 8)
+	    ? TYPE_LIST : TYPE_INT;
+	program->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	program->value_owned_slots[i] = -1;
+	program->value_use_counts[i] = 1;
+    }
+    program->value_ownership[2] = JIT_OWNERSHIP_OWNED;
+    program->value_ownership[4] = JIT_OWNERSHIP_OWNED;
+    program->value_ownership[5] = JIT_OWNERSHIP_OWNED;
+    program->value_ownership[6] = JIT_OWNERSHIP_OWNED;
+    program->value_ownership[8] = JIT_OWNERSHIP_OWNED;
+    program->value_owner_root[2] = 2;
+    program->value_owner_root[4] = 4;
+    program->value_owner_root[5] = 4;
+    program->value_owner_root[6] = 6;
+    program->value_owner_root[8] = 8;
+    program->value_owned_slots[8] = 0;
+    program->value_escape_flags[8] = JIT_ESCAPE_RETURN;
+    program->num_owned_slots = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    first->value = 1;
+    first->literal = 10;
+    first->literal_type = TYPE_INT;
+    first->next = head;
+    head->value = 2;
+    head->src1 = 1;
+    head->op = HIR_OP_MAKE_SINGLETON_LIST;
+    head->next = second;
+    second->value = 3;
+    second->literal = 20;
+    second->literal_type = TYPE_INT;
+    second->next = spliced;
+    spliced->value = 4;
+    spliced->src1 = 3;
+    spliced->op = HIR_OP_MAKE_SINGLETON_LIST;
+    spliced->next = checked;
+    checked->value = 5;
+    checked->src1 = 4;
+    checked->op = HIR_OP_CHECK_LIST_FOR_SPLICE;
+    checked->next = append;
+    append->value = 6;
+    append->src1 = 2;
+    append->src2 = 5;
+    append->op = HIR_OP_LIST_APPEND;
+    append->next = third;
+    third->value = 7;
+    third->literal = 30;
+    third->literal_type = TYPE_INT;
+    third->next = tail;
+    tail->value = 8;
+    tail->src1 = 6;
+    tail->src2 = 7;
+    tail->op = HIR_OP_LIST_ADD_TAIL;
+    tail->next = ret;
+    ret->src1 = 8;
+    ret->literal_type = TYPE_LIST;
+    block->first = first;
+    block->last = ret;
+    jit_analyze_owned_last_uses(program);
     return program;
 }
 
@@ -4339,7 +4763,12 @@ test_released_ir_restoration(void)
 {
     Program bytecode;
     JITProgram *program = arithmetic_program();
+    JITProgram *strings;
     JITProgram *rebuilt;
+    Var result;
+    enum error error = E_NONE;
+    int ticks = 10;
+    int timed_out = 0;
 
     memset(&bytecode, 0, sizeof(bytecode));
     bytecode.ref_count = 1;
@@ -4348,6 +4777,21 @@ test_released_ir_restoration(void)
 	  "bytecode-backed JIT program did not compile");
     check(!program->blocks,
 	  "compiled bytecode-backed program retained its lowering IR");
+
+    strings = string_concat_program("retained ", "constants");
+    strings->bytecode_program = &bytecode;
+    check(jit_program_compile(strings),
+	  "bytecode-backed string program did not compile");
+    check(!strings->blocks && strings->retained_constants,
+	  "bytecode-backed string program did not retain its constants");
+    check(jit_program_execute(strings, 0, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	  "released string IR did not execute natively");
+    check(result.type == TYPE_STR
+	  && !strcmp(result.v.str, "retained constants"),
+	  "released string IR lost its retained constants");
+    free_var(result);
+    jit_program_free(strings);
 
     rebuilt = arithmetic_program();
     jit_test_set_compiled_program(rebuilt);
@@ -4378,11 +4822,50 @@ test_guard_and_index_set_lowering(void)
     JITProgram *guard = tagged_guard_instruction_program();
     JITProgram *direct_set = index_set_program(1);
     JITProgram *cow_set = index_set_program(0);
+    JITProgram *tagged_set = tagged_index_set_program();
     JITProgram *float_property = put_prop_lowering_program(0, TYPE_FLOAT, 0);
     JITProgram *tagged_property = put_prop_lowering_program(1, TYPE_INT, 1);
     JITProgram *tagged_range = tagged_range_ref_program();
-    JITProgram *fixed_chain = fixed_list_chain_program(0);
-    JITProgram *checked_chain = fixed_list_chain_program(1);
+    JITProgram *fixed_chain = fixed_list_chain_program(0, TYPE_INT);
+    JITProgram *checked_chain = fixed_list_chain_program(1, TYPE_INT);
+    JITProgram *float_chain = fixed_list_chain_program(0, TYPE_FLOAT);
+    JITProgram *spliced_tail = spliced_list_tail_program();
+    JITInstruction *checked_splice = 0;
+    JITInstruction *list_append = 0;
+    JITInstruction *dynamic_tail = 0;
+    Var env[1];
+    Var result;
+    JITRunResult run_result;
+    int ticks = 10;
+    int timed_out = 0;
+    enum error error = E_NONE;
+
+    {
+	JITInstruction *instr;
+
+	for (instr = spliced_tail->blocks->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_UNARY
+		&& instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE)
+		checked_splice = instr;
+	    else if (instr->kind == HIR_TAC_BINARY
+		     && instr->op == HIR_OP_LIST_APPEND)
+		list_append = instr;
+	    else if (instr->kind == HIR_TAC_BINARY
+		     && instr->op == HIR_OP_LIST_ADD_TAIL)
+		dynamic_tail = instr;
+	}
+    }
+    check(checked_splice
+	  && !(checked_splice->owned_last_use & JIT_LAST_USE_SRC1),
+	  "splice check consumed its alias-forming operand");
+    check(list_append
+	  && (list_append->owned_last_use
+	      & (JIT_LAST_USE_SRC1 | JIT_LAST_USE_SRC2))
+	     == (JIT_LAST_USE_SRC1 | JIT_LAST_USE_SRC2),
+	  "list splice did not release both last-use operands");
+    check(dynamic_tail
+	  && (dynamic_tail->owned_last_use & JIT_LAST_USE_SRC1),
+	  "dynamic list tail did not release its last-use list");
 
     check(jit_program_compile(guard),
 	  "tagged guard instruction did not compile");
@@ -4390,6 +4873,8 @@ test_guard_and_index_set_lowering(void)
 	  "direct integer-list index set did not compile");
     check(jit_program_compile(cow_set),
 	  "copy-on-write list index set did not compile");
+    check(jit_program_compile(tagged_set),
+	  "tagged list index set did not compile");
     check(jit_program_compile(float_property),
 	  "floating-point property write did not compile");
     check(jit_program_compile(tagged_property),
@@ -4400,12 +4885,145 @@ test_guard_and_index_set_lowering(void)
 	  "fixed-capacity list construction did not compile");
     check(jit_program_compile(checked_chain),
 	  "capacity-checked list construction did not compile");
+    check(jit_program_compile(float_chain),
+	  "fixed-capacity float list construction did not compile");
+    check(jit_program_compile(spliced_tail),
+	  "spliced list tail construction did not compile");
 
+    env[0] = new_list(2);
+    env[0].v.list[1].type = TYPE_INT;
+    env[0].v.list[1].v.num = 10;
+    env[0].v.list[2].type = TYPE_INT;
+    env[0].v.list[2].v.num = 20;
+    run_result = jit_program_execute(direct_set, env, &result, &ticks,
+	&timed_out, &error, 0, 0, 0);
+    check(run_result == JIT_RUN_RETURNED,
+	  "exclusive integer-list update did not execute");
+    check(result.type == TYPE_LIST && result.v.list == env[0].v.list
+	  && result.v.list[1].type == TYPE_INT
+	  && result.v.list[1].v.num == 42
+	  && result.v.list[2].v.num == 20,
+	  "exclusive integer-list update returned the wrong list");
+    free_var(result);
+    free_var(env[0]);
+
+    {
+	Var shared;
+	Var *original;
+
+	env[0] = new_list(2);
+	env[0].v.list[1].type = TYPE_INT;
+	env[0].v.list[1].v.num = 10;
+	env[0].v.list[2].type = TYPE_INT;
+	env[0].v.list[2].v.num = 20;
+	original = env[0].v.list;
+	shared = var_ref(env[0]);
+	ticks = 10;
+	run_result = jit_program_execute(cow_set, env, &result, &ticks,
+	    &timed_out, &error, 0, 0, 0);
+	check(run_result == JIT_RUN_RETURNED,
+	      "shared-list update did not execute");
+	check(result.type == TYPE_LIST && result.v.list == env[0].v.list
+	      && result.v.list != original
+	      && result.v.list[1].type == TYPE_INT
+	      && result.v.list[1].v.num == 42
+	      && shared.v.list[1].v.num == 10,
+	      "shared-list update did not preserve copy-on-write semantics");
+	free_var(result);
+	free_var(env[0]);
+	free_var(shared);
+    }
+
+    {
+	Var tagged_env[3];
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_INT;
+	tagged_env[0].v.list[1].v.num = 10;
+	tagged_env[1].type = TYPE_INT;
+	tagged_env[1].v.num = 1;
+	tagged_env[2].type = TYPE_STR;
+	tagged_env[2].v.str = str_dup("tagged replacement");
+	ticks = 10;
+	check(jit_program_execute(tagged_set, tagged_env, &result, &ticks,
+		&timed_out, &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged list update did not execute");
+	check(result.type == TYPE_LIST && result.v.list == tagged_env[0].v.list
+	      && result.v.list[1].type == TYPE_STR
+	      && !strcmp(result.v.list[1].v.str, "tagged replacement"),
+	      "tagged list update returned the wrong value or type");
+	free_var(result);
+	free_var(tagged_env[0]);
+	free_var(tagged_env[2]);
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("not a list");
+	tagged_env[1].type = TYPE_INT;
+	tagged_env[1].v.num = 1;
+	tagged_env[2].type = TYPE_INT;
+	tagged_env[2].v.num = 42;
+	ticks = 10;
+	check(jit_program_execute(tagged_set, tagged_env, &result, &ticks,
+		&timed_out, &error, 0, 0, 0) == JIT_RUN_FALLBACK,
+	      "tagged list update accepted a non-list base");
+	free_var(tagged_env[0]);
+
+	tagged_env[0] = new_list(1);
+	tagged_env[0].v.list[1].type = TYPE_INT;
+	tagged_env[0].v.list[1].v.num = 10;
+	tagged_env[1].type = TYPE_STR;
+	tagged_env[1].v.str = str_dup("not an index");
+	ticks = 10;
+	check(jit_program_execute(tagged_set, tagged_env, &result, &ticks,
+		&timed_out, &error, 0, 0, 0) == JIT_RUN_FALLBACK,
+	      "tagged list update accepted a non-integer index");
+	free_var(tagged_env[1]);
+	free_var(tagged_env[0]);
+    }
+
+    check(jit_program_execute(fixed_chain, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	  "fixed-capacity list construction did not execute");
+    check(result.type == TYPE_LIST && result.v.list[0].v.num == 3
+	  && result.v.list[1].type == TYPE_INT
+	  && result.v.list[1].v.num == 10
+	  && result.v.list[2].v.num == 20
+	  && result.v.list[3].v.num == 30,
+	  "fixed-capacity list construction returned the wrong list");
+    free_var(result);
+
+    ticks = 10;
+    check(jit_program_execute(float_chain, env, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	  "fixed-capacity float list construction did not execute");
+    check(result.type == TYPE_LIST && result.v.list[0].v.num == 3
+	  && result.v.list[1].type == TYPE_FLOAT
+	  && fl_unbox(result.v.list[1].v.fnum) == 10.5
+	  && fl_unbox(result.v.list[2].v.fnum) == 20.5
+	  && fl_unbox(result.v.list[3].v.fnum) == 30.5,
+	  "fixed-capacity float list construction returned the wrong list");
+    free_var(result);
+
+    ticks = 10;
+    check(jit_program_execute(spliced_tail, env, &result, &ticks,
+			      &timed_out, &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	  "spliced list tail construction did not execute");
+    check(result.type == TYPE_LIST && result.v.list[0].v.num == 3
+	  && result.v.list[1].type == TYPE_INT
+	  && result.v.list[1].v.num == 10
+	  && result.v.list[2].v.num == 20
+	  && result.v.list[3].v.num == 30,
+	  "spliced list tail construction returned the wrong list");
+    free_var(result);
+
+    jit_program_free(spliced_tail);
+    jit_program_free(float_chain);
     jit_program_free(checked_chain);
     jit_program_free(fixed_chain);
     jit_program_free(tagged_range);
     jit_program_free(tagged_property);
     jit_program_free(float_property);
+    jit_program_free(tagged_set);
     jit_program_free(cow_set);
     jit_program_free(direct_set);
     jit_program_free(guard);
@@ -4601,7 +5219,7 @@ test_numeric_and_comparison_lowering_matrix(void)
 static void
 test_tick_return_and_dump_lowering(void)
 {
-    JITProgram *batched = arithmetic_program();
+    JITProgram *batched = two_tick_program();
     JITProgram *elided = arithmetic_program();
     JITProgram *return_zero = arithmetic_program();
     JITProgram *call = call_verb_program();
@@ -4618,12 +5236,20 @@ test_tick_return_and_dump_lowering(void)
 	TYPE_INT, 0, 0);
     JITProgram *tagged_copy = parallel_copy_lowering_program(TYPE_ANY,
 	TYPE_ANY, 1, 1);
-    JITInstruction *batched_tick = batched->blocks->first->next->next;
+    JITProgram *int_to_tagged = parallel_copy_lowering_program(TYPE_INT,
+	TYPE_ANY, 0, 1);
+    JITInstruction *batched_tick = batched->blocks->first->next;
+    JITInstruction *second_batched_tick = batched_tick->next->next;
     JITInstruction *elided_tick = elided->blocks->first->next->next;
     JITInstruction *ret = return_zero->blocks->last;
     struct mir_dump dump = { 0 };
+    Var result;
+    int ticks;
+    int timed_out = 0;
+    enum error error = E_NONE;
 
-    batched_tick->tick_batch_count = 3;
+    batched_tick->tick_batch_count = 9;
+    second_batched_tick->tick_batch_count = 9;
     elided_tick->tick_batch_count = (unsigned char) -1;
     ret->kind = HIR_TAC_RETURN0;
     ret->src1 = 0;
@@ -4638,12 +5264,55 @@ test_tick_return_and_dump_lowering(void)
     check(jit_program_compile(int_to_float), "int-to-float copy did not compile");
     check(jit_program_compile(float_to_int), "float-to-int copy did not compile");
     check(jit_program_compile(tagged_copy), "tagged copy did not compile");
+    check(jit_program_compile(int_to_tagged),
+	  "static-to-tagged copy did not compile");
+
+    {
+	Var env[1];
+	Var copied;
+	int copy_ticks = 10;
+	int copy_timed_out = 0;
+	enum error copy_error = E_NONE;
+
+	env[0].type = TYPE_INT;
+	env[0].v.num = 42;
+	check(jit_program_execute(int_to_tagged, env, &copied, &copy_ticks,
+		&copy_timed_out, &copy_error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "static-to-tagged copy did not execute");
+	check(copied.type == TYPE_INT && copied.v.num == 42,
+	      "static-to-tagged copy lost its value or runtime type");
+    }
+
+    ticks = 19;
+    check(jit_program_execute(batched, 0, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	  "two batched ticks did not execute");
+    check(result.type == TYPE_INT && result.v.num == 3 && ticks == 1,
+	  "two batched ticks returned the wrong result or tick count");
+
+    ticks = 9;
+    check(jit_program_execute(batched, 0, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_ABORT_TICKS,
+	  "batched tick exhaustion did not abort");
+    check(ticks == 0,
+	  "batched tick exhaustion left a nonzero tick balance");
+
+    ticks = 19;
+    timed_out = 1;
+    check(jit_program_execute(batched, 0, &result, &ticks, &timed_out,
+			      &error, 0, 0, 0) == JIT_RUN_ABORT_SECONDS,
+	  "batched seconds timeout did not abort");
+    check(ticks == 18,
+	  "batched seconds timeout charged more than the failing tick");
+    timed_out = 0;
+
     check(jit_program_dump_hir(call, check_mir_line, &dump),
 	  "verb-call HIR dump failed");
     check(jit_program_dump_hir(copies, check_mir_line, &dump),
 	  "parallel-copy HIR dump failed");
     check(dump.lines > 0, "expanded HIR dumps produced no lines");
 
+    jit_program_free(int_to_tagged);
     jit_program_free(tagged_copy);
     jit_program_free(float_to_int);
     jit_program_free(int_to_float);
@@ -4762,12 +5431,19 @@ static void
 test_perf_map_and_manual_rotation(void)
 {
     JITProgram *program = arithmetic_program();
+    JITProgram *anonymous = arithmetic_program();
     JITPoolPolicyStats policy;
+    FILE *map;
     char path[128];
+    char line[256];
+    int found_named = 0;
+    int found_anonymous = 0;
 
     jit_program_note_location(program, 42, 7);
     check(jit_program_compile(program),
 	  "perf-map test program did not compile");
+    check(jit_program_compile(anonymous),
+	  "anonymous perf-map test program did not compile");
     check(jit_perf_map_start() && jit_perf_map_active(),
 	  "perf map did not start");
     check(jit_perf_map_start(), "starting an active perf map failed");
@@ -4776,6 +5452,18 @@ test_perf_map_and_manual_rotation(void)
     jit_perf_map_stop();
     check(!jit_perf_map_active(), "perf map did not stop");
     jit_perf_map_stop();
+
+    map = path[0] ? fopen(path, "r") : 0;
+    while (map && fgets(line, sizeof(line), map)) {
+	if (strstr(line, "moo_jit_#42_7"))
+	    found_named = 1;
+	if (strstr(line, "moo_jit_unknown_"))
+	    found_anonymous = 1;
+    }
+    check(found_named && found_anonymous,
+	  "perf map omitted a named or anonymous JIT program");
+    if (map)
+	fclose(map);
     if (path[0])
 	remove(path);
 
@@ -4788,6 +5476,7 @@ test_perf_map_and_manual_rotation(void)
     check(!policy.rotation_pending,
 	  "manual pool rotation request was not completed");
     jit_program_free(program);
+    jit_program_free(anonymous);
 }
 
 static void
@@ -5947,6 +6636,8 @@ test_owned_value_predicates(void)
 
     definition->kind = HIR_TAC_UNARY;
     definition->op = HIR_OP_MAKE_SINGLETON_LIST;
+    tagged[2] = 0;
+    types[2] = TYPE_LIST;
     uses[2] = 0;
     escapes[2] = JIT_ESCAPE_NONE;
     check(jit_test_value_is_dead_owned_list(program, definition),
@@ -6789,6 +7480,7 @@ main(void)
 {
     JITProgram *program = arithmetic_program();
     JITProgram *two_ticks = two_tick_program();
+    JITProgram *many_ticks = many_tick_program(17);
     JITProgram *duplicate_tick_exits = duplicate_tick_exit_program();
     JITProgram *guard = guard_program();
     JITProgram *deep_guard = deep_guard_program();
@@ -6803,6 +7495,7 @@ main(void)
 	HIR_OP_MOD);
     JITProgram *minimum_modulus_power_two = binary_program(NUM_MIN, 8,
 	HIR_OP_MOD);
+    JITProgram *two_negative_moduli = two_negative_modulus_program();
     JITProgram *modulus_one = binary_program(-13, 1, HIR_OP_MOD);
     JITProgram *power = binary_program(3, 13, HIR_OP_EXP);
     JITProgram *power_wrap = binary_program(2, 63, HIR_OP_EXP);
@@ -7180,6 +7873,14 @@ main(void)
 	root_resume.map_id = 1;
 	root_resume.result_home = 0;
 	root_resume.state = JIT_RESUME_PREPARING;
+	context.activation_limit = 1;
+	check(!jit_execution_context_push_compact(&context, &middle,
+	    chain_program, deep_env, &root_resume, -1)
+	      && context.current_frame == &root && !root.callee
+	      && root.state == JIT_FRAME_RUNNING
+	      && root_resume.state == JIT_RESUME_PREPARING,
+	      "compact dispatch crossed the activation depth limit");
+	context.activation_limit = 4;
 	check(jit_execution_context_push_compact(&context, &middle,
 	    chain_program, deep_env, &root_resume, -1),
 	      "first compact native dispatch failed");
@@ -7512,12 +8213,18 @@ main(void)
 	  "MIR dump did not contain PC and line information");
     {
 	struct mir_dump tick_dump = { 0 };
+	struct mir_dump many_tick_dump = { 0 };
 	struct mir_dump exit_dump = { 0 };
 
 	check(jit_program_dump_mir(two_ticks, check_mir_line, &tick_dump),
 	      "two-tick MIR dump failed");
 	check(tick_dump.timeout_checks == 1,
 	      "basic block emitted redundant seconds-timeout checks");
+	check(jit_program_dump_mir(many_ticks, check_mir_line,
+				   &many_tick_dump),
+	      "many-tick MIR dump failed");
+	check(many_tick_dump.timeout_checks == 2,
+	      "long basic block did not refresh its seconds-timeout check");
 	check(jit_program_dump_mir(duplicate_tick_exits, check_mir_line,
 				   &exit_dump),
 	      "duplicate-tick MIR dump failed");
@@ -7598,6 +8305,8 @@ main(void)
 		       "negative power-of-two modulus differed from reference");
     check_differential(minimum_modulus_power_two, env, 10, 0,
 		       "minimum power-of-two modulus differed from reference");
+    check_differential(two_negative_moduli, env, 10, 0,
+		       "two negative power-of-two moduli differed from reference");
     check_differential(modulus_one, env, 10, 0,
 		       "modulus by one differed from reference execution");
     check_differential(power, env, 10, 0,
@@ -7650,6 +8359,8 @@ main(void)
 		       "coalesced seconds abort differed from reference execution");
     check_differential(two_ticks, env, 2, 0,
 		       "coalesced tick exhaustion differed from reference execution");
+    check_differential(many_ticks, env, 18, 0,
+		       "long basic-block tick accounting differed from reference");
     check_differential(charge_tick, env, 1, 1,
 		       "charge-only tick differed from reference execution");
 
@@ -9023,6 +9734,20 @@ main(void)
 	free_var(result);
 	jit_program_free(duplicate_str);
 
+	JITProgram *duplicate_discard =
+	    duplicate_discarded_owned_string_program();
+	check(duplicate_discard->blocks->first->next->next->next->owned_last_use
+	      == (JIT_LAST_USE_SRC1 | JIT_LAST_USE_SRC2),
+	      "duplicate discarded string was not a two-operand last use");
+	ticks = 10;
+	check(jit_program_execute(duplicate_discard, 0, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "duplicate discarded string operands did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "duplicate discarded string comparison returned the wrong value");
+	jit_program_free(duplicate_discard);
+
 	JITProgram *str_idx = string_index_program("LambdaMOO", 7);
 	ticks = 10;
 	check(jit_program_execute(str_idx, 0, &result, &ticks, &timed_out,
@@ -9032,6 +9757,35 @@ main(void)
 	      "string index returned expected character");
 	free_var(result);
 	jit_program_free(str_idx);
+
+	{
+	    JITProgram *tagged_idx = tagged_string_index_program();
+	    Var tagged_env[2];
+
+	    tagged_env[0].type = TYPE_STR;
+	    tagged_env[0].v.str = str_dup("LambdaMOO");
+	    tagged_env[1].type = TYPE_INT;
+	    tagged_env[1].v.num = 7;
+	    ticks = 10;
+	    check(jit_program_execute(tagged_idx, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "tagged string index execution returned");
+	    check(result.type == TYPE_STR && !strcmp(result.v.str, "M"),
+		  "tagged string index returned expected character");
+	    free_var(result);
+
+	    tagged_env[1].type = TYPE_STR;
+	    tagged_env[1].v.str = str_dup("invalid index");
+	    ticks = 10;
+	    check(jit_program_execute(tagged_idx, tagged_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_ERROR && error == E_TYPE,
+		  "tagged string index did not report a non-integer index");
+	    free_var(tagged_env[1]);
+	    free_var(tagged_env[0]);
+	    jit_program_free(tagged_idx);
+	}
 
 	JITProgram *str_lt = string_compare_program("abc", "def", HIR_OP_LT);
 	ticks = 10;
@@ -9259,8 +10013,8 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, 0)
-	      == JIT_RUN_FALLBACK,
-	      "tagged non-integer index did not fallback");
+	      == JIT_RUN_ERROR && error == E_TYPE,
+	      "tagged non-integer index did not report E_TYPE");
 	free_var(tagged_env[0].v.list[2]);
 	tagged_env[0].v.list[2].type = TYPE_INT;
 	tagged_env[0].v.list[2].v.num = 1;
@@ -9270,8 +10024,8 @@ main(void)
 	ticks = 10;
 	check(jit_program_execute(tagged, tagged_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, 0)
-	      == JIT_RUN_FALLBACK,
-	      "tagged non-list base did not fallback");
+	      == JIT_RUN_ERROR && error == E_TYPE,
+	      "tagged non-list base did not report E_TYPE");
 	free_var(tagged_env[0]);
 	jit_program_free(tagged);
     }
@@ -9334,6 +10088,19 @@ main(void)
 	      "float singleton returned the wrong value");
 	free_var(result);
 	jit_program_free(singleton);
+
+	JITProgram *dead_singleton = dead_singleton_program();
+	check(jit_test_value_is_dead_owned_list(dead_singleton,
+		dead_singleton->blocks->first->next),
+	      "unused singleton was not classified for disposal");
+	ticks = 10;
+	check(jit_program_execute(dead_singleton, 0, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "unused singleton list did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == 9,
+	      "unused singleton list changed the following return");
+	jit_program_free(dead_singleton);
     }
 
     /* Type-transparent consumers accept every core user-visible runtime type. */
@@ -9371,6 +10138,8 @@ main(void)
 
 	guard->guarded_type_masks[0] = JIT_TYPE_MASK(TYPE_LIST)
 	    | JIT_TYPE_MASK(TYPE_WAIF);
+	complex_guard->deopt_maps[1].guard_expected[0]
+	    = guard->guarded_type_masks[0];
 	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
 	    Var guarded_env[1];
 
@@ -9381,6 +10150,20 @@ main(void)
 		  == JIT_RUN_RETURNED && result.type == types[i],
 		  "complex tagged guard rejected an accepted runtime type");
 	    free_var(result);
+	    free_var(guarded_env[0]);
+	}
+	{
+	    Var guarded_env[1];
+
+	    guarded_env[0].type = TYPE_STR;
+	    guarded_env[0].v.str = str_dup("rejected tagged guard");
+	    ticks = 10;
+	    check(jit_program_execute(complex_guard, guarded_env, &result,
+				      &ticks, &timed_out, &error, 0,
+				      &deopt, 0) == JIT_RUN_FALLBACK
+		  && deopt.reason == JIT_DEOPT_TYPE_GUARD
+		  && deopt.guard_actual[0] == TYPE_STR,
+		  "complex tagged guard lost its fallback runtime type");
 	    free_var(guarded_env[0]);
 	}
 	jit_program_free(complex_guard);
@@ -10039,6 +10822,7 @@ main(void)
 
     jit_program_free(program);
     jit_program_free(two_ticks);
+    jit_program_free(many_ticks);
     jit_program_free(duplicate_tick_exits);
     jit_program_free(guard);
     jit_program_free(scatter);
@@ -10057,6 +10841,7 @@ main(void)
     jit_program_free(modulus_overflow);
     jit_program_free(modulus_power_two);
     jit_program_free(negative_modulus_power_two);
+    jit_program_free(two_negative_moduli);
     jit_program_free(minimum_modulus_power_two);
     jit_program_free(modulus_one);
     jit_program_free(power);
@@ -10515,7 +11300,8 @@ main(void)
 #endif
 	}
 	{
-	    JITProgram *native_get = owned_property_result_program();
+	    JITProgram *native_get = owned_property_result_program(0);
+	    JITProgram *tagged_get = owned_property_result_program(1);
 	    Var native_env[2];
 	    Var property;
 	    JITRunResult status;
@@ -10539,6 +11325,19 @@ main(void)
 	    hir_test_reset_property();
 	    free_var(property);
 
+	    property.type = TYPE_STR;
+	    property.v.str = str_dup("tagged receiver property");
+	    hir_test_set_property(property);
+	    ticks = 10;
+	    status = jit_program_execute(tagged_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_RETURNED && result.type == TYPE_STR
+		  && !strcmp(result.v.str, "tagged receiver property"),
+		  "tagged receiver with a result home did not read natively");
+	    free_var(result);
+	    hir_test_reset_property();
+	    free_var(property);
+
 #ifdef WAIF_CORE
 	    property = hir_test_new_waif();
 	    hir_test_set_property(property);
@@ -10553,10 +11352,43 @@ main(void)
 	    free_var(result);
 	    hir_test_reset_property();
 	    free_var(property);
+
+	    native_env[0] = hir_test_new_waif();
+	    property.type = TYPE_STR;
+	    property.v.str = str_dup("waif receiver property");
+	    hir_test_set_property(property);
+	    refs = var_refcount(property);
+	    ticks = 10;
+	    status = jit_program_execute(tagged_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_RETURNED && result.type == TYPE_STR
+		  && !strcmp(result.v.str, "waif receiver property")
+		  && var_refcount(property) == refs + 1,
+		  "tagged waif receiver did not read its property natively");
+	    free_var(result);
+	    hir_test_set_property_allowed(0);
+	    ticks = 10;
+	    status = jit_program_execute(tagged_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_ERROR && error == E_PERM,
+		  "native waif property denial did not report E_PERM");
+	    hir_test_set_property_allowed(1);
+	    free_var(native_env[0]);
+	    native_env[0].type = TYPE_INT;
+	    native_env[0].v.num = 0;
+	    ticks = 10;
+	    status = jit_program_execute(tagged_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_ERROR && error == E_TYPE,
+		  "native property read did not report a tagged receiver type error");
+	    native_env[0].type = TYPE_OBJ;
+	    hir_test_reset_property();
+	    free_var(property);
 #else
 	    (void) refs;
 #endif
 	    free_var(native_env[1]);
+	    jit_program_free(tagged_get);
 	    jit_program_free(native_get);
 	}
 	{
@@ -10871,6 +11703,12 @@ main(void)
 	      && pool_stats.native_chain_frame_bytes == 256,
 	      "pool native frame accounting is wrong");
 	jit_profile_native_frame_released(&frame, 256);
+	check(jit_pool_set_policy(3, pool_stats.total_native_allocated_bytes
+				       + pool_stats.total_mir_heap_bytes),
+	      "failed to constrain populated JIT pool");
+	jit_pool_policy_stats(&policy_stats);
+	check(policy_stats.rotation_pending,
+	      "lowering the populated JIT pool limit did not request rotation");
 
 	/* Reset pool and verify invalidation of active programs */
 	check(!jit_program_admit_interpreter_entry(cold)

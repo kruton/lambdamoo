@@ -116,6 +116,34 @@ hir_test_new_waif(void)
     value.v.waif = waif;
     return value;
 }
+
+enum error
+waif_get_prop(Waif *waif, const char *name, Var *property, Objid progr)
+{
+    (void) progr;
+    if (!waif || !name || !*name)
+	return E_PROPNF;
+    if (!mystrcasecmp(name, "owner")) {
+	property->type = TYPE_OBJ;
+	property->v.obj = waif->owner;
+	return E_NONE;
+    }
+    if (!mystrcasecmp(name, "class")) {
+	property->type = TYPE_OBJ;
+	property->v.obj = waif->class;
+	return E_NONE;
+    }
+    if (!mystrcasecmp(name, "wizard")) {
+	*property = zero;
+	return E_NONE;
+    }
+    if (!test_property_allowed)
+	return E_PERM;
+    if (strcmp(name, "value"))
+	return E_PROPNF;
+    *property = var_ref(test_property);
+    return E_NONE;
+}
 #endif
 
 unsigned
