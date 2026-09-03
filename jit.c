@@ -484,6 +484,7 @@ jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
     if (val.type == TYPE_FLOAT) {
 	double d = (double) fl_unbox(val.v.fnum);
 	*out_raw = double_to_raw(d);
+	free_var(val);
     }
     else if (val.type == TYPE_STR)
 	*out_raw = (intptr_t) val.v.str;
@@ -1597,6 +1598,36 @@ jit_mir_allocator_free(JITMIRAllocator *allocator)
     assert(allocator->live_allocations == 0);
     myfree(allocator, M_PROGRAM);
 }
+
+#ifdef JIT_TESTING
+int
+jit_test_mir_allocator(void)
+{
+    JITMIRAllocator *allocator = jit_mir_allocator_new();
+    void *first;
+    void *second;
+    void *third;
+    int ok;
+
+    first = allocator->interface.calloc(2, 8, allocator);
+    second = allocator->interface.malloc(16, allocator);
+    ok = first && second && !((unsigned char *) first)[0]
+	&& allocator->live_allocations == 2;
+    first = allocator->interface.realloc(first, 16, 32, allocator);
+    second = allocator->interface.realloc(second, 16, 0, allocator);
+    third = allocator->interface.realloc(0, 0, 12, allocator);
+    ok = ok && first && !second && third
+	&& allocator->live_allocations == 2
+	&& !allocator->interface.calloc((size_t) -1, 2, allocator)
+	&& !allocator->interface.malloc((size_t) UINT_MAX, allocator);
+    allocator->interface.free(0, allocator);
+    allocator->interface.free(first, allocator);
+    ok = ok && allocator->live_allocations == 1;
+    jit_mir_allocator_free(allocator);
+    jit_mir_allocator_free(0);
+    return ok;
+}
+#endif
 
 typedef struct JITPool {
     MIR_context_t context;
@@ -3008,6 +3039,27 @@ jit_value_is_owned_string_result(JITProgram *program, int value)
 	    || (definition->kind == HIR_TAC_RANGE_REF
 		&& program->value_types[definition->src1] == TYPE_STR));
 }
+
+#ifdef JIT_TESTING
+int
+jit_test_value_is_dead_owned_list(JITProgram *program, JITInstruction *instr)
+{
+    return jit_value_is_dead_owned_list(program, instr);
+}
+
+int
+jit_test_value_is_owned_string_result(JITProgram *program, int value)
+{
+    return jit_value_is_owned_string_result(program, value);
+}
+
+int
+jit_test_list_tail_consumes_home(JITProgram *program, JITInstruction *instr)
+{
+    return jit_list_tail_consume_mode(program, instr)
+	== JIT_LIST_APPEND_CONSUME_HOME;
+}
+#endif
 
 static int
 jit_owned_alias_root(int *roots, int value)
@@ -8386,6 +8438,31 @@ jit_take_boundary_stack_value(JITProgram *program, JITDeoptMap *map, int slot,
 	jit_deopt_raw_value(program, value, deopt_values));
 }
 
+#ifdef JIT_TESTING
+Var
+jit_test_take_boundary_stack_value(JITProgram *program,
+				   JITBoundaryValueOwnership ownership,
+				   int owner, var_type type, int value,
+				   Num *deopt_values, Var *owned_values,
+				   unsigned char *home_states)
+{
+    JITDeoptMap map;
+    unsigned char stack_ownership[1];
+    int stack_values[1];
+    int stack_owner_slots[1];
+
+    memset(&map, 0, sizeof(map));
+    stack_ownership[0] = ownership;
+    stack_values[0] = value;
+    stack_owner_slots[0] = owner;
+    map.stack_boundary_ownership = stack_ownership;
+    map.stack_values = stack_values;
+    map.stack_owner_slots = stack_owner_slots;
+    return jit_take_boundary_stack_value(program, &map, 0, type,
+	deopt_values, owned_values, home_states);
+}
+#endif
+
 static JITResumeValue *
 jit_continuation_resume_value(JITContinuationFrame *frame, int value)
 {
@@ -8470,6 +8547,18 @@ jit_resume_value_needs_capture(JITResumeValue *resume, var_type type)
 	|| resume->source == JIT_RESUME_STACK
 	|| resume->source == JIT_RESUME_CAPTURED;
 }
+
+#ifdef JIT_TESTING
+int
+jit_test_resume_value_needs_capture(JITResumeSource source, var_type type)
+{
+    JITResumeValue resume;
+
+    memset(&resume, 0, sizeof(resume));
+    resume.source = source;
+    return jit_resume_value_needs_capture(&resume, type);
+}
+#endif
 
 static int
 jit_continuation_boundary_operand(JITContinuationFrame *frame, int value,
@@ -8729,6 +8818,21 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	program->usage->continuation_captures++;
     return frame;
 }
+
+#ifdef JIT_TESTING
+JITContinuationFrame *
+jit_test_continuation_capture(JITProgram *program, int map_id,
+			      Num *deopt_values, void *runtime_storage,
+			      Var *borrowed_locals, Var *owned_values,
+			      unsigned char *home_states,
+			      unsigned *home_capacities, size_t runtime_bytes,
+			      JITContinuationFrame *frame)
+{
+    return jit_continuation_capture(program, map_id, deopt_values,
+	runtime_storage, borrowed_locals, owned_values, home_states,
+	home_capacities, runtime_bytes, frame);
+}
+#endif
 
 int
 jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
@@ -9104,6 +9208,17 @@ jit_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
     return 0;
 }
 
+#ifdef JIT_TESTING
+int
+jit_test_deopt_map_is_suspend_zero(JITProgram *program, JITDeoptMap *map,
+				    Num *deopt_values, Var *owned_values,
+				    unsigned char *home_states)
+{
+    return jit_deopt_map_is_suspend_zero(program, map, deopt_values,
+	owned_values, home_states);
+}
+#endif
+
 static var_type
 jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 		      Num *deopt_values, Var *owned_values,
@@ -9136,6 +9251,17 @@ jit_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
     }
     return TYPE_NONE;
 }
+
+#ifdef JIT_TESTING
+var_type
+jit_test_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
+			   Num *deopt_values, Var *owned_values,
+			   unsigned char *home_states, int operand)
+{
+    return jit_guard_actual_type(program, map, env, deopt_values,
+	owned_values, home_states, operand);
+}
+#endif
 
 static void
 jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,

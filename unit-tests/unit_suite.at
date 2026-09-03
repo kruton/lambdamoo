@@ -1,0 +1,19 @@
+AT_SETUP([uT-hir-tac])
+AT_KEYWORDS([hir tac jit])
+AT_CHECK([[
+${MAKE:-make} -C ../../.. uT-hir-tac || exit 99]],
+[ignore],[ignore])
+AT_CHECK([[
+uT-hir-tac]],
+[0],[ignore],[ignore])
+AT_CLEANUP
+
+AT_SETUP([uT-jit])
+AT_KEYWORDS([jit])
+AT_CHECK([[
+${MAKE:-make} -C ../../.. uT-jit || exit 99]],
+[ignore],[ignore])
+AT_CHECK([[
+uT-jit]],
+[0],[ignore],[ignore])
+AT_CLEANUP

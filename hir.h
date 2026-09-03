@@ -199,6 +199,41 @@ extern void hir_dump_ssa(HIRSSAProgram *);
 #endif
 
 #ifdef HIR_TESTING
+typedef enum {
+    HIR_TEST_DOM_NO_REACHABLE,
+    HIR_TEST_DOM_BAD_ENTRY_IDOM,
+    HIR_TEST_DOM_NULL_RPO_BLOCK,
+    HIR_TEST_DOM_BAD_RPO_BLOCK_ID,
+    HIR_TEST_DOM_BAD_BLOCK_INDEX,
+    HIR_TEST_DOM_BAD_RPO_INDEX,
+    HIR_TEST_DOM_MISSING_IDOM,
+    HIR_TEST_DOM_UNREACHABLE_IDOM,
+    HIR_TEST_DOM_SELF_IDOM
+} HIRTestDominatorCorruption;
+
+extern const char *hir_test_expr_kind_name(enum Expr_Kind);
+extern const char *hir_test_stmt_kind_name(enum Stmt_Kind);
+extern const char *hir_test_tac_kind_name(HIRTacKind);
+extern const char *hir_test_op_name(HIROp);
+extern HIRTypeTag hir_test_type_tag_for_var_type(var_type);
+extern int hir_test_optimized_bytecode_shape(HIRTacKind, HIROp, Byte, Byte,
+					     int, Byte *, Byte *);
+extern int hir_test_optimized_bytecode_lowering_cases(void);
+extern int hir_test_verify_corrupt_dominator(HIRContext *, HIRCFG *,
+					     HIRDominatorTree *,
+					     HIRTestDominatorCorruption);
+extern int hir_test_binary_op_for_expr(enum Expr_Kind, HIROp *);
+extern HIRValueKind hir_test_analyze_unary(HIROp, Num, Num *);
+extern HIRValueKind hir_test_analyze_binary(HIROp, Num, Num, Num *);
+extern int hir_test_analyze_binary_nonconstant_cases(void);
+extern int hir_test_join_value_fact_cases(void);
+extern int hir_test_match_rotate32_and_cases(void);
+extern int hir_test_replace_ssa_value_uses(void);
+extern int hir_test_current_version_cases(void);
+#ifdef HIR_DUMP_SSA
+extern int hir_test_dump_ssa_cases(void);
+#endif
+extern int hir_test_inspection_edge_cases(void);
 extern int hir_test_resume_stack_is_safe(var_type *, unsigned, int);
 extern int hir_test_resume_stack_matches_point(ResumeStackSlot *, unsigned,
 					       const ResumePoint *, int);
@@ -272,11 +307,34 @@ extern Num hir_ssa_return_constant(HIRSSAProgram *, HIRValueAnalysis *);
 extern enum error hir_ssa_return_error(HIRSSAProgram *, HIRValueAnalysis *);
 extern HIRTacProgram *hir_test_tac_with_undefined_return(HIRContext *);
 extern HIRTacProgram *hir_test_tac_with_duplicate_temp(HIRContext *);
+typedef enum {
+    HIR_TEST_TAC_PHI,
+    HIR_TEST_TAC_PARALLEL_COPY,
+    HIR_TEST_TAC_UNSUPPORTED_NODEF,
+    HIR_TEST_TAC_UNDEFINED_LABEL,
+    HIR_TEST_TAC_CORRUPTION_COUNT
+} HIRTestTacCorruption;
+extern HIRTacProgram *hir_test_corrupt_tac(HIRContext *,
+					  HIRTestTacCorruption);
 extern HIRCFG *hir_test_cfg_with_missing_successor(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_external_successor(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_predecessor_mismatch(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_duplicate_block_id(HIRContext *);
 extern HIRCFG *hir_test_cfg_with_critical_edge(HIRContext *);
+typedef enum {
+    HIR_TEST_CFG_ZERO_BLOCKS,
+    HIR_TEST_CFG_MISSING_ENTRY,
+    HIR_TEST_CFG_WRONG_ENTRY,
+    HIR_TEST_CFG_INVALID_ID,
+    HIR_TEST_CFG_MISSING_FIRST,
+    HIR_TEST_CFG_MISSING_LAST,
+    HIR_TEST_CFG_NEGATIVE_SUCCESSORS,
+    HIR_TEST_CFG_EXCESS_SUCCESSORS,
+    HIR_TEST_CFG_BLOCK_COUNT,
+    HIR_TEST_CFG_NONTERMINAL_LAST,
+    HIR_TEST_CFG_CORRUPTION_COUNT
+} HIRTestCFGCorruption;
+extern HIRCFG *hir_test_corrupt_cfg(HIRContext *, HIRTestCFGCorruption);
 extern HIRSSAProgram *hir_test_ssa_with_use_before_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_duplicate_def(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_nondominating_use(HIRContext *);
@@ -285,8 +343,40 @@ extern HIRSSAProgram *hir_test_ssa_with_late_phi(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_missing_phi_arg(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_nonpred_phi_arg(HIRContext *);
 extern HIRSSAProgram *hir_test_ssa_with_critical_phi_edge(HIRContext *);
+typedef enum {
+    HIR_TEST_SSA_WRONG_FORM,
+    HIR_TEST_SSA_MISSING_FIRST,
+    HIR_TEST_SSA_MISSING_LAST,
+    HIR_TEST_SSA_ZERO_DEFINITION,
+    HIR_TEST_SSA_HIGH_DEFINITION,
+    HIR_TEST_SSA_INVALID_LOCAL,
+    HIR_TEST_SSA_PARALLEL_COPY,
+    HIR_TEST_SSA_BLOCK_COUNT,
+    HIR_TEST_SSA_INSTRUCTION_COUNT,
+    HIR_TEST_SSA_VALUE_COUNT,
+    HIR_TEST_SSA_CORRUPTION_COUNT
+} HIRTestSSACorruption;
+extern HIRSSAProgram *hir_test_corrupt_ssa(HIRContext *,
+					   HIRTestSSACorruption);
 extern HIRSSAProgram *hir_test_out_ssa_with_phi(HIRContext *);
 extern HIRSSAProgram *hir_test_out_ssa_with_bad_copy_source(HIRContext *);
+typedef enum {
+    HIR_TEST_OUT_SSA_WRONG_FORM,
+    HIR_TEST_OUT_SSA_MISSING_FIRST,
+    HIR_TEST_OUT_SSA_MISSING_LAST,
+    HIR_TEST_OUT_SSA_UNSUPPORTED_DEF,
+    HIR_TEST_OUT_SSA_UNSUPPORTED_NODEF,
+    HIR_TEST_OUT_SSA_STORE_BEFORE_DEF,
+    HIR_TEST_OUT_SSA_COPY_DST_ZERO,
+    HIR_TEST_OUT_SSA_COPY_DST_HIGH,
+    HIR_TEST_OUT_SSA_BLOCK_COUNT,
+    HIR_TEST_OUT_SSA_INSTRUCTION_COUNT,
+    HIR_TEST_OUT_SSA_VALUE_COUNT,
+    HIR_TEST_OUT_SSA_CRITICAL_EDGE,
+    HIR_TEST_OUT_SSA_CORRUPTION_COUNT
+} HIRTestOutSSACorruption;
+extern HIRSSAProgram *hir_test_corrupt_out_ssa(HIRContext *,
+					       HIRTestOutSSACorruption);
 #endif
 
 #endif /* !HIR_h */

@@ -404,4 +404,22 @@ extern int64_t jit_rt_valid(int64_t);
 extern int64_t jit_rt_parent(int64_t, int32_t *);
 extern int64_t jit_rt_var_raw(const Var *);
 
+#ifdef JIT_TESTING
+extern int jit_test_mir_allocator(void);
+extern int jit_test_value_is_dead_owned_list(JITProgram *, JITInstruction *);
+extern int jit_test_value_is_owned_string_result(JITProgram *, int);
+extern int jit_test_list_tail_consumes_home(JITProgram *, JITInstruction *);
+extern int jit_test_resume_value_needs_capture(JITResumeSource, var_type);
+extern Var jit_test_take_boundary_stack_value(JITProgram *,
+	JITBoundaryValueOwnership, int, var_type, int, Num *, Var *,
+	unsigned char *);
+extern var_type jit_test_guard_actual_type(JITProgram *, JITDeoptMap *, Var *,
+	Num *, Var *, unsigned char *, int);
+extern JITContinuationFrame *jit_test_continuation_capture(JITProgram *, int,
+	Num *, void *, Var *, Var *, unsigned char *, unsigned *, size_t,
+	JITContinuationFrame *);
+extern int jit_test_deopt_map_is_suspend_zero(JITProgram *, JITDeoptMap *,
+	Num *, Var *, unsigned char *);
+#endif
+
 #endif /* !JIT_Internal_H */

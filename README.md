@@ -844,6 +844,10 @@ If you add `--enable-testing=unit` to the `configure` arguments,
 your "build" will have make targets and a test run directory that runs
 the unit tests without actually building a server.
 
+Server-specific unit sources live in `unit-tests/`.  A current L8TF
+installation includes `unit-tests/unit_suite.at`, adding the HIR/TAC and JIT
+unit executables to the standard unit suite.
+
 Some of these unit tests are useful utility programs in their own
 right.  Notably, `uT-bquota --report` will give you all relevant
 structure and value sizes for the chosen `BYTE_QUOTA_MODEL`; you can

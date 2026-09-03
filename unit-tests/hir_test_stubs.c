@@ -18,7 +18,11 @@
 
 static unsigned test_protection_generation = 1;
 static int test_length_protected;
+static enum bi_prop test_builtin_property;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
+static int test_property_allowed = 1;
+static const ResumePoint *test_resume_point;
+static JITProgram *test_compiled_jit_program;
 Var zero = { .type = TYPE_INT, .v.num = 0 };
 
 Program *
@@ -65,18 +69,30 @@ const ResumePoint *
 resume_point_for_key(Program *program, ResumeKey key)
 {
     (void) program;
-    (void) key;
+    if (test_resume_point
+	&& test_resume_point->key.code_unit == key.code_unit
+	&& test_resume_point->key.site == key.site)
+	return test_resume_point;
     return 0;
 }
 
 JITProgram *
 compile_program_to_jit(Program *program)
 {
+    JITProgram *result = test_compiled_jit_program;
+
     (void) program;
-    return 0;
+    test_compiled_jit_program = 0;
+    return result;
 }
 
 void hir_test_set_length_protected(int);
+void hir_test_set_builtin_property(enum bi_prop);
+void hir_test_set_property(Var);
+void hir_test_set_property_allowed(int);
+void hir_test_set_resume_point(const ResumePoint *);
+void jit_test_set_compiled_program(JITProgram *);
+void hir_test_reset_property(void);
 #ifdef WAIF_CORE
 Var hir_test_new_waif(void);
 #endif
@@ -145,6 +161,46 @@ hir_test_set_length_protected(int protected)
 	test_length_protected = protected;
 	test_protection_generation++;
     }
+}
+
+void
+hir_test_set_builtin_property(enum bi_prop property)
+{
+    test_builtin_property = property;
+}
+
+void
+hir_test_set_property(Var value)
+{
+    free_var(test_property);
+    test_property = var_ref(value);
+}
+
+void
+hir_test_set_property_allowed(int allowed)
+{
+    test_property_allowed = allowed;
+}
+
+void
+hir_test_set_resume_point(const ResumePoint *point)
+{
+    test_resume_point = point;
+}
+
+void
+jit_test_set_compiled_program(JITProgram *program)
+{
+    test_compiled_jit_program = program;
+}
+
+void
+hir_test_reset_property(void)
+{
+    free_var(test_property);
+    test_property.type = TYPE_INT;
+    test_property.v.num = 123;
+    test_property_allowed = 1;
 }
 
 static inline int
@@ -307,6 +363,11 @@ name_func_by_num(unsigned id)
     case 8: return "rindex";
     case 9: return "pass";
     case 10: return "time";
+    case 11: return "suspend";
+    case 12: return "ticks_left";
+    case 13: return "seconds_left";
+    case 14: return "valid";
+    case 15: return "parent";
     default: return "unknown_func";
     }
 }
@@ -585,6 +646,7 @@ db_find_property(Objid oid, const char *name, Var *value)
     memset(&h, 0, sizeof(h));
     if (oid >= 0 && name && *name) {
 	h.ptr = (void *) 0x1;
+	h.built_in = test_builtin_property;
 	if (value) {
 	    *value = test_property;
 	}
@@ -606,7 +668,7 @@ db_property_allows(db_prop_handle h, Objid progr, db_prop_flag flag)
     (void) h;
     (void) progr;
     (void) flag;
-    return 1;
+    return test_property_allowed;
 }
 
 Num
