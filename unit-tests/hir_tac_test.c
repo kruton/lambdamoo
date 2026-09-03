@@ -37,6 +37,338 @@ check_rejected(const char *name, int accepted, int before_errors,
 }
 
 static void
+test_ast_and_operation_tables(void)
+{
+    static const struct {
+	var_type type;
+	HIRTypeTag tag;
+    } type_tags[] = {
+	{TYPE_INT, HIR_TYPE_INT},
+	{TYPE_FLOAT, HIR_TYPE_FLOAT},
+	{TYPE_STR, HIR_TYPE_STR},
+	{TYPE_LIST, HIR_TYPE_LIST},
+	{TYPE_OBJ, HIR_TYPE_OBJ},
+	{TYPE_ERR, HIR_TYPE_ERR},
+	{TYPE_CLEAR, HIR_TYPE_ANY},
+	{TYPE_NONE, HIR_TYPE_ANY},
+	{TYPE_CATCH, HIR_TYPE_ANY},
+	{TYPE_FINALLY, HIR_TYPE_ANY},
+	{TYPE_WAIF, HIR_TYPE_ANY}
+    };
+    HIROp op;
+    Num value;
+    int binary_kinds = 0;
+    int kind;
+    unsigned i;
+
+    for (i = 0; i < sizeof(type_tags) / sizeof(type_tags[0]); i++)
+	check_int("MOO type maps to HIR tag",
+	    hir_test_type_tag_for_var_type(type_tags[i].type),
+	    type_tags[i].tag);
+
+    for (kind = 0; kind < SizeOf_Expr_Kind; kind++) {
+	check_int("known expression kind name",
+	    !!strcmp(hir_test_expr_kind_name((enum Expr_Kind) kind), "unknown"),
+	    1);
+	if (hir_test_binary_op_for_expr((enum Expr_Kind) kind, &op))
+	    binary_kinds++;
+    }
+    check_int("unknown expression kind name",
+	      !strcmp(hir_test_expr_kind_name(SizeOf_Expr_Kind), "unknown"), 1);
+    check_int("binary expression kind count", binary_kinds, 21);
+    check_int("non-binary expression rejected",
+	      hir_test_binary_op_for_expr(EXPR_VAR, &op), 0);
+
+    for (kind = STMT_COND; kind <= STMT_CONTINUE; kind++)
+	check_int("known statement kind name",
+	    !!strcmp(hir_test_stmt_kind_name((enum Stmt_Kind) kind), "unknown"),
+	    1);
+    check_int("unknown statement kind name",
+	      !strcmp(hir_test_stmt_kind_name((enum Stmt_Kind) -1), "unknown"), 1);
+
+    for (kind = HIR_TAC_TICK; kind <= HIR_TAC_PARALLEL_COPY; kind++)
+	check_int("known TAC kind name",
+	    !!strcmp(hir_test_tac_kind_name((HIRTacKind) kind), "unknown"), 1);
+    check_int("unknown TAC kind name",
+	      !strcmp(hir_test_tac_kind_name((HIRTacKind) -1), "unknown"), 1);
+
+    for (kind = HIR_OP_NEGATE; kind <= HIR_OP_ROTL32; kind++)
+	check_int("known HIR operation name",
+	    !!strcmp(hir_test_op_name((HIROp) kind), "?"), 1);
+    check_int("unknown HIR operation name",
+	      !strcmp(hir_test_op_name((HIROp) -1), "?"), 1);
+
+    check_int("constant unary negate analysis",
+	      hir_test_analyze_unary(HIR_OP_NEGATE, 7, &value),
+	      HIR_VALUE_INT_CONSTANT);
+    check_int("constant unary negate value", value, -7);
+    hir_test_analyze_unary(HIR_OP_NOT, 7, &value);
+    hir_test_analyze_unary(HIR_OP_COMPLEMENT, 7, &value);
+    hir_test_analyze_unary(HIR_OP_ABS, -7, &value);
+    hir_test_analyze_unary(HIR_OP_ABS, 7, &value);
+    hir_test_analyze_unary(HIR_OP_TOINT, 7, &value);
+    hir_test_analyze_unary(HIR_OP_TYPEOF, 7, &value);
+    hir_test_analyze_unary(HIR_OP_LENGTH, 7, &value);
+    hir_test_analyze_unary(HIR_OP_MAKE_SINGLETON_LIST, 7, &value);
+    hir_test_analyze_unary(HIR_OP_CHECK_LIST_FOR_SPLICE, 7, &value);
+    hir_test_analyze_unary(HIR_OP_ROTL32, 7, &value);
+
+    for (kind = HIR_OP_NEGATE; kind <= HIR_OP_ROTL32; kind++)
+	hir_test_analyze_binary((HIROp) kind, 7, 2, &value);
+    check_int("binary analysis handles nonconstant lattice inputs",
+	      hir_test_analyze_binary_nonconstant_cases(), 4);
+    check_int("value-fact joins cover lattice combinations",
+	      hir_test_join_value_fact_cases(), 9);
+    check_int("rotate matcher rejects malformed SSA shapes",
+	      hir_test_match_rotate32_and_cases(), 13);
+    check_int("SSA use replacement covers all operand homes",
+	      hir_test_replace_ssa_value_uses(), 12);
+    check_int("SSA local versioning covers implicit definitions",
+	      hir_test_current_version_cases(), 12);
+#ifdef HIR_DUMP_SSA
+    check_int("SSA dumping covers sparse and parallel-copy forms",
+	      hir_test_dump_ssa_cases(), 1);
+#endif
+    check_int("SSA inspection handles absent and out-of-range values",
+	      hir_test_inspection_edge_cases(), 22);
+}
+
+static void
+test_optimized_bytecode_shapes(void)
+{
+    static const struct {
+	HIROp op;
+	Byte opcode;
+	Byte extended_opcode;
+    } binary_cases[] = {
+	{HIR_OP_ADD, OP_ADD, 0},
+	{HIR_OP_SUB, OP_MINUS, 0},
+	{HIR_OP_MUL, OP_MULT, 0},
+	{HIR_OP_DIV, OP_DIV, 0},
+	{HIR_OP_MOD, OP_MOD, 0},
+	{HIR_OP_EQ, OP_EQ, 0},
+	{HIR_OP_NE, OP_NE, 0},
+	{HIR_OP_LT, OP_LT, 0},
+	{HIR_OP_LE, OP_LE, 0},
+	{HIR_OP_GT, OP_GT, 0},
+	{HIR_OP_GE, OP_GE, 0},
+	{HIR_OP_EXP, OP_EXTENDED, EOP_EXP},
+	{HIR_OP_BITOR, OP_EXTENDED, EOP_BITOR},
+	{HIR_OP_BITXOR, OP_EXTENDED, EOP_BITXOR},
+	{HIR_OP_BITAND, OP_EXTENDED, EOP_BITAND},
+	{HIR_OP_SHL, OP_EXTENDED, EOP_SHL},
+	{HIR_OP_SHR, OP_EXTENDED, EOP_SHR},
+	{HIR_OP_LSHR, OP_EXTENDED, EOP_LSHR},
+	{HIR_OP_ROTL32, OP_EXTENDED, EOP_LSHR}
+    };
+    Byte pop_count;
+    Byte skip_count;
+    unsigned i;
+
+    check_int("unary negate bytecode shape",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_NEGATE,
+	    OP_UNARY_MINUS, 0, 0, &pop_count, &skip_count), 1);
+    check_int("unary negate pop count", pop_count, 1);
+    check_int("unary negate skip count", skip_count, 0);
+    check_int("unary not bytecode shape",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_NOT,
+	    OP_NOT, 0, 0, &pop_count, &skip_count), 1);
+    check_int("unary complement bytecode shape",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_COMPLEMENT,
+	    OP_EXTENDED, EOP_COMPLEMENT, 1, &pop_count, &skip_count), 1);
+    check_int("unary complement skip count", skip_count, 1);
+    check_int("truncated unary complement rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_COMPLEMENT,
+	    OP_EXTENDED, EOP_COMPLEMENT, 0, &pop_count, &skip_count), 0);
+    check_int("wrong unary complement opcode rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_COMPLEMENT,
+	    OP_NOT, EOP_COMPLEMENT, 1, &pop_count, &skip_count), 0);
+    check_int("wrong extended complement rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_COMPLEMENT,
+	    OP_EXTENDED, EOP_BITOR, 1, &pop_count, &skip_count), 0);
+    check_int("wrong unary opcode rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_NEGATE,
+	    OP_NOT, 0, 0, &pop_count, &skip_count), 0);
+    check_int("unknown unary operation rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_UNARY, HIR_OP_ADD,
+	    OP_ADD, 0, 0, &pop_count, &skip_count), 0);
+
+    for (i = 0; i < sizeof(binary_cases) / sizeof(binary_cases[0]); i++) {
+	int extended = binary_cases[i].opcode == OP_EXTENDED;
+
+	check_int("binary bytecode shape",
+	    hir_test_optimized_bytecode_shape(HIR_TAC_BINARY,
+		binary_cases[i].op, binary_cases[i].opcode,
+		binary_cases[i].extended_opcode, extended, &pop_count,
+		&skip_count), 1);
+	check_int("binary bytecode pop count", pop_count, 2);
+	check_int("binary bytecode skip count", skip_count, extended);
+	check_int("wrong binary opcode rejected",
+	    hir_test_optimized_bytecode_shape(HIR_TAC_BINARY,
+		binary_cases[i].op, OP_RETURN,
+		binary_cases[i].extended_opcode, extended, &pop_count,
+		&skip_count), 0);
+	if (extended)
+	    check_int("wrong extended binary opcode rejected",
+		hir_test_optimized_bytecode_shape(HIR_TAC_BINARY,
+		    binary_cases[i].op, OP_EXTENDED, EOP_COMPLEMENT, 1,
+		    &pop_count, &skip_count), 0);
+    }
+    check_int("wrong binary opcode rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_BINARY, HIR_OP_ADD,
+	    OP_MINUS, 0, 0, &pop_count, &skip_count), 0);
+    check_int("truncated extended binary rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_BINARY, HIR_OP_EXP,
+	    OP_EXTENDED, EOP_EXP, 0, &pop_count, &skip_count), 0);
+    check_int("wrong extended binary rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_BINARY, HIR_OP_BITOR,
+	    OP_EXTENDED, EOP_BITXOR, 1, &pop_count, &skip_count), 0);
+    check_int("truncated bitwise binary rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_BINARY, HIR_OP_BITOR,
+	    OP_EXTENDED, EOP_BITOR, 0, &pop_count, &skip_count), 0);
+    check_int("unknown binary operation rejected",
+	hir_test_optimized_bytecode_shape(HIR_TAC_BINARY, HIR_OP_FORK,
+	    OP_EXTENDED, 0, 1, &pop_count, &skip_count), 0);
+    check_int("optimized bytecode lowering covers edge cases",
+	hir_test_optimized_bytecode_lowering_cases(), 11);
+}
+
+static void
+test_null_analysis_accessors(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRTacProgram *empty_tac;
+    HIRCFG *empty_cfg;
+    HIRDominatorTree *empty_dom;
+    HIRSSAProgram *empty_ssa;
+
+    memset(&names, 0, sizeof(names));
+    ctx = hir_context_new(&names);
+
+    check_int("null TAC verifier context", hir_verify_tac(0, 0), 0);
+    check_int("null TAC verifier program", hir_verify_tac(ctx, 0), 0);
+    check_int("null CFG builder context", hir_build_cfg(0, 0) == 0, 1);
+    check_int("null CFG builder program", hir_build_cfg(ctx, 0) == 0, 1);
+    check_int("null CFG verifier context", hir_verify_cfg(0, 0), 0);
+    check_int("null CFG verifier graph", hir_verify_cfg(ctx, 0), 0);
+    check_int("null dominator builder context",
+	      hir_build_dominator_tree(0, 0) == 0, 1);
+    check_int("null dominator builder graph",
+	      hir_build_dominator_tree(ctx, 0) == 0, 1);
+    check_int("null dominator verifier context",
+	      hir_verify_dominator_tree(0, 0, 0), 0);
+    check_int("null dominator verifier graph",
+	      hir_verify_dominator_tree(ctx, 0, 0), 0);
+    check_int("null SSA builder context", hir_build_ssa(0, 0) == 0, 1);
+    check_int("null SSA builder graph", hir_build_ssa(ctx, 0) == 0, 1);
+    check_int("null SSA verifier context", hir_verify_ssa(0, 0), 0);
+    check_int("null SSA verifier program", hir_verify_ssa(ctx, 0), 0);
+    check_int("null SSA analyzer context",
+	      hir_analyze_ssa_values(0, 0) == 0, 1);
+    check_int("null SSA analyzer program",
+	      hir_analyze_ssa_values(ctx, 0) == 0, 1);
+    check_int("null SSA optimizer context",
+	      hir_optimize_ssa_for_backends(0, 0) == 0, 1);
+    check_int("null SSA optimizer program",
+	      hir_optimize_ssa_for_backends(ctx, 0) == 0, 1);
+    check_int("null SSA destroy context", hir_destroy_ssa(0, 0), 0);
+    check_int("null SSA destroy program", hir_destroy_ssa(ctx, 0), 0);
+    check_int("null out-of-SSA verifier context",
+	      hir_verify_out_of_ssa(0, 0), 0);
+    check_int("null out-of-SSA verifier program",
+	      hir_verify_out_of_ssa(ctx, 0), 0);
+
+    check_int("null context error count", hir_context_error_count(0), 0);
+    check_int("null context error message", hir_context_error_message(0) == 0,
+	      1);
+    check_int("null value kind", hir_value_kind(0, 1), HIR_VALUE_UNKNOWN);
+    check_int("null value constant", hir_value_constant(0, 1), 0);
+    check_int("null value error", hir_value_error(0, 1), E_NONE);
+    check_int("null optimization count", hir_optimization_change_count(0), 0);
+    hir_context_set_first_user_local(0, 0);
+    hir_context_set_first_user_local(ctx, -1);
+    hir_context_set_first_user_local(ctx, 1);
+
+    check_int("null TAC kind count", hir_tac_count_kind(0, HIR_TAC_CONST), 0);
+    check_int("null TAC unary count",
+	      hir_tac_count_unary_op(0, HIR_OP_NEGATE), 0);
+    check_int("null TAC binary count",
+	      hir_tac_count_binary_op(0, HIR_OP_ADD), 0);
+    check_int("null TAC instruction count", hir_tac_instruction_count(0), 0);
+    check_int("null TAC line count", hir_tac_count_lineno(0, 1), 0);
+    check_int("null TAC pc count", hir_tac_count_bytecode_pc(0, 1), 0);
+    check_int("null TAC stack depth",
+	      hir_tac_stack_depth_at_bytecode_pc(0, 1), -1);
+    check_int("null TAC stack mismatch count",
+	      hir_tac_stack_depth_mismatch_count(0, 1, 0), 0);
+
+    check_int("null CFG block count", hir_cfg_block_count(0), 0);
+    check_int("null CFG edge count", hir_cfg_edge_count(0), 0);
+    check_int("null CFG unsupported count",
+	      hir_cfg_unsupported_block_count(0), 0);
+    check_int("null CFG critical edge count",
+	      hir_cfg_critical_edge_count(0), 0);
+    check_int("null critical-edge split context",
+	      hir_split_critical_edges(0, 0), 0);
+    check_int("null critical-edge split graph",
+	      hir_split_critical_edges(ctx, 0), 0);
+    check_int("null dominator reachable count",
+	      hir_dom_reachable_block_count(0), 0);
+    check_int("null immediate dominator", hir_dom_idom_block(0, 1), 0);
+    check_int("null dominance frontier count", hir_dom_df_count(0, 1), 0);
+
+    check_int("null SSA block count", hir_ssa_block_count(0), 0);
+    check_int("null SSA instruction count", hir_ssa_instruction_count(0), 0);
+    check_int("null SSA value count", hir_ssa_value_count(0), 0);
+    check_int("null SSA kind count", hir_ssa_count_kind(0, HIR_TAC_CONST), 0);
+    check_int("null SSA invalid-load count",
+	      hir_ssa_out_of_range_load_count(0, 0), 0);
+    check_int("null SSA pc count", hir_ssa_count_bytecode_pc(0, 1), 0);
+    check_int("null SSA stack depth",
+	      hir_ssa_stack_depth_at_bytecode_pc(0, 1), -1);
+    check_int("null SSA stack value",
+	      hir_ssa_stack_value_at_bytecode_pc(0, 1, 0), -1);
+    check_int("null SSA binary value",
+	      hir_ssa_binary_value_at_bytecode_pc(0, 1, HIR_OP_ADD), -1);
+    check_int("null SSA local value",
+	      hir_ssa_local_value_at_bytecode_pc(0, 1, 0), -1);
+    check_int("null SSA local snapshots", hir_ssa_local_snapshot_count(0), 0);
+    check_int("null SSA phi arguments", hir_ssa_phi_arg_count(0), 0);
+    check_int("null SSA empty phi arguments", hir_ssa_zero_phi_arg_count(0), 0);
+    check_int("null SSA return phi uses", hir_ssa_return_uses_phi_count(0), 0);
+    check_int("null SSA branch phi uses", hir_ssa_branch_uses_phi_count(0), 0);
+    check_int("null SSA binary phi uses",
+	      hir_ssa_binary_uses_phi_count(0, HIR_OP_ADD), 0);
+    check_int("null SSA parallel copies",
+	      hir_ssa_parallel_copy_pair_count(0), 0);
+    check_int("null SSA form", hir_ssa_form(0), -1);
+    check_int("null SSA CFG block count", hir_ssa_cfg_block_count(0), 0);
+    check_int("null SSA CFG edge count", hir_ssa_cfg_edge_count(0), 0);
+    check_int("null SSA CFG critical edge count",
+	      hir_ssa_cfg_critical_edge_count(0), 0);
+
+    empty_tac = hir_lower_to_tac(ctx, 0);
+    check_int("empty TAC verifies", hir_verify_tac(ctx, empty_tac), 1);
+    check_int("empty TAC has no instructions",
+	      hir_tac_instruction_count(empty_tac), 0);
+    empty_cfg = hir_build_cfg(ctx, empty_tac);
+    check_int("empty CFG has no blocks", hir_cfg_block_count(empty_cfg), 0);
+    check_int("empty CFG verifies", hir_verify_cfg(ctx, empty_cfg), 1);
+    empty_dom = hir_build_dominator_tree(ctx, empty_cfg);
+    check_int("empty dominator tree has no reachable blocks",
+	      hir_dom_reachable_block_count(empty_dom), 0);
+    check_int("empty dominator tree verifies",
+	      hir_verify_dominator_tree(ctx, empty_cfg, empty_dom), 1);
+    empty_ssa = hir_build_ssa(ctx, empty_cfg);
+    check_int("empty SSA has no blocks", hir_ssa_block_count(empty_ssa), 0);
+    check_int("empty SSA verifies", hir_verify_ssa(ctx, empty_ssa), 1);
+
+    hir_context_free(ctx);
+    hir_context_free(0);
+}
+
+static void
 test_resume_stack_safety(void)
 {
     var_type plain[] = {TYPE_INT, TYPE_STR, TYPE_LIST};
@@ -65,6 +397,8 @@ test_resume_stack_shape(void)
     memset(&point, 0, sizeof(point));
     memset(point_slots, 0, sizeof(point_slots));
     memset(boundary_slots, 0, sizeof(boundary_slots));
+    check_int("missing resume point rejected",
+	      hir_test_resume_stack_matches_point(0, 0, 0, 0), 0);
     point.stack_depth = 2;
     point.stack_slots = point_slots;
     point_slots[0].kind = RSS_FINALLY;
@@ -80,6 +414,19 @@ test_resume_stack_shape(void)
     check_int("wrong resume stack depth rejected",
 	      hir_test_resume_stack_matches_point(boundary_slots, 2,
 					  &point, 1), 0);
+    check_int("negative call operand count rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, -1), 0);
+    check_int("short operand stack rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 0,
+					  &point, 1), 0);
+    check_int("missing boundary slots rejected",
+	      hir_test_resume_stack_matches_point(0, 3, &point, 1), 0);
+    point.stack_slots = 0;
+    check_int("missing point slots rejected",
+	      hir_test_resume_stack_matches_point(boundary_slots, 3,
+					  &point, 1), 0);
+    point.stack_slots = point_slots;
     boundary_slots[0].kind = RSS_VALUE;
     check_int("wrong resume stack marker rejected",
 	      hir_test_resume_stack_matches_point(boundary_slots, 3,
@@ -271,6 +618,19 @@ binary_expr(enum Expr_Kind kind, Expr *lhs, Expr *rhs)
     return expr;
 }
 
+static Expr
+unary_expr(enum Expr_Kind kind, Expr *operand)
+{
+    Expr expr;
+
+    memset(&expr, 0, sizeof(expr));
+    expr.kind = kind;
+    expr.lineno = operand ? operand->lineno : 0;
+    expr.bytecode_pc = NO_BYTECODE_PC;
+    expr.e.expr = operand;
+    return expr;
+}
+
 static Stmt
 expr_stmt(Expr *expr)
 {
@@ -317,6 +677,9 @@ lower_stmt(Names *names, Stmt *stmt, HIRContext **ctx_out, HIRCFG **cfg_out,
     (void) hir_verify_dominator_tree(ctx, cfg, dom);
     ssa = hir_build_ssa(ctx, cfg);
     (void) hir_verify_ssa(ctx, ssa);
+#ifdef HIR_DUMP_SSA
+    check_ssa_dump_contains("lowered SSA dump", ssa, "HIR SSA END");
+#endif
     *ctx_out = ctx;
     *cfg_out = cfg;
     *dom_out = dom;
@@ -437,6 +800,198 @@ test_arithmetic_and_local_tac(void)
     }
 
     hir_context_free(ctx);
+}
+
+static void
+test_unary_and_empty_list_tac(void)
+{
+    static const struct {
+	enum Expr_Kind kind;
+	HIROp op;
+    } cases[] = {
+	{EXPR_NEGATE, HIR_OP_NEGATE},
+	{EXPR_NOT, HIR_OP_NOT},
+	{EXPR_COMPLEMENT, HIR_OP_COMPLEMENT}
+    };
+    Names names;
+    unsigned i;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	HIRContext *ctx;
+	HIRCFG *cfg;
+	HIRDominatorTree *dom;
+	HIRSSAProgram *ssa;
+	Expr value = int_expr(7, 12);
+	Expr unary = unary_expr(cases[i].kind, &value);
+	Stmt ret = return_stmt(&unary);
+	HIRTacProgram *tac;
+
+	unary.bytecode_pc = 2;
+	tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+	check_int("unary expression lowered",
+	    hir_tac_count_unary_op(tac, cases[i].op), 1);
+	check_int("unary expression verifies", hir_context_error_count(ctx), 0);
+	hir_context_free(ctx);
+    }
+    {
+	HIRContext *ctx;
+	HIRCFG *cfg;
+	HIRDominatorTree *dom;
+	HIRSSAProgram *ssa;
+	Expr empty;
+	Stmt ret;
+	HIRTacProgram *tac;
+
+	memset(&empty, 0, sizeof(empty));
+	empty.kind = EXPR_LIST;
+	empty.lineno = 13;
+	empty.bytecode_pc = 1;
+	ret = return_stmt(&empty);
+	tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+	check_int("empty list lowered as a constant",
+	    hir_tac_count_kind(tac, HIR_TAC_CONST), 1);
+	check_int("empty list verifies", hir_context_error_count(ctx), 0);
+	hir_context_free(ctx);
+    }
+}
+
+static void
+test_empty_and_discarded_statements(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr literal = int_expr(1, 13);
+    Expr local = id_expr(0, 13);
+    Stmt literal_stmt = expr_stmt(&literal);
+    Stmt local_stmt = expr_stmt(&local);
+    Stmt empty_expr_stmt = expr_stmt(0);
+    Stmt empty_return = return_stmt(0);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    literal_stmt.next = &local_stmt;
+    local_stmt.next = &empty_expr_stmt;
+    empty_expr_stmt.next = &empty_return;
+    tac = lower_stmt(&names, &literal_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("discarded trivial expressions emit no values",
+	      hir_tac_count_kind(tac, HIR_TAC_CONST)
+	      + hir_tac_count_kind(tac, HIR_TAC_LOAD_LOCAL), 0);
+    check_int("empty return lowers directly",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN0), 1);
+    check_int("empty and discarded statements verify",
+	      hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+check_inline_builtin(unsigned func, HIROp op, int argc)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr first = int_expr(7, 14);
+    Expr second = int_expr(9, 14);
+    Expr call;
+    Arg_List args[2];
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    memset(args, 0, sizeof(args));
+    args[0].kind = args[1].kind = ARG_NORMAL;
+    args[0].expr = &first;
+    args[1].expr = &second;
+    args[0].next = argc == 2 ? &args[1] : 0;
+    memset(&call, 0, sizeof(call));
+    call.kind = EXPR_CALL;
+    call.lineno = 14;
+    call.bytecode_pc = 3;
+    call.e.call.func = func;
+    call.e.call.args = argc ? &args[0] : 0;
+    ret = return_stmt(&call);
+
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("pure builtin lowered inline",
+	      hir_tac_count_unary_op(tac, op)
+	      + hir_tac_count_binary_op(tac, op), 1);
+    check_int("pure builtin omitted generic call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 0);
+    check_int("pure builtin verifies", hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+check_builtin_not_inlined(unsigned func, HIROp op, int argc,
+			  enum Arg_Kind first_kind, enum Arg_Kind second_kind)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr values[3];
+    Expr call;
+    Arg_List args[3];
+    Stmt ret;
+    int i;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    memset(args, 0, sizeof(args));
+    for (i = 0; i < 3; i++) {
+	values[i] = int_expr(i + 1, 15);
+	args[i].kind = ARG_NORMAL;
+	args[i].expr = &values[i];
+	args[i].next = i + 1 < argc ? &args[i + 1] : 0;
+    }
+    args[0].kind = first_kind;
+    args[1].kind = second_kind;
+    memset(&call, 0, sizeof(call));
+    call.kind = EXPR_CALL;
+    call.lineno = 15;
+    call.e.call.func = func;
+    call.e.call.args = argc ? &args[0] : 0;
+    ret = return_stmt(&call);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("malformed pure builtin uses generic call",
+	      hir_tac_count_kind(tac, HIR_TAC_CALL), 1);
+    check_int("malformed pure builtin is not inlined",
+	      hir_tac_count_unary_op(tac, op)
+	      + hir_tac_count_binary_op(tac, op), 0);
+    check_int("malformed pure builtin verifies",
+	      hir_context_error_count(ctx), 0);
+    hir_context_free(ctx);
+}
+
+static void
+test_pure_builtin_inlining_matrix(void)
+{
+    check_inline_builtin(1, HIR_OP_TOINT, 1);
+    check_inline_builtin(2, HIR_OP_TYPEOF, 1);
+    check_inline_builtin(5, HIR_OP_MAX, 2);
+    check_inline_builtin(6, HIR_OP_LENGTH, 1);
+    check_inline_builtin(12, HIR_OP_TICKS_LEFT, 0);
+    check_inline_builtin(13, HIR_OP_SECONDS_LEFT, 0);
+    check_inline_builtin(14, HIR_OP_VALID, 1);
+    check_inline_builtin(15, HIR_OP_PARENT, 1);
+    check_builtin_not_inlined(12, HIR_OP_TICKS_LEFT, 1, ARG_NORMAL,
+	ARG_NORMAL);
+    check_builtin_not_inlined(1, HIR_OP_TOINT, 0, ARG_NORMAL, ARG_NORMAL);
+    check_builtin_not_inlined(1, HIR_OP_TOINT, 1, ARG_SPLICE, ARG_NORMAL);
+    check_builtin_not_inlined(4, HIR_OP_MIN, 1, ARG_NORMAL, ARG_NORMAL);
+    check_builtin_not_inlined(4, HIR_OP_MIN, 2, ARG_SPLICE, ARG_NORMAL);
+    check_builtin_not_inlined(4, HIR_OP_MIN, 2, ARG_NORMAL, ARG_SPLICE);
+    check_builtin_not_inlined(4, HIR_OP_MIN, 3, ARG_NORMAL, ARG_NORMAL);
 }
 
 static void
@@ -711,6 +1266,31 @@ test_negative_tac_verifier_cases(void)
 }
 
 static void
+test_negative_tac_verifier_matrix(void)
+{
+    Names names;
+    int corruption;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    for (corruption = 0; corruption <= HIR_TEST_TAC_CORRUPTION_COUNT;
+	 corruption++) {
+	HIRContext *ctx = hir_context_new(&names);
+	HIRTacProgram *tac = hir_test_corrupt_tac(ctx,
+	    (HIRTestTacCorruption) corruption);
+	int before = hir_context_error_count(ctx);
+	int accepted = hir_verify_tac(ctx, tac);
+
+	if (corruption == HIR_TEST_TAC_CORRUPTION_COUNT)
+	    check_int("valid TAC verifier edge case", accepted, 1);
+	else
+	    check_rejected("negative TAC verifier matrix", accepted, before,
+		 hir_context_error_count(ctx));
+	hir_context_free(ctx);
+    }
+}
+
+static void
 test_negative_cfg_verifier_cases(void)
 {
     Names names;
@@ -753,6 +1333,71 @@ test_negative_cfg_verifier_cases(void)
     check_rejected("negative cfg duplicate block id", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+}
+
+static void
+test_negative_cfg_verifier_matrix(void)
+{
+    Names names;
+    int corruption;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    for (corruption = 0; corruption <= HIR_TEST_CFG_CORRUPTION_COUNT;
+	 corruption++) {
+	HIRContext *ctx = hir_context_new(&names);
+	HIRCFG *cfg = hir_test_corrupt_cfg(ctx,
+	    (HIRTestCFGCorruption) corruption);
+	int before = hir_context_error_count(ctx);
+	int accepted = hir_verify_cfg(ctx, cfg);
+
+	if (corruption == HIR_TEST_CFG_ZERO_BLOCKS
+	    || corruption == HIR_TEST_CFG_CORRUPTION_COUNT)
+	    check_int("valid CFG verifier edge case", accepted, 1);
+	else
+	    check_rejected("negative CFG verifier matrix", accepted, before,
+		hir_context_error_count(ctx));
+	hir_context_free(ctx);
+    }
+}
+
+static void
+test_negative_dominator_verifier_cases(void)
+{
+    Names names;
+    int corruption;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    for (corruption = HIR_TEST_DOM_NO_REACHABLE;
+	 corruption <= HIR_TEST_DOM_SELF_IDOM; corruption++) {
+	HIRContext *ctx;
+	HIRCFG *cfg;
+	HIRDominatorTree *dom;
+	HIRSSAProgram *ssa;
+	Expr condition = id_expr(0, 20);
+	Expr value = int_expr(1, 21);
+	Stmt body = expr_stmt(&value);
+	Stmt loop;
+	int before;
+	int accepted;
+
+	memset(&loop, 0, sizeof(loop));
+	loop.kind = STMT_WHILE;
+	loop.lineno = 20;
+	loop.s.loop.id = -1;
+	loop.s.loop.condition = &condition;
+	loop.s.loop.body = &body;
+	(void) lower_stmt(&names, &loop, &ctx, &cfg, &dom, &ssa);
+	check_int("dominator corruption fixture has multiple blocks",
+	    hir_dom_reachable_block_count(dom) > 1, 1);
+	before = hir_context_error_count(ctx);
+	accepted = hir_test_verify_corrupt_dominator(ctx, cfg, dom,
+	    (HIRTestDominatorCorruption) corruption);
+	check_rejected("negative dominator verifier", accepted, before,
+	    hir_context_error_count(ctx));
+	hir_context_free(ctx);
+    }
 }
 
 static void
@@ -838,6 +1483,58 @@ test_negative_ssa_verifier_cases(void)
     check_rejected("negative out ssa bad copy source", accepted, before,
 		   hir_context_error_count(ctx));
     hir_context_free(ctx);
+}
+
+static void
+test_negative_ssa_verifier_matrix(void)
+{
+    Names names;
+    int corruption;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    for (corruption = 0; corruption <= HIR_TEST_SSA_CORRUPTION_COUNT;
+	 corruption++) {
+	HIRContext *ctx = hir_context_new(&names);
+	HIRSSAProgram *ssa = hir_test_corrupt_ssa(ctx,
+	    (HIRTestSSACorruption) corruption);
+	int before = hir_context_error_count(ctx);
+	int accepted = hir_verify_ssa(ctx, ssa);
+
+	if (corruption == HIR_TEST_SSA_CORRUPTION_COUNT)
+	    check_int("valid SSA verifier edge case", accepted, 1);
+	else
+	    check_rejected("negative SSA verifier matrix", accepted, before,
+		hir_context_error_count(ctx));
+	hir_context_free(ctx);
+    }
+}
+
+static void
+test_negative_out_ssa_verifier_matrix(void)
+{
+    Names names;
+    int corruption;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    for (corruption = 0;
+	 corruption <= HIR_TEST_OUT_SSA_CORRUPTION_COUNT; corruption++) {
+	HIRContext *ctx = hir_context_new(&names);
+	HIRSSAProgram *ssa = hir_test_corrupt_out_ssa(ctx,
+	    (HIRTestOutSSACorruption) corruption);
+	int before = hir_context_error_count(ctx);
+	int accepted = hir_verify_out_of_ssa(ctx, ssa);
+
+	if (corruption == HIR_TEST_OUT_SSA_UNSUPPORTED_DEF
+	    || corruption == HIR_TEST_OUT_SSA_UNSUPPORTED_NODEF
+	    || corruption == HIR_TEST_OUT_SSA_CORRUPTION_COUNT)
+	    check_int("supported out-of-ssa placeholder verifies", accepted, 1);
+	else
+	    check_rejected("negative out-of-ssa verifier matrix", accepted,
+		before, hir_context_error_count(ctx));
+	hir_context_free(ctx);
+    }
 }
 
 static Stmt
@@ -1960,6 +2657,74 @@ test_optional_scatter_default_lowering(void)
 }
 
 static void
+test_malformed_scatter_lowering(void)
+{
+    static const struct {
+	enum Scatter_Kind first_kind;
+	enum Scatter_Kind second_kind;
+	int first_has_default;
+	int second_has_default;
+    } cases[] = {
+	{SCAT_REST, SCAT_REST, 0, 0},
+	{SCAT_OPTIONAL, SCAT_REQUIRED, 1, 0},
+	{SCAT_REST, SCAT_REQUIRED, 0, 0},
+	{SCAT_REST, SCAT_OPTIONAL, 0, 1},
+	{SCAT_REQUIRED, SCAT_OPTIONAL, 0, 0}
+    };
+    unsigned i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	Names names;
+	HIRContext *ctx;
+	HIRCFG *cfg;
+	HIRDominatorTree *dom;
+	HIRSSAProgram *ssa;
+	HIRTacProgram *tac;
+	Scatter first, second;
+	Expr default_value = int_expr(10, 10);
+	Expr scatter_lhs;
+	Expr rhs = id_expr(0, 10);
+	Expr assign;
+	Stmt ret;
+
+	memset(&first, 0, sizeof(first));
+	first.kind = cases[i].first_kind;
+	first.id = 1;
+	first.expr = cases[i].first_has_default ? &default_value : 0;
+	first.next = &second;
+	memset(&second, 0, sizeof(second));
+	second.kind = cases[i].second_kind;
+	second.id = 2;
+	second.expr = cases[i].second_has_default ? &default_value : 0;
+
+	memset(&scatter_lhs, 0, sizeof(scatter_lhs));
+	scatter_lhs.kind = EXPR_SCATTER;
+	scatter_lhs.lineno = 10;
+	scatter_lhs.e.scatter = &first;
+	assign = binary_expr(EXPR_ASGN, &scatter_lhs, &rhs);
+	ret = return_stmt(&assign);
+	memset(&names, 0, sizeof(names));
+	names.size = 3;
+	rhs.bytecode_pc = 1;
+	assign.bytecode_pc = 2;
+	ret.bytecode_pc = 3;
+
+	tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+	check_int("malformed scatter lowers to one safe deopt",
+		  hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	check_int("malformed scatter preserves rhs for deopt",
+		  hir_tac_stack_depth_at_bytecode_pc(tac,
+		      assign.bytecode_pc), 1);
+	check_int("malformed scatter has no native indexing",
+		  hir_tac_count_binary_op(tac, HIR_OP_INDEX)
+		  + hir_tac_count_binary_op(tac, HIR_OP_SUBLIST_FROM), 0);
+	check_int("malformed scatter TAC verifies",
+		  hir_context_error_count(ctx), 0);
+	hir_context_free(ctx);
+    }
+}
+
+static void
 test_list_construction_and_splicing_tac_ssa(void)
 {
     Names names;
@@ -2718,6 +3483,45 @@ test_labeled_break_nested_loops_tac_ssa(void)
 }
 
 static void
+test_labeled_continue_and_unmatched_exits(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr outer_from = int_expr(1, 20);
+    Expr outer_to = int_expr(2, 20);
+    Expr inner_from = int_expr(1, 21);
+    Expr inner_to = int_expr(2, 21);
+    Stmt cont_outer = continue_stmt(2, 22);
+    Stmt inner_loop = range_stmt(3, &inner_from, &inner_to, &cont_outer, 21);
+    Stmt outer_loop = range_stmt(2, &outer_from, &outer_to, &inner_loop, 20);
+    Stmt bad_break = break_stmt(99, 30);
+    Stmt bad_continue = continue_stmt(99, 31);
+    Expr result = int_expr(1, 32);
+    Stmt ret = return_stmt(&result);
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    tac = lower_stmt(&names, &outer_loop, &ctx, &cfg, &dom, &ssa);
+    check_int("labeled continue verifies", hir_context_error_count(ctx), 0);
+    check_int("labeled continue has loop jumps",
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP) >= 3, 1);
+    hir_context_free(ctx);
+
+    bad_break.next = &bad_continue;
+    bad_continue.next = &ret;
+    tac = lower_stmt(&names, &bad_break, &ctx, &cfg, &dom, &ssa);
+    check_int("unmatched exits report both errors",
+	      hir_context_error_count(ctx) >= 2, 1);
+    check_int("unmatched exits retain following return",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_range_expr_and_assignment_tac_ssa(void)
 {
     Names names;
@@ -3292,6 +4096,51 @@ test_try_except_tac_ssa(void)
 }
 
 static void
+test_multi_arm_try_except_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr body_val = int_expr(1, 45);
+    Expr first_val = int_expr(2, 46);
+    Expr second_val = int_expr(3, 47);
+    Stmt body = expr_stmt(&body_val);
+    Stmt first_handler = expr_stmt(&first_val);
+    Stmt second_handler = return_stmt(&second_val);
+    Except_Arm first;
+    Except_Arm second;
+    Stmt try_stmt;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    first.id = 1;
+    first.stmt = &first_handler;
+    first.handler_pc = 100;
+    first.next = &second;
+    second.id = -1;
+    second.stmt = &second_handler;
+    second.handler_pc = 101;
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_EXCEPT;
+    try_stmt.lineno = 45;
+    try_stmt.s.catch.body = &body;
+    try_stmt.s.catch.excepts = &first;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("multi-arm try except verifies", hir_context_error_count(ctx), 0);
+    check_int("multi-arm try except branches to done",
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 2);
+    check_int("multi-arm try except return",
+	      hir_tac_count_kind(tac, HIR_TAC_RETURN), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_try_finally_tac_ssa(void)
 {
     Names names;
@@ -3326,6 +4175,44 @@ test_try_finally_tac_ssa(void)
     check_int("try finally ssa blocks", hir_ssa_block_count(ssa), 1);
     check_int("try finally verify errors", hir_context_error_count(ctx), 0);
 
+    hir_context_free(ctx);
+}
+
+static void
+test_loop_exit_through_finally_tac_ssa(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr from = int_expr(1, 55);
+    Expr to = int_expr(2, 55);
+    Stmt brk = break_stmt(-1, 56);
+    Expr handler_lhs = int_expr(9, 57);
+    Expr handler_rhs = int_expr(1, 57);
+    Expr handler_val = binary_expr(EXPR_PLUS, &handler_lhs, &handler_rhs);
+    Stmt handler = expr_stmt(&handler_val);
+    Stmt try_stmt;
+    Stmt loop;
+
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_FINALLY;
+    try_stmt.lineno = 56;
+    try_stmt.s.finally.body = &brk;
+    try_stmt.s.finally.handler = &handler;
+    try_stmt.s.finally.handler_pc = 110;
+    loop = range_stmt(1, &from, &to, &try_stmt, 55);
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &loop, &ctx, &cfg, &dom, &ssa);
+    check_int("break through finally verifies", hir_context_error_count(ctx), 0);
+    check_int("break through finally lowers handler twice",
+	      hir_tac_count_lineno(tac, 57), 8);
+    check_int("break through finally emits loop jumps",
+	      hir_tac_count_kind(tac, HIR_TAC_JUMP) >= 2, 1);
     hir_context_free(ctx);
 }
 
@@ -3529,6 +4416,39 @@ test_binary_type_pair_contracts(void)
     check_int("mixed numeric addition pair is invalid",
 	      hir_test_binary_type_pair_is_valid(HIR_OP_ADD, TYPE_INT,
 						 TYPE_FLOAT), 0);
+    check_int("integer subtraction pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_SUB, TYPE_INT,
+						 TYPE_INT), 1);
+    check_int("float multiplication pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_MUL, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("string division pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_DIV, TYPE_STR,
+						 TYPE_STR), 0);
+    check_int("mixed modulus pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_MOD, TYPE_INT,
+						 TYPE_FLOAT), 0);
+    check_int("integer comparison pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_LT, TYPE_INT,
+						 TYPE_INT), 1);
+    check_int("float comparison pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_GE, TYPE_FLOAT,
+						 TYPE_FLOAT), 1);
+    check_int("string comparison pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_LE, TYPE_STR,
+						 TYPE_STR), 1);
+    check_int("mixed comparison pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_GT, TYPE_STR,
+						 TYPE_INT), 0);
+    check_int("integer exponent pair is valid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_INT,
+						 TYPE_INT), 1);
+    check_int("string exponent pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_EXP, TYPE_STR,
+						 TYPE_INT), 0);
+    check_int("unrelated operation pair is invalid",
+	      hir_test_binary_type_pair_is_valid(HIR_OP_IN, TYPE_INT,
+						 TYPE_INT), 0);
     check_int("unknown addition left mask",
 	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 0, TYPE_NONE),
 	      numeric | type_mask(TYPE_STR));
@@ -3554,6 +4474,14 @@ test_binary_type_pair_contracts(void)
     check_int("integer base narrows exponent mask",
 	      hir_test_binary_operand_type_mask(HIR_OP_EXP, 1, 1, TYPE_INT),
 	      type_mask(TYPE_INT));
+    check_int("unknown subtraction mask is numeric",
+	      hir_test_binary_operand_type_mask(HIR_OP_SUB, 0, 0, TYPE_NONE),
+	      numeric);
+    check_int("unknown exponent base mask is numeric",
+	      hir_test_binary_operand_type_mask(HIR_OP_EXP, 0, 0, TYPE_NONE),
+	      numeric);
+    check_int("string exponent peer permits no base",
+	      hir_test_binary_operand_type_mask(HIR_OP_EXP, 0, 1, TYPE_STR), 0);
 }
 
 static void
@@ -3616,11 +4544,30 @@ test_unknown_type_inference(void)
 static void
 test_builtin_result_type_inference(void)
 {
+    static const struct {
+	const char *name;
+	var_type type;
+    } cases[] = {
+	{"caller_perms", TYPE_OBJ},
+	{"toobj", TYPE_OBJ},
+	{"parent", TYPE_OBJ},
+	{"owner", TYPE_OBJ},
+	{"location", TYPE_OBJ},
+	{"tostr", TYPE_STR},
+	{"toliteral", TYPE_STR},
+	{"tonum", TYPE_INT},
+	{"toint", TYPE_INT},
+	{"tofloat", TYPE_FLOAT}
+    };
     var_type inferred = TYPE_NONE;
+    unsigned i;
 
-    check_int("caller_perms result type is inferred",
-	      hir_test_infer_builtin_result_type("caller_perms", &inferred), 1);
-    check_int("caller_perms result is object", inferred, TYPE_OBJ);
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	inferred = TYPE_NONE;
+	check_int("builtin result type is inferred",
+	    hir_test_infer_builtin_result_type(cases[i].name, &inferred), 1);
+	check_int("builtin result has expected type", inferred, cases[i].type);
+    }
 #ifdef WAIF_CORE
     inferred = TYPE_NONE;
     check_int("new_waif result type is inferred",
@@ -3759,6 +4706,175 @@ test_length_expr_in_stores_and_negatives(void)
 }
 
 static void
+test_rotate32_optimization(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIROptimizationPlan *plan;
+    Expr source, left_count, right_count, mask, modulus;
+    Expr shift_left, shift_right, bit_and, bit_or, rotate;
+    Stmt ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    source = id_expr(0, 89);
+    left_count = int_expr(5, 89);
+    right_count = int_expr(27, 89);
+    mask = int_expr(31, 89);
+    modulus = int_expr((Num) ((UNum) 1 << 32), 89);
+    shift_left = binary_expr(EXPR_SHL, &source, &left_count);
+    shift_right = binary_expr(EXPR_SHR, &source, &right_count);
+    bit_and = binary_expr(EXPR_BITAND, &shift_right, &mask);
+    bit_or = binary_expr(EXPR_BITOR, &shift_left, &bit_and);
+    rotate = binary_expr(EXPR_MOD, &bit_or, &modulus);
+    ret = return_stmt(&rotate);
+
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("rotate32 input verifies", hir_context_error_count(ctx), 0);
+    plan = hir_optimize_ssa_for_backends(ctx, ssa);
+    check_int("rotate32 optimization changed",
+	      hir_optimization_change_count(plan), 1);
+    check_int("rotate32 optimized SSA verifies", hir_verify_ssa(ctx, ssa), 1);
+#ifdef HIR_DUMP_SSA
+    check_ssa_dump_contains("rotate32 optimized operation", ssa, "ROTL32");
+#endif
+    hir_context_free(ctx);
+}
+
+typedef enum {
+    ROTATE32_SWAPPED_OR,
+    ROTATE32_MASK_FIRST,
+    ROTATE32_WRONG_MODULUS,
+    ROTATE32_WRONG_OUTER_OP,
+    ROTATE32_WRONG_OR_OP,
+    ROTATE32_WRONG_LEFT_SHIFT,
+    ROTATE32_WRONG_AND_OP,
+    ROTATE32_WRONG_RIGHT_SHIFT,
+    ROTATE32_ZERO_LEFT_COUNT,
+    ROTATE32_LARGE_LEFT_COUNT,
+    ROTATE32_WRONG_RIGHT_COUNT,
+    ROTATE32_WRONG_MASK,
+    ROTATE32_DIFFERENT_SOURCE,
+    ROTATE32_MISSING_OR,
+    ROTATE32_NONCONSTANT_MODULUS,
+    ROTATE32_NONCONSTANT_LEFT_COUNT,
+    ROTATE32_NONCONSTANT_RIGHT_COUNT,
+    ROTATE32_NONCONSTANT_MASK
+} Rotate32Variant;
+
+static int
+rotate32_variant_change_count(Rotate32Variant variant)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIROptimizationPlan *plan;
+    Expr source, other_source, left_count, right_count, mask, modulus;
+    Expr shift_left, shift_right, bit_and, bit_or, rotate;
+    Stmt ret;
+    int changes;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+    source = id_expr(0, 89);
+    other_source = id_expr(1, 89);
+    left_count = int_expr(5, 89);
+    right_count = int_expr(27, 89);
+    mask = int_expr(31, 89);
+    modulus = int_expr((Num) ((UNum) 1 << 32), 89);
+    shift_left = binary_expr(EXPR_SHL, &source, &left_count);
+    shift_right = binary_expr(EXPR_SHR, &source, &right_count);
+    bit_and = binary_expr(EXPR_BITAND, &shift_right, &mask);
+    bit_or = binary_expr(EXPR_BITOR, &shift_left, &bit_and);
+    rotate = binary_expr(EXPR_MOD, &bit_or, &modulus);
+
+    switch (variant) {
+    case ROTATE32_SWAPPED_OR:
+	bit_or.e.bin.lhs = &bit_and;
+	bit_or.e.bin.rhs = &shift_left;
+	break;
+    case ROTATE32_MASK_FIRST:
+	bit_and.e.bin.lhs = &mask;
+	bit_and.e.bin.rhs = &shift_right;
+	break;
+    case ROTATE32_WRONG_MODULUS:
+	modulus.e.var.v.num--;
+	break;
+    case ROTATE32_WRONG_OUTER_OP:
+	rotate.kind = EXPR_DIVIDE;
+	break;
+    case ROTATE32_WRONG_OR_OP:
+	bit_or.kind = EXPR_BITXOR;
+	break;
+    case ROTATE32_WRONG_LEFT_SHIFT:
+	shift_left.kind = EXPR_SHR;
+	break;
+    case ROTATE32_WRONG_AND_OP:
+	bit_and.kind = EXPR_BITOR;
+	break;
+    case ROTATE32_WRONG_RIGHT_SHIFT:
+	shift_right.kind = EXPR_LSHR;
+	break;
+    case ROTATE32_ZERO_LEFT_COUNT:
+	left_count.e.var.v.num = 0;
+	break;
+    case ROTATE32_LARGE_LEFT_COUNT:
+	left_count.e.var.v.num = 32;
+	break;
+    case ROTATE32_WRONG_RIGHT_COUNT:
+	right_count.e.var.v.num = 26;
+	break;
+    case ROTATE32_WRONG_MASK:
+	mask.e.var.v.num = 30;
+	break;
+    case ROTATE32_DIFFERENT_SOURCE:
+	shift_right.e.bin.lhs = &other_source;
+	break;
+    case ROTATE32_MISSING_OR:
+	rotate.e.bin.lhs = &source;
+	break;
+    case ROTATE32_NONCONSTANT_MODULUS:
+	rotate.e.bin.rhs = &other_source;
+	break;
+    case ROTATE32_NONCONSTANT_LEFT_COUNT:
+	shift_left.e.bin.rhs = &other_source;
+	break;
+    case ROTATE32_NONCONSTANT_RIGHT_COUNT:
+	shift_right.e.bin.rhs = &other_source;
+	break;
+    case ROTATE32_NONCONSTANT_MASK:
+	bit_and.e.bin.rhs = &other_source;
+	break;
+    }
+    ret = return_stmt(&rotate);
+    (void) lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    plan = hir_optimize_ssa_for_backends(ctx, ssa);
+    changes = hir_optimization_change_count(plan);
+    hir_context_free(ctx);
+    return changes;
+}
+
+static void
+test_rotate32_optimization_matrix(void)
+{
+    int variant;
+
+    check_int("rotate32 accepts swapped or operands",
+	rotate32_variant_change_count(ROTATE32_SWAPPED_OR), 1);
+    check_int("rotate32 accepts a leading mask",
+	rotate32_variant_change_count(ROTATE32_MASK_FIRST), 1);
+    for (variant = ROTATE32_WRONG_MODULUS;
+	 variant <= ROTATE32_NONCONSTANT_MASK; variant++)
+	check_int("malformed rotate32 pattern rejected",
+	    rotate32_variant_change_count((Rotate32Variant) variant), 0);
+}
+
+static void
 test_constant_folded_branch_clears_bytecode_pc(void)
 {
     Names names;
@@ -3801,6 +4917,10 @@ test_constant_folded_branch_clears_bytecode_pc(void)
 	      hir_ssa_count_bytecode_pc(ssa, 0), 1);
     check_int("folded branch destroys ssa", hir_destroy_ssa(ctx, ssa), 1);
     check_int("folded branch verifies out of ssa", hir_verify_out_of_ssa(ctx, ssa), 1);
+    check_int("out-of-ssa form is not analyzed",
+	      hir_analyze_ssa_values(ctx, ssa) == 0, 1);
+    check_int("out-of-ssa form is not optimized",
+	      hir_optimize_ssa_for_backends(ctx, ssa) == 0, 1);
 
     hir_context_free(ctx);
 }
@@ -3808,6 +4928,9 @@ test_constant_folded_branch_clears_bytecode_pc(void)
 int
 main(void)
 {
+    test_ast_and_operation_tables();
+    test_optimized_bytecode_shapes();
+    test_null_analysis_accessors();
     test_resume_stack_safety();
     test_resume_stack_shape();
     test_boundary_tick_refunds();
@@ -3822,6 +4945,8 @@ main(void)
     test_uninitialized_entry_load_classification();
     test_builtin_entry_types();
     test_arithmetic_and_local_tac();
+    test_unary_and_empty_list_tac();
+    test_empty_and_discarded_statements();
     test_control_flow_tac();
     test_short_circuit_tac();
     test_constant_analysis_overflow();
@@ -3845,11 +4970,13 @@ main(void)
     test_scatter_destructuring_tac_ssa();
     test_optional_rest_scatter_deopt();
     test_optional_scatter_default_lowering();
+    test_malformed_scatter_lowering();
     test_list_construction_and_splicing_tac_ssa();
     test_initial_list_splice_anchor();
     test_builtin_call_tac_ssa();
     test_zero_argument_builtin_tac_ssa();
     test_pure_builtin_inlining_tac_ssa();
+    test_pure_builtin_inlining_matrix();
     test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
@@ -3857,6 +4984,7 @@ main(void)
     test_cond_expr_tac_ssa();
     test_break_and_continue_tac_ssa();
     test_labeled_break_nested_loops_tac_ssa();
+    test_labeled_continue_and_unmatched_exits();
     test_range_expr_and_assignment_tac_ssa();
     test_verb_call_tac_ssa();
     test_object_scalars_tac_ssa();
@@ -3864,11 +4992,15 @@ main(void)
     test_string_scalars_tac_ssa();
     test_catch_expr_tac_ssa();
     test_try_except_tac_ssa();
+    test_multi_arm_try_except_tac_ssa();
     test_try_finally_tac_ssa();
+    test_loop_exit_through_finally_tac_ssa();
     test_fork_stmt_tac_ssa();
     test_fork_body_does_not_reject_enclosing_hir();
     test_length_expr_in_index_tac_ssa();
     test_length_expr_in_stores_and_negatives();
+    test_rotate32_optimization();
+    test_rotate32_optimization_matrix();
     test_constant_folded_branch_clears_bytecode_pc();
     test_cfg_critical_edge_splitting();
     test_if_else_ssa_destruction();
@@ -3878,8 +5010,13 @@ main(void)
     test_unreachable_dead_code_and_folded_phi_ssa();
     test_unsupported_tac();
     test_negative_tac_verifier_cases();
+    test_negative_tac_verifier_matrix();
     test_negative_cfg_verifier_cases();
+    test_negative_cfg_verifier_matrix();
+    test_negative_dominator_verifier_cases();
     test_negative_ssa_verifier_cases();
+    test_negative_ssa_verifier_matrix();
+    test_negative_out_ssa_verifier_matrix();
 
     return failures ? 1 : 0;
 }

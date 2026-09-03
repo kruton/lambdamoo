@@ -134,11 +134,11 @@ OBJS = $(COBJS) $(YOBJS) keywords.o bf_register.o
 
 DFILES = $(OBJS:.o=.d) $(CLIENT_CSRCS:.c=.d)
 
-HIR_TAC_TEST_OBJS = tests/hir_tac_test.o tests/hir_test_hir.o \
-	tests/hir_test_stubs.o arena.o integer_arithmetic.o
+HIR_TAC_TEST_OBJS = unit-tests/hir_tac_test.o unit-tests/hir_test_hir.o \
+	unit-tests/hir_test_stubs.o arena.o integer_arithmetic.o
 
-JIT_TEST_OBJS = tests/jit_test.o tests/jit_test_jit.o \
-	tests/hir_test_stubs.o integer_arithmetic.o utf.o mir-vendor.o mir-gen-vendor.o
+JIT_TEST_OBJS = unit-tests/jit_test.o unit-tests/jit_test_jit.o \
+	unit-tests/hir_test_stubs.o integer_arithmetic.o utf.o mir-vendor.o mir-gen-vendor.o
 
 all: moo
 
@@ -151,33 +151,36 @@ mir-vendor.o: $(abs_srcdir)/vendor/mir/mir.c
 mir-gen-vendor.o: $(abs_srcdir)/vendor/mir/mir-gen.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -std=gnu99 -w -c -o $@ $<
 
-tests/hir_test_hir.o: hir.c hir.h
+unit-tests/hir_test_hir.o: hir.c hir.h
 	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ hir.c
 
-tests/hir_tac_test.o: tests/hir_tac_test.c hir.h ast.h structures.h
-	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ tests/hir_tac_test.c
+unit-tests/hir_tac_test.o: unit-tests/hir_tac_test.c hir.h ast.h structures.h
+	$(COMPILE.c) -DHIR_TESTING -DHIR_DUMP_SSA -o $@ unit-tests/hir_tac_test.c
 
-tests/hir_test_stubs.o: tests/hir_test_stubs.c storage.h
-	$(COMPILE.c) -o $@ tests/hir_test_stubs.c
+unit-tests/hir_test_stubs.o: unit-tests/hir_test_stubs.c storage.h
+	$(COMPILE.c) -o $@ unit-tests/hir_test_stubs.c
 
-tests/hir_tac_test: $(HIR_TAC_TEST_OBJS)
+uT-hir-tac: $(HIR_TAC_TEST_OBJS)
 	$(CC) $(LDFLAGS) $(HIR_TAC_TEST_OBJS) $(LIBS) -o $@
 
-test-hir-tac: tests/hir_tac_test
-	./tests/hir_tac_test
+test-hir-tac: uT-hir-tac
+	./uT-hir-tac
 
-tests/jit_test.o: tests/jit_test.c jit.h jit_internal.h
-	$(COMPILE.c) -o $@ tests/jit_test.c
+unit-tests/jit_test.o: unit-tests/jit_test.c jit.h jit_internal.h
+	$(COMPILE.c) -DJIT_TESTING -o $@ unit-tests/jit_test.c
 
-tests/jit_test_jit.o: jit.c jit.h jit_internal.h \
+unit-tests/jit_test_jit.o: jit.c jit.h jit_internal.h \
 	$(abs_srcdir)/vendor/mir/mir.h $(abs_srcdir)/vendor/mir/mir-gen.h
-	$(COMPILE.c) -I$(abs_srcdir)/vendor/mir -o $@ jit.c
+	$(COMPILE.c) -DJIT_TESTING -I$(abs_srcdir)/vendor/mir -o $@ jit.c
 
-tests/jit_test: $(JIT_TEST_OBJS)
+uT-jit: $(JIT_TEST_OBJS)
 	$(CC) $(LDFLAGS) $(JIT_TEST_OBJS) $(LIBS) -o $@
 
-test-jit: tests/jit_test
-	./tests/jit_test
+test-jit: uT-jit
+	./uT-jit
+
+coverage-jit-hir:
+	$(SHELL) $(srcdir)/test-support/jit-hir-coverage.sh
 
 pure_moo: moo
 	purify $(CC) $(CFLAGS) $(OBJS) $(XT_LOBJS) $(LIBS) -o $@

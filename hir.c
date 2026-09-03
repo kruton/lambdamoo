@@ -1411,6 +1411,7 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
     for (block = cfg->blocks; block; block = block->next) {
 	HIRBasicBlock *other;
 	int expected_successors;
+	int checked_successors;
 	int i;
 
 	block_count++;
@@ -1424,10 +1425,13 @@ hir_verify_cfg(HIRContext *ctx, HIRCFG *cfg)
 	if (!block->first || !block->last)
 	    record_unsupported_fmt(ctx, "cfg: block %d has missing TAC bounds", block->id);
 
-	if (block->num_successors < 0 || block->num_successors > 2)
+	checked_successors = block->num_successors;
+	if (checked_successors < 0 || checked_successors > 2) {
 	    record_unsupported_fmt(ctx, "cfg: block %d has invalid successor count %d", block->id, block->num_successors);
+	    checked_successors = 0;
+	}
 
-	for (i = 0; i < block->num_successors; i++) {
+	for (i = 0; i < checked_successors; i++) {
 	    if (!block->successors[i])
 		record_unsupported_fmt(ctx, "cfg: block %d has missing successor", block->id);
 	    else if (!cfg_contains_block_ptr(cfg, block->successors[i]))
@@ -12139,6 +12143,577 @@ lower_stmt_list(HIRContext *ctx, HIRTacProgram *program, HIRStmt *stmt)
 }
 
 #ifdef HIR_TESTING
+const char *
+hir_test_expr_kind_name(enum Expr_Kind kind)
+{
+    return ast_expr_kind_name(kind);
+}
+
+const char *
+hir_test_stmt_kind_name(enum Stmt_Kind kind)
+{
+    return ast_stmt_kind_name(kind);
+}
+
+const char *
+hir_test_tac_kind_name(HIRTacKind kind)
+{
+    return tac_kind_name(kind);
+}
+
+const char *
+hir_test_op_name(HIROp op)
+{
+    return op_name(op);
+}
+
+HIRTypeTag
+hir_test_type_tag_for_var_type(var_type type)
+{
+    return type_tag_for_var_type(type);
+}
+
+int
+hir_test_optimized_bytecode_shape(HIRTacKind kind, HIROp op, Byte opcode,
+				  Byte extended_opcode, int has_extended,
+				  Byte *pop_count, Byte *skip_count)
+{
+    Byte vector[2];
+    Bytecodes bytecodes;
+    HIROptimizedValue value;
+
+    memset(&bytecodes, 0, sizeof(bytecodes));
+    memset(&value, 0, sizeof(value));
+    vector[0] = opcode;
+    vector[1] = extended_opcode;
+    bytecodes.vector = vector;
+    bytecodes.size = has_extended ? 2 : 1;
+    value.kind = kind;
+    value.op = op;
+    return optimized_bytecode_shape(&bytecodes, &value, pop_count, skip_count);
+}
+
+int
+hir_test_optimized_bytecode_lowering_cases(void)
+{
+    HIROptimizationPlan plan;
+    HIROptimizedValue values[3];
+    Program program;
+    Byte vector[4] = {OP_DONE, OP_UNARY_MINUS, OP_ADD, OP_DONE};
+    Byte pop_count, skip_count;
+    OptimizedBytecode *optimized;
+    int matched = 0;
+
+    memset(&plan, 0, sizeof(plan));
+    memset(values, 0, sizeof(values));
+    memset(&program, 0, sizeof(program));
+    matched += hir_lower_optimized_bytecode(0, 0, 0) == 0;
+    matched += hir_lower_optimized_bytecode(0, &plan, 0) == 0;
+    matched += hir_lower_optimized_bytecode(0, &plan, &program) == 0;
+    program.main_vector.vector = vector;
+    program.main_vector.size = sizeof(vector);
+    matched += hir_lower_optimized_bytecode(0, &plan, &program) == 0;
+
+    values[0].bytecode_pc = 2;
+    values[0].kind = HIR_TAC_BINARY;
+    values[0].op = HIR_OP_ADD;
+    values[0].value = 22;
+    values[0].next = &values[1];
+    values[1].bytecode_pc = 0;
+    values[1].kind = HIR_TAC_BINARY;
+    values[1].op = HIR_OP_FORK;
+    values[1].next = &values[2];
+    values[2].bytecode_pc = 1;
+    values[2].kind = HIR_TAC_UNARY;
+    values[2].op = HIR_OP_NEGATE;
+    values[2].value = 11;
+    plan.values = &values[0];
+    optimized = hir_lower_optimized_bytecode(0, &plan, &program);
+    matched += optimized != 0;
+    matched += optimized->num_replacements == 2;
+    matched += optimized->replacements[0].pc == 1;
+    matched += optimized->replacements[1].pc == 2;
+    myfree(optimized->main_vector.vector, M_BYTECODES);
+    myfree(optimized->replacements, M_PROGRAM);
+    myfree(optimized, M_PROGRAM);
+
+    values[0].next = &values[2];
+    values[2].bytecode_pc = 2;
+    values[2].kind = HIR_TAC_BINARY;
+    values[2].op = HIR_OP_ADD;
+    matched += hir_lower_optimized_bytecode(0, &plan, &program) == 0;
+    values[0].bytecode_pc = sizeof(vector);
+    matched += !optimized_bytecode_shape(&program.main_vector, &values[0],
+	&pop_count, &skip_count);
+    matched += !optimized_bytecode_shape(0, &values[0], &pop_count,
+	&skip_count);
+    return matched;
+}
+
+int
+hir_test_verify_corrupt_dominator(HIRContext *ctx, HIRCFG *cfg,
+				  HIRDominatorTree *dom,
+				  HIRTestDominatorCorruption corruption)
+{
+    HIRBasicBlock *entry = cfg->entry;
+    HIRBasicBlock *other = dom->num_reachable > 1 ? dom->rpo[1] : 0;
+    HIRBasicBlock external;
+
+    memset(&external, 0, sizeof(external));
+    external.id = dom->max_block_id + 1;
+    switch (corruption) {
+    case HIR_TEST_DOM_NO_REACHABLE:
+	dom->num_reachable = 0;
+	break;
+    case HIR_TEST_DOM_BAD_ENTRY_IDOM:
+	dom->idom[entry->id] = 0;
+	break;
+    case HIR_TEST_DOM_NULL_RPO_BLOCK:
+	dom->rpo[0] = 0;
+	break;
+    case HIR_TEST_DOM_BAD_RPO_BLOCK_ID:
+	dom->rpo[0]->id = 0;
+	break;
+    case HIR_TEST_DOM_BAD_BLOCK_INDEX:
+	dom->block_by_id[entry->id] = 0;
+	break;
+    case HIR_TEST_DOM_BAD_RPO_INDEX:
+	dom->rpo_index[entry->id]++;
+	break;
+    case HIR_TEST_DOM_MISSING_IDOM:
+	if (other)
+	    dom->idom[other->id] = 0;
+	break;
+    case HIR_TEST_DOM_UNREACHABLE_IDOM:
+	if (other)
+	    dom->idom[other->id] = &external;
+	break;
+    case HIR_TEST_DOM_SELF_IDOM:
+	if (other)
+	    dom->idom[other->id] = other;
+	break;
+    }
+    return hir_verify_dominator_tree(ctx, cfg, dom);
+}
+
+int
+hir_test_binary_op_for_expr(enum Expr_Kind kind, HIROp *op)
+{
+    return binary_op_for_expr(kind, op);
+}
+
+HIRValueKind
+hir_test_analyze_unary(HIROp op, Num operand, Num *constant)
+{
+    HIRValueFact fact = analyze_unary(op, constant_fact(operand));
+
+    *constant = fact.constant;
+    if (fact.kind == HIR_VALUE_FACT_CONSTANT)
+	return HIR_VALUE_INT_CONSTANT;
+    if (fact.kind == HIR_VALUE_FACT_INT)
+	return HIR_VALUE_INT;
+    if (fact.kind == HIR_VALUE_FACT_ERROR)
+	return HIR_VALUE_ERROR;
+    return HIR_VALUE_UNKNOWN;
+}
+
+HIRValueKind
+hir_test_analyze_binary(HIROp op, Num lhs, Num rhs, Num *constant)
+{
+    HIRValueFact fact = analyze_binary(op, constant_fact(lhs),
+	constant_fact(rhs));
+
+    *constant = fact.constant;
+    if (fact.kind == HIR_VALUE_FACT_CONSTANT)
+	return HIR_VALUE_INT_CONSTANT;
+    if (fact.kind == HIR_VALUE_FACT_INT)
+	return HIR_VALUE_INT;
+    if (fact.kind == HIR_VALUE_FACT_ERROR)
+	return HIR_VALUE_ERROR;
+    return HIR_VALUE_UNKNOWN;
+}
+
+int
+hir_test_analyze_binary_nonconstant_cases(void)
+{
+    HIRValueFact bottom = {HIR_VALUE_BOTTOM, 0, E_NONE};
+    HIRValueFact unknown = unknown_fact();
+    HIRValueFact constant = constant_fact(1);
+    int matched = 0;
+
+    matched += analyze_binary(HIR_OP_ADD, bottom, constant).kind
+	== HIR_VALUE_BOTTOM;
+    matched += analyze_binary(HIR_OP_ADD, constant, bottom).kind
+	== HIR_VALUE_BOTTOM;
+    matched += analyze_binary(HIR_OP_ADD, unknown, constant).kind
+	== HIR_VALUE_FACT_UNKNOWN;
+    matched += analyze_binary(HIR_OP_ADD, constant, unknown).kind
+	== HIR_VALUE_FACT_UNKNOWN;
+    return matched;
+}
+
+int
+hir_test_join_value_fact_cases(void)
+{
+    HIRValueFact bottom = {HIR_VALUE_BOTTOM, 0, E_NONE};
+    HIRValueFact unknown = unknown_fact();
+    HIRValueFact one = constant_fact(1);
+    HIRValueFact div_error = error_fact(E_DIV);
+    HIRValueFact range_error = error_fact(E_RANGE);
+    HIRValueFact result;
+    int matched = 0;
+
+    result = join_value_fact(one, bottom);
+    matched += result.kind == HIR_VALUE_FACT_CONSTANT;
+    matched += result.constant == 1;
+    matched += join_value_fact(unknown, one).kind == HIR_VALUE_FACT_UNKNOWN;
+    matched += join_value_fact(one, unknown).kind == HIR_VALUE_FACT_UNKNOWN;
+    matched += join_value_fact(div_error, one).kind == HIR_VALUE_FACT_UNKNOWN;
+    matched += join_value_fact(one, div_error).kind == HIR_VALUE_FACT_UNKNOWN;
+    matched += join_value_fact(div_error, range_error).kind
+	== HIR_VALUE_FACT_UNKNOWN;
+    result = join_value_fact(one, one);
+    matched += result.kind == HIR_VALUE_FACT_CONSTANT;
+    matched += result.constant == 1;
+    return matched;
+}
+
+int
+hir_test_match_rotate32_and_cases(void)
+{
+    HIRValueAnalysis analysis;
+    HIRValueFact facts[8];
+    HIRSSAInstr *definitions[8];
+    HIRSSAInstr bit_and, constant, shift;
+    HIRSSAInstr *shift_result;
+    Num mask;
+    int matched = 0;
+
+    memset(&analysis, 0, sizeof(analysis));
+    memset(facts, 0, sizeof(facts));
+    memset(definitions, 0, sizeof(definitions));
+    memset(&bit_and, 0, sizeof(bit_and));
+    memset(&constant, 0, sizeof(constant));
+    memset(&shift, 0, sizeof(shift));
+    analysis.facts = facts;
+    analysis.num_facts = 8;
+    bit_and.kind = HIR_TAC_BINARY;
+    bit_and.op = HIR_OP_BITAND;
+    bit_and.src1 = 1;
+    bit_and.src2 = 2;
+    constant.kind = HIR_TAC_CONST;
+    constant.literal.type = TYPE_INT;
+    constant.literal.v.num = 31;
+    shift.kind = HIR_TAC_BINARY;
+    shift.op = HIR_OP_SHR;
+    shift.src2 = 3;
+    definitions[1] = &constant;
+    definitions[2] = &shift;
+    facts[3] = constant_fact(27);
+
+    matched += match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    definitions[1] = &shift;
+    definitions[2] = &constant;
+    matched += match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    matched += !match_rotate32_and(&analysis, definitions, 8, 0,
+	&shift_result, &mask);
+    bit_and.kind = HIR_TAC_CONST;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    bit_and.kind = HIR_TAC_BINARY;
+    bit_and.op = HIR_OP_ADD;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    bit_and.op = HIR_OP_BITAND;
+    bit_and.src1 = 0;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    bit_and.src1 = 1;
+    bit_and.src2 = 8;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    bit_and.src2 = 2;
+    definitions[1] = 0;
+    definitions[2] = 0;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    definitions[1] = &constant;
+    constant.literal.type = TYPE_STR;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    constant.literal.type = TYPE_INT;
+    definitions[1] = &constant;
+    definitions[2] = 0;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    definitions[2] = &shift;
+    shift.kind = HIR_TAC_CONST;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    shift.kind = HIR_TAC_BINARY;
+    shift.op = HIR_OP_ADD;
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    shift.op = HIR_OP_SHR;
+    facts[3] = unknown_fact();
+    matched += !match_rotate32_and(&analysis, definitions, 8, &bit_and,
+	&shift_result, &mask);
+    return matched;
+}
+
+int
+hir_test_replace_ssa_value_uses(void)
+{
+    HIRSSAProgram ssa;
+    HIRSSABlock blocks[2];
+    HIRSSAInstr instructions[3];
+    HIRPhiArg phi_args[2];
+    HIRParallelCopy copies[2];
+    int stack_values[2] = {7, 8};
+    int local_values[2] = {7, 9};
+    int matched = 0;
+
+    memset(&ssa, 0, sizeof(ssa));
+    memset(blocks, 0, sizeof(blocks));
+    memset(instructions, 0, sizeof(instructions));
+    memset(phi_args, 0, sizeof(phi_args));
+    memset(copies, 0, sizeof(copies));
+    ssa.blocks = &blocks[0];
+    blocks[0].first = &instructions[0];
+    blocks[0].last = &instructions[1];
+    blocks[0].next = &blocks[1];
+    blocks[1].first = blocks[1].last = &instructions[2];
+    instructions[0].src1 = 7;
+    instructions[0].src2 = 8;
+    instructions[0].src3 = 7;
+    instructions[0].num_stack_values = 2;
+    instructions[0].stack_values = stack_values;
+    instructions[0].num_local_values = 2;
+    instructions[0].local_values = local_values;
+    instructions[0].phi_args = &phi_args[0];
+    instructions[0].copies = &copies[0];
+    instructions[0].next = &instructions[1];
+    phi_args[0].value = 7;
+    phi_args[0].next = &phi_args[1];
+    phi_args[1].value = 8;
+    copies[0].src = 7;
+    copies[0].next = &copies[1];
+    copies[1].src = 8;
+    instructions[2].src2 = 7;
+
+    replace_ssa_value_uses(&ssa, 7, 11);
+    matched += instructions[0].src1 == 11;
+    matched += instructions[0].src2 == 8;
+    matched += instructions[0].src3 == 11;
+    matched += stack_values[0] == 11;
+    matched += stack_values[1] == 8;
+    matched += local_values[0] == 11;
+    matched += local_values[1] == 9;
+    matched += phi_args[0].value == 11;
+    matched += phi_args[1].value == 8;
+    matched += copies[0].src == 11;
+    matched += copies[1].src == 8;
+    matched += instructions[2].src2 == 11;
+    return matched;
+}
+
+int
+hir_test_current_version_cases(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRSSAProgram ssa;
+    HIRSSABlock entries[3];
+    HIRSSAInstr phi[2];
+    HIRSSAInstr tail;
+    int stacks[12];
+    int tops[3];
+    int first;
+    int matched = 0;
+
+    memset(&names, 0, sizeof(names));
+    memset(&ssa, 0, sizeof(ssa));
+    memset(entries, 0, sizeof(entries));
+    memset(phi, 0, sizeof(phi));
+    memset(&tail, 0, sizeof(tail));
+    memset(stacks, 0, sizeof(stacks));
+    memset(tops, 0, sizeof(tops));
+    names.size = 2;
+    ctx = hir_context_new(&names);
+    hir_context_set_first_user_local(ctx, 1);
+
+    matched += current_version(ctx, -1, 3, stacks, tops, 4,
+	&entries[0], &ssa) == 0;
+    first = current_version(ctx, 0, 3, stacks, tops, 4, &entries[0], &ssa);
+    matched += first > 0;
+    matched += entries[0].first->kind == HIR_TAC_LOAD_LOCAL;
+    matched += current_version(ctx, 0, 3, stacks, tops, 4,
+	&entries[0], &ssa) == first;
+    matched += current_version(ctx, 1, 3, stacks, tops, 4,
+	&entries[0], &ssa) > first;
+    matched += entries[0].first->literal.type == TYPE_NONE;
+    matched += current_version(ctx, 2, 3, stacks, tops, 4,
+	&entries[0], &ssa) > first;
+    matched += entries[0].first->literal.type == TYPE_INT;
+
+    phi[0].kind = HIR_TAC_PHI;
+    entries[1].first = entries[1].last = &phi[0];
+    tops[0] = 0;
+    matched += current_version(ctx, 0, 3, stacks, tops, 4,
+	&entries[1], &ssa) > first;
+    matched += entries[1].last != &phi[0];
+
+    phi[1].kind = HIR_TAC_PHI;
+    phi[1].next = &tail;
+    entries[2].first = &phi[1];
+    entries[2].last = &tail;
+    tops[0] = 0;
+    matched += current_version(ctx, 0, 3, stacks, tops, 4,
+	&entries[2], &ssa) > first;
+    matched += entries[2].last == &tail;
+    hir_context_free(ctx);
+    return matched;
+}
+
+#ifdef HIR_DUMP_SSA
+int
+hir_test_dump_ssa_cases(void)
+{
+    HIRSSAProgram ssa;
+    HIRSSABlock block;
+    HIRSSAInstr instructions[4];
+    HIRParallelCopy copies[2];
+    FILE *file = tmpfile();
+
+    memset(&ssa, 0, sizeof(ssa));
+    memset(&block, 0, sizeof(block));
+    memset(instructions, 0, sizeof(instructions));
+    memset(copies, 0, sizeof(copies));
+    ssa.form = HIR_FORM_OUT_OF_SSA;
+    ssa.blocks = ssa.last_block = &block;
+    ssa.num_blocks = 1;
+    ssa.num_instructions = 4;
+    block.id = 1;
+    block.first = &instructions[0];
+    block.last = &instructions[3];
+    instructions[0].kind = HIR_TAC_LOAD_ERROR;
+    instructions[0].next = &instructions[1];
+    instructions[1].kind = HIR_TAC_STORE_LOCAL;
+    instructions[1].next = &instructions[2];
+    instructions[2].kind = HIR_TAC_UNSUPPORTED;
+    instructions[2].next = &instructions[3];
+    instructions[3].kind = HIR_TAC_PARALLEL_COPY;
+    instructions[3].copies = &copies[0];
+    copies[0].dst = 1;
+    copies[0].src = 2;
+    copies[0].next = &copies[1];
+    copies[1].dst = 3;
+    copies[1].src = 4;
+
+    hir_dump_ssa_to_file(0, &ssa);
+    hir_dump_ssa_to_file(file, 0);
+    hir_dump_ssa_to_file(file, &ssa);
+    fclose(file);
+    return 1;
+}
+#endif
+
+int
+hir_test_inspection_edge_cases(void)
+{
+    HIRSSAProgram ssa;
+    HIRSSABlock blocks[2];
+    HIRSSAInstr instructions[6];
+    HIRPhiArg phi_args[2];
+    HIRValueAnalysis analysis;
+    HIRValueFact facts[6];
+    int stack_values[2] = {3, 4};
+    int local_values[2] = {1, 2};
+    int matched = 0;
+
+    memset(&ssa, 0, sizeof(ssa));
+    memset(blocks, 0, sizeof(blocks));
+    memset(instructions, 0, sizeof(instructions));
+    memset(phi_args, 0, sizeof(phi_args));
+    memset(&analysis, 0, sizeof(analysis));
+    memset(facts, 0, sizeof(facts));
+    ssa.form = HIR_FORM_SSA;
+    ssa.blocks = &blocks[0];
+    ssa.last_block = &blocks[1];
+    blocks[0].first = &instructions[0];
+    blocks[0].last = &instructions[3];
+    blocks[0].next = &blocks[1];
+    blocks[1].first = &instructions[4];
+    blocks[1].last = &instructions[5];
+    instructions[0].kind = HIR_TAC_LOAD_LOCAL;
+    instructions[0].local_id = -1;
+    instructions[0].bytecode_pc = 10;
+    instructions[0].next = &instructions[1];
+    instructions[1].kind = HIR_TAC_LOAD_LOCAL;
+    instructions[1].local_id = 5;
+    instructions[1].bytecode_pc = 11;
+    instructions[1].next = &instructions[2];
+    instructions[2].kind = HIR_TAC_LOAD_LOCAL;
+    instructions[2].local_id = 1;
+    instructions[2].bytecode_pc = 12;
+    instructions[2].next = &instructions[3];
+    instructions[3].kind = HIR_TAC_BINARY;
+    instructions[3].op = HIR_OP_ADD;
+    instructions[3].value = 4;
+    instructions[3].src1 = 5;
+    instructions[3].src2 = 3;
+    instructions[3].bytecode_pc = 20;
+    instructions[3].num_stack_values = 2;
+    instructions[3].stack_values = stack_values;
+    instructions[3].num_local_values = 2;
+    instructions[3].local_values = local_values;
+    instructions[4].kind = HIR_TAC_PHI;
+    instructions[4].value = 5;
+    instructions[4].phi_args = &phi_args[0];
+    instructions[4].next = &instructions[5];
+    phi_args[0].value = 0;
+    phi_args[0].next = &phi_args[1];
+    phi_args[1].value = 3;
+    instructions[5].kind = HIR_TAC_RETURN;
+    instructions[5].src1 = 5;
+    analysis.facts = facts;
+    analysis.num_facts = 6;
+    facts[5] = constant_fact(42);
+
+    matched += hir_ssa_out_of_range_load_count(&ssa, 3) == 2;
+    matched += hir_ssa_stack_value_at_bytecode_pc(&ssa, 20, -1) == -1;
+    matched += hir_ssa_stack_value_at_bytecode_pc(&ssa, 20, 2) == -1;
+    matched += hir_ssa_stack_value_at_bytecode_pc(&ssa, 20, 1) == 4;
+    matched += hir_ssa_binary_value_at_bytecode_pc(&ssa, 20,
+	HIR_OP_SUB) == -1;
+    matched += hir_ssa_binary_value_at_bytecode_pc(&ssa, 21,
+	HIR_OP_ADD) == -1;
+    matched += hir_ssa_binary_value_at_bytecode_pc(&ssa, 20,
+	HIR_OP_ADD) == 4;
+    matched += hir_ssa_local_value_at_bytecode_pc(&ssa, 20, -1) == -1;
+    matched += hir_ssa_local_value_at_bytecode_pc(&ssa, 20, 2) == -1;
+    matched += hir_ssa_local_value_at_bytecode_pc(&ssa, 20, 1) == 2;
+    matched += hir_ssa_phi_arg_count(&ssa) == 2;
+    matched += hir_ssa_zero_phi_arg_count(&ssa) == 1;
+    matched += hir_ssa_return_uses_phi_count(&ssa) == 1;
+    matched += hir_ssa_branch_uses_phi_count(&ssa) == 0;
+    matched += hir_ssa_binary_uses_phi_count(&ssa, HIR_OP_ADD) == 1;
+    matched += hir_ssa_binary_uses_phi_count(&ssa, HIR_OP_SUB) == 0;
+    matched += hir_ssa_return_value_kind(&ssa, &analysis)
+	== HIR_VALUE_INT_CONSTANT;
+    matched += hir_ssa_return_constant(&ssa, &analysis) == 42;
+    facts[5] = error_fact(E_RANGE);
+    matched += hir_ssa_return_error(&ssa, &analysis) == E_RANGE;
+    instructions[5].kind = HIR_TAC_RETURN0;
+    matched += hir_ssa_return_value_kind(&ssa, &analysis)
+	== HIR_VALUE_UNKNOWN;
+    matched += hir_ssa_return_constant(&ssa, &analysis) == 0;
+    matched += hir_ssa_return_error(&ssa, &analysis) == E_NONE;
+    return matched;
+}
+
 int
 hir_test_resume_stack_is_safe(var_type *stack_types, unsigned stack_depth,
 			      int call_operands)
@@ -12342,6 +12917,35 @@ hir_test_tac_with_duplicate_temp(HIRContext *ctx)
     return program;
 }
 
+HIRTacProgram *
+hir_test_corrupt_tac(HIRContext *ctx, HIRTestTacCorruption corruption)
+{
+    HIRTacProgram *program = new_test_tac_program(ctx);
+    HIRTacInstr *instr = new_tac(ctx, HIR_TAC_RETURN0, 1004);
+
+    switch (corruption) {
+    case HIR_TEST_TAC_PHI:
+	instr->kind = HIR_TAC_PHI;
+	break;
+    case HIR_TEST_TAC_PARALLEL_COPY:
+	instr->kind = HIR_TAC_PARALLEL_COPY;
+	break;
+    case HIR_TEST_TAC_UNSUPPORTED_NODEF:
+	instr->kind = HIR_TAC_UNSUPPORTED;
+	instr->dst = 0;
+	break;
+    case HIR_TEST_TAC_UNDEFINED_LABEL:
+	instr->kind = HIR_TAC_JUMP;
+	instr->label = 1;
+	ctx->next_label = 2;
+	break;
+    case HIR_TEST_TAC_CORRUPTION_COUNT:
+	break;
+    }
+    append_tac(program, instr);
+    return program;
+}
+
 HIRCFG *
 hir_test_cfg_with_missing_successor(HIRContext *ctx)
 {
@@ -12496,6 +13100,61 @@ hir_test_cfg_with_critical_edge(HIRContext *ctx)
     return cfg;
 }
 
+HIRCFG *
+hir_test_corrupt_cfg(HIRContext *ctx, HIRTestCFGCorruption corruption)
+{
+    HIRTacInstr *tac = new_tac(ctx, HIR_TAC_RETURN0, 1019);
+    HIRCFG *cfg = hir_alloc(ctx, sizeof(HIRCFG));
+    HIRBasicBlock *block = hir_alloc(ctx, sizeof(HIRBasicBlock));
+    HIRBasicBlock *other = hir_alloc(ctx, sizeof(HIRBasicBlock));
+
+    init_test_block(block, 1, tac);
+    init_test_block(other, 2, tac);
+    cfg->entry = block;
+    cfg->blocks = block;
+    cfg->last_block = block;
+    cfg->num_blocks = 1;
+    cfg->num_edges = 0;
+    switch (corruption) {
+    case HIR_TEST_CFG_ZERO_BLOCKS:
+	cfg->entry = 0;
+	cfg->blocks = 0;
+	cfg->last_block = 0;
+	cfg->num_blocks = 0;
+	break;
+    case HIR_TEST_CFG_MISSING_ENTRY:
+	cfg->entry = 0;
+	break;
+    case HIR_TEST_CFG_WRONG_ENTRY:
+	cfg->entry = other;
+	break;
+    case HIR_TEST_CFG_INVALID_ID:
+	block->id = 0;
+	break;
+    case HIR_TEST_CFG_MISSING_FIRST:
+	block->first = 0;
+	break;
+    case HIR_TEST_CFG_MISSING_LAST:
+	block->last = 0;
+	break;
+    case HIR_TEST_CFG_NEGATIVE_SUCCESSORS:
+	block->num_successors = -1;
+	break;
+    case HIR_TEST_CFG_EXCESS_SUCCESSORS:
+	block->num_successors = 3;
+	break;
+    case HIR_TEST_CFG_BLOCK_COUNT:
+	cfg->num_blocks++;
+	break;
+    case HIR_TEST_CFG_NONTERMINAL_LAST:
+	block->next = other;
+	break;
+    case HIR_TEST_CFG_CORRUPTION_COUNT:
+	break;
+    }
+    return cfg;
+}
+
 static HIRSSAProgram *
 new_test_ssa_program(HIRContext *ctx, HIRSSAInstr *first, HIRSSAInstr *last,
 		     int instruction_count, int value_count)
@@ -12609,6 +13268,57 @@ hir_test_ssa_with_duplicate_def(HIRContext *ctx)
     second->next = 0;
 
     return new_test_ssa_program(ctx, first, second, 2, 2);
+}
+
+HIRSSAProgram *
+hir_test_corrupt_ssa(HIRContext *ctx, HIRTestSSACorruption corruption)
+{
+    HIRSSAInstr *definition = new_test_ssa_instr(ctx, HIR_TAC_CONST,
+	1100, 1);
+    HIRSSAInstr *ret = new_test_ssa_instr(ctx, HIR_TAC_RETURN, 1101, 0);
+    HIRSSAProgram *ssa;
+
+    ctx->next_temp = 2;
+    definition->literal.type = TYPE_INT;
+    definition->next = ret;
+    ret->src1 = 1;
+    ssa = new_test_ssa_program(ctx, definition, ret, 2, 1);
+    switch (corruption) {
+    case HIR_TEST_SSA_WRONG_FORM:
+	ssa->form = HIR_FORM_OUT_OF_SSA;
+	break;
+    case HIR_TEST_SSA_MISSING_FIRST:
+	ssa->blocks->first = 0;
+	break;
+    case HIR_TEST_SSA_MISSING_LAST:
+	ssa->blocks->last = 0;
+	break;
+    case HIR_TEST_SSA_ZERO_DEFINITION:
+	definition->value = 0;
+	break;
+    case HIR_TEST_SSA_HIGH_DEFINITION:
+	definition->value = 2;
+	break;
+    case HIR_TEST_SSA_INVALID_LOCAL:
+	definition->kind = HIR_TAC_LOAD_LOCAL;
+	definition->local_id = -1;
+	break;
+    case HIR_TEST_SSA_PARALLEL_COPY:
+	definition->kind = HIR_TAC_PARALLEL_COPY;
+	break;
+    case HIR_TEST_SSA_BLOCK_COUNT:
+	ssa->num_blocks++;
+	break;
+    case HIR_TEST_SSA_INSTRUCTION_COUNT:
+	ssa->num_instructions++;
+	break;
+    case HIR_TEST_SSA_VALUE_COUNT:
+	ssa->num_values++;
+	break;
+    case HIR_TEST_SSA_CORRUPTION_COUNT:
+	break;
+    }
+    return ssa;
 }
 
 HIRSSAProgram *
@@ -13022,6 +13732,71 @@ hir_test_out_ssa_with_bad_copy_source(HIRContext *ctx)
     ssa = new_test_ssa_program(ctx, def, copy_instr, 2, 2);
     ssa->form = HIR_FORM_OUT_OF_SSA;
 
+    return ssa;
+}
+
+HIRSSAProgram *
+hir_test_corrupt_out_ssa(HIRContext *ctx,
+			 HIRTestOutSSACorruption corruption)
+{
+    HIRSSAInstr *instr = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1031, 1);
+    HIRSSAProgram *ssa;
+
+    ctx->next_temp = 3;
+    ssa = new_test_ssa_program(ctx, instr, instr, 1, 1);
+    ssa->form = HIR_FORM_OUT_OF_SSA;
+    switch (corruption) {
+    case HIR_TEST_OUT_SSA_WRONG_FORM:
+	ssa->form = HIR_FORM_SSA;
+	break;
+    case HIR_TEST_OUT_SSA_MISSING_FIRST:
+	ssa->blocks->first = 0;
+	break;
+    case HIR_TEST_OUT_SSA_MISSING_LAST:
+	ssa->blocks->last = 0;
+	break;
+    case HIR_TEST_OUT_SSA_UNSUPPORTED_DEF:
+	instr->kind = HIR_TAC_UNSUPPORTED;
+	break;
+    case HIR_TEST_OUT_SSA_UNSUPPORTED_NODEF:
+	instr->kind = HIR_TAC_UNSUPPORTED;
+	instr->value = 0;
+	ssa->num_values = 0;
+	break;
+    case HIR_TEST_OUT_SSA_STORE_BEFORE_DEF:
+	instr->kind = HIR_TAC_STORE_LOCAL;
+	instr->value = 0;
+	instr->src1 = 1;
+	ssa->num_values = 0;
+	break;
+    case HIR_TEST_OUT_SSA_COPY_DST_ZERO:
+    case HIR_TEST_OUT_SSA_COPY_DST_HIGH:
+	{
+	    HIRParallelCopy *copy = hir_alloc(ctx, sizeof(HIRParallelCopy));
+
+	    instr->kind = HIR_TAC_PARALLEL_COPY;
+	    instr->value = 0;
+	    copy->src = 1;
+	    copy->dst = corruption == HIR_TEST_OUT_SSA_COPY_DST_ZERO ? 0 : 3;
+	    copy->next = 0;
+	    instr->copies = copy;
+	}
+	break;
+    case HIR_TEST_OUT_SSA_BLOCK_COUNT:
+	ssa->num_blocks++;
+	break;
+    case HIR_TEST_OUT_SSA_INSTRUCTION_COUNT:
+	ssa->num_instructions++;
+	break;
+    case HIR_TEST_OUT_SSA_VALUE_COUNT:
+	ssa->num_values++;
+	break;
+    case HIR_TEST_OUT_SSA_CRITICAL_EDGE:
+	ssa->cfg = hir_test_cfg_with_critical_edge(ctx);
+	break;
+    case HIR_TEST_OUT_SSA_CORRUPTION_COUNT:
+	break;
+    }
     return ssa;
 }
 #endif
