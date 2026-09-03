@@ -615,25 +615,34 @@ one of five authoritative source classes:
 * an owning native-frame home.
 
 The legacy captured-raw source is not an authoritative source for the new
-native chain and must not be admitted by general dispatch.  The first
-owner-backed source is implemented for list-tail values which already have an
-audited move-to-home transfer.  It stores the home index; capture and retained
-native resume validate that the index is in range and the home is
+native chain and must not be admitted by general dispatch. Owner-backed
+sources are implemented for list-tail values with an audited move-to-home
+transfer and for property results whose runtime helper normalizes every
+successful result to an owned `Var`. They store the home index; capture and
+retained native resume validate that the index is in range and the home is
 `JIT_HOME_OWNED`, then reload the complete `Var`, including its runtime tag,
-from `owned_values[index]`.  A map which requires this source is explicitly
+from `owned_values[index]`. A map which requires this source is explicitly
 non-rehydratable: canonical entry falls back instead of reading a newly
-allocated, empty home array.  The raw SSA/deoptimization payload may still
+allocated, empty home array. The raw SSA/deoptimization payload may still
 contain a cache of that value, but it is never selected for owner-backed
 recovery.
 
-Owner-home admission also requires forward must-availability at the call.  The
+Owner-home admission also requires forward must-availability at the call. The
 analysis intersects availability from every reachable predecessor and then
-walks definitions in instruction order within the call's block.  A definition
+walks definitions in instruction order within the call's block. A definition
 on only one branch, after the call, or in an unreachable predecessor is not
-sufficient.  Additional producer classes remain disabled until their runtime
-helpers have an explicit move/reference contract; assigning homes generically
-to property results or other complex producers caused database-startup heap
-corruption and is not part of the supported frame format.
+sufficient. Property results were admitted only after their helper acquired an
+explicit owned-result contract; the earlier generic assignment of homes without
+that contract caused database-startup heap corruption. Other complex producer
+classes remain disabled until their runtime helpers have an equally explicit
+move/reference contract.
+
+Owner-backed reconstruction does not by itself authorize moving a value into a
+call boundary. Boundary argument analysis currently moves only
+`JIT_OWNERSHIP_OWNED` values. `JIT_OWNERSHIP_OWNED_PROPERTY` values remain
+retained by their owner home across the call until a separate proof covers the
+callee's consumption, exceptional exits, and caller-resume cleanup. This keeps
+the reconstruction contract and the argument-transfer contract independent.
 
 Arguments are transferred according to the shared verb-environment
 constructor.  The call request owns the receiver, verb name, and argument list

@@ -803,6 +803,41 @@ test_arithmetic_and_local_tac(void)
 }
 
 static void
+test_deep_expression_lowering_stack(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr values[10];
+    Expr additions[9];
+    Stmt ret;
+    int i;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 2;
+    for (i = 0; i < 10; i++)
+	values[i] = int_expr(i + 1, 12);
+    additions[8] = binary_expr(EXPR_PLUS, &values[8], &values[9]);
+    additions[8].bytecode_pc = 9;
+    for (i = 7; i >= 0; i--) {
+	additions[i] = binary_expr(EXPR_PLUS, &values[i], &additions[i + 1]);
+	additions[i].bytecode_pc = i + 1;
+    }
+    ret = return_stmt(&additions[0]);
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+
+    check_int("deep expression lowering stack depth",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 9), 10);
+    check_int("deep expression lowering verifies",
+	      hir_context_error_count(ctx), 0);
+    check_int("deep expression destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
 test_unary_and_empty_list_tac(void)
 {
     static const struct {
@@ -2884,6 +2919,9 @@ test_builtin_call_tac_ssa(void)
     check_int("builtin call call pc",
 	      hir_tac_count_bytecode_pc(tac, 3), 1);
     check_int("builtin call verify errors", hir_context_error_count(ctx), 0);
+    check_int("builtin call constant optimization",
+	      hir_optimize_ssa_constants(ctx, ssa), 0);
+    check_int("optimized builtin call verifies", hir_verify_ssa(ctx, ssa), 1);
 
     check_int("builtin call destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
@@ -4019,7 +4057,8 @@ test_catch_expr_tac_ssa(void)
     HIRDominatorTree *dom;
     HIRSSAProgram *ssa;
     HIRTacProgram *tac;
-    Expr catch_expr, try_expr, lhs_expr, rhs_expr, handler_expr;
+    Expr catch_expr, try_expr, lhs_expr, rhs_expr, handler_expr, code_expr;
+    Arg_List code;
     Stmt ret;
 
     memset(&names, 0, sizeof(names));
@@ -4028,11 +4067,19 @@ test_catch_expr_tac_ssa(void)
     rhs_expr = int_expr(0, 30);
     try_expr = binary_expr(EXPR_DIVIDE, &lhs_expr, &rhs_expr);
     handler_expr = int_expr(42, 30);
+    memset(&code_expr, 0, sizeof(code_expr));
+    code_expr.kind = EXPR_VAR;
+    code_expr.lineno = 30;
+    code_expr.e.var.type = TYPE_ERR;
+    code_expr.e.var.v.err = E_DIV;
+    memset(&code, 0, sizeof(code));
+    code.kind = ARG_NORMAL;
+    code.expr = &code_expr;
     memset(&catch_expr, 0, sizeof(catch_expr));
     catch_expr.kind = EXPR_CATCH;
     catch_expr.lineno = 30;
     catch_expr.e.catch.try = &try_expr;
-    catch_expr.e.catch.codes = 0;
+    catch_expr.e.catch.codes = &code;
     catch_expr.e.catch.except = &handler_expr;
     ret = return_stmt(&catch_expr);
 
@@ -4046,6 +4093,16 @@ test_catch_expr_tac_ssa(void)
     check_int("catch expr ssa blocks", hir_ssa_block_count(ssa) > 1, 1);
     check_int("catch expr verify errors", hir_context_error_count(ctx), 0);
 
+    hir_context_free(ctx);
+
+    catch_expr.e.catch.codes = 0;
+    catch_expr.e.catch.except = 0;
+    tac = lower_stmt(&names, &ret, &ctx, &cfg, &dom, &ssa);
+    check_int("wildcard catch loads caught error",
+	      hir_tac_count_kind(tac, HIR_TAC_LOAD_ERROR), 1);
+    check_int("wildcard catch returns", hir_tac_count_kind(tac,
+	      HIR_TAC_RETURN), 1);
+    check_int("wildcard catch verify errors", hir_context_error_count(ctx), 0);
     hir_context_free(ctx);
 }
 
@@ -5022,6 +5079,7 @@ main(void)
     test_uninitialized_entry_load_classification();
     test_builtin_entry_types();
     test_arithmetic_and_local_tac();
+    test_deep_expression_lowering_stack();
     test_unary_and_empty_list_tac();
     test_empty_and_discarded_statements();
     test_control_flow_tac();
