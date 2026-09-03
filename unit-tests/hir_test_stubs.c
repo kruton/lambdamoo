@@ -88,6 +88,7 @@ compile_program_to_jit(Program *program)
 
 void hir_test_set_length_protected(int);
 void hir_test_set_builtin_property(enum bi_prop);
+void hir_test_set_builtin_property_protected(enum bi_prop, int);
 void hir_test_set_property(Var);
 void hir_test_set_property_allowed(int);
 void hir_test_set_resume_point(const ResumePoint *);
@@ -167,6 +168,12 @@ void
 hir_test_set_builtin_property(enum bi_prop property)
 {
     test_builtin_property = property;
+}
+
+void
+hir_test_set_builtin_property_protected(enum bi_prop property, int protected)
+{
+    _server_int_option_cache[property] = protected;
 }
 
 void
@@ -540,6 +547,8 @@ listconcat(Var first, Var second)
 	result.v.list[i] = var_ref(first.v.list[i]);
     for (i = 1; i <= len2; i++)
 	result.v.list[len1 + i] = var_ref(second.v.list[i]);
+    free_var(first);
+    free_var(second);
     return result;
 }
 
@@ -647,9 +656,8 @@ db_find_property(Objid oid, const char *name, Var *value)
     if (oid >= 0 && name && *name) {
 	h.ptr = (void *) 0x1;
 	h.built_in = test_builtin_property;
-	if (value) {
-	    *value = test_property;
-	}
+	if (value)
+	    *value = h.built_in ? var_ref(test_property) : test_property;
     }
     return h;
 }

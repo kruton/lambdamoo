@@ -8,6 +8,7 @@
 #include "execute.h"
 #include "integer_arithmetic.h"
 #include "list.h"
+#include "server.h"
 #include "storage.h"
 #include "utf.h"
 #include "utils.h"
@@ -22,6 +23,7 @@ static int failures;
 static void check(int, const char *);
 extern void hir_test_set_length_protected(int);
 extern void hir_test_set_builtin_property(enum bi_prop);
+extern void hir_test_set_builtin_property_protected(enum bi_prop, int);
 extern void hir_test_set_property(Var);
 extern void hir_test_set_property_allowed(int);
 extern void hir_test_set_resume_point(const ResumePoint *);
@@ -144,6 +146,38 @@ set_program_value_type(JITProgram *program, int value, var_type type)
     if (!program->value_types)
 	program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_types[value] = type;
+}
+
+static void
+set_program_owned_value(JITProgram *program, int value)
+{
+    int i;
+
+    if (!program->value_ownership)
+	program->value_ownership = allocate(program->num_values);
+    if (!program->value_owner_root) {
+	program->value_owner_root = allocate(sizeof(int) * program->num_values);
+	for (i = 0; i < program->num_values; i++)
+	    program->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+    }
+    program->value_ownership[value] = JIT_OWNERSHIP_OWNED;
+    program->value_owner_root[value] = value;
+}
+
+static void
+set_program_owned_home(JITProgram *program, int value, int slot)
+{
+    int i;
+
+    set_program_owned_value(program, value);
+    if (!program->value_owned_slots) {
+	program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+	for (i = 0; i < program->num_values; i++)
+	    program->value_owned_slots[i] = -1;
+    }
+    program->value_owned_slots[value] = slot;
+    if (program->num_owned_slots <= slot)
+	program->num_owned_slots = slot + 1;
 }
 
 static void
@@ -661,6 +695,50 @@ builtin_call_program(unsigned func)
 }
 
 static JITProgram *
+owned_builtin_call_program(unsigned func)
+{
+    JITProgram *program = builtin_call_program(func);
+    JITInstruction *load = program->blocks->first;
+    JITInstruction *call = load->next;
+    JITInstruction *ret = call->next;
+    JITInstruction *singleton = instruction(HIR_TAC_UNARY);
+    JITDeoptMap *map = &program->deopt_maps[1];
+
+    program->num_values = 4;
+    program->value_types = myrealloc(program->value_types,
+				     sizeof(var_type) * program->num_values,
+				     M_PROGRAM);
+    program->value_is_tagged = myrealloc(program->value_is_tagged,
+					 program->num_values, M_PROGRAM);
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_LIST;
+    program->value_types[3] = TYPE_ANY;
+    program->value_is_tagged[1] = 0;
+    program->value_is_tagged[2] = 0;
+    program->value_is_tagged[3] = 1;
+    set_program_owned_home(program, 2, 0);
+
+    singleton->value = 2;
+    singleton->src1 = 1;
+    singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
+    singleton->next = call;
+    load->literal_type = TYPE_STR;
+    load->next = singleton;
+    call->value = 3;
+    call->src1 = 2;
+    ret->src1 = 3;
+    map->native_resume->values[0].value = 3;
+    map->stack_values[0] = 2;
+    map->stack_types[0] = TYPE_LIST;
+    map->stack_owner_slots = allocate(sizeof(int));
+    map->stack_owner_slots[0] = 0;
+    map->local_values[0].value = 2;
+    map->local_owner_slots = allocate(sizeof(int));
+    map->local_owner_slots[0] = 0;
+    return program;
+}
+
+static JITProgram *
 get_prop_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -1053,6 +1131,121 @@ call_verb_program(void)
 }
 
 static JITProgram *
+call_verb_preserved_float_program(void)
+{
+    JITProgram *program = call_verb_program();
+    JITDeoptMap *map = &program->deopt_maps[1];
+    JITInstruction *load_args = program->blocks->first->next->next;
+    JITInstruction *load_float = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *return_instr = program->blocks->last;
+
+    program->num_values = 6;
+    program->num_vars = 4;
+    program->value_types = myrealloc(program->value_types,
+				     sizeof(var_type) * 6, M_PROGRAM);
+    program->value_is_tagged = myrealloc(program->value_is_tagged, 6,
+					 M_PROGRAM);
+    program->value_types[5] = TYPE_FLOAT;
+    program->value_is_tagged[5] = 0;
+    map->num_locals = 4;
+    map->num_local_values = 4;
+    map->local_values = myrealloc(map->local_values,
+				  sizeof(JITLocalValue) * 4, M_PROGRAM);
+    map->local_values[3].slot = 3;
+    map->local_values[3].value = 5;
+    map->native_resume->values[3].value = 5;
+    map->native_resume->values[3].source = JIT_RESUME_LOCAL;
+    map->native_resume->values[3].index = 3;
+    load_float->value = 5;
+    load_float->local_id = 3;
+    load_float->literal_type = TYPE_FLOAT;
+    load_float->next = load_args->next;
+    load_args->next = load_float;
+    return_instr->src1 = 5;
+    return_instr->literal_type = TYPE_FLOAT;
+    return program;
+}
+
+static JITProgram *
+call_verb_preserved_property_program(void)
+{
+    JITProgram *program = call_verb_program();
+    JITDeoptMap *call_map = &program->deopt_maps[1];
+    JITDeoptMap *property_map;
+    JITInstruction *load_args = program->blocks->first->next->next;
+    JITInstruction *load_property = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *get_property = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = program->blocks->last;
+
+    program->num_values = 7;
+    program->num_vars = 5;
+    program->value_types = myrealloc(program->value_types,
+				     sizeof(var_type) * 7, M_PROGRAM);
+    program->value_is_tagged = myrealloc(program->value_is_tagged, 7,
+					 M_PROGRAM);
+    program->value_types[5] = TYPE_STR;
+    program->value_types[6] = TYPE_ANY;
+    program->value_is_tagged[5] = 0;
+    program->value_is_tagged[6] = 1;
+    set_program_owned_home(program, 6, 0);
+    program->value_ownership[6] = JIT_OWNERSHIP_OWNED_PROPERTY;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 3, M_PROGRAM);
+    call_map = &program->deopt_maps[1];
+    property_map = &program->deopt_maps[2];
+    memset(property_map, 0, sizeof(*property_map));
+    program->num_deopt_maps = 3;
+    property_map->reason = JIT_DEOPT_PROPERTY_READ;
+    property_map->operation = HIR_OP_GET_PROP;
+    property_map->bytecode_pc = property_map->error_pc = 29;
+    property_map->num_locals = 5;
+    allocate_map_locals(property_map, 5);
+    property_map->local_values[0].value = 1;
+    property_map->local_values[1].value = 2;
+    property_map->local_values[2].value = 3;
+    property_map->local_values[3].value = 5;
+    property_map->stack_depth = 2;
+    property_map->stack_values = allocate(sizeof(int) * 2);
+    property_map->stack_types = allocate(sizeof(var_type) * 2);
+    property_map->stack_values[0] = 1;
+    property_map->stack_values[1] = 5;
+    property_map->stack_types[0] = TYPE_OBJ;
+    property_map->stack_types[1] = TYPE_STR;
+
+    call_map->num_locals = 5;
+    call_map->num_local_values = 5;
+    call_map->local_values = myrealloc(call_map->local_values,
+				       sizeof(JITLocalValue) * 5, M_PROGRAM);
+    call_map->local_values[3].slot = 3;
+    call_map->local_values[3].value = 5;
+    call_map->local_values[4].slot = 4;
+    call_map->local_values[4].value = 6;
+    call_map->native_resume->num_values = 5;
+    call_map->native_resume->values = myrealloc(
+	call_map->native_resume->values, sizeof(JITResumeValue) * 5, M_PROGRAM);
+    call_map->native_resume->values[4].value = 6;
+    call_map->native_resume->values[4].source = JIT_RESUME_OWNER;
+    call_map->native_resume->values[4].index = 0;
+
+    load_property->value = 5;
+    load_property->local_id = 3;
+    load_property->literal_type = TYPE_STR;
+    load_property->next = get_property;
+    get_property->value = 6;
+    get_property->src1 = 1;
+    get_property->src2 = 5;
+    get_property->op = HIR_OP_GET_PROP;
+    get_property->deopt_map = 2;
+    get_property->bytecode_pc = 29;
+    get_property->next = load_args->next;
+    load_args->next = load_property;
+    return_instr->src1 = 6;
+    return_instr->literal_type = TYPE_ANY;
+    return program;
+}
+
+static JITProgram *
 object_return_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -1159,6 +1352,7 @@ float_binary_program(HIROp op)
     program->value_types[1] = TYPE_FLOAT;
     program->value_types[2] = TYPE_FLOAT;
     program->value_types[3] = TYPE_FLOAT;
+    set_program_owned_home(program, 3, 0);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -1389,6 +1583,7 @@ string_concat_program(const char *left_string, const char *right_string)
     program->value_types[1] = TYPE_STR;
     program->value_types[2] = TYPE_STR;
     program->value_types[3] = TYPE_STR;
+    set_program_owned_home(program, 3, 0);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -1415,6 +1610,58 @@ string_concat_program(const char *left_string, const char *right_string)
 }
 
 static JITProgram *
+duplicate_owned_string_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *duplicate = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    char *ls = str_dup("a");
+    char *rs = str_dup("b");
+
+    program->num_values = 5;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_STR;
+    program->value_types[4] = TYPE_STR;
+    set_program_owned_home(program, 3, 0);
+    set_program_owned_home(program, 4, 0);
+    program->value_owner_root[4] = 3;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    left->value = 1;
+    left->literal_type = TYPE_STR;
+    left->literal = (uintptr_t) ls;
+    left->next = right;
+    right->value = 2;
+    right->literal_type = TYPE_STR;
+    right->literal = (uintptr_t) rs;
+    right->next = concat;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->next = duplicate;
+    duplicate->value = 4;
+    duplicate->src1 = 3;
+    duplicate->src2 = 3;
+    duplicate->op = HIR_OP_ADD;
+    duplicate->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_STR;
+    block->first = left;
+    block->last = ret;
+    jit_analyze_owned_last_uses(program);
+    return program;
+}
+
+static JITProgram *
 string_index_program(const char *s, int idx)
 {
     JITProgram *program = new_jit_program();
@@ -1433,6 +1680,7 @@ string_index_program(const char *s, int idx)
     program->value_types[1] = TYPE_STR;
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_STR;
+    set_program_owned_value(program, 3);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -1920,6 +2168,7 @@ range_ref_test_program(var_type base_type)
     program->value_types[2] = TYPE_INT;
     program->value_types[3] = TYPE_INT;
     program->value_types[4] = base_type;
+    set_program_owned_value(program, 4);
 
     map = &program->deopt_maps[1];
     map->bytecode_pc = 10;
@@ -2364,6 +2613,7 @@ tagged_unary_result_program(HIROp op, var_type result_type)
     JITInstruction *ret = unary->next;
 
     program->value_types[2] = result_type;
+    set_program_owned_value(program, 2);
     ret->literal_type = result_type;
     return program;
 }
@@ -2422,6 +2672,7 @@ float_singleton_program(void)
     program->value_is_tagged = allocate(3);
     program->value_types[1] = TYPE_FLOAT;
     program->value_types[2] = TYPE_LIST;
+    set_program_owned_value(program, 2);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -2458,6 +2709,8 @@ tagged_binary_program(HIROp op)
     program->value_is_tagged[1] = 1;
     program->value_is_tagged[2] = 1;
     program->value_is_tagged[3] = 1;
+    if (op == HIR_OP_ADD)
+	set_program_owned_value(program, 3);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -2490,15 +2743,8 @@ tagged_binary_result_program(HIROp op, var_type result_type)
     JITInstruction *ret = binary->next;
 
     program->value_types[3] = result_type;
-    if (op == HIR_OP_LIST_ADD_TAIL) {
-	int i;
-
-	program->value_owned_slots = allocate(sizeof(int) * program->num_values);
-	for (i = 0; i < program->num_values; i++)
-	    program->value_owned_slots[i] = -1;
-	program->value_owned_slots[3] = 0;
-	program->num_owned_slots = 1;
-    }
+    if (op == HIR_OP_LIST_ADD_TAIL)
+	set_program_owned_home(program, 3, 0);
     ret->literal_type = result_type;
     return program;
 }
@@ -2529,6 +2775,7 @@ tagged_string_pipeline_program(void)
     program->value_is_tagged[3] = 1;
     program->value_is_tagged[5] = 1;
     program->value_is_tagged[6] = 1;
+    set_program_owned_value(program, 6);
     add_entry_deopt_map(program);
     program->blocks = program->last_block = block;
     block->id = 1;
@@ -2569,6 +2816,7 @@ tagged_string_pipeline_program(void)
     ret->literal_type = TYPE_INT;
     block->first = load_list;
     block->last = ret;
+    jit_analyze_owned_last_uses(program);
     return program;
 }
 
@@ -3458,6 +3706,44 @@ owned_last_use_branch_program(int old_value_on_successor)
 }
 
 static JITProgram *
+owned_last_use_third_operand_program(int use_after)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *set = instruction(HIR_TAC_INDEX_SET);
+    JITInstruction *after = use_after ? instruction(HIR_TAC_UNARY) : 0;
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 8;
+    program->num_blocks = 1;
+    program->blocks = program->last_block = block;
+    program->value_ownership = allocate(program->num_values);
+    program->value_ownership[3] = JIT_OWNERSHIP_OWNED;
+    block->id = 1;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->next = set;
+    set->value = 6;
+    set->src1 = 4;
+    set->src2 = 5;
+    set->src3 = 3;
+    set->next = after ? after : ret;
+    if (after) {
+	after->value = 7;
+	after->src1 = 3;
+	after->op = HIR_OP_LENGTH;
+	after->next = ret;
+    }
+    ret->src1 = 6;
+    block->first = concat;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 tagged_guard_instruction_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -3719,6 +4005,79 @@ typed_unary_lowering_program(HIROp op, var_type operand_type,
 }
 
 static JITProgram *
+owned_property_result_program(void)
+{
+    JITProgram *program = typed_binary_lowering_program(HIR_OP_GET_PROP,
+	TYPE_OBJ, TYPE_STR, TYPE_ANY, 0, 0, 1);
+    JITInstruction *get = program->blocks->first->next->next;
+    JITDeoptMap *map;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+				    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->reason = JIT_DEOPT_PROPERTY_READ;
+    map->operation = HIR_OP_GET_PROP;
+    map->bytecode_pc = map->error_pc = 72;
+    map->num_locals = 2;
+    allocate_map_locals(map, 2);
+    map->local_values[0].value = 1;
+    map->local_values[1].value = 2;
+    map->stack_depth = 2;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_types = allocate(sizeof(var_type) * 2);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_types[0] = TYPE_OBJ;
+    map->stack_types[1] = TYPE_STR;
+    program->blocks->first->literal_type = TYPE_OBJ;
+    program->blocks->first->next->literal_type = TYPE_STR;
+    get->deopt_map = 1;
+    get->bytecode_pc = 72;
+    set_program_owned_home(program, 3, 0);
+    program->value_ownership[3] = JIT_OWNERSHIP_OWNED_PROPERTY;
+    return program;
+}
+
+static JITProgram *
+repeated_owned_property_program(void)
+{
+    JITProgram *program = owned_property_result_program();
+    JITInstruction *first_get = program->blocks->first->next->next;
+    JITInstruction *second_get = instruction(HIR_TAC_BINARY);
+    JITInstruction *return_instr = program->blocks->last;
+
+    program->num_values = 5;
+    program->value_types = myrealloc(program->value_types,
+				     sizeof(var_type) * 5, M_PROGRAM);
+    program->value_is_tagged = myrealloc(program->value_is_tagged, 5,
+					 M_PROGRAM);
+    program->value_ownership = myrealloc(program->value_ownership,
+					 5, M_PROGRAM);
+    program->value_owner_root = myrealloc(program->value_owner_root,
+					  sizeof(int) * 5, M_PROGRAM);
+    program->value_owned_slots = myrealloc(program->value_owned_slots,
+					   sizeof(int) * 5, M_PROGRAM);
+    program->value_types[4] = TYPE_ANY;
+    program->value_is_tagged[4] = 1;
+    program->value_ownership[4] = JIT_OWNERSHIP_OWNED_PROPERTY;
+    program->value_owner_root[4] = 4;
+    program->value_owned_slots[4] = 0;
+
+    second_get->value = 4;
+    second_get->src1 = first_get->src1;
+    second_get->src2 = first_get->src2;
+    second_get->op = HIR_OP_GET_PROP;
+    second_get->deopt_map = first_get->deopt_map;
+    second_get->bytecode_pc = first_get->bytecode_pc;
+    second_get->next = return_instr;
+    first_get->next = second_get;
+    return_instr->src1 = 4;
+    return program;
+}
+
+static JITProgram *
 fixed_list_chain_program(int interrupted_capacity)
 {
     JITProgram *program = new_jit_program();
@@ -3876,6 +4235,9 @@ typed_deopt_program(var_type type, int tagged)
     map->operation = HIR_OP_FORK;
     map->bytecode_pc = map->error_pc = 71;
     map->stack_depth = 1;
+    map->num_locals = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_values = allocate(sizeof(int));
     map->stack_types = allocate(sizeof(var_type));
     map->stack_values[0] = 1;
@@ -4533,6 +4895,27 @@ test_suspend_zero_detection(void)
     continuation = 0;
     free_var(env[0]);
     jit_program_free(list_program);
+
+    list_program = owned_builtin_call_program(11);
+    list_program->deopt_maps[1].builtin_args = -1;
+    list_program->deopt_maps[1].local_values[0].value = 1;
+    list_program->deopt_maps[1].local_owner_slots[0] = -1;
+    list_program->value_types[1] = TYPE_INT;
+    list_program->blocks->first->literal_type = TYPE_INT;
+    jit_analyze_owned_last_uses(list_program);
+    env[0].type = TYPE_INT;
+    env[0].v.num = 0;
+    check((jit_program_execute)(list_program, env, &result, &ticks,
+			      &timed_out, &error, 0, &deopt, deopt_stack,
+			      0, -1, 0, &continuation)
+	  == JIT_RUN_CALL_VERB && deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO,
+	  "owned suspend({0}) was not recognized as a fast suspension");
+    check(continuation != 0
+	  && list_program->deopt_maps[1].stack_boundary_ownership[0]
+	     == JIT_BOUNDARY_VALUE_MOVED_OWNER,
+	  "fast suspension did not consume its owned argument list");
+    jit_continuation_free(continuation);
+    jit_program_free(list_program);
 }
 
 static void
@@ -5060,6 +5443,55 @@ test_boundary_value_ownership_transfer(void)
 	}
 	free_var(taken);
     }
+#ifdef WAIF_CORE
+    for (i = 0; i < sizeof(owner_modes) / sizeof(owner_modes[0]); i++) {
+	Var homes[1];
+	unsigned char states[1] = {JIT_HOME_OWNED};
+	Var taken;
+
+	homes[0] = hir_test_new_waif();
+	taken = jit_test_take_boundary_stack_value(program, owner_modes[i], 0,
+	    TYPE_WAIF, 1, 0, homes, states);
+	check(taken.type == TYPE_WAIF,
+	      "owner-backed waif boundary produced the wrong type");
+	if (owner_modes[i] == JIT_BOUNDARY_VALUE_MOVED_OWNER) {
+	    check(homes[0].type == TYPE_NONE && states[0] == JIT_HOME_EMPTY
+		  && var_refcount(taken) == 1,
+		  "moved waif boundary did not transfer its owner reference");
+	} else {
+	    check(homes[0].type == TYPE_WAIF && states[0] == JIT_HOME_OWNED
+		  && homes[0].v.waif == taken.v.waif
+		  && var_refcount(taken) == 2,
+		  "borrowed waif boundary did not retain its owner reference");
+	    free_var(homes[0]);
+	}
+	free_var(taken);
+    }
+    {
+	Num raw[2] = {0, 0};
+	Var original = hir_test_new_waif();
+	Var taken;
+
+	raw[1] = (Num) (intptr_t) original.v.waif;
+	taken = jit_test_take_boundary_stack_value(program,
+	    JIT_BOUNDARY_VALUE_RETAINED, -1, TYPE_WAIF, 1, raw, 0, 0);
+	check(taken.type == TYPE_WAIF && taken.v.waif == original.v.waif
+	      && var_refcount(taken) == 2,
+	      "retained raw waif boundary did not retain its source");
+	free_var(taken);
+	free_var(original);
+
+	original = hir_test_new_waif();
+	raw[1] = (Num) (intptr_t) original.v.waif;
+	taken = jit_test_take_boundary_stack_value(program,
+	    JIT_BOUNDARY_VALUE_MOVED_RAW, -1, TYPE_WAIF, 1, raw, 0, 0);
+	check(taken.type == TYPE_WAIF && taken.v.waif == original.v.waif
+	      && raw[1] == 0 && var_refcount(taken) == 1,
+	      "moved raw waif boundary did not consume its source");
+	original.type = TYPE_NONE;
+	free_var(taken);
+    }
+#endif
     {
 	Num raw[2] = {0, 0};
 	Var original;
@@ -5214,6 +5646,8 @@ test_typed_deopt_materialization(void)
 	      "typed deopt program did not request fallback");
 	check(stack[0].type == types[i] && deopt.guard_actual[0] == types[i],
 	      "typed deopt reconstructed the wrong value or guard type");
+	check(inputs[i].type == types[i],
+	      "typed deopt reconstructed the wrong local type");
 	if (types[i] == TYPE_ERR)
 	    check(stack[0].v.err == E_INVARG,
 		  "typed error deopt reconstructed the wrong error");
@@ -5911,7 +6345,7 @@ test_control_stack_continuation_materialization(void)
     JITDeoptMap *map;
     JITContinuationFrame *continuation;
     activation owner;
-    Var stack[2];
+    Var stack[3];
     Num raw[1] = {0};
 
     program->num_values = 1;
@@ -5927,13 +6361,15 @@ test_control_stack_continuation_materialization(void)
     map->reason = JIT_DEOPT_TYPE_GUARD;
     map->bytecode_pc = 76;
     map->error_pc = 77;
-    map->stack_depth = 2;
-    map->stack_values = allocate(sizeof(int) * 2);
-    map->stack_slots = allocate(sizeof(ResumeStackSlot) * 2);
+    map->stack_depth = 3;
+    map->stack_values = allocate(sizeof(int) * 3);
+    map->stack_slots = allocate(sizeof(ResumeStackSlot) * 3);
     map->stack_slots[0].kind = RSS_CATCH;
     map->stack_slots[0].data = 101;
     map->stack_slots[1].kind = RSS_FINALLY;
     map->stack_slots[1].data = 202;
+    map->stack_slots[2].kind = RSS_HANDLER_PC;
+    map->stack_slots[2].data = 303;
     map->native_resume = allocate(sizeof(JITNativeResume));
     map->native_resume->valid = 1;
     map->native_resume->rehydratable = 1;
@@ -5945,7 +6381,7 @@ test_control_stack_continuation_materialization(void)
     stack[0].v.str = str_dup("discarded stack value");
     owner.base_rt_stack = stack;
     owner.top_rt_stack = stack + 1;
-    owner.rt_stack_size = 2;
+    owner.rt_stack_size = 3;
     owner.temp.type = TYPE_STR;
     owner.temp.v.str = str_dup("discarded temporary");
     check(continuation != 0,
@@ -5956,9 +6392,10 @@ test_control_stack_continuation_materialization(void)
 	      "control-stack continuation did not materialize");
     }
     check(!owner.jit_continuation
-	  && owner.top_rt_stack == owner.base_rt_stack + 2
+	  && owner.top_rt_stack == owner.base_rt_stack + 3
 	  && stack[0].type == TYPE_CATCH && stack[0].v.num == 101
 	  && stack[1].type == TYPE_FINALLY && stack[1].v.num == 202
+	  && stack[2].type == TYPE_INT && stack[2].v.num == 303
 	  && owner.temp.type == TYPE_NONE
 	  && owner.pc == 76 && owner.error_pc == 77
 	  && program->usage->continuation_captures == 1
@@ -5975,17 +6412,17 @@ test_control_stack_continuation_materialization(void)
 static void
 test_all_continuations_materialize(void)
 {
-    JITProgram *programs[2];
+    JITProgram *programs[3];
     JITContinuationFrame *continuation;
-    activation owners[2];
+    activation owners[3];
     Program bytecode;
-    Var env[2];
-    Var stacks[2];
+    Var env[3];
+    Var stacks[3];
     Num raw[2] = {0, 0};
     int i;
 
     memset(&bytecode, 0, sizeof(bytecode));
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 3; i++) {
 	JITNativeResume *resume;
 
 	programs[i] = single_local_continuation_program(
@@ -6011,12 +6448,17 @@ test_all_continuations_materialize(void)
 	    jit_continuation_attach(continuation, &owners[i]);
     }
 
+    jit_continuation_free(owners[1].jit_continuation);
+    check(!owners[1].jit_continuation && env[1].v.num == 1,
+	  "middle continuation did not unlink independently");
     jit_continuation_materialize_all();
     check(!owners[0].jit_continuation && !owners[1].jit_continuation
+	  && !owners[2].jit_continuation
 	  && env[0].type == TYPE_INT && env[0].v.num == 300
-	  && env[1].type == TYPE_INT && env[1].v.num == 301,
+	  && env[1].type == TYPE_INT && env[1].v.num == 1
+	  && env[2].type == TYPE_INT && env[2].v.num == 302,
 	  "global boundary did not materialize every continuation");
-    for (i = 0; i < 2; i++)
+    for (i = 0; i < 3; i++)
 	jit_program_free(programs[i]);
 }
 
@@ -6028,12 +6470,15 @@ test_specialized_builtin_boundary_materialization(void)
     JITContinuationFrame *continuation;
     JITNativeResume *resume;
     activation owner;
+    Program bytecode;
+    Var owner_env[1];
     Var owner_stack[2];
     Var wrong;
     Var boundary;
     Num raw[3] = {0, 0, 0};
 
     program->num_values = 3;
+    program->num_vars = 1;
     program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_is_tagged = allocate(program->num_values);
     program->usage = allocate(sizeof(JITProgramUsage));
@@ -6050,6 +6495,9 @@ test_specialized_builtin_boundary_materialization(void)
     map->builtin_args = 2;
     map->bytecode_pc = 81;
     map->error_pc = 82;
+    map->num_locals = 1;
+    allocate_map_locals(map, 1);
+    map->local_values[0].value = 1;
     map->stack_depth = 2;
     map->stack_values = allocate(sizeof(int) * 2);
     map->stack_types = allocate(sizeof(var_type) * 2);
@@ -6070,6 +6518,12 @@ test_specialized_builtin_boundary_materialization(void)
     continuation = jit_test_continuation_capture(program, 1, raw, 0, 0,
 	0, 0, 0, 0, 0);
     memset(&owner, 0, sizeof(owner));
+    memset(&bytecode, 0, sizeof(bytecode));
+    bytecode.num_var_names = 1;
+    owner_env[0].type = TYPE_INT;
+    owner_env[0].v.num = 99;
+    owner.prog = &bytecode;
+    owner.rt_env = owner_env;
     owner.base_rt_stack = owner.top_rt_stack = owner_stack;
     owner.rt_stack_size = 2;
     owner.temp.type = TYPE_NONE;
@@ -6107,6 +6561,7 @@ test_specialized_builtin_boundary_materialization(void)
 	  && owner_stack[0].type == TYPE_INT && owner_stack[0].v.num == 10
 	  && owner_stack[1].type == TYPE_STR
 	  && !strcmp(owner_stack[1].v.str, "twenty")
+	  && owner_env[0].type == TYPE_INT && owner_env[0].v.num == 10
 	  && owner.pc == 81 && owner.error_pc == 82
 	  && program->usage->continuation_captures == 1
 	  && program->usage->continuation_materializations == 1,
@@ -6128,13 +6583,13 @@ test_verb_boundary_outer_state_materialization(void)
     JITNativeResume *resume;
     activation owner;
     Program bytecode;
-    Var env[1];
-    Var owner_stack[4];
+    Var env[2];
+    Var owner_stack[7];
     Var boundary[3];
-    Num raw[4] = {0, 0, 0, 0};
+    Num raw[5] = {0, 0, 0, 0, 0};
     int i;
 
-    program->num_values = 4;
+    program->num_values = 5;
     program->value_types = allocate(sizeof(var_type) * program->num_values);
     program->value_is_tagged = allocate(program->num_values);
     for (i = 1; i < program->num_values; i++)
@@ -6148,39 +6603,56 @@ test_verb_boundary_outer_state_materialization(void)
     map->reason = JIT_DEOPT_VERB_CALL;
     map->bytecode_pc = 91;
     map->error_pc = 92;
-    map->num_locals = 1;
-    allocate_map_locals(map, 1);
+    map->num_locals = 2;
+    allocate_map_locals(map, 2);
     map->local_values[0].value = 1;
-    map->stack_depth = 4;
+    map->local_values[1].value = 0;
+    map->stack_depth = 7;
     map->stack_values = allocate(sizeof(int) * map->stack_depth);
     map->stack_types = allocate(sizeof(var_type) * map->stack_depth);
     map->stack_slots = allocate(sizeof(ResumeStackSlot) * map->stack_depth);
     map->stack_slots[0].kind = RSS_CATCH;
     map->stack_slots[0].data = 123;
-    for (i = 1; i < (int) map->stack_depth; i++) {
-	map->stack_values[i] = i;
+    map->stack_slots[1].kind = RSS_FINALLY;
+    map->stack_slots[1].data = 456;
+    map->stack_slots[2].kind = RSS_HANDLER_PC;
+    map->stack_slots[2].data = 789;
+    map->stack_values[3] = 4;
+    map->stack_types[3] = TYPE_INT;
+    map->stack_slots[3].kind = RSS_VALUE;
+    for (i = 4; i < (int) map->stack_depth; i++) {
+	map->stack_values[i] = i - 3;
 	map->stack_types[i] = TYPE_INT;
 	map->stack_slots[i].kind = RSS_VALUE;
     }
     map->native_resume = resume = allocate(sizeof(*resume));
     resume->valid = 1;
     resume->rehydratable = 1;
-    resume->num_values = 1;
-    resume->values = allocate(sizeof(*resume->values));
+    resume->num_values = 2;
+    resume->values = allocate(sizeof(*resume->values) * 2);
     resume->values[0].value = 1;
     resume->values[0].source = JIT_RESUME_OPERAND;
+    resume->values[1].value = 4;
+    resume->values[1].source = JIT_RESUME_CONSTANT;
+    resume->values[1].index = 0;
+    resume->num_literals = 1;
+    resume->literals = allocate(sizeof(*resume->literals));
+    resume->literals[0].literal_type = TYPE_INT;
+    resume->literals[0].literal = 77;
 
     continuation = jit_test_continuation_capture(program, 1, raw, 0, 0,
 	0, 0, 0, 0, 0);
     memset(&owner, 0, sizeof(owner));
     memset(&bytecode, 0, sizeof(bytecode));
-    bytecode.num_var_names = 1;
+    bytecode.num_var_names = 2;
     env[0].type = TYPE_STR;
     env[0].v.str = str_dup("replaced local");
+    env[1].type = TYPE_INT;
+    env[1].v.num = 888;
     owner.prog = &bytecode;
     owner.rt_env = env;
     owner.base_rt_stack = owner.top_rt_stack = owner_stack;
-    owner.rt_stack_size = 4;
+    owner.rt_stack_size = 7;
     owner.temp.type = TYPE_NONE;
     check(continuation != 0,
 	  "verb boundary continuation was not captured");
@@ -6194,18 +6666,24 @@ test_verb_boundary_outer_state_materialization(void)
     check(jit_continuation_materialize_boundary(&owner, boundary, 3),
 	  "verb boundary with outer state did not materialize");
     check(!owner.jit_continuation
-	  && owner.top_rt_stack == owner.base_rt_stack + 4
+	  && owner.top_rt_stack == owner.base_rt_stack + 7
 	  && owner_stack[0].type == TYPE_CATCH
 	  && owner_stack[0].v.num == 123
-	  && owner_stack[1].type == TYPE_INT && owner_stack[1].v.num == 10
-	  && owner_stack[2].type == TYPE_INT && owner_stack[2].v.num == 11
-	  && owner_stack[3].type == TYPE_INT && owner_stack[3].v.num == 12
+	  && owner_stack[1].type == TYPE_FINALLY
+	  && owner_stack[1].v.num == 456
+	  && owner_stack[2].type == TYPE_INT && owner_stack[2].v.num == 789
+	  && owner_stack[3].type == TYPE_INT && owner_stack[3].v.num == 77
+	  && owner_stack[4].type == TYPE_INT && owner_stack[4].v.num == 10
+	  && owner_stack[5].type == TYPE_INT && owner_stack[5].v.num == 11
+	  && owner_stack[6].type == TYPE_INT && owner_stack[6].v.num == 12
 	  && env[0].type == TYPE_INT && env[0].v.num == 10
+	  && env[1].type == TYPE_INT && env[1].v.num == 888
 	  && owner.pc == 91 && owner.error_pc == 92,
 	  "verb boundary restored the wrong outer state or operands");
     while (owner.top_rt_stack > owner.base_rt_stack)
 	free_var(*--owner.top_rt_stack);
     free_var(env[0]);
+    free_var(env[1]);
     if (owner.jit_continuation)
 	jit_continuation_free(owner.jit_continuation);
     jit_program_free(program);
@@ -6256,6 +6734,8 @@ test_dispatched_continuation_materialization(void)
 	&continuation) == JIT_RUN_CALL_VERB && continuation,
 	"verb call did not capture a materializable continuation");
     if (continuation) {
+	Var replaced;
+
 	/* The post-call map stores the returned expression in local zero. */
 	program->deopt_maps[1].local_values[0].value = 4;
 	point.key = program->deopt_maps[1].resume_key;
@@ -6265,9 +6745,15 @@ test_dispatched_continuation_materialization(void)
 	hir_test_set_resume_point(&point);
 	jit_continuation_attach(continuation, &owner);
 	jit_continuation_mark_dispatched(continuation);
+	replaced.type = TYPE_STR;
+	replaced.v.str = str_dup("superseded callee result");
+	jit_continuation_set_result(continuation, var_ref(replaced));
 	returned.type = TYPE_STR;
 	returned.v.str = str_dup("callee result");
 	jit_continuation_set_result(continuation, returned);
+	check(var_refcount(replaced) == 1,
+	      "replaced continuation result retained a reference");
+	free_var(replaced);
 	check(jit_continuation_materialize(&owner),
 	      "dispatched continuation did not materialize");
 	check(!owner.jit_continuation
@@ -6388,6 +6874,8 @@ main(void)
 	JITProgram *loop_live = owned_last_use_program(1, 1);
 	JITProgram *branch_dead = owned_last_use_branch_program(0);
 	JITProgram *branch_live = owned_last_use_branch_program(1);
+	JITProgram *third_dead = owned_last_use_third_operand_program(0);
+	JITProgram *third_live = owned_last_use_third_operand_program(1);
 
 	jit_analyze_owned_last_uses(dead);
 	jit_analyze_owned_last_uses(live);
@@ -6395,6 +6883,8 @@ main(void)
 	jit_analyze_owned_last_uses(loop_live);
 	jit_analyze_owned_last_uses(branch_dead);
 	jit_analyze_owned_last_uses(branch_live);
+	jit_analyze_owned_last_uses(third_dead);
+	jit_analyze_owned_last_uses(third_live);
 	check(owned_last_use_candidate(dead)->owned_last_use
 	      & JIT_LAST_USE_SRC1,
 	      "owned last-use analysis missed a dead alias");
@@ -6413,6 +6903,14 @@ main(void)
 	check(!(owned_last_use_candidate(branch_live)->owned_last_use
 		& JIT_LAST_USE_SRC1),
 	      "owned last-use analysis ignored a live CFG successor");
+	check(third_dead->blocks->first->next->owned_last_use
+	      & JIT_LAST_USE_SRC3,
+	      "owned last-use analysis missed a dead third operand");
+	check(!(third_live->blocks->first->next->owned_last_use
+		& JIT_LAST_USE_SRC3),
+	      "owned last-use analysis discarded a live third operand");
+	jit_program_free(third_live);
+	jit_program_free(third_dead);
 	jit_program_free(branch_live);
 	jit_program_free(branch_dead);
 	jit_program_free(loop_live);
@@ -6427,6 +6925,9 @@ main(void)
 	Program bytecode;
 	activation invocation;
 	Var invocation_env[1];
+#ifdef WAIF_CORE
+	int receiver_refs;
+#endif
 
 	memset(&compact, 0, sizeof(compact));
 	memset(&overlay, 0, sizeof(overlay));
@@ -6440,8 +6941,8 @@ main(void)
 	invocation.prog = &bytecode;
 	invocation.rt_env = invocation_env;
 #ifdef WAIF_CORE
-	invocation.THIS.type = TYPE_OBJ;
-	invocation.THIS.v.obj = 17;
+	invocation.THIS = hir_test_new_waif();
+	receiver_refs = var_refcount(invocation.THIS);
 #endif
 	invocation.this = 17;
 	invocation.player = 18;
@@ -6470,10 +6971,20 @@ main(void)
 	      && compact.progr == 19 && compact.vloc == 20
 	      && compact.debug == 1 && bytecode.ref_count == 2,
 	      "compact frame invocation metadata is incomplete");
+#ifdef WAIF_CORE
+	check(compact.receiver.type == TYPE_WAIF
+	      && compact.receiver.v.waif == invocation.THIS.v.waif
+	      && var_refcount(invocation.THIS) == receiver_refs + 1,
+	      "compact frame did not retain its waif receiver");
+#endif
 	jit_native_frame_release_invocation(&compact);
 	check(!compact.owns_invocation && !compact.bytecode_program
 	      && !compact.env && bytecode.ref_count == 1,
 	      "compact frame invocation release was incomplete");
+#ifdef WAIF_CORE
+	check(var_refcount(invocation.THIS) == receiver_refs,
+	      "compact frame leaked its waif receiver");
+#endif
 	{
 	    PreparedVerbCall prepared;
 	    Var *prepared_env = mymalloc(sizeof(Var), M_RT_ENV);
@@ -6517,6 +7028,9 @@ main(void)
 		"prepared invocation release leaked its program reference");
 	}
 	free_var(invocation_env[0]);
+#ifdef WAIF_CORE
+	free_var(invocation.THIS);
+#endif
 	free_str(invocation.verb);
 	free_str(invocation.verbname);
     }
@@ -6525,15 +7039,15 @@ main(void)
 	JITExecutionContext context;
 	JITNativeFrame root;
 	JITNativeFrame child;
-	Var homes[4];
-	unsigned home_capacities[4] = { 0 };
-	unsigned char home_states[4];
+	Var homes[5];
+	unsigned home_capacities[5] = { 0 };
+	unsigned char home_states[5];
 	Var value;
 	Var taken;
 	const char *shared;
 	int i;
 
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < 5; i++) {
 	    homes[i].type = TYPE_NONE;
 	    homes[i].v.num = 0;
 	    home_states[i] = JIT_HOME_EMPTY;
@@ -6542,7 +7056,7 @@ main(void)
 	    &ticks, &timed_out, &error, -1);
 	check(jit_native_frame_verify(&context, &root),
 	      "native root frame verification failed");
-	jit_native_frame_bind_runtime(&root, homes, sizeof(homes), homes, 4,
+	jit_native_frame_bind_runtime(&root, homes, sizeof(homes), homes, 5,
 	    home_states, home_capacities);
 	check(jit_native_frame_verify(&context, &root),
 	      "native frame runtime binding verification failed");
@@ -6568,16 +7082,26 @@ main(void)
 
 	value = new_list(0);
 	check(jit_native_frame_home_move(&root, 2, &value)
+	      && jit_native_frame_verify(&context, &root)
 	      && jit_native_frame_home_take(&root, 2, &taken),
 	      "native list home transfer failed");
 	free_var(taken);
 
 	value.type = TYPE_FLOAT;
 	value.v.fnum = box_fl(1.5);
-	check(jit_native_frame_home_move(&root, 3, &value)
-	      && jit_native_frame_home_take(&root, 3, &taken),
+	check(jit_native_frame_home_move(&root, 4, &value)
+	      && jit_native_frame_verify(&context, &root)
+	      && jit_native_frame_home_take(&root, 4, &taken),
 	      "native float home transfer failed");
 	free_var(taken);
+#ifdef WAIF_CORE
+	value = hir_test_new_waif();
+	check(jit_native_frame_home_move(&root, 3, &value)
+	      && jit_native_frame_verify(&context, &root)
+	      && jit_native_frame_home_take(&root, 3, &taken),
+	      "native waif home transfer failed");
+	free_var(taken);
+#endif
 	check(jit_native_frame_verify(&context, &root),
 	      "consumed native homes failed verification");
 
@@ -6864,6 +7388,13 @@ main(void)
 	      "activation preparation consumed its native owner");
 	free_var(*--owner.top_rt_stack);
 	jit_native_frame_unbind_runtime(&native_frame);
+	jit_native_frame_bind_runtime(&native_frame, stale_values,
+	    sizeof(stale_values), owner_home, 1, home_state, owner_capacity);
+	jit_native_frame_release_runtime(&native_frame);
+	check(!native_frame.runtime_storage && !native_frame.owns_runtime
+	      && owner_home[0].type == TYPE_STR
+	      && !strcmp(owner_home[0].v.str, "authoritative owner tag"),
+	      "borrowed native runtime release consumed caller storage");
 	free_var(owner_home[0]);
 	owner_program->num_borrowed_locals = 1;
 	owner_program->borrowed_local_slots = allocate(sizeof(int));
@@ -7358,6 +7889,32 @@ main(void)
 	jit_program_free(call_prog);
     }
 
+    /* Full boundary materialization moves an owned argument from its home. */
+    {
+	JITProgram *owned_call = owned_builtin_call_program(17);
+	Var owned_env[1];
+
+	owned_env[0].type = TYPE_STR;
+	owned_env[0].v.str = str_dup("owned argument");
+	ticks = 10;
+	check(jit_program_execute(owned_call, owned_env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_CALL_VERB,
+	      "owned built-in argument did not reach its VM boundary");
+	check(deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST
+	      && deopt_stack[0].v.list[0].v.num == 1
+	      && deopt_stack[0].v.list[1].type == TYPE_STR
+	      && !strcmp(deopt_stack[0].v.list[1].v.str, "owned argument"),
+	      "owned built-in argument was not materialized intact");
+	check(owned_env[0].type == TYPE_LIST
+	      && owned_env[0].v.list == deopt_stack[0].v.list
+	      && var_refcount(owned_env[0]) == 2,
+	      "owner-backed local was not reconstructed alongside the stack");
+	free_var(deopt_stack[0]);
+	free_var(owned_env[0]);
+	jit_program_free(owned_call);
+    }
+
     /* pass() VM call and native continuation tests */
     {
 	JITProgram *pass_prog = builtin_call_program(9);
@@ -7691,6 +8248,101 @@ main(void)
 	    free_var(result);
 	}
 	{
+	    JITProgram *float_caller = call_verb_preserved_float_program();
+	    JITContinuationFrame *continuation = 0;
+	    Var float_env[4];
+	    Var returned;
+
+	    float_env[0].type = TYPE_OBJ;
+	    float_env[0].v.obj = 0;
+	    float_env[1].type = TYPE_STR;
+	    float_env[1].v.str = str_dup("test");
+	    float_env[2] = new_list(0);
+	    float_env[3].type = TYPE_FLOAT;
+	    float_env[3].v.fnum = box_fl(12.5);
+	    ticks = 10;
+	    check((jit_program_execute)(float_caller, float_env, &result, &ticks,
+					  &timed_out, &error, 0, &deopt,
+					  deopt_stack, 2, -1, 0,
+					  &continuation) == JIT_RUN_CALL_VERB,
+		  "float-preserving caller did not request a VM call");
+	    check(continuation != 0,
+		  "float-preserving caller did not capture a continuation");
+	    jit_continuation_mark_dispatched(continuation);
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 99;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(float_caller, float_env, &result, &ticks,
+					  &timed_out, &error, 0, &deopt,
+					  deopt_stack, 2, -1, continuation,
+					  0) == JIT_RUN_RETURNED,
+		  "float-preserving continuation did not resume natively");
+	    check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 12.5,
+		  "native continuation did not preserve its float local");
+	    jit_continuation_free(continuation);
+	    free_var(result);
+	    free_var(float_env[1]);
+	    free_var(float_env[2]);
+	    free_var(float_env[3]);
+	    jit_program_free(float_caller);
+	}
+	{
+	    JITProgram *property_caller =
+		call_verb_preserved_property_program();
+	    JITContinuationFrame *continuation = 0;
+	    Var property_env[5];
+	    Var property;
+	    Var returned;
+	    int refs;
+
+	    property_env[0].type = TYPE_OBJ;
+	    property_env[0].v.obj = 0;
+	    property_env[1].type = TYPE_STR;
+	    property_env[1].v.str = str_dup("test");
+	    property_env[2] = new_list(0);
+	    property_env[3].type = TYPE_STR;
+	    property_env[3].v.str = str_dup("value");
+	    property_env[4].type = TYPE_NONE;
+	    property = new_list(1);
+	    property.v.list[1].type = TYPE_STR;
+	    property.v.list[1].v.str = str_dup("preserved property");
+	    hir_test_set_property(property);
+	    refs = var_refcount(property);
+	    ticks = 10;
+	    check((jit_program_execute)(property_caller, property_env, &result,
+					  &ticks, &timed_out, &error, 0,
+					  &deopt, deopt_stack, 2, -1, 0,
+					  &continuation) == JIT_RUN_CALL_VERB,
+		  "property-preserving caller did not request a VM call");
+	    check(continuation && continuation->owns_runtime
+		  && var_refcount(property) == refs + 1,
+		  "property result was not retained by the continuation runtime");
+	    jit_continuation_mark_dispatched(continuation);
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    returned.type = TYPE_INT;
+	    returned.v.num = 99;
+	    jit_continuation_set_result(continuation, returned);
+	    check((jit_program_execute)(property_caller, property_env, &result,
+					  &ticks, &timed_out, &error, 0,
+					  &deopt, deopt_stack, 2, -1,
+					  continuation, 0) == JIT_RUN_RETURNED,
+		  "property-preserving continuation did not resume natively");
+	    check(result.type == TYPE_LIST && result.v.list == property.v.list
+		  && var_refcount(property) == refs + 1,
+		  "native continuation corrupted its owned property result");
+	    jit_continuation_free(continuation);
+	    free_var(result);
+	    hir_test_reset_property();
+	    free_var(property);
+	    free_var(property_env[1]);
+	    free_var(property_env[2]);
+	    free_var(property_env[3]);
+	    jit_program_free(property_caller);
+	}
+	{
 	    JITContinuationFrame *continuation = 0;
 	    JITExecutionContext context;
 	    JITNativeFrame root;
@@ -7727,6 +8379,11 @@ main(void)
 		&& !owner.jit_continuation && !continuation->owner
 		&& jit_native_frame_verify(&context, &root),
 		"adopted continuation runtime ownership is inconsistent");
+	    check(jit_native_frame_continuation_matches(&root,
+		continuation->map_id)
+		&& !jit_native_frame_continuation_matches(&root,
+		    continuation->map_id + 1),
+		"native frame continuation map matching is wrong");
 	    bytecode.num_var_names = 3;
 	    for (i = 0; i < 3; i++)
 		promoted_env[i] = var_ref(deep_env[i]);
@@ -7818,6 +8475,32 @@ main(void)
 		"returned continuation did not release runtime exactly once");
 	    check(jit_execution_context_finish(&context, &root),
 		"borrowed-runtime root frame did not detach cleanly");
+
+	    continuation = 0;
+	    ticks = 10;
+	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
+					&timed_out, &error, 0, &deopt,
+					deopt_stack, 2, -1, 0,
+					&continuation) == JIT_RUN_CALL_VERB,
+		"cancellation test did not capture a continuation");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    jit_execution_context_init(&context, &root, call_prog, deep_env,
+		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    check(jit_native_frame_adopt_continuation_runtime(&root,
+		continuation),
+		"cancellation frame did not adopt continuation runtime");
+	    jit_continuation_free(continuation);
+	    check(!root.runtime_borrower && root.owns_runtime
+		  && root.runtime_storage
+		  && call_prog->active_runtime_bytes > runtime_before,
+		"continuation cancellation corrupted frame-owned runtime");
+	    jit_native_frame_release_runtime(&root);
+	    check(!root.runtime_storage
+		  && call_prog->active_runtime_bytes == runtime_before,
+		"cancelled continuation runtime was not released exactly once");
+	    check(jit_execution_context_finish(&context, &root),
+		"cancellation frame did not detach cleanly");
 	}
 	{
 	    JITProgram *sparse = call_verb_program();
@@ -7826,6 +8509,7 @@ main(void)
 	    activation owner = { 0 };
 	    Var owner_env[3];
 	    Var owner_stack[4];
+	    int i;
 
 	    sparse_map->num_local_values = 2;
 	    sparse_map->local_values[1].slot = 2;
@@ -7865,6 +8549,8 @@ main(void)
 		check(jit_continuation_materialize(&owner),
 		      "sparse continuation did not materialize");
 	    }
+	    for (i = 0; i < 3; i++)
+		free_var(deopt_stack[i]);
 	    check(owner_env[1].type == TYPE_STR
 		  && !strcmp(owner_env[1].v.str, "resident local"),
 		  "sparse continuation replaced an environment local");
@@ -7881,11 +8567,14 @@ main(void)
 	    JITProgram *fallthrough = call_verb_program();
 	    JITInstruction *call = fallthrough->blocks->first;
 	    JITInstruction *terminal = instruction(HIR_TAC_LABEL);
+	    JITInstruction *replaced;
 
 	    while (call->kind != HIR_TAC_CALL_VERB)
 		call = call->next;
+	    replaced = call->next;
 	    call->next = terminal;
 	    fallthrough->blocks->last = terminal;
+	    myfree(replaced, M_PROGRAM);
 	    deopt_stack[0].type = TYPE_INT;
 	    deopt_stack[0].v.num = 17;
 	    check((jit_program_execute)(fallthrough, deep_env, &result, &ticks,
@@ -8323,6 +9012,17 @@ main(void)
 	free_var(result);
 	jit_program_free(str_cat);
 
+	JITProgram *duplicate_str = duplicate_owned_string_program();
+	ticks = 10;
+	check(jit_program_execute(duplicate_str, 0, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "duplicate owned string operands did not execute natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "abab"),
+	      "duplicate owned string operands returned the wrong value");
+	free_var(result);
+	jit_program_free(duplicate_str);
+
 	JITProgram *str_idx = string_index_program("LambdaMOO", 7);
 	ticks = 10;
 	check(jit_program_execute(str_idx, 0, &result, &ticks, &timed_out,
@@ -8638,6 +9338,56 @@ main(void)
 
     /* Type-transparent consumers accept every core user-visible runtime type. */
     {
+	const var_type types[] = {TYPE_STR, TYPE_LIST, TYPE_OBJ, TYPE_ERR};
+	unsigned i;
+
+	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+	    JITProgram *typed_not = typed_unary_lowering_program(HIR_OP_NOT,
+		types[i], TYPE_INT, 0, 0, 0);
+	    Var typed_env[1];
+	    int expected;
+
+	    typed_not->blocks->first->literal_type = types[i];
+	    typed_env[0] = tagged_test_value(types[i]);
+	    expected = !is_true(typed_env[0]);
+	    ticks = 10;
+	    check(jit_program_execute(typed_not, typed_env, &result, &ticks,
+				      &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "statically typed truth test did not execute natively");
+	    check(result.type == TYPE_INT && result.v.num == expected,
+		  "statically typed truth test returned the wrong value");
+	    free_var(typed_env[0]);
+	    jit_program_free(typed_not);
+	}
+    }
+
+#ifdef WAIF_CORE
+    {
+	JITProgram *complex_guard = tagged_guard_instruction_program();
+	JITInstruction *guard = complex_guard->blocks->first->next;
+	const var_type types[] = {TYPE_LIST, TYPE_WAIF};
+	unsigned i;
+
+	guard->guarded_type_masks[0] = JIT_TYPE_MASK(TYPE_LIST)
+	    | JIT_TYPE_MASK(TYPE_WAIF);
+	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+	    Var guarded_env[1];
+
+	    guarded_env[0] = tagged_test_value(types[i]);
+	    ticks = 10;
+	    check(jit_program_execute(complex_guard, guarded_env, &result,
+				      &ticks, &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED && result.type == types[i],
+		  "complex tagged guard rejected an accepted runtime type");
+	    free_var(result);
+	    free_var(guarded_env[0]);
+	}
+	jit_program_free(complex_guard);
+    }
+#endif
+
+    {
 	JITProgram *tagged_typeof = tagged_unary_program(HIR_OP_TYPEOF);
 	JITProgram *tagged_not = tagged_unary_program(HIR_OP_NOT);
 	JITProgram *tagged_eq = tagged_binary_program(HIR_OP_EQ);
@@ -8788,7 +9538,19 @@ main(void)
     /* Overloaded addition dispatches only semantically valid type pairs. */
     {
 	JITProgram *tagged_add = tagged_binary_program(HIR_OP_ADD);
+	JITProgram *typed_left_add = tagged_binary_program(HIR_OP_ADD);
+	JITProgram *typed_right_add = tagged_binary_program(HIR_OP_ADD);
 	Var tagged_env[2];
+	JITInstruction *typed_load;
+
+	typed_load = typed_left_add->blocks->first;
+	typed_left_add->value_is_tagged[1] = 0;
+	typed_left_add->value_types[1] = TYPE_STR;
+	typed_load->literal_type = TYPE_STR;
+	typed_load = typed_right_add->blocks->first->next;
+	typed_right_add->value_is_tagged[2] = 0;
+	typed_right_add->value_types[2] = TYPE_STR;
+	typed_load->literal_type = TYPE_STR;
 
 	tagged_env[0].type = tagged_env[1].type = TYPE_INT;
 	tagged_env[0].v.num = 20;
@@ -8810,8 +9572,35 @@ main(void)
 	check(result.type == TYPE_STR && !strcmp(result.v.str, "hello world"),
 	      "tagged string addition returned the wrong value");
 	free_var(result);
+
+	ticks = 10;
+	check(jit_program_execute(typed_left_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "typed-left string addition did not execute natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "hello world"),
+	      "typed-left string addition returned the wrong value");
+	free_var(result);
+	free_var(tagged_env[0]);
 	free_var(tagged_env[1]);
 
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("hello ");
+	tagged_env[1].type = TYPE_STR;
+	tagged_env[1].v.str = str_dup("world");
+	ticks = 10;
+	check(jit_program_execute(typed_right_add, tagged_env, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "typed-right string addition did not execute natively");
+	check(result.type == TYPE_STR && !strcmp(result.v.str, "hello world"),
+	      "typed-right string addition returned the wrong value");
+	free_var(result);
+	free_var(tagged_env[0]);
+	free_var(tagged_env[1]);
+
+	tagged_env[0].type = TYPE_STR;
+	tagged_env[0].v.str = str_dup("hello ");
 	tagged_env[1].type = TYPE_INT;
 	tagged_env[1].v.num = 1;
 	ticks = 10;
@@ -8830,6 +9619,8 @@ main(void)
 	      == JIT_RUN_FALLBACK,
 	      "tagged float addition bypassed its unimplemented dispatch");
 	jit_program_free(tagged_add);
+	jit_program_free(typed_left_add);
+	jit_program_free(typed_right_add);
     }
 
     /* Tagged strings retain their type through concatenation and index(). */
@@ -9339,6 +10130,15 @@ main(void)
 	      "jit_rt_str_concat accepts a null right operand");
 	free_str(concat_res);
 	{
+	    Num saved_limit = _server_int_option_cache[SVO_MAX_STRING_CONCAT];
+
+	    _server_int_option_cache[SVO_MAX_STRING_CONCAT] = 3;
+	    concat_res = jit_rt_str_concat("ab", "cd", &rt_err);
+	    _server_int_option_cache[SVO_MAX_STRING_CONCAT] = saved_limit;
+	    check(!concat_res && rt_err == E_QUOTA,
+		  "jit_rt_str_concat did not enforce the configured limit");
+	}
+	{
 	    Var homes[1];
 	    const char *owned;
 	    int64_t owned_raw = 0;
@@ -9357,10 +10157,31 @@ main(void)
 		  && var_refcount(homes[0]) == 1,
 		  "owned string concat transfers a last-use operand");
 	    owned = homes[0].v.str;
+	    check(jit_rt_str_concat_owned(homes, 0, "prefix", owned,
+		JIT_LAST_USE_SRC2, &owned_raw, &rt_err)
+		  && rt_err == E_NONE
+		  && !strcmp(homes[0].v.str, "prefixabc")
+		  && var_refcount(homes[0]) == 1,
+		  "owned string concat transfers a last-use right operand");
+	    owned = homes[0].v.str;
 	    check(!jit_rt_str_concat_owned(homes, 0, "x", "y",
 		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
 		  && rt_err == E_NONE && homes[0].v.str == owned,
 		  "owned string concat rejects an owner mismatch");
+	    {
+		Num saved_limit =
+		    _server_int_option_cache[SVO_MAX_STRING_CONCAT];
+
+		owned_raw = 17;
+		_server_int_option_cache[SVO_MAX_STRING_CONCAT] = 3;
+		check(jit_rt_str_concat_owned(homes, 0, owned, "x",
+		    JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		      && rt_err == E_QUOTA && owned_raw == 17
+		      && homes[0].type == TYPE_STR
+		      && homes[0].v.str == owned,
+		      "owned string concat consumed its home on quota failure");
+		_server_int_option_cache[SVO_MAX_STRING_CONCAT] = saved_limit;
+	    }
 	    free_var(homes[0]);
 	}
 
@@ -9669,6 +10490,146 @@ main(void)
 		  "JIT list property write changed caller ownership");
 	    hir_test_reset_property();
 	    free_var(property);
+
+#ifdef WAIF_CORE
+	    property = hir_test_new_waif();
+	    hir_test_set_property(property);
+	    refs = var_refcount(property);
+	    ok = jit_rt_get_prop(0, "value", 2, &prop_raw, &prop_type,
+		&rt_err);
+	    returned.type = (var_type) prop_type;
+	    returned.v.waif = (Waif *) (intptr_t) prop_raw;
+	    check(ok == 1 && rt_err == E_NONE && returned.type == TYPE_WAIF
+		  && returned.v.waif == property.v.waif
+		  && var_refcount(property) == refs + 1,
+		  "jit_rt_get_prop did not transfer its waif reference");
+	    free_var(returned);
+	    refs = var_refcount(property);
+	    ok = jit_rt_put_prop(0, "value", 2,
+		(int64_t) (intptr_t) property.v.waif, TYPE_WAIF, &rt_err);
+	    check(ok == 1 && rt_err == E_NONE
+		  && var_refcount(property) == refs,
+		  "JIT waif property write changed caller ownership");
+	    hir_test_reset_property();
+	    free_var(property);
+#endif
+	}
+	{
+	    JITProgram *native_get = owned_property_result_program();
+	    Var native_env[2];
+	    Var property;
+	    JITRunResult status;
+	    int refs;
+
+	    native_env[0].type = TYPE_OBJ;
+	    native_env[0].v.obj = 0;
+	    native_env[1].type = TYPE_STR;
+	    native_env[1].v.str = str_dup("value");
+
+	    property.type = TYPE_FLOAT;
+	    property.v.fnum = box_fl(6.25);
+	    hir_test_set_property(property);
+	    ticks = 10;
+	    status = jit_program_execute(native_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_RETURNED && result.type == TYPE_FLOAT
+		  && fl_unbox(result.v.fnum) == 6.25,
+		  "owned native float property result did not return intact");
+	    free_var(result);
+	    hir_test_reset_property();
+	    free_var(property);
+
+#ifdef WAIF_CORE
+	    property = hir_test_new_waif();
+	    hir_test_set_property(property);
+	    refs = var_refcount(property);
+	    ticks = 10;
+	    status = jit_program_execute(native_get, native_env, &result, &ticks,
+				 &timed_out, &error, 0, 0, 0);
+	    check(status == JIT_RUN_RETURNED && result.type == TYPE_WAIF
+		  && result.v.waif == property.v.waif
+		  && var_refcount(property) == refs + 1,
+		  "owned native waif property result did not return intact");
+	    free_var(result);
+	    hir_test_reset_property();
+	    free_var(property);
+#else
+	    (void) refs;
+#endif
+	    free_var(native_env[1]);
+	    jit_program_free(native_get);
+	}
+	{
+	    JITProgram *repeated_get = repeated_owned_property_program();
+	    Var repeated_env[2];
+	    Var property = new_list(1);
+	    int refs;
+
+	    repeated_env[0].type = TYPE_OBJ;
+	    repeated_env[0].v.obj = 0;
+	    repeated_env[1].type = TYPE_STR;
+	    repeated_env[1].v.str = str_dup("value");
+	    property.v.list[1].type = TYPE_STR;
+	    property.v.list[1].v.str = str_dup("reused property owner");
+	    hir_test_set_property(property);
+	    refs = var_refcount(property);
+	    ticks = 10;
+	    check(jit_program_execute(repeated_get, repeated_env, &result,
+				      &ticks, &timed_out, &error, 0, 0, 0)
+		  == JIT_RUN_RETURNED,
+		  "repeated native property reads did not return");
+	    check(result.type == TYPE_LIST && result.v.list == property.v.list
+		  && var_refcount(property) == refs + 1,
+		  "reused property owner retained more than its final value");
+	    free_var(result);
+	    hir_test_reset_property();
+	    free_var(property);
+	    free_var(repeated_env[1]);
+	    jit_program_free(repeated_get);
+	}
+	{
+	    Var property;
+	    Var returned;
+	    int refs;
+
+	    property.type = TYPE_STR;
+	    property.v.str = str_dup("built-in property string");
+	    hir_test_set_property(property);
+	    hir_test_set_builtin_property(BP_NAME);
+	    refs = var_refcount(property);
+	    ok = jit_rt_get_prop(0, "name", 2, &prop_raw, &prop_type,
+		&rt_err);
+	    returned.type = (var_type) prop_type;
+	    returned.v.str = (const char *) (intptr_t) prop_raw;
+	    check(ok == 1 && rt_err == E_NONE && returned.type == TYPE_STR
+		  && returned.v.str == property.v.str
+		  && var_refcount(property) == refs + 1,
+		  "JIT built-in property read did not transfer ownership");
+	    free_var(returned);
+	    refs = var_refcount(property);
+	    ok = jit_rt_get_prop(0, "name", 1, &prop_raw, &prop_type,
+		&rt_err);
+	    returned.type = (var_type) prop_type;
+	    returned.v.str = (const char *) (intptr_t) prop_raw;
+	    check(ok == 1 && rt_err == E_NONE
+		  && returned.type == TYPE_STR
+		  && returned.v.str == property.v.str
+		  && var_refcount(property) == refs + 1,
+		  "unprotected built-in property rejected a nonwizard read");
+	    free_var(returned);
+	    hir_test_set_builtin_property_protected(BP_NAME, 1);
+	    refs = var_refcount(property);
+	    prop_raw = 111;
+	    prop_type = 222;
+	    ok = jit_rt_get_prop(0, "name", 1, &prop_raw, &prop_type,
+		&rt_err);
+	    check(ok == 0 && rt_err == E_PERM && prop_raw == 111
+		  && prop_type == 222 && var_refcount(property) == refs,
+		  "protected built-in property leaked or changed its outputs");
+	    hir_test_set_builtin_property_protected(BP_NAME, 0);
+	    hir_test_set_builtin_property(BP_NONE);
+	    hir_test_reset_property();
+	    free_var(property);
 	}
 
 	hir_test_set_property_allowed(0);
@@ -9876,11 +10837,15 @@ main(void)
 	JITProgram *prog = binary_program(10, 2, HIR_OP_DIV);
 	JITProgram *cold = binary_program(10, 2, HIR_OP_DIV);
 	JITNativeFrame frame = { 0 };
+	uint64_t generation;
 
 	check(prog != 0, "failed to create test program for pool verification");
 	check(cold != 0, "failed to create cold program for pool verification");
 	check(jit_pool_set_policy(3, 0), "failed to set JIT pool test policy");
 	jit_pool_maintain();
+	generation = jit_program_warmup_generation(prog);
+	check(generation != 0,
+	      "pending program did not adopt the active pool generation");
 	check(!jit_program_admit_interpreter_entry(prog)
 	      && jit_program_warmup_count(prog) == 1,
 	      "first pending invocation was not counted");
@@ -9914,6 +10879,8 @@ main(void)
 	jit_pool_reset();
 	check(jit_program_state(prog) == JIT_STATE_PENDING,
 	      "jit_pool_reset did not return program to pending state");
+	check(jit_program_warmup_generation(prog) != generation,
+	      "pool rotation did not update the program generation");
 	check(jit_program_warmup_count(prog) == 0
 	      && jit_program_warmup_count(cold) == 0,
 	      "pool rotation did not reset pending warmup counts");
@@ -9921,14 +10888,17 @@ main(void)
 	check(pool_stats.active_programs == 0, "pool has remaining active programs after reset");
 	check(pool_stats.total_machine_code_bytes == 0, "pool machine code bytes not zeroed");
 
-	/* Recompile after reset */
+	/* Recompile into a constrained pool and rotate after crossing its limit. */
+	check(jit_pool_set_policy(3, 1), "failed to lower JIT pool limit");
+	jit_pool_policy_stats(&policy_stats);
+	check(!policy_stats.rotation_pending,
+	      "empty constrained JIT pool unexpectedly requested rotation");
 	check(jit_program_compile(prog), "failed to recompile program after pool reset");
 	check(jit_program_state(prog) == JIT_STATE_COMPILED,
 	      "program did not compile after pool reset");
-	check(jit_pool_set_policy(3, 1), "failed to lower JIT pool limit");
 	jit_pool_policy_stats(&policy_stats);
 	check(policy_stats.rotation_pending,
-	      "lowered JIT pool limit did not request rotation");
+	      "JIT pool growth beyond its limit did not request rotation");
 	jit_pool_maintain();
 	jit_pool_policy_stats(&policy_stats);
 	check(!policy_stats.rotation_pending && policy_stats.active_programs == 0,

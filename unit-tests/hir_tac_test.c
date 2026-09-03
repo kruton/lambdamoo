@@ -4096,6 +4096,80 @@ test_try_except_tac_ssa(void)
 }
 
 static void
+test_native_error_edge_kinds(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+    Expr unary_value, unary;
+    Expr dividend, divisor, divide;
+    Expr range_base, range_from, range_to, range;
+    Expr store_base, store_from, store_to, store_range, store_value, assign;
+    Expr handler_value;
+    Stmt unary_stmt, divide_stmt, range_stmt, store_stmt, handler_stmt;
+    Stmt try_stmt;
+    Except_Arm except_arm;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    unary_value = id_expr(0, 43);
+    unary = unary_expr(EXPR_NEGATE, &unary_value);
+    unary_stmt = expr_stmt(&unary);
+
+    dividend = id_expr(1, 44);
+    divisor = id_expr(2, 44);
+    divide = binary_expr(EXPR_DIVIDE, &dividend, &divisor);
+    divide_stmt = expr_stmt(&divide);
+
+    range_base = id_expr(3, 45);
+    range_from = int_expr(1, 45);
+    range_to = int_expr(2, 45);
+    range = range_expr_ast(&range_base, &range_from, &range_to, 45);
+    range_stmt = expr_stmt(&range);
+
+    store_base = id_expr(3, 46);
+    store_from = int_expr(1, 46);
+    store_to = int_expr(2, 46);
+    store_range = range_expr_ast(&store_base, &store_from, &store_to, 46);
+    store_value = id_expr(4, 46);
+    assign = binary_expr(EXPR_ASGN, &store_range, &store_value);
+    store_stmt = expr_stmt(&assign);
+
+    unary_stmt.next = &divide_stmt;
+    divide_stmt.next = &range_stmt;
+    range_stmt.next = &store_stmt;
+
+    handler_value = int_expr(0, 47);
+    handler_stmt = return_stmt(&handler_value);
+    memset(&except_arm, 0, sizeof(except_arm));
+    except_arm.id = -1;
+    except_arm.stmt = &handler_stmt;
+    memset(&try_stmt, 0, sizeof(try_stmt));
+    try_stmt.kind = STMT_TRY_EXCEPT;
+    try_stmt.lineno = 43;
+    try_stmt.s.catch.body = &unary_stmt;
+    try_stmt.s.catch.excepts = &except_arm;
+
+    tac = lower_stmt(&names, &try_stmt, &ctx, &cfg, &dom, &ssa);
+    check_int("native error edge unary count",
+	      hir_tac_count_kind(tac, HIR_TAC_UNARY), 1);
+    check_int("native error edge binary count",
+	      hir_tac_count_kind(tac, HIR_TAC_BINARY), 1);
+    check_int("native error edge range read count",
+	      hir_tac_count_kind(tac, HIR_TAC_RANGE_REF), 1);
+    check_int("native error edge range write count",
+	      hir_tac_count_kind(tac, HIR_TAC_RANGE_SET), 1);
+    check_int("native error edge CFG edge count", hir_cfg_edge_count(cfg), 9);
+    check_int("native error edge verify errors", hir_context_error_count(ctx),
+	      0);
+    hir_context_free(ctx);
+}
+
+static void
 test_multi_arm_try_except_tac_ssa(void)
 {
     Names names;
@@ -4451,6 +4525,9 @@ test_binary_type_pair_contracts(void)
 						 TYPE_INT), 0);
     check_int("unknown addition left mask",
 	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 0, TYPE_NONE),
+	      numeric | type_mask(TYPE_STR));
+    check_int("unknown addition right mask",
+	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 1, 0, TYPE_NONE),
 	      numeric | type_mask(TYPE_STR));
     check_int("string peer narrows addition left mask",
 	      hir_test_binary_operand_type_mask(HIR_OP_ADD, 0, 1, TYPE_STR),
@@ -4992,6 +5069,7 @@ main(void)
     test_string_scalars_tac_ssa();
     test_catch_expr_tac_ssa();
     test_try_except_tac_ssa();
+    test_native_error_edge_kinds();
     test_multi_arm_try_except_tac_ssa();
     test_try_finally_tac_ssa();
     test_loop_exit_through_finally_tac_ssa();
