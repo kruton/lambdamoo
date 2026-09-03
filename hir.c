@@ -13561,6 +13561,7 @@ hir_test_ssa_with_missing_phi_arg(HIRContext *ctx)
 
     first_block->next = second_block;
     second_block->next = join_block;
+    ssa->form = HIR_FORM_SSA;
     ssa->cfg = cfg;
     ssa->blocks = first_block;
     ssa->last_block = join_block;
@@ -13612,6 +13613,7 @@ hir_test_ssa_with_nonpred_phi_arg(HIRContext *ctx)
 
     entry_block->next = extra_block;
     extra_block->next = join_block;
+    ssa->form = HIR_FORM_SSA;
     ssa->cfg = cfg;
     ssa->blocks = entry_block;
     ssa->last_block = join_block;

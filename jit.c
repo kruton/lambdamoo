@@ -38,6 +38,7 @@
 
 /* Bound asynchronous timeout latency within long straight-line blocks. */
 #define JIT_TIMEOUT_CHECK_TICK_INTERVAL 16
+#define JIT_NATIVE_RETURNED_OWNED (JIT_RUN_ABORT_SECONDS + 1)
 
 static int jit_runtime_value_slots(JITProgram *);
 
@@ -471,6 +472,8 @@ jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
     }
     if (h.built_in ? bi_prop_protected(h.built_in, progr)
 		   : !db_property_allows(h, progr, PF_READ)) {
+	if (h.built_in)
+	    free_var(prop);
 	*err_out = E_PERM;
 	return 0;
     }
@@ -1614,8 +1617,8 @@ jit_test_mir_allocator(void)
     ok = first && second && !((unsigned char *) first)[0]
 	&& allocator->live_allocations == 2;
     first = allocator->interface.realloc(first, 16, 32, allocator);
-    second = allocator->interface.realloc(second, 16, 0, allocator);
     third = allocator->interface.realloc(0, 0, 12, allocator);
+    second = allocator->interface.realloc(second, 16, 0, allocator);
     ok = ok && first && !second && third
 	&& allocator->live_allocations == 2
 	&& !allocator->interface.calloc((size_t) -1, 2, allocator)
@@ -2418,7 +2421,7 @@ finish_build(MIRBuild *build)
 
 static void
 return_status(MIRBuild *build, MIR_reg_t status, MIR_label_t common_return,
-	      JITRunResult value)
+	      int value)
 {
     append(build, MIR_new_insn(build->context, MIR_MOV,
 			      MIR_new_reg_op(build->context, status),
@@ -2509,6 +2512,49 @@ static size_t
 jit_tag_offset(JITProgram *program, int value)
 {
     return (size_t) jit_tag_index(program, value) * sizeof(Num);
+}
+
+static void
+jit_take_returned_owner(JITProgram *program, Var *result, Var *owned_values,
+			unsigned char *home_states,
+			unsigned *home_capacities)
+{
+    int i;
+
+    for (i = 0; i < program->num_owned_slots; i++) {
+	Var *home = &owned_values[i];
+	int matches = home_states[i] == JIT_HOME_OWNED
+	    && home->type == result->type;
+
+	if (matches) {
+	    switch (result->type) {
+	    case TYPE_STR:
+		matches = home->v.str == result->v.str;
+		break;
+	    case TYPE_LIST:
+		matches = home->v.list == result->v.list;
+		break;
+	    case TYPE_FLOAT:
+		matches = home->v.fnum == result->v.fnum;
+		break;
+#ifdef WAIF_CORE
+	    case TYPE_WAIF:
+		matches = home->v.waif == result->v.waif;
+		break;
+#endif
+	    default:
+		matches = 0;
+		break;
+	    }
+	}
+	if (matches) {
+	    home->type = TYPE_NONE;
+	    home->v.num = 0;
+	    home_states[i] = JIT_HOME_CONSUMED;
+	    home_capacities[i] = 0;
+	    return;
+	}
+    }
 }
 
 static var_type
@@ -6752,7 +6798,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    MIR_new_mem_op(build->context, MIR_T_I32,
 				offsetof(Var, type), result, 0, 1),
 			    MIR_new_int_op(build->context, instr->literal_type)));
-		    return_status(build, status, common_return, JIT_RUN_RETURNED);
+		    return_status(build, status, common_return,
+			program->value_ownership
+			&& (program->value_ownership[instr->src1]
+			    == JIT_OWNERSHIP_OWNED
+			 || program->value_ownership[instr->src1]
+			    == JIT_OWNERSHIP_OWNED_PROPERTY)
+			? JIT_NATIVE_RETURNED_OWNED : JIT_RUN_RETURNED);
 		    break;
 		case HIR_TAC_RETURN0:
 		    append_return_zero(build, result, status, common_return);
@@ -7367,6 +7419,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    && program->value_owned_slots[instr->value] >= 0
 		    && ((instr->kind == HIR_TAC_UNARY
 			 && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
+			|| (program->value_ownership
+			    && program->value_ownership[instr->value]
+			       == JIT_OWNERSHIP_OWNED_PROPERTY)
 			|| (instr->kind == HIR_TAC_BINARY
 			    && instr->op == HIR_OP_LIST_ADD_TAIL
 			    && jit_list_tail_consume_mode(program, instr)
@@ -9309,6 +9364,7 @@ jit_program_execute_in_context(JITProgram *program,
     int runtime_from_continuation = continuation_in != 0;
     int runtime_borrowed_from_frame = 0;
     int runtime_transferred = 0;
+    int returned_owned;
     int i;
 
     if (!execution_context || !native_frame
@@ -9436,6 +9492,7 @@ jit_program_execute_in_context(JITProgram *program,
 			     continuation_in && continuation_in->has_result
 			     ? &continuation_in->result : 0,
 			     owned_values);
+    returned_owned = native_result == JIT_NATIVE_RETURNED_OWNED;
     if (source_location->bytecode_pc < (unsigned) program->num_status_locations)
 	*source_location = program->status_locations[source_location->bytecode_pc];
     else {
@@ -9613,9 +9670,14 @@ jit_program_execute_in_context(JITProgram *program,
 	    }
 	}
     }
-    if (native_result == JIT_RUN_RETURNED) {
-	if (result)
+
+    if (native_result == JIT_RUN_RETURNED || returned_owned) {
+	if (result && returned_owned)
+	    jit_take_returned_owner(program, result, owned_values, home_states,
+				    home_capacities);
+	else if (result)
 	    *result = var_ref(*result);
+	native_result = JIT_RUN_RETURNED;
     }
     if (!runtime_from_continuation && !runtime_transferred) {
 	for (i = 0; i < program->num_borrowed_locals; i++)
