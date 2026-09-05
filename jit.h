@@ -75,6 +75,8 @@ struct JITNativeFrame {
     const char *verb;
     const char *verbname;
     JITContinuationFrame *runtime_borrower;
+    Var *resume_roots;
+    Var resume_result;
     void *runtime_storage;
     Var *homes;
     unsigned *home_capacities;
@@ -82,11 +84,15 @@ struct JITNativeFrame {
     Var *boundary_stack;
     size_t runtime_bytes;
     unsigned num_homes;
+    unsigned num_resume_roots;
+    unsigned resume_roots_capacity;
     unsigned boundary_depth;
     unsigned canonical_index;
     int entry_map;
     int current_map;
     int boundary_map;
+    int pending_resume_map;
+    int has_resume_result;
     int debug;
     int owns_invocation;
     int owns_runtime;
@@ -105,6 +111,7 @@ struct JITExecutionContext {
     int *ticks_remaining;
     int *task_timed_out;
     enum error *pending_error;
+    int lazy_verb_calls;
 };
 
 typedef void (*JITPromotionMaterializer) (JITNativeFrame *,
@@ -309,6 +316,9 @@ extern int jit_native_frame_return_continuation_runtime(
 extern int jit_native_frame_continuation_matches(const JITNativeFrame *, int);
 extern void jit_native_frame_release_runtime(JITNativeFrame *);
 extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
+extern int jit_native_frame_preserve_resume(JITNativeFrame *, int);
+extern JITContinuationFrame *jit_native_frame_capture_continuation(
+	JITNativeFrame *, int);
 extern int jit_native_frame_capture_boundary(JITNativeFrame *, Var *,
 					     unsigned, int);
 extern void jit_native_frame_release_boundary(JITNativeFrame *);

@@ -1170,9 +1170,12 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	*error_out = E_NONE;
     if (!context || !caller || !args || args->type != TYPE_LIST
 	|| !call_out || !error_out
-	|| context->current_frame != caller || !caller->env || !continuation
-	|| continuation != caller->runtime_borrower
-	|| !jit_native_frame_continuation_matches(caller, map_id))
+	|| context->current_frame != caller || !caller->env
+	|| (continuation
+	    ? (continuation != caller->runtime_borrower
+	       || !jit_native_frame_continuation_matches(caller, map_id))
+	    : (!caller->runtime_storage || !caller->owns_runtime
+	       || caller->pending_resume_map != map_id)))
 	return 0;
     error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
 	&resolved);
@@ -1266,34 +1269,42 @@ dispatch_jit_native_boundary(JITExecutionContext *context,
     Var *args = &stack[2];
     Objid class = NOTHING;
     enum error error = E_NONE;
+    const char *vname;
+#ifdef WAIF_CORE
+    char *waif_vname = 0;
+#endif
+    int dispatched;
 
     if (deopt->stack_depth != 3 || args->type != TYPE_LIST
 	|| verb->type != TYPE_STR)
 	return 0;
+    vname = verb->v.str;
 #ifdef WAIF_CORE
     if (obj->type == TYPE_WAIF) {
-	char *name;
-
 	if (!valid(class = obj->v.waif->class))
 	    return 0;
-	name = mymalloc(strlen(verb->v.str) + 2, M_STRING);
-	name[0] = WAIF_VERB_PREFIX;
-	strcpy(name + 1, verb->v.str);
-	free_str(verb->v.str);
-	verb->v.str = name;
+	waif_vname = mymalloc(strlen(vname) + 2, M_STRING);
+	waif_vname[0] = WAIF_VERB_PREFIX;
+	strcpy(waif_vname + 1, vname);
+	vname = waif_vname;
     } else
 #endif
     {
 	if (obj->type != TYPE_OBJ || !valid(class = obj->v.obj))
 	    return 0;
 #ifdef WAIF_CORE
-	if (verb->v.str[0] == WAIF_VERB_PREFIX)
+	if (vname[0] == WAIF_VERB_PREFIX)
 	    return 0;
 #endif
     }
-    return execute_jit_dispatch_native_verb_call(context, caller, class,
-	verb->v.str WAIF_COMMA_ARG(*obj), args, &error, deopt->map_id,
+    dispatched = execute_jit_dispatch_native_verb_call(context, caller, class,
+	vname WAIF_COMMA_ARG(*obj), args, &error, deopt->map_id,
 	deopt->bytecode_pc, deopt->error_pc, continuation, call_out);
+#ifdef WAIF_CORE
+    if (waif_vname)
+	free_str(waif_vname);
+#endif
+    return dispatched;
 }
 
 static void
@@ -1320,6 +1331,7 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 
     memset(out, 0, sizeof(*out));
     out->value.type = TYPE_NONE;
+    context->lazy_verb_calls = 1;
     for (;;) {
 	JITContinuationFrame *continuation = 0;
 	Var *stack = root_stack;
@@ -1358,6 +1370,8 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    execute_jit_free_native_call(completed);
 	    active = context->current_frame;
 	    continuation_in = active->runtime_borrower;
+	    if (!continuation_in)
+		resume_map = active->pending_resume_map;
 	    continue;
 	}
 
@@ -1390,13 +1404,16 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    continue;
 	}
 
-	if (out->result == JIT_RUN_CALL_VERB && continuation
-	    && out->deopt.boundary == JIT_BOUNDARY_VERB) {
+	if (out->result == JIT_RUN_CALL_VERB
+	    && out->deopt.boundary == JIT_BOUNDARY_VERB
+	    && (continuation
+		|| active->pending_resume_map == out->deopt.map_id)) {
 	    struct JITNativeCall *callee = 0;
 
 	    active->current_map = out->deopt.map_id;
-	    if (!jit_native_frame_continuation_matches(active,
-		out->deopt.map_id)
+	    if (continuation
+		&& !jit_native_frame_continuation_matches(active,
+		    out->deopt.map_id)
 		&& !jit_native_frame_adopt_continuation_runtime(active,
 		    continuation))
 		panic("Native caller could not adopt its continuation");
@@ -1410,6 +1427,12 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		active = &callee->frame;
 		jit_profile_record_entry(active->program);
 		continue;
+	    }
+	    if (!continuation) {
+		continuation = jit_native_frame_capture_continuation(active,
+		    out->deopt.map_id);
+		if (!continuation)
+		    panic("Lazy native caller could not capture a continuation");
 	    }
 	}
 

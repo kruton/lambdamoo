@@ -32,6 +32,9 @@
 #include "exceptions.h"
 #include "execute.h"
 #include "functions.h"
+#ifdef ENABLE_JIT
+#  include "jit.h"
+#endif
 #include "list.h"
 #include "log.h"
 #include "match.h"
@@ -1466,6 +1469,9 @@ tasks_checkpoint_begin(void)
 
     if (checkpoint_tasks_active)
 	panic("TASKS_CHECKPOINT_BEGIN: Checkpoint already active");
+#ifdef ENABLE_JIT
+    jit_continuation_materialize_all();
+#endif
     checkpoint_tasks = NULL;
     checkpoint_shared_tasks = NULL;
     for (t = waiting_tasks; t; t = t->next)

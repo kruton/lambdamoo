@@ -1804,6 +1804,71 @@ duplicate_discarded_owned_string_program(void)
 }
 
 static JITProgram *
+aliased_discarded_owned_string_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_CONST);
+    JITInstruction *concat = instruction(HIR_TAC_BINARY);
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *equal = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITCopy *pair = allocate(sizeof(JITCopy));
+    char *ls = str_dup("a");
+    char *rs = str_dup("b");
+
+    program->num_values = 6;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_ownership = allocate(program->num_values);
+    program->value_owner_root = allocate(sizeof(int) * program->num_values);
+    program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+    program->value_types[1] = TYPE_STR;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_STR;
+    program->value_types[4] = TYPE_STR;
+    program->value_types[5] = TYPE_INT;
+    program->value_ownership[3] = JIT_OWNERSHIP_OWNED;
+    program->value_ownership[4] = JIT_OWNERSHIP_OWNED;
+    program->value_owner_root[3] = program->value_owner_root[4] = 3;
+    memset(program->value_owned_slots, -1,
+	   sizeof(int) * program->num_values);
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    left->value = 1;
+    left->literal_type = TYPE_STR;
+    left->literal = (uintptr_t) ls;
+    left->next = right;
+    right->value = 2;
+    right->literal_type = TYPE_STR;
+    right->literal = (uintptr_t) rs;
+    right->next = concat;
+    concat->value = 3;
+    concat->src1 = 1;
+    concat->src2 = 2;
+    concat->op = HIR_OP_ADD;
+    concat->next = copy;
+    pair->dst = 4;
+    pair->src = 3;
+    copy->copies = pair;
+    copy->next = equal;
+    equal->value = 5;
+    equal->src1 = 3;
+    equal->src2 = 4;
+    equal->op = HIR_OP_EQ;
+    equal->next = ret;
+    ret->src1 = 5;
+    ret->literal_type = TYPE_INT;
+    block->first = left;
+    block->last = ret;
+    jit_analyze_owned_last_uses(program);
+    return program;
+}
+
+static JITProgram *
 string_index_program(const char *s, int idx)
 {
     JITProgram *program = new_jit_program();
@@ -4147,7 +4212,7 @@ tagged_index_set_program(void)
 
 static JITProgram *
 put_prop_lowering_program(int tagged_object, var_type rhs_type,
-			  int tagged_result)
+			  int tagged_rhs, int tagged_result)
 {
     JITProgram *program = new_jit_program();
     JITBlock *block = allocate(sizeof(JITBlock));
@@ -4168,6 +4233,7 @@ put_prop_lowering_program(int tagged_object, var_type rhs_type,
     program->value_types[3] = rhs_type;
     program->value_types[4] = tagged_result ? TYPE_ANY : rhs_type;
     program->value_is_tagged[1] = tagged_object;
+    program->value_is_tagged[3] = tagged_rhs;
     program->value_is_tagged[4] = tagged_result;
     use_compact_tag_slots(program);
     add_entry_deopt_map(program);
@@ -4187,12 +4253,15 @@ put_prop_lowering_program(int tagged_object, var_type rhs_type,
     block->id = 1;
     object->value = 1;
     object->local_id = 0;
+    object->literal_type = tagged_object ? TYPE_ANY : TYPE_OBJ;
     object->next = property;
     property->value = 2;
     property->local_id = 1;
+    property->literal_type = TYPE_STR;
     property->next = rhs;
     rhs->value = 3;
     rhs->local_id = 2;
+    rhs->literal_type = tagged_rhs ? TYPE_ANY : rhs_type;
     rhs->next = put;
     put->value = 4;
     put->src1 = 1;
@@ -4823,8 +4892,14 @@ test_guard_and_index_set_lowering(void)
     JITProgram *direct_set = index_set_program(1);
     JITProgram *cow_set = index_set_program(0);
     JITProgram *tagged_set = tagged_index_set_program();
-    JITProgram *float_property = put_prop_lowering_program(0, TYPE_FLOAT, 0);
-    JITProgram *tagged_property = put_prop_lowering_program(1, TYPE_INT, 1);
+    JITProgram *float_property = put_prop_lowering_program(0, TYPE_FLOAT, 0, 0);
+    JITProgram *tagged_property = put_prop_lowering_program(1, TYPE_INT, 0, 1);
+    JITProgram *tagged_rhs_property = put_prop_lowering_program(0,
+	TYPE_INT, 1, 1);
+    JITProgram *tagged_float_property = put_prop_lowering_program(1,
+	TYPE_FLOAT, 0, 1);
+    JITProgram *tagged_float_rhs_property = put_prop_lowering_program(0,
+	TYPE_FLOAT, 1, 1);
     JITProgram *tagged_range = tagged_range_ref_program();
     JITProgram *fixed_chain = fixed_list_chain_program(0, TYPE_INT);
     JITProgram *checked_chain = fixed_list_chain_program(1, TYPE_INT);
@@ -4879,6 +4954,12 @@ test_guard_and_index_set_lowering(void)
 	  "floating-point property write did not compile");
     check(jit_program_compile(tagged_property),
 	  "tagged property write did not compile");
+    check(jit_program_compile(tagged_rhs_property),
+	  "tagged property value write did not compile");
+    check(jit_program_compile(tagged_float_property),
+	  "tagged floating-point property write did not compile");
+    check(jit_program_compile(tagged_float_rhs_property),
+	  "tagged floating-point property value write did not compile");
     check(jit_program_compile(tagged_range),
 	  "tagged range reference did not compile");
     check(jit_program_compile(fixed_chain),
@@ -4889,6 +4970,38 @@ test_guard_and_index_set_lowering(void)
 	  "fixed-capacity float list construction did not compile");
     check(jit_program_compile(spliced_tail),
 	  "spliced list tail construction did not compile");
+
+    {
+	Var property;
+	Var property_env[3];
+
+	property.type = TYPE_INT;
+	property.v.num = 0;
+	hir_test_set_property(property);
+	property_env[0].type = TYPE_OBJ;
+	property_env[0].v.obj = 0;
+	property_env[1].type = TYPE_STR;
+	property_env[1].v.str = str_dup("value");
+	property_env[2].type = TYPE_INT;
+	property_env[2].v.num = 42;
+	ticks = 10;
+	check(jit_program_execute(tagged_rhs_property, property_env, &result,
+		&ticks, &timed_out, &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged property write did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "tagged property write lost its runtime value or type");
+
+	property_env[2].type = TYPE_FLOAT;
+	property_env[2].v.fnum = box_fl(4.25);
+	ticks = 10;
+	check(jit_program_execute(tagged_float_rhs_property, property_env, &result,
+		&ticks, &timed_out, &error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged floating-point property write did not execute natively");
+	check(result.type == TYPE_FLOAT && fl_unbox(result.v.fnum) == 4.25,
+	      "tagged floating-point property write lost its runtime value or type");
+	hir_test_reset_property();
+	free_var(property_env[1]);
+    }
 
     env[0] = new_list(2);
     env[0].v.list[1].type = TYPE_INT;
@@ -5021,6 +5134,9 @@ test_guard_and_index_set_lowering(void)
     jit_program_free(checked_chain);
     jit_program_free(fixed_chain);
     jit_program_free(tagged_range);
+    jit_program_free(tagged_float_rhs_property);
+    jit_program_free(tagged_float_property);
+    jit_program_free(tagged_rhs_property);
     jit_program_free(tagged_property);
     jit_program_free(float_property);
     jit_program_free(tagged_set);
@@ -5228,6 +5344,7 @@ test_tick_return_and_dump_lowering(void)
     JITProgram *list_branch = typed_branch_program(TYPE_LIST, 0);
     JITProgram *float_branch = typed_branch_program(TYPE_FLOAT, 0);
     JITProgram *tagged_branch = typed_branch_program(TYPE_ANY, 1);
+    JITProgram *tagged_inferred_list_branch = typed_branch_program(TYPE_ANY, 1);
     JITProgram *float_copy = parallel_copy_lowering_program(TYPE_FLOAT,
 	TYPE_FLOAT, 0, 0);
     JITProgram *int_to_float = parallel_copy_lowering_program(TYPE_INT,
@@ -5260,6 +5377,9 @@ test_tick_return_and_dump_lowering(void)
     check(jit_program_compile(list_branch), "list branch did not compile");
     check(jit_program_compile(float_branch), "float branch did not compile");
     check(jit_program_compile(tagged_branch), "tagged branch did not compile");
+    tagged_inferred_list_branch->value_types[1] = TYPE_LIST;
+    check(jit_program_compile(tagged_inferred_list_branch),
+	  "tagged inferred-list branch did not compile");
     check(jit_program_compile(float_copy), "float copy did not compile");
     check(jit_program_compile(int_to_float), "int-to-float copy did not compile");
     check(jit_program_compile(float_to_int), "float-to-int copy did not compile");
@@ -5281,6 +5401,16 @@ test_tick_return_and_dump_lowering(void)
 	      "static-to-tagged copy did not execute");
 	check(copied.type == TYPE_INT && copied.v.num == 42,
 	      "static-to-tagged copy lost its value or runtime type");
+
+	env[0].type = TYPE_INT;
+	env[0].v.num = 1;
+	copy_ticks = 10;
+	check(jit_program_execute(tagged_inferred_list_branch, env, &copied,
+		&copy_ticks, &copy_timed_out, &copy_error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "tagged inferred-list branch did not execute");
+	check(copied.type == TYPE_INT && copied.v.num == 10,
+	      "tagged inferred-list branch ignored its runtime type");
     }
 
     ticks = 19;
@@ -5317,6 +5447,7 @@ test_tick_return_and_dump_lowering(void)
     jit_program_free(float_to_int);
     jit_program_free(int_to_float);
     jit_program_free(float_copy);
+    jit_program_free(tagged_inferred_list_branch);
     jit_program_free(tagged_branch);
     jit_program_free(float_branch);
     jit_program_free(list_branch);
@@ -6646,6 +6777,12 @@ test_owned_value_predicates(void)
     definition->op = HIR_OP_LIST_ADD_TAIL;
     check(jit_test_value_is_dead_owned_list(program, definition),
 	  "dead owned list tail was not recognized");
+    definition->op = HIR_OP_LIST_APPEND;
+    check(jit_test_value_is_dead_owned_list(program, definition),
+	  "dead owned list append was not recognized");
+    definition->op = HIR_OP_SUBLIST_FROM;
+    check(jit_test_value_is_dead_owned_list(program, definition),
+	  "dead owned sublist-from was not recognized");
     definition->op = HIR_OP_ADD;
     check(!jit_test_value_is_dead_owned_list(program, definition),
 	  "non-list operation was recognized as a dead list");
@@ -6698,6 +6835,461 @@ test_owned_value_predicates(void)
 }
 
 static void
+test_owner_slot_resolution_and_splice_aliases(void)
+{
+    JITProgram *program = new_jit_program();
+    int i;
+
+    program->num_values = 10;
+    program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+    program->value_owner_root = allocate(sizeof(int) * program->num_values);
+    for (i = 0; i < program->num_values; i++) {
+	program->value_owned_slots[i] = -1;
+	program->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+    }
+
+    /* Out-of-range value returns -1 */
+    check(jit_resolve_owner_slot(program, 0) == -1,
+	  "slot resolution did not reject zero value");
+    check(jit_resolve_owner_slot(program, -1) == -1,
+	  "slot resolution did not reject negative value");
+    check(jit_resolve_owner_slot(program, 10) == -1,
+	  "slot resolution did not reject out-of-bounds value");
+
+    /* Direct slot resolution */
+    program->value_owned_slots[1] = 2;
+    check(jit_resolve_owner_slot(program, 1) == 2,
+	  "direct slot resolution failed");
+
+    /* Multi-hop root traversal */
+    program->value_owner_root[2] = 3;
+    program->value_owner_root[3] = 4;
+    program->value_owned_slots[4] = 5;
+    check(jit_resolve_owner_slot(program, 2) == 5,
+	  "multi-hop root slot resolution failed");
+    check(jit_resolve_owner_slot(program, 3) == 5,
+	  "intermediate hop slot resolution failed");
+
+    /* Conflict root returns -1 */
+    program->value_owner_root[5] = JIT_OWNER_ROOT_CONFLICT;
+    check(jit_resolve_owner_slot(program, 5) == -1,
+	  "conflict root returned a valid slot");
+
+    /* Cyclic root chain terminates and returns -1 */
+    program->value_owner_root[6] = 7;
+    program->value_owner_root[7] = 6;
+    check(jit_resolve_owner_slot(program, 6) == -1,
+	  "cyclic root chain did not return -1");
+    check(jit_resolve_owner_slot(program, 7) == -1,
+	  "cyclic root chain did not return -1");
+
+    /* Self-loop root returns -1 */
+    program->value_owner_root[8] = 8;
+    check(jit_resolve_owner_slot(program, 8) == -1,
+	  "self-loop root returned a valid slot");
+
+    jit_program_free(program);
+
+    {
+	/* Regression test: ensure jit_resolve_owner_slot does not follow roots
+	   from borrowed locals whose local_id happens to match an owned value ID. */
+	JITProgram *borrow_prog = new_jit_program();
+	borrow_prog->num_values = 5;
+	borrow_prog->value_ownership = allocate(5);
+	borrow_prog->value_owner_root = allocate(sizeof(int) * 5);
+	borrow_prog->value_owned_slots = allocate(sizeof(int) * 5);
+	for (i = 0; i < 5; i++) {
+	    borrow_prog->value_ownership[i] = JIT_OWNERSHIP_UNKNOWN;
+	    borrow_prog->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	    borrow_prog->value_owned_slots[i] = -1;
+	}
+
+	/* Value 1 is an owned list with slot 0 */
+	borrow_prog->value_ownership[1] = JIT_OWNERSHIP_OWNED;
+	borrow_prog->value_owner_root[1] = 1;
+	borrow_prog->value_owned_slots[1] = 0;
+
+	/* Value 2 is a borrowed local loaded from local 1.
+	   Here value_owner_root[2] is local_id 1, which equals the owned value ID 1. */
+	borrow_prog->value_ownership[2] = JIT_OWNERSHIP_BORROWED_LOCAL;
+	borrow_prog->value_owner_root[2] = 1;
+	borrow_prog->value_owned_slots[2] = -1;
+
+	/* Value 3 is a borrowed property. */
+	borrow_prog->value_ownership[3] = JIT_OWNERSHIP_BORROWED_PROPERTY;
+	borrow_prog->value_owner_root[3] = 1;
+	borrow_prog->value_owned_slots[3] = -1;
+
+	/* jit_resolve_owner_slot must NOT follow local_id 1 to value 1 */
+	check(jit_resolve_owner_slot(borrow_prog, 2) == -1,
+	      "borrowed local resolved to an unrelated owner slot sharing its local_id");
+	check(jit_resolve_owner_slot(borrow_prog, 3) == -1,
+	      "borrowed property resolved to an unrelated owner slot sharing its root");
+	check(jit_resolve_owner_slot(borrow_prog, 1) == 0,
+	      "owned value failed to resolve its direct owner slot");
+
+	/* Value 4 is an owned value aliased to value 1 via root */
+	borrow_prog->value_ownership[4] = JIT_OWNERSHIP_OWNED;
+	borrow_prog->value_owner_root[4] = 1;
+	borrow_prog->value_owned_slots[4] = -1;
+	check(jit_resolve_owner_slot(borrow_prog, 4) == 0,
+	      "owned alias failed to resolve its root owner slot");
+
+	jit_program_free(borrow_prog);
+    }
+
+    {
+	/* Test HIR_OP_CHECK_LIST_FOR_SPLICE alias tracking in jit_analyze_owned_last_uses */
+	JITProgram *splice_alias_prog = new_jit_program();
+	JITBlock *block = allocate(sizeof(JITBlock));
+	JITInstruction *const_list = instruction(HIR_TAC_CONST);
+	JITInstruction *chk = instruction(HIR_TAC_UNARY);
+	JITInstruction *use2 = instruction(HIR_TAC_BINARY);
+	JITInstruction *use1 = instruction(HIR_TAC_BINARY);
+	JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+	splice_alias_prog->num_values = 6;
+	splice_alias_prog->num_blocks = 1;
+	splice_alias_prog->blocks = splice_alias_prog->last_block = block;
+	splice_alias_prog->value_types = allocate(sizeof(var_type) * 6);
+	splice_alias_prog->value_ownership = allocate(6);
+	for (i = 0; i < 6; i++) {
+	    splice_alias_prog->value_types[i] = TYPE_LIST;
+	    splice_alias_prog->value_ownership[i] = JIT_OWNERSHIP_OWNED;
+	}
+	block->id = 1;
+	const_list->value = 1;
+	const_list->next = chk;
+
+	chk->value = 2;
+	chk->src1 = 1;
+	chk->op = HIR_OP_CHECK_LIST_FOR_SPLICE;
+	chk->next = use2;
+
+	use2->value = 3;
+	use2->src1 = 2;
+	use2->src2 = 2;
+	use2->op = HIR_OP_LIST_APPEND;
+	use2->next = use1;
+
+	use1->value = 4;
+	use1->src1 = 1;
+	use1->src2 = 1;
+	use1->op = HIR_OP_LIST_APPEND;
+	use1->next = ret;
+
+	ret->src1 = 4;
+	ret->literal_type = TYPE_LIST;
+	block->first = const_list;
+	block->last = ret;
+
+	jit_analyze_owned_last_uses(splice_alias_prog);
+
+	check(!(use2->owned_last_use & JIT_LAST_USE_SRC1),
+	      "splice alias value 2 was prematurely marked as last use while src1 was live");
+	check((use1->owned_last_use & JIT_LAST_USE_SRC1) != 0,
+	      "final use of splice alias was not marked as last use");
+
+	jit_program_free(splice_alias_prog);
+    }
+
+    {
+	/* Test string concatenation where the input string reaches its owned home
+	   via an alias root chain rather than having the slot directly on the operand. */
+	JITProgram *chain_prog = new_jit_program();
+	JITBlock *blk = allocate(sizeof(JITBlock));
+	JITInstruction *c1 = instruction(HIR_TAC_CONST);
+	JITInstruction *c2 = instruction(HIR_TAC_CONST);
+	JITInstruction *copy_ins = instruction(HIR_TAC_PARALLEL_COPY);
+	JITInstruction *concat = instruction(HIR_TAC_BINARY);
+	JITInstruction *ret = instruction(HIR_TAC_RETURN);
+	JITCopy *cp = allocate(sizeof(JITCopy));
+	char *s1 = str_dup("hello ");
+	char *s2 = str_dup("world");
+	Var env[1];
+	Var res;
+	int tks = 10;
+	int to = 0;
+	enum error err = E_NONE;
+
+	chain_prog->num_values = 5;
+	chain_prog->num_blocks = 1;
+	chain_prog->blocks = chain_prog->last_block = blk;
+	chain_prog->value_types = allocate(sizeof(var_type) * 5);
+	chain_prog->value_types[0] = TYPE_INT;
+	chain_prog->value_types[1] = TYPE_STR;
+	chain_prog->value_types[2] = TYPE_STR;
+	chain_prog->value_types[3] = TYPE_STR;
+	chain_prog->value_types[4] = TYPE_STR;
+	chain_prog->value_ownership = allocate(5);
+	chain_prog->value_owner_root = allocate(sizeof(int) * 5);
+	chain_prog->value_owned_slots = allocate(sizeof(int) * 5);
+	for (i = 0; i < 5; i++) {
+	    chain_prog->value_ownership[i] = JIT_OWNERSHIP_OWNED;
+	    chain_prog->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	    chain_prog->value_owned_slots[i] = -1;
+	}
+	chain_prog->value_owned_slots[1] = 0;
+	chain_prog->value_owner_root[1] = 1;
+	chain_prog->value_owner_root[3] = 1;
+	chain_prog->value_owned_slots[4] = 0;
+	chain_prog->value_owner_root[4] = 4;
+	chain_prog->num_owned_slots = 1;
+	add_entry_deopt_map(chain_prog);
+	blk->id = 1;
+
+	c1->value = 1;
+	c1->literal = (uintptr_t) s1;
+	c1->literal_type = TYPE_STR;
+	c1->next = c2;
+
+	c2->value = 2;
+	c2->literal = (uintptr_t) s2;
+	c2->literal_type = TYPE_STR;
+	c2->next = copy_ins;
+
+	cp->dst = 3;
+	cp->src = 1;
+	cp->next = 0;
+	copy_ins->copies = cp;
+	copy_ins->next = concat;
+
+	concat->value = 4;
+	concat->src1 = 3;
+	concat->src2 = 2;
+	concat->op = HIR_OP_ADD;
+	concat->next = ret;
+
+	ret->src1 = 4;
+	ret->literal_type = TYPE_STR;
+
+	blk->first = c1;
+	blk->last = ret;
+
+	jit_analyze_owned_last_uses(chain_prog);
+	check(jit_program_compile(chain_prog),
+	      "string concat with root-chained owner slot did not compile");
+	check(jit_program_execute(chain_prog, env, &res, &tks, &to, &err, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "string concat with root-chained owner slot did not execute");
+	check(res.type == TYPE_STR && !strcmp(res.v.str, "hello world"),
+	      "string concat with root-chained owner slot returned wrong string");
+	free_var(res);
+	jit_program_free(chain_prog);
+    }
+
+    {
+	/* Test list add tail where the input list reaches its owned home via
+	   a root chain rather than having the slot directly on the operand. */
+	JITProgram *tail_prog = new_jit_program();
+	JITBlock *tblk = allocate(sizeof(JITBlock));
+	JITInstruction *c_head = instruction(HIR_TAC_CONST);
+	JITInstruction *mk_list = instruction(HIR_TAC_UNARY);
+	JITInstruction *c_tail = instruction(HIR_TAC_CONST);
+	JITInstruction *copy_lst = instruction(HIR_TAC_PARALLEL_COPY);
+	JITInstruction *add_tail = instruction(HIR_TAC_BINARY);
+	JITInstruction *ret_lst = instruction(HIR_TAC_RETURN);
+	JITCopy *cp_lst = allocate(sizeof(JITCopy));
+	Var env[1];
+	Var res;
+	int tks = 10;
+	int to = 0;
+	enum error err = E_NONE;
+
+	tail_prog->num_values = 6;
+	tail_prog->num_blocks = 1;
+	tail_prog->blocks = tail_prog->last_block = tblk;
+	tail_prog->value_types = allocate(sizeof(var_type) * 6);
+	tail_prog->value_types[0] = TYPE_INT;
+	tail_prog->value_types[1] = TYPE_INT;
+	tail_prog->value_types[2] = TYPE_LIST;
+	tail_prog->value_types[3] = TYPE_INT;
+	tail_prog->value_types[4] = TYPE_LIST;
+	tail_prog->value_types[5] = TYPE_LIST;
+	tail_prog->value_ownership = allocate(6);
+	tail_prog->value_owner_root = allocate(sizeof(int) * 6);
+	tail_prog->value_owned_slots = allocate(sizeof(int) * 6);
+	for (i = 0; i < 6; i++) {
+	    tail_prog->value_ownership[i] = JIT_OWNERSHIP_OWNED;
+	    tail_prog->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	    tail_prog->value_owned_slots[i] = -1;
+	}
+	tail_prog->value_owned_slots[2] = 0;
+	tail_prog->value_owner_root[2] = 2;
+	tail_prog->value_owner_root[4] = 2;
+	tail_prog->value_owned_slots[5] = 0;
+	tail_prog->value_owner_root[5] = 5;
+	tail_prog->num_owned_slots = 1;
+	add_entry_deopt_map(tail_prog);
+	tblk->id = 1;
+
+	c_head->value = 1;
+	c_head->literal = 10;
+	c_head->literal_type = TYPE_INT;
+	c_head->next = mk_list;
+
+	mk_list->value = 2;
+	mk_list->src1 = 1;
+	mk_list->op = HIR_OP_MAKE_SINGLETON_LIST;
+	mk_list->next = c_tail;
+
+	c_tail->value = 3;
+	c_tail->literal = 20;
+	c_tail->literal_type = TYPE_INT;
+	c_tail->next = copy_lst;
+
+	cp_lst->dst = 4;
+	cp_lst->src = 2;
+	cp_lst->next = 0;
+	copy_lst->copies = cp_lst;
+	copy_lst->next = add_tail;
+
+	add_tail->value = 5;
+	add_tail->src1 = 4;
+	add_tail->src2 = 3;
+	add_tail->op = HIR_OP_LIST_ADD_TAIL;
+	add_tail->next = ret_lst;
+
+	ret_lst->src1 = 5;
+	ret_lst->literal_type = TYPE_LIST;
+
+	tblk->first = c_head;
+	tblk->last = ret_lst;
+
+	jit_analyze_owned_last_uses(tail_prog);
+	check(jit_program_compile(tail_prog),
+	      "list add tail with root-chained owner slot did not compile");
+	check(jit_program_execute(tail_prog, env, &res, &tks, &to, &err, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "list add tail with root-chained owner slot did not execute");
+	check(res.type == TYPE_LIST && res.v.list[0].v.num == 2
+	      && res.v.list[1].v.num == 10 && res.v.list[2].v.num == 20,
+	      "list add tail with root-chained owner slot returned wrong list");
+	free_var(res);
+	jit_program_free(tail_prog);
+    }
+}
+
+static JITProgram *
+dead_list_result_program(HIROp op)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *left = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *right = op == HIR_OP_LIST_APPEND
+	? instruction(HIR_TAC_LOAD_LOCAL) : instruction(HIR_TAC_CONST);
+    JITInstruction *operation = instruction(HIR_TAC_BINARY);
+    JITInstruction *answer = instruction(HIR_TAC_CONST);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    int i;
+
+    program->num_values = 5;
+    program->num_vars = op == HIR_OP_LIST_APPEND ? 2 : 1;
+    program->num_blocks = 1;
+    program->blocks = program->last_block = block;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_ownership = allocate(program->num_values);
+    program->value_owner_root = allocate(sizeof(int) * program->num_values);
+    program->value_owned_slots = allocate(sizeof(int) * program->num_values);
+    program->value_use_counts = allocate(sizeof(unsigned) * program->num_values);
+    program->value_escape_flags = allocate(program->num_values);
+    for (i = 0; i < program->num_values; i++) {
+	program->value_types[i] = TYPE_INT;
+	program->value_is_tagged[i] = 0;
+	program->value_ownership[i] = JIT_OWNERSHIP_SCALAR;
+	program->value_owner_root[i] = JIT_OWNER_ROOT_NONE;
+	program->value_owned_slots[i] = JIT_OWNER_SLOT_NONE;
+	program->value_use_counts[i] = 1;
+	program->value_escape_flags[i] = JIT_ESCAPE_NONE;
+    }
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = op == HIR_OP_LIST_APPEND ? TYPE_LIST : TYPE_INT;
+    program->value_types[3] = TYPE_LIST;
+    program->value_ownership[1] = JIT_OWNERSHIP_BORROWED_LOCAL;
+    program->value_ownership[2] = op == HIR_OP_LIST_APPEND
+	? JIT_OWNERSHIP_BORROWED_LOCAL : JIT_OWNERSHIP_SCALAR;
+    program->value_ownership[3] = JIT_OWNERSHIP_OWNED;
+    program->value_owner_root[1] = 0;
+    program->value_owner_root[2] = op == HIR_OP_LIST_APPEND
+	? 1 : JIT_OWNER_ROOT_NONE;
+    program->value_owner_root[3] = 3;
+    program->value_use_counts[3] = 0;
+    add_entry_deopt_map(program);
+    block->id = 1;
+
+    left->value = 1;
+    left->local_id = 0;
+    left->literal_type = TYPE_LIST;
+    left->next = right;
+    right->value = 2;
+    if (op == HIR_OP_LIST_APPEND) {
+	right->local_id = 1;
+	right->literal_type = TYPE_LIST;
+    } else {
+	right->literal = 1;
+	right->literal_type = TYPE_INT;
+    }
+    right->next = operation;
+    operation->value = 3;
+    operation->src1 = 1;
+    operation->src2 = 2;
+    operation->op = op;
+    operation->next = answer;
+    answer->value = 4;
+    answer->literal = 42;
+    answer->literal_type = TYPE_INT;
+    answer->next = ret;
+    ret->src1 = 4;
+    ret->literal_type = TYPE_INT;
+    block->first = left;
+    block->last = ret;
+
+    jit_analyze_owned_last_uses(program);
+    return program;
+}
+
+static void
+test_dead_list_result_cleanup(void)
+{
+    HIROp operations[] = { HIR_OP_LIST_APPEND, HIR_OP_SUBLIST_FROM };
+    unsigned i;
+
+    for (i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+	JITProgram *program = dead_list_result_program(operations[i]);
+	Var env[2];
+	Var result;
+	int ticks = 10;
+	int timed_out = 0;
+	int refs;
+	enum error error = E_NONE;
+	JITRunResult status;
+
+	env[0] = new_list(1);
+	env[0].v.list[1].type = TYPE_STR;
+	env[0].v.list[1].v.str = str_dup("left element");
+	env[1] = new_list(1);
+	env[1].v.list[1].type = TYPE_STR;
+	env[1].v.list[1].v.str = str_dup("right element");
+	refs = var_refcount(env[0].v.list[1]);
+	check(jit_program_compile(program),
+	      "dead list result program did not compile");
+	status = jit_program_execute(program, env, &result, &ticks, &timed_out,
+		&error, 0, 0, 0);
+	check(status == JIT_RUN_RETURNED,
+	      "dead list result program did not execute");
+	check(result.type == TYPE_INT && result.v.num == 42,
+	      "dead list result program returned the wrong value");
+	check(var_refcount(env[0].v.list[1]) == refs,
+	      "dead list result retained a source element");
+	free_var(result);
+	free_var(env[1]);
+	free_var(env[0]);
+	jit_program_free(program);
+    }
+}
+
+static void
 test_resume_capture_classification(void)
 {
     static const var_type owned_types[] = {TYPE_STR, TYPE_LIST};
@@ -6734,7 +7326,7 @@ test_continuation_capture_validation(void)
     JITContinuationFrame *frame;
     JITNativeFrame runtime_owner;
     activation stats_owner;
-    Num raw[8];
+    Num raw[16];
     Var strings[3];
     Var list;
     Var homes[1];
@@ -6845,6 +7437,29 @@ test_continuation_capture_validation(void)
 	size_t minimum_bytes = sizeof(*frame)
 	    + sizeof(Var) * (frame->retained_capacity
 		+ frame->spare_retained_capacity);
+
+	raw[3] = raw[1];
+	values[2].source = JIT_RESUME_STACK;
+	check(jit_test_continuation_capture(program, 1, raw, 0, 0, homes,
+	    states, capacities, 0, frame) == frame
+	      && frame->num_retained == 2,
+	      "continuation capture retained duplicate stack aliases");
+	program->value_is_tagged[3] = 1;
+	raw[program->num_values + 3] = TYPE_STR;
+	check(jit_test_continuation_capture(program, 1, raw, 0, 0, homes,
+	    states, capacities, 0, frame) == frame
+	      && frame->num_retained == 2,
+	      "continuation capture retained a tagged duplicate alias");
+	program->value_is_tagged[3] = 0;
+	raw[1] = raw[3] = (Num) (intptr_t) homes[0].v.str;
+	check(jit_test_continuation_capture(program, 1, raw, 0, 0, homes,
+	    states, capacities, 0, frame) == frame
+	      && frame->num_retained == 1
+	      && frame->retained_values[0].type == TYPE_LIST,
+	      "continuation capture retained an owned-home alias");
+	raw[1] = (Num) (intptr_t) strings[0].v.str;
+	raw[3] = (Num) (intptr_t) strings[1].v.str;
+	values[2].source = JIT_RESUME_BORROWED_LOCAL;
 
 	jit_continuation_attach(frame, &stats_owner);
 	jit_program_stats(program, &program_stats);
@@ -7551,6 +8166,8 @@ main(void)
     test_null_jit_api_contracts();
     test_entry_activation_validation();
     test_owned_value_predicates();
+    test_owner_slot_resolution_and_splice_aliases();
+    test_dead_list_result_cleanup();
     test_resume_capture_classification();
     test_continuation_capture_validation();
     test_undispatched_continuation_materialization();
@@ -8833,6 +9450,66 @@ main(void)
 	call_args[0].v.num = 0;
 	deep_env[2].type = TYPE_LIST;
 	deep_env[2].v.list = call_args;
+	{
+	    JITContinuationFrame *lazy_continuation = 0;
+	    JITExecutionContext context;
+	    JITNativeFrame root;
+	    Var returned;
+	    size_t runtime_before = call_prog->active_runtime_bytes;
+
+	    ticks = 10;
+	    jit_execution_context_init(&context, &root, call_prog, deep_env,
+		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    context.lazy_verb_calls = 1;
+	    check(jit_program_execute_in_context(call_prog, &context, &root,
+		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
+		deopt_stack, 2, -1, 0, &lazy_continuation)
+		  == JIT_RUN_CALL_VERB,
+		  "lazy verb call did not request a VM call");
+	    check(!lazy_continuation && root.runtime_storage
+		  && root.pending_resume_map == 1
+		  && call_prog->active_runtime_bytes > runtime_before,
+		  "lazy verb call eagerly created a continuation");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    returned.type = TYPE_STR;
+	    returned.v.str = str_dup("lazy result");
+	    root.resume_result = returned;
+	    root.has_resume_result = 1;
+	    check(jit_program_execute_in_context(call_prog, &context, &root,
+		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
+		deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
+		  "lazy verb call did not resume natively");
+	    check(result.type == TYPE_STR
+		  && !strcmp(result.v.str, "lazy result")
+		  && !root.runtime_storage && !root.pending_resume_map
+		  && call_prog->active_runtime_bytes == runtime_before,
+		  "lazy verb resume corrupted its result or runtime ownership");
+	    free_var(result);
+	    check(jit_execution_context_finish(&context, &root),
+		  "lazy verb call root frame did not detach cleanly");
+
+	    ticks = 10;
+	    jit_execution_context_init(&context, &root, call_prog, deep_env,
+		0, 1, 4, &ticks, &timed_out, &error, -1);
+	    context.lazy_verb_calls = 1;
+	    check(jit_program_execute_in_context(call_prog, &context, &root,
+		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
+		deopt_stack, 2, -1, 0, &lazy_continuation)
+		  == JIT_RUN_CALL_VERB && !lazy_continuation,
+		  "lazy continuation fallback setup failed");
+	    free_var(deopt_stack[1]);
+	    free_var(deopt_stack[2]);
+	    lazy_continuation = jit_native_frame_capture_continuation(&root, 1);
+	    check(lazy_continuation && lazy_continuation->owns_runtime
+		  && !root.runtime_storage && !root.pending_resume_map,
+		  "lazy state did not materialize a continuation on fallback");
+	    jit_continuation_free(lazy_continuation);
+	    check(call_prog->active_runtime_bytes == runtime_before,
+		  "materialized lazy continuation leaked runtime storage");
+	    check(jit_execution_context_finish(&context, &root),
+		  "materialized lazy root frame did not detach cleanly");
+	}
 	ticks = 10;
 	check(jit_program_execute(call_prog, deep_env, &result, &ticks,
 				  &timed_out, &error, 0, &deopt, deopt_stack)
@@ -8925,6 +9602,7 @@ main(void)
 	    activation owner = { 0 };
 	    Var shadow_stack[3];
 	    Var returned;
+	    int result_refs;
 
 	    ticks = 10;
 	    check((jit_program_execute)(call_prog, deep_env, &result, &ticks,
@@ -8952,9 +9630,13 @@ main(void)
 					deopt_stack, 2, -1, continuation,
 					0) == JIT_RUN_RETURNED,
 		  "compact call_verb continuation did not return");
+	    check(!continuation->has_result,
+		  "native resume did not consume its continuation result");
+	    result_refs = var_refcount(result);
 	    jit_continuation_free(continuation);
 	    check(result.type == TYPE_STR
-		  && !strcmp(result.v.str, "compact returned"),
+		  && !strcmp(result.v.str, "compact returned")
+		  && var_refcount(result) == result_refs,
 		  "compact call_verb continuation returned the wrong value");
 	    free_var(result);
 	}
@@ -9747,6 +10429,17 @@ main(void)
 	check(result.type == TYPE_INT && result.v.num == 1,
 	      "duplicate discarded string comparison returned the wrong value");
 	jit_program_free(duplicate_discard);
+
+	JITProgram *aliased_discard =
+	    aliased_discarded_owned_string_program();
+	ticks = 10;
+	check(jit_program_execute(aliased_discard, 0, &result, &ticks,
+				  &timed_out, &error, 0, 0, 0)
+	      == JIT_RUN_RETURNED,
+	      "aliased owned string operands did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == 1,
+	      "aliased owned string comparison returned the wrong value");
+	jit_program_free(aliased_discard);
 
 	JITProgram *str_idx = string_index_program("LambdaMOO", 7);
 	ticks = 10;
@@ -10877,6 +11570,7 @@ main(void)
 	l_elem.v.list[1].v.num = 1;
 	check(jit_rt_is_true((intptr_t)l_empty.v.list, TYPE_LIST) == 0, "jit_rt_is_true list empty");
 	check(jit_rt_is_true((intptr_t)l_elem.v.list, TYPE_LIST) == 1, "jit_rt_is_true list non-empty");
+	check(jit_rt_is_true(0, TYPE_LIST) == 0, "jit_rt_is_true list null");
 	free_var(l_empty);
 	free_var(l_elem);
 
