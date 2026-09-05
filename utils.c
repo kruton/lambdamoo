@@ -258,7 +258,7 @@ is_true(Var v)
     return ((v.type == TYPE_INT && v.v.num != 0)
 	    || (v.type == TYPE_FLOAT && fl_unbox(v.v.fnum) != 0.0)
 	    || (v.type == TYPE_STR && v.v.str && *v.v.str != '\0')
-	    || (v.type == TYPE_LIST && v.v.list[0].v.num != 0));
+	    || (v.type == TYPE_LIST && v.v.list && v.v.list[0].v.num != 0));
 }
 
 int

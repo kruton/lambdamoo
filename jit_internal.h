@@ -223,6 +223,7 @@ struct JITInstruction {
     unsigned char owned_last_use;
     unsigned char tick_batch_count;
     unsigned char shift_count_proven_valid;
+    unsigned char range_increment;
     JITInstruction *next;
 };
 
@@ -318,6 +319,27 @@ struct JITProgram {
 extern void jit_analyze_owned_last_uses(JITProgram *);
 
 static inline __attribute__((always_inline)) int
+jit_resolve_owner_slot(JITProgram *program, int value)
+{
+    int hops = 0;
+
+    while (value > 0 && value < program->num_values && hops++ < 16) {
+	if (program->value_ownership
+	    && program->value_ownership[value] != JIT_OWNERSHIP_OWNED
+	    && program->value_ownership[value] != JIT_OWNERSHIP_OWNED_PROPERTY)
+	    break;
+	if (program->value_owned_slots && program->value_owned_slots[value] >= 0)
+	    return program->value_owned_slots[value];
+	if (!program->value_owner_root || program->value_owner_root[value] <= 0
+	    || program->value_owner_root[value] >= program->num_values
+	    || program->value_owner_root[value] == value)
+	    break;
+	value = program->value_owner_root[value];
+    }
+    return -1;
+}
+
+static inline __attribute__((always_inline)) int
 jit_deopt_map_local_value(JITProgram *program, JITDeoptMap *map, int slot)
 {
     while (map) {
@@ -390,6 +412,7 @@ extern Var *jit_rt_fixed_list_append_owned(Var *, unsigned *, int, Var *, int,
 					   int64_t, int);
 extern void jit_rt_owned_replace(Var *, int, int64_t, int);
 extern void jit_rt_discard_owned(Var *, int, int64_t, int);
+extern void jit_rt_retain_raw(int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);

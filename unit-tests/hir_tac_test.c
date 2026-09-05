@@ -3242,7 +3242,7 @@ test_for_range_loop_tac_ssa(void)
     check_int("for range tac not null", tac != 0, 1);
     check_int("for range verify errors", hir_context_error_count(ctx), 0);
     check_int("for range branch false count",
-	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 2);
+	      hir_tac_count_kind(tac, HIR_TAC_BRANCH_FALSE), 1);
     check_int("for range jump count",
 	      hir_tac_count_kind(tac, HIR_TAC_JUMP), 1);
     check_int("for range tick count",
@@ -3251,6 +3251,57 @@ test_for_range_loop_tac_ssa(void)
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI) >= 2, 1);
 
     check_int("for range destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
+    hir_context_free(ctx);
+}
+
+static void
+test_for_range_body_stack_snapshot(void)
+{
+    Names names;
+    HIRContext *ctx;
+    HIRCFG *cfg;
+    HIRDominatorTree *dom;
+    HIRSSAProgram *ssa;
+    HIRTacProgram *tac;
+
+    /* for i in [1..5] sum = sum + i; endfor */
+    Expr from = int_expr(1, 11);
+    Expr to = int_expr(5, 11);
+    Expr sum_body_lhs = id_expr(1, 12);
+    Expr sum_body_rhs = id_expr(1, 12);
+    Expr i_rhs = id_expr(2, 12);
+    Expr add = binary_expr(EXPR_PLUS, &sum_body_rhs, &i_rhs);
+    Expr body_assign = binary_expr(EXPR_ASGN, &sum_body_lhs, &add);
+    Stmt body_stmt = expr_stmt(&body_assign);
+    Stmt loop = range_stmt(2, &from, &to, &body_stmt, 11);
+    Expr sum_ret = id_expr(1, 13);
+    Stmt ret = return_stmt(&sum_ret);
+
+    from.bytecode_pc = 20;
+    to.bytecode_pc = 21;
+    loop.bytecode_pc = 22;
+    add.bytecode_pc = 23;
+    body_assign.bytecode_pc = 23;
+    loop.next = &ret;
+
+    memset(&names, 0, sizeof(names));
+    names.size = 32;
+
+    tac = lower_stmt(&names, &loop, &ctx, &cfg, &dom, &ssa);
+
+    check_int("for range body tac not null", tac != 0, 1);
+    check_int("for range body stack depth",
+	      hir_tac_stack_depth_at_bytecode_pc(tac, 23), 4);
+    check_int("for range body stack uses incremented from",
+	      hir_ssa_stack_value_at_bytecode_pc(ssa, 23, 0) > 0, 1);
+    check_int("for range body stack to is present",
+	      hir_ssa_stack_value_at_bytecode_pc(ssa, 23, 1) > 0, 1);
+    check_int("for range body guards maximum counter",
+	      hir_tac_count_binary_op(tac, HIR_OP_GT), 1);
+    check_int("for range body has maximum-value adjustment",
+	      hir_tac_count_binary_op(tac, HIR_OP_ADD), 4);
+
+    check_int("for range body destroy ssa", hir_destroy_ssa(ctx, ssa), 1);
     hir_context_free(ctx);
 }
 
@@ -5115,6 +5166,7 @@ main(void)
     test_string_search_builtin_inlining();
     test_property_read_and_write_tac_ssa();
     test_for_range_loop_tac_ssa();
+    test_for_range_body_stack_snapshot();
     test_for_list_loop_tac_ssa();
     test_cond_expr_tac_ssa();
     test_break_and_continue_tac_ssa();
