@@ -4,6 +4,7 @@
 #include "options.h"
 
 #include "my-stdio.h"
+#include "my-stdlib.h"
 #include "my-string.h"
 #include "my-time.h"
 #include "my-unistd.h"
@@ -422,6 +423,45 @@ jit_rt_list_index_set(Var *env, int local_id, Var *list, int64_t index,
     env[local_id] = result;
     *err_out = E_NONE;
     return result.v.list;
+}
+
+Var *
+jit_rt_list_nested_index_set(Var *env, int local_id, int64_t outer_idx,
+			     int64_t inner_idx, int64_t value_raw,
+			     int value_type, int32_t *err_out)
+{
+    Var root;
+    Var sub;
+    Var value;
+    Var new_sub;
+    Var new_root;
+
+    assert(env && local_id >= 0);
+    root = env[local_id];
+    if (root.type != TYPE_LIST) {
+	*err_out = E_TYPE;
+	return 0;
+    }
+    if (outer_idx < 1 || outer_idx > root.v.list[0].v.num) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    sub = root.v.list[outer_idx];
+    if (sub.type != TYPE_LIST) {
+	*err_out = E_TYPE;
+	return 0;
+    }
+    if (inner_idx < 1 || inner_idx > sub.v.list[0].v.num) {
+	*err_out = E_RANGE;
+	return 0;
+    }
+    value = var_ref(raw_to_var(value_raw, value_type));
+    new_sub = listset(var_dup(sub), value, (int) inner_idx);
+    new_root = listset(var_dup(root), new_sub, (int) outer_idx);
+    free_var(env[local_id]);
+    env[local_id] = new_root;
+    *err_out = E_NONE;
+    return new_root.v.list;
 }
 
 Var *
@@ -1237,8 +1277,6 @@ void
 jit_native_frame_release_runtime(JITNativeFrame *frame)
 {
     Var *borrowed_locals;
-    size_t deopt_bytes;
-    size_t deopt_storage_bytes;
     int i;
 
     if (!frame || !frame->runtime_storage)
@@ -1249,11 +1287,8 @@ jit_native_frame_release_runtime(JITNativeFrame *frame)
 	jit_native_frame_unbind_runtime(frame);
 	return;
     }
-    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(frame->program);
-    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
-	* sizeof(Var);
     borrowed_locals = (Var *) ((char *) frame->runtime_storage
-	+ deopt_storage_bytes);
+	+ frame->program->runtime_layout.borrowed_offset);
     for (i = 0; i < frame->program->num_borrowed_locals; i++)
 	free_var(borrowed_locals[i]);
     for (i = 0; i < frame->program->num_owned_slots; i++)
@@ -1757,6 +1792,12 @@ static JITPoolPolicy jit_pool_policy = {
 static uint64_t next_module_serial = 0;
 static FILE *jit_perf_map_file = 0;
 static char jit_perf_map_filename[64];
+static time_t jit_profile_detail_time = 0;
+#ifdef JIT_TESTING
+static int jit_profile_detail = 1;
+#else
+static int jit_profile_detail = 0;
+#endif
 
 static void
 jit_perf_map_write_program(JITProgram *program)
@@ -1883,6 +1924,8 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_retain_raw",
 		      (void *) jit_rt_retain_raw);
     MIR_load_external(context, "jit_rt_list_index_set", (void *) jit_rt_list_index_set);
+    MIR_load_external(context, "jit_rt_list_nested_index_set",
+		      (void *) jit_rt_list_nested_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
     MIR_load_external(context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
@@ -1896,8 +1939,6 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
     MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
-    MIR_load_external(context, "execute_jit_direct_verb_call",
-		      (void *) execute_jit_direct_verb_call);
 }
 
 static int
@@ -2186,6 +2227,8 @@ typedef struct {
     MIR_item_t import_retain_raw;
     MIR_item_t proto_list_index_set;
     MIR_item_t import_list_index_set;
+    MIR_item_t proto_list_nested_index_set;
+    MIR_item_t import_list_nested_index_set;
     MIR_item_t proto_sublist_from;
     MIR_item_t import_sublist_from;
     MIR_item_t proto_list_in;
@@ -2208,8 +2251,6 @@ typedef struct {
     MIR_item_t import_parent;
     MIR_item_t proto_var_raw;
     MIR_item_t import_var_raw;
-    MIR_item_t proto_direct_verb_call;
-    MIR_item_t import_direct_verb_call;
     MIR_label_t shared_return[JIT_RUN_ABORT_SECONDS + 1];
 } MIRBuild;
 
@@ -3760,6 +3801,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						MIR_T_I32, "value_type", MIR_T_P, "err");
     build->import_list_index_set = MIR_new_import(build->context, "jit_rt_list_index_set");
 
+    build->proto_list_nested_index_set = MIR_new_proto(build->context, "proto_list_nested_index_set", 1, &res_p, 7,
+						MIR_T_P, "env", MIR_T_I32, "local",
+						MIR_T_I64, "outer_index", MIR_T_I64, "inner_index",
+						MIR_T_I64, "value_raw", MIR_T_I32, "value_type",
+						MIR_T_P, "err");
+    build->import_list_nested_index_set = MIR_new_import(build->context, "jit_rt_list_nested_index_set");
+
     build->proto_sublist_from = MIR_new_proto(build->context, "proto_sublist_from", 1, &res_p, 2,
 					     MIR_T_P, "list", MIR_T_I64, "start");
     build->import_sublist_from = MIR_new_import(build->context, "jit_rt_sublist_from");
@@ -3805,17 +3853,6 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_var_raw = MIR_new_proto(build->context, "proto_var_raw", 1,
 					 &res_i64, 1, MIR_T_P, "value");
     build->import_var_raw = MIR_new_import(build->context, "jit_rt_var_raw");
-
-    build->proto_direct_verb_call = MIR_new_proto(build->context,
-	"proto_direct_verb_call", 1, &res_i32, 13,
-	MIR_T_P, "execution_context", MIR_T_P, "native_frame",
-	MIR_T_I64, "obj_raw", MIR_T_I32, "obj_type",
-	MIR_T_I64, "verb_raw", MIR_T_I32, "verb_type",
-	MIR_T_I64, "args_raw", MIR_T_I32, "args_type",
-	MIR_T_P, "ticks", MIR_T_P, "timed_out", MIR_T_P, "error",
-	MIR_T_P, "result_raw", MIR_T_P, "result_type");
-    build->import_direct_verb_call = MIR_new_import(build->context,
-	"execute_jit_direct_verb_call");
 
     if (program->diagnostic_object >= 0 && program->diagnostic_verb > 0)
 	snprintf(func_name, sizeof(func_name), "jit_o%" PRIdN "_v%u_%" PRIu64,
@@ -4993,6 +5030,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 						      MIR_new_reg_op(build->context,
 								     values[instr->src1]),
 						      MIR_new_int_op(build->context, -1)));
+			if (program->value_is_tagged
+			    && program->value_is_tagged[instr->value]) {
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_mem_op(build->context, tag_t,
+				    jit_tag_offset(program, instr->value),
+				    deopt_values, 0, 1),
+				MIR_new_int_op(build->context, TYPE_INT)));
+			}
 		    }
 		    break;
 		case HIR_TAC_BINARY:
@@ -5769,7 +5814,6 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				instr->source_lineno);
 
 			    if (owner >= 0) {
-				MIR_label_t deopt = MIR_new_label(build->context);
 				MIR_label_t done = MIR_new_label(build->context);
 				MIR_reg_t transferred;
 				MIR_reg_t result_out;
@@ -5799,8 +5843,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					instr->owned_last_use),
 				    MIR_new_reg_op(build->context, result_out),
 				    MIR_new_reg_op(build->context, error_out)));
+				MIR_label_t fallback = MIR_new_label(build->context);
 				append(build, MIR_new_insn(build->context, MIR_BF,
-				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_label_op(build->context, fallback),
 				    MIR_new_reg_op(build->context, transferred)));
 				append(build, MIR_new_insn(build->context, MIR_MOV,
 				    MIR_new_reg_op(build->context, err_reg),
@@ -5818,10 +5863,27 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					0, 1)));
 				append(build, MIR_new_insn(build->context, MIR_JMP,
 				    MIR_new_label_op(build->context, done)));
-				append(build, deopt);
-			    append_deopt_exit(build, program, instr,
-				    values, deopt_map_out, deopt_values, status,
-				    common_return);
+				append(build, fallback);
+				append(build, MIR_new_call_insn(build->context, 6,
+				    MIR_new_ref_op(build->context,
+					build->proto_str_concat),
+				    MIR_new_ref_op(build->context,
+					build->import_str_concat),
+				    MIR_new_reg_op(build->context,
+					values[instr->value]),
+				    MIR_new_reg_op(build->context,
+					values[instr->src1]),
+				    MIR_new_reg_op(build->context,
+					values[instr->src2]),
+				    MIR_new_reg_op(build->context, error_out)));
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+					error_out, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, quota_error),
+				    MIR_new_reg_op(build->context, err_reg),
+				    MIR_new_int_op(build->context, E_NONE)));
 				append(build, done);
 			    } else {
 				append(build, MIR_new_call_insn(build->context, 6,
@@ -7115,10 +7177,110 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    &status_exits, &last_status_exit, JIT_RUN_ERROR,
 			    E_RANGE, instr->deopt_map, instr->bytecode_pc,
 			    instr->source_lineno);
-			MIR_reg_t base = values[instr->src1];
-			MIR_reg_t index = values[instr->src2];
 			MIR_reg_t raw_value;
 			MIR_reg_t value_type;
+
+			if (instr->op == HIR_OP_INDEX) {
+			    MIR_reg_t outer_idx = values[instr->src1];
+			    MIR_reg_t inner_idx = values[instr->src2];
+			    int tagged_outer = program->value_is_tagged
+				&& program->value_is_tagged[instr->src1];
+			    int tagged_inner = program->value_is_tagged
+				&& program->value_is_tagged[instr->src2];
+
+			    if (tagged_outer) {
+				MIR_reg_t outer_type;
+				sprintf(name, "set_outer_type%d", copy_serial++);
+				outer_type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, outer_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, instr->src1),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, outer_type),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    } else if (program->value_types
+				       && program->value_types[instr->src1] != TYPE_INT) {
+				append_deopt_exit(build, program, instr,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				break;
+			    }
+			    if (tagged_inner) {
+				MIR_reg_t inner_type;
+				sprintf(name, "set_inner_type%d", copy_serial++);
+				inner_type = new_reg(build, name);
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, inner_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, instr->src2),
+					deopt_values, 0, 1)));
+				append(build, MIR_new_insn(build->context, MIR_BNE,
+				    MIR_new_label_op(build->context, deopt),
+				    MIR_new_reg_op(build->context, inner_type),
+				    MIR_new_int_op(build->context, TYPE_INT)));
+			    } else if (program->value_types
+				       && program->value_types[instr->src2] != TYPE_INT) {
+				append_deopt_exit(build, program, instr,
+				    values, deopt_map_out, deopt_values, status,
+				    common_return);
+				break;
+			    }
+			    sprintf(name, "set_value_type%d", copy_serial++);
+			    value_type = new_reg(build, name);
+			    if (program->value_is_tagged && program->value_is_tagged[instr->src3])
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, value_type),
+				    MIR_new_mem_op(build->context, tag_t,
+					jit_tag_offset(program, instr->src3),
+					deopt_values, 0, 1)));
+			    else
+				append(build, MIR_new_insn(build->context, MIR_MOV,
+				    MIR_new_reg_op(build->context, value_type),
+				    MIR_new_int_op(build->context,
+					program->value_types ? program->value_types[instr->src3] : TYPE_ANY)));
+			    raw_value = append_raw_value(build, program, values,
+				instr->src3, deopt_values, &copy_serial);
+			    append(build, MIR_new_call_insn(build->context, 10,
+				MIR_new_ref_op(build->context,
+				    build->proto_list_nested_index_set),
+				MIR_new_ref_op(build->context,
+				    build->import_list_nested_index_set),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, env),
+				MIR_new_int_op(build->context, instr->local_id),
+				MIR_new_reg_op(build->context, outer_idx),
+				MIR_new_reg_op(build->context, inner_idx),
+				MIR_new_reg_op(build->context, raw_value),
+				MIR_new_reg_op(build->context, value_type),
+				MIR_new_reg_op(build->context, error_out)));
+			    sprintf(name, "nested_err%d", copy_serial++);
+			    MIR_reg_t err_reg = new_reg(build, name);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_mem_op(build->context, MIR_T_I32, 0,
+				    error_out, 0, 1)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, range_error),
+				MIR_new_reg_op(build->context, err_reg),
+				MIR_new_int_op(build->context, E_RANGE)));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, deopt),
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_int_op(build->context, 0)));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, deopt);
+			    append_deopt_exit(build, program, instr, values,
+				deopt_map_out, deopt_values, status, common_return);
+			    append(build, done);
+			    break;
+			}
+
+			MIR_reg_t base = values[instr->src1];
+			MIR_reg_t index = values[instr->src2];
 			MIR_reg_t list_len;
 			int direct_int_list = instr->direct_int_list_index_set;
 			int tagged_base = program->value_is_tagged
@@ -7461,115 +7623,13 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      common_return);
 		    break;
 		case HIR_TAC_CALL_VERB:
-		    {
-			JITDeoptMap *map = &program->deopt_maps[instr->deopt_map];
-			int args_value = map->stack_depth
-			    ? map->stack_values[map->stack_depth - 1] : 0;
-			int operands[3] = { instr->src1, instr->src2, args_value };
-			MIR_reg_t raw[3], type[3], call_result;
-			MIR_reg_t raw_out, type_out;
-			MIR_label_t materialize = MIR_new_label(build->context);
-			MIR_label_t done = MIR_new_label(build->context);
-			int operand;
-
-			if (!program->value_types || operands[0] <= 0
-			    || operands[0] >= program->num_values
-			    || operands[1] <= 0
-			    || operands[1] >= program->num_values
-			    || operands[2] <= 0
-			    || operands[2] >= program->num_values) {
-			    append_materialized_exit(build, program,
-				instr->deopt_map, values, deopt_map_out,
-				deopt_values, status, common_return,
-				JIT_RUN_CALL_VERB);
-			    if (instr->deopt_map > 0
-				&& instr->deopt_map < program->num_deopt_maps
-				&& resume_continuations[instr->deopt_map])
-				append(build,
-				    resume_continuations[instr->deopt_map]);
-			    break;
-			}
-			for (operand = 0; operand < 3; operand++) {
-			    char name[32];
-
-			    raw[operand] = append_raw_value(build, program, values,
-				operands[operand], deopt_values, &copy_serial);
-			    sprintf(name, "verb_type%d", copy_serial++);
-			    type[operand] = new_reg(build, name);
-			    if (program->value_is_tagged
-				&& program->value_is_tagged[operands[operand]])
-				append(build, MIR_new_insn(build->context, MIR_MOV,
-				    MIR_new_reg_op(build->context, type[operand]),
-				    MIR_new_mem_op(build->context, tag_t,
-					jit_tag_offset(program, operands[operand]), deopt_values, 0, 1)));
-			    else
-				append(build, MIR_new_insn(build->context, MIR_MOV,
-				    MIR_new_reg_op(build->context, type[operand]),
-				    MIR_new_int_op(build->context,
-					program->value_types[operands[operand]])));
-			}
-			{
-			    char name[32];
-
-			    sprintf(name, "direct_verb_result%d", copy_serial++);
-			    call_result = new_reg(build, name);
-			    sprintf(name, "direct_verb_raw_out%d", copy_serial++);
-			    raw_out = new_reg(build, name);
-			    sprintf(name, "direct_verb_type_out%d", copy_serial++);
-			    type_out = new_reg(build, name);
-			}
-			append(build, MIR_new_insn(build->context, MIR_ADD,
-			    MIR_new_reg_op(build->context, raw_out),
-			    MIR_new_reg_op(build->context, deopt_values),
-			    MIR_new_int_op(build->context,
-				instr->value * sizeof(Num))));
-			append(build, MIR_new_insn(build->context, MIR_ADD,
-			    MIR_new_reg_op(build->context, type_out),
-			    MIR_new_reg_op(build->context, deopt_values),
-			    MIR_new_int_op(build->context,
-				jit_tag_offset(program, instr->value))));
-			append(build, MIR_new_call_insn(build->context, 16,
-			    MIR_new_ref_op(build->context,
-				build->proto_direct_verb_call),
-			    MIR_new_ref_op(build->context,
-				build->import_direct_verb_call),
-			    MIR_new_reg_op(build->context, call_result),
-			    MIR_new_reg_op(build->context,
-				build->execution_context),
-			    MIR_new_reg_op(build->context, build->native_frame),
-			    MIR_new_reg_op(build->context, raw[0]),
-			    MIR_new_reg_op(build->context, type[0]),
-			    MIR_new_reg_op(build->context, raw[1]),
-			    MIR_new_reg_op(build->context, type[1]),
-			    MIR_new_reg_op(build->context, raw[2]),
-			    MIR_new_reg_op(build->context, type[2]),
-			    MIR_new_reg_op(build->context, ticks),
-			    MIR_new_reg_op(build->context, timed_out),
-			    MIR_new_reg_op(build->context, error_out),
-			    MIR_new_reg_op(build->context, raw_out),
-			    MIR_new_reg_op(build->context, type_out)));
-			append(build, MIR_new_insn(build->context, MIR_BEQ,
-			    MIR_new_label_op(build->context, materialize),
-			    MIR_new_reg_op(build->context, call_result),
-			    MIR_new_int_op(build->context, 0)));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-			    MIR_new_reg_op(build->context, values[instr->value]),
-			    MIR_new_mem_op(build->context,
-				sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
-				instr->value * sizeof(Num), deopt_values, 0, 1)));
-			append(build, MIR_new_insn(build->context, MIR_JMP,
-			    MIR_new_label_op(build->context, done)));
-			append(build, materialize);
-			append_materialized_exit(build, program, instr->deopt_map,
-			    values, deopt_map_out, deopt_values, status,
-			    common_return, JIT_RUN_CALL_VERB);
-			if (instr->deopt_map > 0
-			    && instr->deopt_map < program->num_deopt_maps
-			    && resume_continuations[instr->deopt_map])
-			    append(build,
-				resume_continuations[instr->deopt_map]);
-			append(build, done);
-		    }
+		    append_materialized_exit(build, program, instr->deopt_map,
+			values, deopt_map_out, deopt_values, status,
+			common_return, JIT_RUN_CALL_VERB);
+		    if (instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+			&& resume_continuations[instr->deopt_map])
+			append(build, resume_continuations[instr->deopt_map]);
 		    break;
 		case HIR_TAC_LABEL:
 		case HIR_TAC_STORE_LOCAL:
@@ -8019,6 +8079,8 @@ jit_program_free(JITProgram *program)
 
     jit_program_release_native(program);
     jit_program_release_ir(program, 0);
+    if (program->resume_map_index)
+	myfree(program->resume_map_index, M_PROGRAM);
     if (program->deopt_maps)
 	{
 	    int i;
@@ -8070,6 +8132,12 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_boundary_ownership,
 			   M_PROGRAM);
 		if (program->deopt_maps[i].native_resume) {
+		    if (program->deopt_maps[i].native_resume->capture_actions)
+			myfree(program->deopt_maps[i].native_resume->capture_actions,
+			       M_PROGRAM);
+		    if (program->deopt_maps[i].native_resume->required_homes)
+			myfree(program->deopt_maps[i].native_resume->required_homes,
+			       M_PROGRAM);
 		    if (program->deopt_maps[i].native_resume->values)
 			myfree(program->deopt_maps[i].native_resume->values,
 			       M_PROGRAM);
@@ -8124,6 +8192,7 @@ jit_program_metadata_bytes(JITProgram *program)
     if (program->diagnostic)
 	bytes += memo_strlen(program->diagnostic) + 1;
     bytes += sizeof(JITDeoptMap) * program->num_deopt_maps;
+    bytes += sizeof(JITResumeMapEntry) * program->num_resume_map_entries;
     bytes += sizeof(JITReconstructionState)
 	* program->num_reconstruction_states;
     bytes += sizeof(JITSourceLocation) * program->num_status_locations;
@@ -8179,6 +8248,11 @@ jit_program_metadata_bytes(JITProgram *program)
 	    bytes += map->stack_depth;
 	if (map->native_resume) {
 	    bytes += sizeof(JITNativeResume);
+	    if (map->native_resume->capture_actions)
+		bytes += sizeof(JITResumeCaptureAction)
+		    * map->native_resume->num_capture_actions;
+	    if (map->native_resume->required_homes)
+		bytes += sizeof(int) * map->native_resume->num_required_homes;
 	    if (map->native_resume->values)
 		bytes += sizeof(JITResumeValue) * map->native_resume->num_values;
 	    if (map->native_resume->literals)
@@ -8443,22 +8517,90 @@ jit_program_deopt_map_count(JITProgram *program)
     return program ? program->num_deopt_maps : 0;
 }
 
+static int
+jit_resume_key_compare(ResumeKey a, ResumeKey b)
+{
+    if (a.code_unit != b.code_unit)
+	return a.code_unit < b.code_unit ? -1 : 1;
+    return a.site < b.site ? -1 : a.site != b.site;
+}
+
+static int
+jit_resume_map_compare(const void *left, const void *right)
+{
+    const JITResumeMapEntry *a = left, *b = right;
+    int order = jit_resume_key_compare(a->key, b->key);
+
+    /* Preserve the old scan's first eligible map for duplicate keys. */
+    return order ? order : a->map_id < b->map_id ? -1 : a->map_id != b->map_id;
+}
+
+static int
+jit_resume_map_candidate(JITDeoptMap *map)
+{
+    /* Protection can change without rebuilding metadata. Index specialized
+       built-ins even while unprotected, and check protection at lookup. */
+    return (map->reason == JIT_DEOPT_VERB_CALL
+	    || map->reason == JIT_DEOPT_BUILTIN_CALL
+	    || jit_deopt_map_is_specialized_builtin(map))
+	&& map->resume_key.site && map->native_resume
+	&& map->native_resume->valid && map->native_resume->rehydratable
+	&& map->stack_depth >= (unsigned) jit_call_stack_operands(map);
+}
+
+static void
+jit_program_index_resume_maps(JITProgram *program)
+{
+    int i, count = 0;
+
+    /* Built lazily after metadata construction; IR/pool rotation preserves
+       these maps. A replacement program owns a separate index. */
+    for (i = 1; i < program->num_deopt_maps; i++)
+	if (jit_resume_map_candidate(&program->deopt_maps[i]))
+	    count++;
+    if (count) {
+	program->resume_map_index = mymalloc(sizeof(JITResumeMapEntry) * count,
+					   M_PROGRAM);
+	count = 0;
+	for (i = 1; i < program->num_deopt_maps; i++)
+	    if (jit_resume_map_candidate(&program->deopt_maps[i])) {
+		program->resume_map_index[count].key = program->deopt_maps[i].resume_key;
+		program->resume_map_index[count++].map_id = i;
+	    }
+	qsort(program->resume_map_index, count, sizeof(JITResumeMapEntry),
+	      jit_resume_map_compare);
+    }
+    program->num_resume_map_entries = count;
+    program->resume_map_index_ready = 1;
+}
+
 int
 jit_program_resume_map(JITProgram *program, ResumeKey key)
 {
-    int i;
+    int low = 0, high;
 
     if (!program || key.site == 0)
 	return -1;
-    for (i = 1; i < program->num_deopt_maps; i++) {
-	JITDeoptMap *map = &program->deopt_maps[i];
+    if (!program->resume_map_index_ready)
+	jit_program_index_resume_maps(program);
+    high = program->num_resume_map_entries;
+    while (low < high) {
+	int mid = low + (high - low) / 2;
 
+	if (jit_resume_key_compare(program->resume_map_index[mid].key, key) < 0)
+	    low = mid + 1;
+	else
+	    high = mid;
+    }
+    for (; low < program->num_resume_map_entries; low++) {
+	JITResumeMapEntry *entry = &program->resume_map_index[low];
+	JITDeoptMap *map = &program->deopt_maps[entry->map_id];
+
+	if (jit_resume_key_compare(entry->key, key))
+	    break;
 	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_bridges_builtin(map))
-	    && map->stack_depth >= (unsigned) jit_call_stack_operands(map)
-	    && map->resume_key.code_unit == key.code_unit
-	    && map->resume_key.site == key.site && map->native_resume
-	    && map->native_resume->valid && map->native_resume->rehydratable)
-	    return i;
+	    && jit_resume_map_candidate(map))
+	    return entry->map_id;
     }
     return -1;
 }
@@ -8475,8 +8617,29 @@ jit_program_note_location(JITProgram *program, Objid oid, unsigned verb)
 {
     if (!program || oid < 0 || verb == 0)
 	return;
+    if (program->diagnostic_object == oid && program->diagnostic_verb == verb)
+	return;
     program->diagnostic_object = oid;
     program->diagnostic_verb = verb;
+}
+
+static void
+jit_program_finalize_runtime_layout(JITProgram *program)
+{
+    JITRuntimeLayout *layout = &program->runtime_layout;
+    size_t raw_bytes = sizeof(Num) * jit_runtime_value_slots(program);
+
+    /* Keep Var arrays aligned after the raw values and compact tag slots.
+       Slot counts are immutable for the lifetime of live native frames. */
+    layout->borrowed_offset = ((raw_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+    layout->owned_offset = layout->borrowed_offset
+	+ sizeof(Var) * program->num_borrowed_locals;
+    layout->capacities_offset = layout->owned_offset
+	+ sizeof(Var) * program->num_owned_slots;
+    layout->states_offset = layout->capacities_offset
+	+ sizeof(unsigned) * program->num_owned_slots;
+    layout->bytes = layout->states_offset + program->num_owned_slots;
 }
 
 int
@@ -8544,6 +8707,7 @@ jit_program_compile(JITProgram *program)
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
     MIR_gen_finish(jit_shared_pool.context);
+    jit_program_finalize_runtime_layout(program);
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
     program->pool_generation = 0;
@@ -8765,6 +8929,7 @@ jit_continuation_materialized_value(JITContinuationFrame *frame, int value,
     return 1;
 }
 
+#ifdef JIT_TESTING
 static int
 jit_resume_value_needs_capture(JITResumeValue *resume, var_type type)
 {
@@ -8782,6 +8947,76 @@ jit_resume_value_needs_capture(JITResumeValue *resume, var_type type)
 	|| resume->source == JIT_RESUME_STACK
 	|| resume->source == JIT_RESUME_CAPTURED;
 }
+#endif
+
+static var_type
+jit_resume_capture_action_type(JITResumeCaptureAction *action,
+			       Num *deopt_values)
+{
+    return action->tag_slot >= 0
+	? (var_type) deopt_values[action->tag_slot] : action->type;
+}
+
+#ifdef JIT_TESTING
+static void
+jit_test_build_resume_recipe(JITProgram *program, JITNativeResume *resume)
+{
+    int i;
+
+    if (!program || !resume)
+	return;
+    if (resume->capture_actions)
+	myfree(resume->capture_actions, M_PROGRAM);
+    if (resume->required_homes)
+	myfree(resume->required_homes, M_PROGRAM);
+    resume->capture_actions = 0;
+    resume->required_homes = 0;
+    resume->num_capture_actions = 0;
+    resume->num_required_homes = 0;
+    resume->capture_actions = resume->num_values
+	? mymalloc(sizeof(JITResumeCaptureAction) * resume->num_values,
+	    M_PROGRAM) : 0;
+    resume->required_homes = resume->num_values
+	? mymalloc(sizeof(int) * resume->num_values, M_PROGRAM) : 0;
+    for (i = 0; i < resume->num_values; i++) {
+	JITResumeValue *value = &resume->values[i];
+	int j;
+
+	if (value->source == JIT_RESUME_OWNER) {
+	    for (j = 0; j < resume->num_required_homes; j++)
+		if (resume->required_homes[j] == value->index)
+		    break;
+	    if (j == resume->num_required_homes)
+		resume->required_homes[resume->num_required_homes++] =
+		    value->index;
+	    continue;
+	}
+	if (value->source != JIT_RESUME_LOCAL
+	    && value->source != JIT_RESUME_STACK
+	    && value->source != JIT_RESUME_CAPTURED)
+	    continue;
+	if (value->value <= 0 || value->value >= program->num_values) {
+	    resume->capture_actions[resume->num_capture_actions].value =
+		value->value;
+	    resume->capture_actions[resume->num_capture_actions].type = TYPE_ANY;
+	    resume->capture_actions[resume->num_capture_actions].tag_slot = -1;
+	    resume->num_capture_actions++;
+	    continue;
+	}
+	for (j = 0; j < resume->num_capture_actions; j++)
+	    if (resume->capture_actions[j].value == value->value)
+		break;
+	if (j < resume->num_capture_actions)
+	    continue;
+	resume->capture_actions[j].value = value->value;
+	resume->capture_actions[j].type = program->value_types[value->value];
+	resume->capture_actions[j].tag_slot = program->value_is_tagged[value->value]
+	    ? jit_tag_index(program, value->value) : -1;
+	resume->num_capture_actions++;
+    }
+    resume->recipe_valid = 1;
+}
+#endif
 
 #ifdef JIT_TESTING
 int
@@ -8951,8 +9186,7 @@ jit_native_frame_preserve_resume(JITNativeFrame *frame, int map_id)
     Num *deopt_values;
     Var *new_roots = 0;
     unsigned num_roots = 0;
-    int capture_values;
-    int owner_values;
+    unsigned root_capacity = 0;
     int i;
 
     if (!frame || !(program = frame->program) || !frame->runtime_storage
@@ -8960,59 +9194,62 @@ jit_native_frame_preserve_resume(JITNativeFrame *frame, int map_id)
 	|| map_id >= program->num_deopt_maps)
 	return 0;
     map = &program->deopt_maps[map_id];
-    if (!(resume = map->native_resume) || !resume->valid)
+#ifdef JIT_TESTING
+    if (map->native_resume)
+	jit_test_build_resume_recipe(program, map->native_resume);
+#endif
+    if (!(resume = map->native_resume) || !resume->valid
+	|| !resume->recipe_valid)
 	return 0;
-    capture_values = resume->capture_classified
-	? resume->num_capture_values : resume->num_values;
-    owner_values = resume->capture_classified
-	? resume->num_owner_values : 0;
-    if (capture_values)
-	new_roots = mymalloc(sizeof(Var) * capture_values, M_PROGRAM);
     deopt_values = frame->runtime_storage;
-    for (i = 0; i < capture_values; i++) {
-	JITResumeValue *value = &resume->values[i];
-	var_type type;
+    for (i = 0; i < resume->num_required_homes; i++) {
+	int home = resume->required_homes[i];
+
+	if (home < 0 || home >= program->num_owned_slots
+	    || !frame->home_states
+	    || frame->home_states[home] != JIT_HOME_OWNED
+	    || frame->homes[home].type == TYPE_NONE)
+	    goto fail;
+    }
+    if (!resume->num_capture_actions) {
+	jit_native_frame_release_resume_roots(frame);
+	frame->pending_resume_map = map_id;
+	return 1;
+    }
+    for (i = 0; i < resume->num_capture_actions; i++) {
+	JITResumeCaptureAction *action = &resume->capture_actions[i];
+	var_type type = jit_resume_capture_action_type(action, deopt_values);
 	Num raw;
 
-	if (value->source == JIT_RESUME_RESULT
-	    || value->source == JIT_RESUME_CONSTANT
-	    || value->source == JIT_RESUME_OPERAND)
-	    continue;
-	if (value->source == JIT_RESUME_OWNER) {
-	    if (value->index < 0 || value->index >= program->num_owned_slots
-		|| !frame->home_states
-		|| frame->home_states[value->index] != JIT_HOME_OWNED
-		|| frame->homes[value->index].type == TYPE_NONE)
-		goto fail;
-	    continue;
-	}
-	type = program->value_is_tagged && program->value_is_tagged[value->value]
-	    ? (var_type) deopt_values[jit_tag_index(program, value->value)]
-	    : program->value_types[value->value];
 	if (!jit_runtime_type_is_valid(type))
 	    goto fail;
-	if (!jit_resume_value_needs_capture(value, type))
+	if (!jit_continuation_type_needs_owner(type))
 	    continue;
-	raw = jit_deopt_raw_value(program, value->value, deopt_values);
+	raw = jit_deopt_raw_value(program, action->value, deopt_values);
+	if (!jit_raw_value_is_retained(program, type, raw, frame->homes,
+		frame->home_states, 0, 0))
+	    root_capacity++;
+    }
+    if (root_capacity)
+	new_roots = mymalloc(sizeof(Var) * root_capacity, M_PROGRAM);
+    for (i = 0; root_capacity && i < resume->num_capture_actions; i++) {
+	JITResumeCaptureAction *action = &resume->capture_actions[i];
+	var_type type = jit_resume_capture_action_type(action, deopt_values);
+	Num raw;
+
+	if (!jit_continuation_type_needs_owner(type))
+	    continue;
+	raw = jit_deopt_raw_value(program, action->value, deopt_values);
 	if (!jit_raw_value_is_retained(program, type, raw, frame->homes,
 		frame->home_states, new_roots, num_roots))
 	    new_roots[num_roots++] = materialize_deopt_value(type, raw);
     }
-    for (i = capture_values; i < capture_values + owner_values; i++) {
-	JITResumeValue *value = &resume->values[i];
-
-	if (value->index < 0 || value->index >= program->num_owned_slots
-	    || !frame->home_states
-	    || frame->home_states[value->index] != JIT_HOME_OWNED
-	    || frame->homes[value->index].type == TYPE_NONE)
-	    goto fail;
-    }
     jit_native_frame_release_resume_roots(frame);
     frame->resume_roots = new_roots;
     frame->num_resume_roots = num_roots;
-    frame->resume_roots_capacity = capture_values;
+    frame->resume_roots_capacity = root_capacity;
     frame->pending_resume_map = map_id;
-    program->active_runtime_bytes += sizeof(Var) * capture_values;
+    program->active_runtime_bytes += sizeof(Var) * root_capacity;
     return 1;
 
   fail:
@@ -9030,20 +9267,15 @@ jit_native_frame_capture_continuation(JITNativeFrame *frame, int map_id)
     JITProgram *program;
     Num *deopt_values;
     Var *borrowed_locals = 0;
-    size_t deopt_bytes;
-    size_t deopt_storage_bytes;
 
     if (!frame || !(program = frame->program) || !frame->runtime_storage
 	|| !frame->owns_runtime || frame->runtime_borrower
 	|| frame->pending_resume_map != map_id)
 	return 0;
     deopt_values = frame->runtime_storage;
-    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
-    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
-	* sizeof(Var);
     if (program->num_borrowed_locals)
 	borrowed_locals = (Var *) ((char *) frame->runtime_storage
-	    + deopt_storage_bytes);
+	    + program->runtime_layout.borrowed_offset);
     continuation = jit_continuation_capture(program, map_id, deopt_values,
 	frame->runtime_storage, borrowed_locals, frame->homes,
 	frame->home_states, frame->home_capacities, frame->runtime_bytes, 0);
@@ -9066,8 +9298,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     Var *new_values;
     int new_values_capacity;
     int captured_values = 0;
-    int capture_values;
-    int owner_values;
+    JITNativeResume *recipe;
     int i;
 
     if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
@@ -9083,72 +9314,51 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	    || frame->runtime_bytes != runtime_bytes))
 	return 0;
     map = &program->deopt_maps[map_id];
-    if (!map->native_resume || !map->native_resume->valid)
+#ifdef JIT_TESTING
+    if (map->native_resume)
+	jit_test_build_resume_recipe(program, map->native_resume);
+#endif
+    if (!(recipe = map->native_resume) || !recipe->valid
+	|| !recipe->recipe_valid)
 	return 0;
-    capture_values = map->native_resume->capture_classified
-	? map->native_resume->num_capture_values
-	: map->native_resume->num_values;
-    owner_values = map->native_resume->capture_classified
-	? map->native_resume->num_owner_values : 0;
-    for (i = 0; i < capture_values; i++) {
-	JITResumeValue *resume = &map->native_resume->values[i];
-	var_type type;
+    for (i = 0; i < recipe->num_required_homes; i++) {
+	int home = recipe->required_homes[i];
 
-	if (resume->source == JIT_RESUME_RESULT
-	    || resume->source == JIT_RESUME_CONSTANT
-	    || resume->source == JIT_RESUME_OPERAND)
-	    continue;
-	if (resume->source == JIT_RESUME_OWNER) {
-	    if (resume->index < 0 || resume->index >= program->num_owned_slots
-		|| !home_states
-		|| home_states[resume->index] != JIT_HOME_OWNED
-		|| owned_values[resume->index].type == TYPE_NONE)
-		return 0;
-	    continue;
-	}
-	type = program->value_is_tagged
-	    && program->value_is_tagged[resume->value]
-	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
-	    : program->value_types[resume->value];
+	if (home < 0 || home >= program->num_owned_slots || !home_states
+	    || home_states[home] != JIT_HOME_OWNED
+	    || owned_values[home].type == TYPE_NONE)
+	    return 0;
+    }
+    for (i = 0; i < recipe->num_capture_actions; i++) {
+	JITResumeCaptureAction *action = &recipe->capture_actions[i];
+	var_type type = jit_resume_capture_action_type(action, deopt_values);
+	Num raw;
+	int duplicate = 0;
+	int j;
+
 	if (!jit_runtime_type_is_valid(type))
 	    return 0;
-	if (jit_resume_value_needs_capture(resume, type)) {
-	    Num raw = jit_deopt_raw_value(program, resume->value, deopt_values);
-	    int duplicate = 0;
-	    int j;
+	if (!jit_continuation_type_needs_owner(type))
+	    continue;
+	raw = jit_deopt_raw_value(program, action->value, deopt_values);
+	if (jit_raw_value_is_retained(program, type, raw, owned_values,
+		home_states, 0, 0))
+	    continue;
+	for (j = 0; j < i; j++) {
+	    JITResumeCaptureAction *previous = &recipe->capture_actions[j];
+	    var_type previous_type = jit_resume_capture_action_type(previous,
+		deopt_values);
 
-	    if (jit_raw_value_is_retained(program, type, raw, owned_values,
-		    home_states, 0, 0))
-		continue;
-	    for (j = 0; j < i; j++) {
-		JITResumeValue *prev = &map->native_resume->values[j];
-		if (prev->source != JIT_RESUME_RESULT
-		    && prev->source != JIT_RESUME_CONSTANT
-		    && prev->source != JIT_RESUME_OPERAND
-		    && prev->source != JIT_RESUME_OWNER) {
-		    var_type prev_type = program->value_is_tagged
-			&& program->value_is_tagged[prev->value]
-			? (var_type) deopt_values[jit_tag_index(program, prev->value)]
-			: program->value_types[prev->value];
-		    if (prev_type == type
-			&& jit_resume_value_needs_capture(prev, prev_type)
-			&& jit_deopt_raw_value(program, prev->value, deopt_values) == raw) {
-			duplicate = 1;
-			break;
-		    }
-		}
+	    if (previous_type == type
+		&& jit_continuation_type_needs_owner(previous_type)
+		&& jit_deopt_raw_value(program, previous->value,
+		    deopt_values) == raw) {
+		duplicate = 1;
+		break;
 	    }
-	    if (!duplicate)
-		captured_values++;
 	}
-    }
-    for (i = capture_values; i < capture_values + owner_values; i++) {
-	JITResumeValue *resume = &map->native_resume->values[i];
-
-	if (resume->index < 0 || resume->index >= program->num_owned_slots
-	    || !home_states || home_states[resume->index] != JIT_HOME_OWNED
-	    || owned_values[resume->index].type == TYPE_NONE)
-	    return 0;
+	if (!duplicate)
+	    captured_values++;
     }
     new_values_capacity = captured_values;
     if (frame) {
@@ -9170,21 +9380,12 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     for (i = 0; i < captured_values; i++)
 	new_values[i].type = TYPE_NONE;
     captured_values = 0;
-    for (i = 0; i < capture_values; i++) {
-	JITResumeValue *resume = &map->native_resume->values[i];
-	var_type type;
+    for (i = 0; i < recipe->num_capture_actions; i++) {
+	JITResumeCaptureAction *action = &recipe->capture_actions[i];
+	var_type type = jit_resume_capture_action_type(action, deopt_values);
 
-	if (resume->source == JIT_RESUME_RESULT
-	    || resume->source == JIT_RESUME_CONSTANT
-	    || resume->source == JIT_RESUME_OWNER
-	    || resume->source == JIT_RESUME_OPERAND)
-	    continue;
-	type = program->value_is_tagged
-	    && program->value_is_tagged[resume->value]
-	    ? (var_type) deopt_values[jit_tag_index(program, resume->value)]
-	    : program->value_types[resume->value];
-	if (jit_resume_value_needs_capture(resume, type)) {
-	    Num raw = jit_deopt_raw_value(program, resume->value, deopt_values);
+	if (jit_continuation_type_needs_owner(type)) {
+	    Num raw = jit_deopt_raw_value(program, action->value, deopt_values);
 
 	    if (!jit_raw_value_is_retained(program, type, raw, owned_values,
 		    home_states, new_values, captured_values))
@@ -9221,7 +9422,7 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
     frame->home_capacities = home_capacities;
     frame->home_states = home_states;
     frame->runtime_bytes = runtime_bytes;
-    if (program->usage)
+    if (jit_profile_detail && program->usage)
 	program->usage->continuation_captures++;
     return frame;
 }
@@ -9250,9 +9451,6 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
     JITProgram *program;
     Num *deopt_values;
     Var *borrowed_locals = 0;
-    size_t deopt_bytes;
-    size_t deopt_storage_bytes;
-    size_t required_bytes;
     unsigned stack_depth;
 
     if (!native_frame || !a || !(program = native_frame->program)
@@ -9309,16 +9507,11 @@ jit_native_frame_prepare_activation(JITNativeFrame *native_frame,
     if (stack_depth > (unsigned) a->rt_stack_size)
 	return 0;
     deopt_values = native_frame->runtime_storage;
-    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
-    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
-	* sizeof(Var);
-    required_bytes = deopt_storage_bytes
-	+ sizeof(Var) * program->num_borrowed_locals;
-    if (native_frame->runtime_bytes < required_bytes)
+    if (native_frame->runtime_bytes < program->runtime_layout.owned_offset)
 	return 0;
     if (program->num_borrowed_locals)
 	borrowed_locals = (Var *) ((char *) native_frame->runtime_storage
-	    + deopt_storage_bytes);
+	    + program->runtime_layout.borrowed_offset);
     continuation = jit_continuation_capture(program, map_id, deopt_values,
 	0, borrowed_locals, native_frame->homes, native_frame->home_states,
 	native_frame->home_capacities, 0, 0);
@@ -9444,7 +9637,7 @@ jit_continuation_materialize(activation *a)
 	|| frame->map_id >= program->num_deopt_maps)
 	return 0;
     map = &program->deopt_maps[frame->map_id];
-    if (program->usage)
+    if (jit_profile_detail && program->usage)
 	program->usage->continuation_materializations++;
     depth = map->stack_depth;
     if (frame->dispatched) {
@@ -9525,7 +9718,7 @@ jit_continuation_materialize_boundary(activation *a, Var *boundary,
     if (!jit_continuation_prepare_boundary_activation(frame, a, boundary,
 	    boundary_depth))
 	return 0;
-    if (frame->program->usage)
+    if (jit_profile_detail && frame->program->usage)
 	frame->program->usage->continuation_materializations++;
     free_var(a->temp);
     a->temp.type = TYPE_NONE;
@@ -9670,6 +9863,7 @@ jit_test_guard_actual_type(JITProgram *program, JITDeoptMap *map, Var *env,
 }
 #endif
 
+#ifdef JIT_VERIFY_NATIVE_FRAMES
 static void
 jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
 			       Num *deopt_values)
@@ -9687,6 +9881,45 @@ jit_validate_materialized_tags(JITProgram *program, JITDeoptMap *map,
 	}
     }
 }
+#endif
+
+static void
+jit_initialize_deopt(JITProgram *program, JITDeoptState *deopt, int entry)
+{
+    if (!deopt)
+	return;
+    memset(deopt, 0, sizeof(*deopt));
+    deopt->map_id = -1;
+    deopt->builtin_func = -1;
+    deopt->operation = -1;
+    deopt->guard_local[0] = deopt->guard_local[1] = -1;
+    if (entry && program->num_deopt_maps > 0) {
+	JITDeoptMap *map = &program->deopt_maps[0];
+
+	deopt->bytecode_pc = map->bytecode_pc;
+	deopt->error_pc = map->error_pc;
+	deopt->source_lineno = map->source_lineno;
+	deopt->stack_depth = map->stack_depth;
+	deopt->ticks_charged = map->ticks_charged;
+	deopt->builtin_func = map->builtin_func;
+	deopt->operation = map->operation;
+	memcpy(deopt->guard_value, map->guard_value, sizeof(deopt->guard_value));
+	memcpy(deopt->guard_local, map->guard_local, sizeof(deopt->guard_local));
+	memcpy(deopt->guard_expected, map->guard_expected,
+	       sizeof(deopt->guard_expected));
+	deopt->reason = map->reason;
+    }
+}
+
+static void
+jit_initialize_return_deopt(JITDeoptState *deopt)
+{
+    if (!deopt)
+	return;
+    deopt->map_id = -1;
+    deopt->materialized = 0;
+    deopt->boundary = JIT_BOUNDARY_NONE;
+}
 
 JITRunResult
 jit_program_execute_in_context(JITProgram *program,
@@ -9698,7 +9931,8 @@ jit_program_execute_in_context(JITProgram *program,
 			       JITDeoptState *deopt, Var *deopt_stack,
 			       Objid progr, int resume_map,
 			       JITContinuationFrame *continuation_in,
-			       JITContinuationFrame **continuation_out)
+			       JITContinuationFrame **continuation_out,
+			       int prepared_entry)
 {
     NativeFunction function;
     int64_t native_result;
@@ -9709,8 +9943,6 @@ jit_program_execute_in_context(JITProgram *program,
     unsigned *home_capacities = 0;
     unsigned char *home_states = 0;
     void *runtime_storage;
-    size_t deopt_bytes;
-    size_t deopt_storage_bytes;
     size_t runtime_bytes;
     JITSourceLocation ignored_location;
     int runtime_from_continuation = continuation_in != 0;
@@ -9749,7 +9981,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    runtime_borrowed_from_frame = 1;
 	}
 	resume_map = continuation_in->map_id;
-	if (program->usage)
+	if (jit_profile_detail && program->usage)
 	    program->usage->continuation_resumes++;
     }
 
@@ -9758,39 +9990,16 @@ jit_program_execute_in_context(JITProgram *program,
     source_location->bytecode_pc = (unsigned) -1;
     source_location->error_pc = 0;
     source_location->source_lineno = 0;
-    if (deopt) {
-	memset(deopt, 0, sizeof(*deopt));
-	deopt->map_id = -1;
-	deopt->builtin_func = -1;
-	deopt->operation = -1;
-	deopt->guard_local[0] = deopt->guard_local[1] = -1;
-	if (program && program->num_deopt_maps > 0) {
-	    deopt->bytecode_pc = program->deopt_maps[0].bytecode_pc;
-	    deopt->error_pc = program->deopt_maps[0].error_pc;
-	    deopt->source_lineno = program->deopt_maps[0].source_lineno;
-	    deopt->stack_depth = program->deopt_maps[0].stack_depth;
-	    deopt->ticks_charged = program->deopt_maps[0].ticks_charged;
-	    deopt->builtin_func = program->deopt_maps[0].builtin_func;
-	    deopt->operation = program->deopt_maps[0].operation;
-	    memcpy(deopt->guard_value, program->deopt_maps[0].guard_value,
-		   sizeof(deopt->guard_value));
-	    memcpy(deopt->guard_local, program->deopt_maps[0].guard_local,
-		   sizeof(deopt->guard_local));
-	    memcpy(deopt->guard_expected, program->deopt_maps[0].guard_expected,
-		   sizeof(deopt->guard_expected));
-	    deopt->reason = program->deopt_maps[0].reason;
-	}
-    }
-    if (!jit_program_compile(program))
+    /* A successful return exposes only neutral boundary state.  Complete
+       reconstruction metadata is initialized on a cold exit below. */
+    jit_initialize_return_deopt(deopt);
+    if (prepared_entry
+	? (program->state != JIT_STATE_COMPILED || !program->native_function)
+	: !jit_program_compile(program)) {
+	jit_initialize_deopt(program, deopt, 1);
 	return JIT_RUN_FALLBACK;
-    deopt_bytes = sizeof(Num) * jit_runtime_value_slots(program);
-    deopt_storage_bytes = ((deopt_bytes + sizeof(Var) - 1) / sizeof(Var))
-	* sizeof(Var);
-    runtime_bytes = deopt_storage_bytes
-	+ sizeof(Var) * (program->num_borrowed_locals
-			 + program->num_owned_slots)
-	+ sizeof(unsigned) * program->num_owned_slots
-	+ program->num_owned_slots;
+    }
+    runtime_bytes = program->runtime_layout.bytes;
     if (runtime_from_continuation) {
 	runtime_storage = continuation_in->runtime_storage;
 	deopt_values = continuation_in->deopt_values;
@@ -9810,7 +10019,7 @@ jit_program_execute_in_context(JITProgram *program,
 	home_states = native_frame->home_states;
 	if (program->num_borrowed_locals)
 	    borrowed_locals = (Var *) ((char *) runtime_storage
-		+ deopt_storage_bytes);
+		+ program->runtime_layout.borrowed_offset);
     } else {
 	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
 				   M_PROGRAM);
@@ -9819,26 +10028,29 @@ jit_program_execute_in_context(JITProgram *program,
 	deopt_values[0] = 0;
 	{
 	    int i;
+#ifdef JIT_VERIFY_NATIVE_FRAMES
 	    int tag_slots = program->value_tag_slots
 		? program->num_tag_slots : program->num_values;
 
 	    for (i = 0; i < tag_slots; i++)
 		deopt_values[program->num_values + i] = TYPE_ANY;
+#endif
 	    if (program->num_borrowed_locals) {
 		borrowed_locals = (Var *) ((char *) runtime_storage
-		    + deopt_storage_bytes);
+		    + program->runtime_layout.borrowed_offset);
 		for (i = 0; i < program->num_borrowed_locals; i++)
 		    borrowed_locals[i] = var_ref(
 			env[program->borrowed_local_slots[i]]);
 	    }
 	    owned_values = program->num_owned_slots
-		? (Var *) ((char *) runtime_storage + deopt_storage_bytes
-		    + sizeof(Var) * program->num_borrowed_locals) : 0;
+		? (Var *) ((char *) runtime_storage
+		    + program->runtime_layout.owned_offset) : 0;
 	    home_capacities = program->num_owned_slots
-		? (unsigned *) (owned_values + program->num_owned_slots) : 0;
+		? (unsigned *) ((char *) runtime_storage
+		    + program->runtime_layout.capacities_offset) : 0;
 	    home_states = program->num_owned_slots
-		? (unsigned char *) (home_capacities
-		    + program->num_owned_slots) : 0;
+		? (unsigned char *) runtime_storage
+		    + program->runtime_layout.states_offset : 0;
 	    for (i = 0; i < program->num_owned_slots; i++) {
 		owned_values[i].type = TYPE_NONE;
 		home_capacities[i] = 0;
@@ -9873,6 +10085,36 @@ jit_program_execute_in_context(JITProgram *program,
 	native_frame->resume_result.v.num = 0;
     }
     returned_owned = native_result == JIT_NATIVE_RETURNED_OWNED;
+    if (native_result == JIT_RUN_RETURNED || returned_owned) {
+	for (i = 0; i < program->num_owned_slots; i++)
+	    home_states[i] = owned_values[i].type == TYPE_NONE
+		? JIT_HOME_EMPTY : JIT_HOME_OWNED;
+	if (result && returned_owned)
+	    jit_take_returned_owner(program, result, owned_values, home_states,
+				    home_capacities);
+	else if (result)
+	    *result = var_ref(*result);
+	if (runtime_from_frame)
+	    jit_native_frame_release_runtime(native_frame);
+	if (!runtime_from_continuation && !runtime_from_frame) {
+	    for (i = 0; i < program->num_borrowed_locals; i++)
+		free_var(borrowed_locals[i]);
+	    for (i = 0; i < program->num_owned_slots; i++)
+		free_var(owned_values[i]);
+	    program->active_runtime_bytes -= runtime_bytes;
+	    myfree(runtime_storage, M_PROGRAM);
+	}
+	if (!runtime_borrowed_from_frame)
+	    jit_native_frame_unbind_runtime(native_frame);
+	source_location->bytecode_pc = 0;
+	source_location->error_pc = 0;
+	source_location->source_lineno = 0;
+	return JIT_RUN_RETURNED;
+    }
+
+    /* Everything below is the cold exit path. */
+    if (deopt_map < 0 && native_result != JIT_RUN_RETURNED && !returned_owned)
+	jit_initialize_deopt(program, deopt, 1);
     if (source_location->bytecode_pc < (unsigned) program->num_status_locations)
 	*source_location = program->status_locations[source_location->bytecode_pc];
     else {
@@ -9889,7 +10131,7 @@ jit_program_execute_in_context(JITProgram *program,
 	|| native_result == JIT_RUN_CALL_VERB
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
 	JITDeoptMap *map;
-	Var *new_stack = 0;
+	Var *stack_values = 0;
 	unsigned materialized_depth;
 	unsigned stack_start = 0;
 	int compact_boundary = 0;
@@ -9912,7 +10154,9 @@ jit_program_execute_in_context(JITProgram *program,
 	    return JIT_RUN_FALLBACK;
 	}
 	map = &program->deopt_maps[deopt_map];
+#ifdef JIT_VERIFY_NATIVE_FRAMES
 	jit_validate_materialized_tags(program, map, deopt_values);
+#endif
 	materialized_depth = map->stack_depth;
 	if (native_result == JIT_RUN_CALL_VERB && continuation_out
 	    && (map->reason == JIT_DEOPT_VERB_CALL
@@ -9952,7 +10196,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    int first_operand = map->stack_depth - jit_call_stack_operands(map);
 
 	    suspend_zero_boundary = 1;
-	    if (program->usage)
+	    if (jit_profile_detail && program->usage)
 		program->usage->continuation_fast_suspends++;
 	    for (i = first_operand; i < (int) map->stack_depth; i++)
 		if (map->stack_boundary_ownership
@@ -9994,17 +10238,17 @@ jit_program_execute_in_context(JITProgram *program,
 	if (!suspend_zero_boundary && deopt_stack && (map->stack_depth
 			    || (jit_deopt_map_is_specialized_builtin(map)
 				&& map->builtin_args == 0)))
-	    new_stack = mymalloc(sizeof(Var) * (map->stack_depth + 1), M_PROGRAM);
-	for (i = stack_start; new_stack && i < (int) map->stack_depth; i++) {
+	    stack_values = deopt_stack;
+	for (i = stack_start; stack_values && i < (int) map->stack_depth; i++) {
 	    ResumeStackSlot slot = map->stack_slots
 		? map->stack_slots[i]
 		: (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
 	    var_type type = jit_deopt_map_stack_type(program, map, i);
 
 	    if (slot.kind != RSS_VALUE) {
-		new_stack[i - stack_start].type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		stack_values[i - stack_start].type = slot.kind == RSS_CATCH ? TYPE_CATCH
 		    : slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
-		new_stack[i - stack_start].v.num = slot.data;
+		stack_values[i - stack_start].v.num = slot.data;
 		continue;
 	    }
 	    if (map->stack_owner_slots && map->stack_owner_slots[i] >= 0)
@@ -10014,22 +10258,18 @@ jit_program_execute_in_context(JITProgram *program,
 		type = (var_type) deopt_values[jit_tag_index(program,
 		    map->stack_values[i])];
 
-	    new_stack[i - stack_start] = jit_take_boundary_stack_value(program,
+	    stack_values[i - stack_start] = jit_take_boundary_stack_value(program,
 		map, i, type, deopt_values, owned_values, home_states);
 	}
-	if (new_stack && jit_deopt_map_is_specialized_builtin(map)) {
+	if (stack_values && jit_deopt_map_is_specialized_builtin(map)) {
 	    int outer_depth = compact_boundary ? 0
 		: map->stack_depth - map->builtin_args;
 	    Var args = new_list(map->builtin_args);
 
 	    for (i = 0; i < map->builtin_args; i++)
-		args.v.list[i + 1] = new_stack[outer_depth + i];
-	    new_stack[outer_depth] = args;
+		args.v.list[i + 1] = stack_values[outer_depth + i];
+	    stack_values[outer_depth] = args;
 	    materialized_depth = outer_depth + 1;
-	}
-	if (new_stack) {
-	    memcpy(deopt_stack, new_stack, sizeof(Var) * materialized_depth);
-	    myfree(new_stack, M_PROGRAM);
 	}
 	if (deopt) {
 	    deopt->map_id = deopt_map;
@@ -10063,17 +10303,8 @@ jit_program_execute_in_context(JITProgram *program,
 	}
     }
 
-    if (native_result == JIT_RUN_RETURNED || returned_owned) {
-	if (result && returned_owned)
-	    jit_take_returned_owner(program, result, owned_values, home_states,
-				    home_capacities);
-	else if (result)
-	    *result = var_ref(*result);
-	native_result = JIT_RUN_RETURNED;
-    }
     if (runtime_from_frame && !runtime_transferred
-	&& (native_result == JIT_RUN_RETURNED
-	    || native_frame->kind != JIT_FRAME_COMPACT))
+	&& native_frame->kind != JIT_FRAME_COMPACT)
 	jit_native_frame_release_runtime(native_frame);
     if (!runtime_from_continuation && !runtime_from_frame
 	&& !runtime_transferred) {
@@ -10106,7 +10337,7 @@ jit_program_execute(JITProgram *program, Var *env, Var *result,
     run_result = jit_program_execute_in_context(program, &context, &root,
 	env, result,
 	ticks, timed_out, error, source_location, deopt, deopt_stack, progr,
-	resume_map, continuation_in, continuation_out);
+	resume_map, continuation_in, continuation_out, 0);
     if (!jit_execution_context_finish(&context, &root))
 	panic("JIT root execution context did not detach cleanly");
     return run_result;
@@ -10469,11 +10700,14 @@ void
 jit_profile_record_entry(JITProgram *program)
 {
     total_jit_entries++;
-    if (program) {
+
+    if (jit_profile_detail && program) {
 	jit_program_usage(program);
+	if (!jit_profile_detail_time)
+	    jit_profile_detail_time = time(0);
 	program->usage->entries++;
 	program->usage->last_used_generation = ++jit_use_generation;
-	program->usage->last_used_time = time(0);
+	program->usage->last_used_time = jit_profile_detail_time;
     }
 }
 
@@ -10481,7 +10715,7 @@ void
 jit_profile_record_completed(JITProgram *program)
 {
     total_jit_completed++;
-    if (program && program->usage)
+    if (jit_profile_detail && program && program->usage)
 	program->usage->completions++;
 }
 
@@ -10489,7 +10723,7 @@ void
 jit_profile_record_vm_call(JITProgram *program)
 {
     total_vm_calls++;
-    if (program && program->usage)
+    if (jit_profile_detail && program && program->usage)
 	program->usage->vm_calls++;
 }
 
@@ -10499,7 +10733,8 @@ jit_profile_record_native_call(JITExecutionContext *context)
     JITNativeFrame *frame;
     uint64_t depth;
 
-    if (!context || !(frame = context->current_frame) || !frame->caller)
+    if (!jit_profile_detail || !context
+	|| !(frame = context->current_frame) || !frame->caller)
 	return;
     jit_program_usage(frame->caller->program)->native_chain_calls++;
     depth = context->native_depth + 1;
@@ -10514,14 +10749,14 @@ jit_profile_record_native_call(JITExecutionContext *context)
 void
 jit_profile_record_native_return(JITNativeFrame *caller)
 {
-    if (caller && caller->program)
+    if (jit_profile_detail && caller && caller->program)
 	jit_program_usage(caller->program)->native_chain_returns++;
 }
 
 void
 jit_profile_record_native_promotion(JITNativeFrame *frame)
 {
-    if (frame && frame->program)
+    if (jit_profile_detail && frame && frame->program)
 	jit_program_usage(frame->program)->native_chain_promotions++;
 }
 
@@ -10729,6 +10964,8 @@ jit_profile_maybe_report(int now)
     Num log_mode = server_int_option("jit_deopt_log_mode", 0);
     Num interval;
 
+    jit_profile_detail_time = now;
+
     if (log_mode == 2)
 	return;
 
@@ -10745,6 +10982,21 @@ jit_profile_maybe_report(int now)
 	last_deopt_report_time = now;
 	jit_profile_report();
     }
+}
+
+int
+jit_profile_detail_enabled(void)
+{
+    return jit_profile_detail;
+}
+
+void
+jit_profile_set_detail(int enabled)
+{
+    enabled = !!enabled;
+    if (enabled && !jit_profile_detail)
+	jit_profile_detail_time = time(0);
+    jit_profile_detail = enabled;
 }
 
 void

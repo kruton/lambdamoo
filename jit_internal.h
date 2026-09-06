@@ -13,6 +13,7 @@ typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
 typedef struct JITReconstructionState JITReconstructionState;
 typedef struct JITResumeValue JITResumeValue;
+typedef struct JITResumeCaptureAction JITResumeCaptureAction;
 typedef struct JITNativeResume JITNativeResume;
 typedef struct JITLocalValue JITLocalValue;
 typedef struct JITProgramUsage JITProgramUsage;
@@ -56,6 +57,12 @@ struct JITResumeValue {
     JITResumeSource source;
 };
 
+struct JITResumeCaptureAction {
+    int value;
+    int tag_slot;
+    var_type type;
+};
+
 typedef struct {
     Num literal;
     var_type literal_type;
@@ -66,11 +73,16 @@ struct JITNativeResume {
     int num_capture_values;
     JITResumeValue *values;
     int num_owner_values;
+    int num_capture_actions;
+    JITResumeCaptureAction *capture_actions;
+    int num_required_homes;
+    int *required_homes;
     int num_literals;
     JITResumeLiteral *literals;
     unsigned char valid;
     unsigned char rehydratable;
     unsigned char capture_classified;
+    unsigned char recipe_valid;
 };
 
 struct JITContinuationFrame {
@@ -254,6 +266,19 @@ struct JITProgramUsage {
     uint64_t native_chain_max_depth;
 };
 
+typedef struct {
+    ResumeKey key;
+    int map_id;
+} JITResumeMapEntry;
+
+typedef struct {
+    size_t borrowed_offset;
+    size_t owned_offset;
+    size_t capacities_offset;
+    size_t states_offset;
+    size_t bytes;
+} JITRuntimeLayout;
+
 struct JITProgram {
     JITState state;
     const char *reason;
@@ -275,6 +300,9 @@ struct JITProgram {
     unsigned type_guard_sites;
     unsigned eliminated_type_guard_sites;
     JITDeoptMap *deopt_maps;
+    JITResumeMapEntry *resume_map_index;
+    int num_resume_map_entries;
+    int resume_map_index_ready;
     JITReconstructionState *reconstruction_states;
     JITSourceLocation *status_locations;
     JITBlock *blocks;
@@ -303,6 +331,8 @@ struct JITProgram {
     unsigned char *value_is_int_list;
     int num_borrowed_locals;
     int *borrowed_local_slots;
+    /* Finalized before publishing native code; retained with its metadata. */
+    JITRuntimeLayout runtime_layout;
     size_t active_runtime_bytes;
     uint64_t active_native_frames;
     size_t active_native_frame_bytes;
@@ -415,6 +445,8 @@ extern void jit_rt_discard_owned(Var *, int, int64_t, int);
 extern void jit_rt_retain_raw(int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
 				  int, int32_t *);
+extern Var *jit_rt_list_nested_index_set(Var *, int, int64_t, int64_t,
+					 int64_t, int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int64_t *, int32_t *);

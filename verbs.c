@@ -811,6 +811,21 @@ bf_jit_perf_map(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr
 }
 
 static package
+bf_jit_profile_detail(Var arglist, Byte next UNUSED_, void *vdata UNUSED_,
+		      Objid progr)
+{
+    int nargs = arglist.v.list[0].v.num;
+    int enabled = nargs > 0 && is_true(arglist.v.list[1]);
+
+    free_var(arglist);
+    if (!is_wizard(progr))
+	return make_error_pack(E_PERM);
+    if (nargs > 0)
+	jit_profile_set_detail(enabled);
+    return make_int_pack(jit_profile_detail_enabled());
+}
+
+static package
 bf_jit_pool_policy(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr)
 {
     int nargs = arglist.v.list[0].v.num;
@@ -900,6 +915,8 @@ register_verbs(void)
     register_function("jit_compile", 2, 2, bf_jit_compile,
 		      TYPE_OBJ, TYPE_ANY);
     register_function("jit_perf_map", 0, 1, bf_jit_perf_map, TYPE_ANY);
+    register_function("jit_profile_detail", 0, 1, bf_jit_profile_detail,
+		      TYPE_ANY);
     register_function("jit_pool_policy", 0, 1, bf_jit_pool_policy, TYPE_LIST);
     register_function("jit_pool_rotate", 0, 0, bf_jit_pool_rotate);
 #else

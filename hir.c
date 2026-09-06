@@ -4731,6 +4731,7 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	case HIR_OP_COMPLEMENT:
 	case HIR_OP_TOINT:
 	    contract.operands[0] = JIT_TYPE_MASK(TYPE_INT);
+	    contract.tagged_dispatch = 1;
 	    break;
 	case HIR_OP_NEGATE:
 	case HIR_OP_ABS:
@@ -6527,6 +6528,7 @@ jit_build_int_list_values(JITProgram *program)
 				&& !program->value_is_tagged[instr->src2]
 				? program->value_types[instr->src2] : TYPE_ANY);
 		    else if (instr->kind == HIR_TAC_INDEX_SET
+			&& instr->op != HIR_OP_INDEX
 			&& instr->src1 > 0 && instr->src1 < program->num_values
 			&& program->value_is_int_list[instr->src1]
 			&& instr->src3 > 0 && instr->src3 < program->num_values
@@ -7426,13 +7428,17 @@ static void
 jit_classify_resume_values(JITProgram *program, JITNativeResume *resume)
 {
     JITResumeValue *ordered;
+    JITResumeCaptureAction *actions;
+    int *required_homes;
     int group;
     int next = 0;
     int i;
 
     if (!resume || resume->num_values <= 0) {
-	if (resume)
+	if (resume) {
 	    resume->capture_classified = 1;
+	    resume->recipe_valid = 1;
+	}
 	return;
     }
     ordered = mymalloc(sizeof(JITResumeValue) * resume->num_values, M_PROGRAM);
@@ -7454,7 +7460,65 @@ jit_classify_resume_values(JITProgram *program, JITNativeResume *resume)
     memcpy(resume->values, ordered,
 	   sizeof(JITResumeValue) * resume->num_values);
     myfree(ordered, M_PROGRAM);
+
+    actions = resume->num_capture_values
+	? mymalloc(sizeof(JITResumeCaptureAction)
+	    * resume->num_capture_values, M_PROGRAM) : 0;
+    required_homes = resume->num_owner_values
+	? mymalloc(sizeof(int) * resume->num_owner_values, M_PROGRAM) : 0;
+    for (i = 0; i < resume->num_capture_values; i++) {
+	JITResumeValue *value = &resume->values[i];
+	int j;
+
+	for (j = 0; j < resume->num_capture_actions; j++)
+	    if (actions[j].value == value->value)
+		break;
+	if (j < resume->num_capture_actions)
+	    continue;
+	actions[resume->num_capture_actions].value = value->value;
+	if (value->value <= 0 || value->value >= program->num_values) {
+	    actions[resume->num_capture_actions].type = TYPE_ANY;
+	    actions[resume->num_capture_actions].tag_slot = -1;
+	    resume->num_capture_actions++;
+	    continue;
+	}
+	actions[resume->num_capture_actions].type =
+	    program->value_types[value->value];
+	actions[resume->num_capture_actions].tag_slot =
+	    program->value_is_tagged[value->value]
+	    ? program->num_values + (program->value_tag_slots
+		? program->value_tag_slots[value->value] : value->value) : -1;
+	resume->num_capture_actions++;
+    }
+    for (i = resume->num_capture_values;
+	 i < resume->num_capture_values + resume->num_owner_values; i++) {
+	int home = resume->values[i].index;
+	int j;
+
+	for (j = 0; j < resume->num_required_homes; j++)
+	    if (required_homes[j] == home)
+		break;
+	if (j == resume->num_required_homes)
+	    required_homes[resume->num_required_homes++] = home;
+    }
+    if (!resume->num_capture_actions) {
+	if (actions)
+	    myfree(actions, M_PROGRAM);
+	actions = 0;
+    } else if (resume->num_capture_actions < resume->num_capture_values)
+	actions = myrealloc(actions, sizeof(JITResumeCaptureAction)
+	    * resume->num_capture_actions, M_PROGRAM);
+    if (!resume->num_required_homes) {
+	if (required_homes)
+	    myfree(required_homes, M_PROGRAM);
+	required_homes = 0;
+    } else if (resume->num_required_homes < resume->num_owner_values)
+	required_homes = myrealloc(required_homes,
+	    sizeof(int) * resume->num_required_homes, M_PROGRAM);
+    resume->capture_actions = actions;
+    resume->required_homes = required_homes;
     resume->capture_classified = 1;
+    resume->recipe_valid = 1;
 }
 
 static int
@@ -7871,11 +7935,11 @@ jit_optimize_native_metadata(HIRContext *ctx, JITProgram *program,
     jit_build_value_ownership(program);
     jit_analyze_owned_last_uses(program);
     jit_build_string_concat_owner_slots(program);
-    jit_build_deopt_owner_slots(program);
     jit_build_int_list_values(program);
     jit_build_direct_int_list_updates(program);
     jit_prune_dead_deopt_locals(program);
     jit_coalesce_deopt_locals(program);
+    jit_build_deopt_owner_slots(program);
     if (!jit_deopt_maps_are_valid(ctx, program, bytecode_program,
 				   dominators))
 	return JIT_METADATA_INVALID_DEOPT;
@@ -7988,7 +8052,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			value_types[si->value] = TYPE_LIST;
 			value_types_known[si->value] = 1;
 		    } else if (si->op == HIR_OP_NOT || si->op == HIR_OP_TYPEOF
-			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_LENGTH
+			       || si->op == HIR_OP_TOINT || si->op == HIR_OP_COMPLEMENT
+			       || si->op == HIR_OP_LENGTH
 			       || si->op == HIR_OP_ABS || si->op == HIR_OP_TICKS_LEFT
 			       || si->op == HIR_OP_SECONDS_LEFT || si->op == HIR_OP_TIME
 			       || si->op == HIR_OP_VALID) {
@@ -8053,7 +8118,8 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 			}
 		    }
 		if (si->kind == HIR_TAC_UNARY
-		    && (si->op == HIR_OP_NEGATE || si->op == HIR_OP_ABS)
+		    && (si->op == HIR_OP_NEGATE || si->op == HIR_OP_ABS
+			|| si->op == HIR_OP_COMPLEMENT)
 		    && si->value > 0 && si->value < program->num_values
 		    && si->src1 > 0 && si->src1 < program->num_values
 		    && value_types_known[si->src1]) {
@@ -8206,12 +8272,20 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    types_changed = 1;
 		}
 	    }
-	    if (si->kind == HIR_TAC_INDEX_SET
-		&& si->src2 > 0 && si->src2 < program->num_values
-		&& !value_types_known[si->src2]) {
-		value_types[si->src2] = TYPE_INT;
-		value_types_known[si->src2] = 1;
-		types_changed = 1;
+	    if (si->kind == HIR_TAC_INDEX_SET) {
+		if (si->op == HIR_OP_INDEX
+		    && si->src1 > 0 && si->src1 < program->num_values
+		    && !value_types_known[si->src1]) {
+		    value_types[si->src1] = TYPE_INT;
+		    value_types_known[si->src1] = 1;
+		    types_changed = 1;
+		}
+		if (si->src2 > 0 && si->src2 < program->num_values
+		    && !value_types_known[si->src2]) {
+		    value_types[si->src2] = TYPE_INT;
+		    value_types_known[si->src2] = 1;
+		    types_changed = 1;
+		}
 	    }
 	    if (si->kind == HIR_TAC_PUT_PROP) {
 		int rhs = si->num_stack_values >= 1
@@ -11411,8 +11485,15 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    int prev_base = ctx->current_length_base;
 	    int base_temp = lower_index_lvalue_base(ctx, program,
 					     expr->u.index_store.base);
+	    int outer_temp = -1;
 	    int index_temp;
 	    int rhs_temp;
+
+	    if (expr->u.index_store.base->kind == HIR_EXPR_INDEX
+		&& expr->u.index_store.base->u.pair.lhs->kind == HIR_EXPR_LOCAL_LOAD
+		&& program->last && program->last->kind == HIR_TAC_BINARY
+		&& program->last->op == HIR_OP_INDEX)
+		outer_temp = program->last->src2;
 
 	    ctx->current_length_base = base_temp;
 	    index_temp = lower_expr(ctx, program, expr->u.index_store.index);
@@ -11429,6 +11510,19 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 		instr->src2 = index_temp;
 		instr->src3 = rhs_temp;
 		instr->local_id = expr->u.index_store.base->u.local_id;
+		snapshot_lower_stack(ctx, instr);
+		append_tac(program, instr);
+	    } else if (outer_temp >= 0) {
+		append_tick(ctx, program, expr->source_lineno,
+			    expr->bytecode_pc);
+		instr = new_tac(ctx, HIR_TAC_INDEX_SET, expr->source_lineno);
+		instr->bytecode_pc = expr->bytecode_pc;
+		instr->dst = new_temp(ctx);
+		instr->src1 = outer_temp;
+		instr->src2 = index_temp;
+		instr->src3 = rhs_temp;
+		instr->op = HIR_OP_INDEX;
+		instr->local_id = expr->u.index_store.base->u.pair.lhs->u.local_id;
 		snapshot_lower_stack(ctx, instr);
 		append_tac(program, instr);
 	    } else {
