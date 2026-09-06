@@ -954,6 +954,8 @@ struct JITNativeCall {
     JITNativeFrame frame;
     JITCallerResume resume;
     struct JITNativeCall *parent;
+    Var *stack;
+    unsigned stack_capacity;
     size_t accounted_bytes;
 };
 #endif
@@ -1162,6 +1164,7 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
     ResolvedVerbCall resolved;
     PreparedVerbCall prepared;
     enum error error = E_NONE;
+    unsigned stack_capacity;
 
     if (call_out)
 	*call_out = 0;
@@ -1183,8 +1186,15 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	*error_out = error;
 	return 0;
     }
-    native_call = mymalloc(sizeof(*native_call), M_VM);
-    memset(native_call, 0, sizeof(*native_call));
+    stack_capacity = MAX(resolved.program->main_vector.max_stack, 1);
+    native_call = mymalloc(sizeof(*native_call)
+	+ sizeof(Var) * stack_capacity, M_VM);
+    /* Compact push initializes the frame; failure frees this raw allocation
+       without inspecting it.  Initialize the remaining fields explicitly. */
+    native_call->parent = 0;
+    native_call->accounted_bytes = 0;
+    native_call->stack = (Var *) (native_call + 1);
+    native_call->stack_capacity = stack_capacity;
     native_call->resume.caller = caller;
     native_call->resume.continuation = continuation;
     native_call->resume.map_id = map_id;
@@ -1208,6 +1218,7 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
     args->type = TYPE_NONE;
     args->v.num = 0;
     native_call->accounted_bytes = sizeof(*native_call)
+	+ sizeof(Var) * stack_capacity
 	+ sizeof(Var) * native_call->frame.bytecode_program->num_var_names;
     jit_profile_native_frame_acquired(&native_call->frame,
 	native_call->accounted_bytes);
@@ -1328,6 +1339,7 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
     JITNativeFrame *active = root;
     JITContinuationFrame *continuation_in = root_continuation;
     int resume_map = root_resume_map;
+    int prepared_entry = 0;
 
     memset(out, 0, sizeof(*out));
     out->value.type = TYPE_NONE;
@@ -1335,17 +1347,16 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
     for (;;) {
 	JITContinuationFrame *continuation = 0;
 	Var *stack = root_stack;
-	int allocated_stack = active != root;
 	unsigned materialized_depth = 0;
 
-	if (allocated_stack)
-	    stack = mymalloc(MAX(active->bytecode_program->main_vector.max_stack,
-		1) * sizeof(Var), M_RT_STACK);
+	if (active_call)
+	    stack = active_call->stack;
 	out->error = E_NONE;
 	out->result = jit_program_execute_in_context(active->program, context,
 	    active, active->env, &out->value, ticks, timed_out, &out->error,
 	    &out->source, &out->deopt, stack, active->progr, resume_map,
-	    continuation_in, &continuation);
+	    continuation_in, &continuation, prepared_entry);
+	prepared_entry = 0;
 	if (continuation_in && continuation_in != continuation) {
 	    jit_continuation_free(continuation_in);
 	    if (active->runtime_storage)
@@ -1365,8 +1376,6 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		&out->value))
 		panic("Native verb return could not resume its caller");
 	    jit_profile_record_native_return(context->current_frame);
-	    if (allocated_stack)
-		myfree(stack, M_RT_STACK);
 	    execute_jit_free_native_call(completed);
 	    active = context->current_frame;
 	    continuation_in = active->runtime_borrower;
@@ -1398,8 +1407,6 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    if (p.kind != BI_RETURN)
 		panic("Compact return-only built-in returned a non-return package");
 	    jit_continuation_set_result(continuation, p.u.ret);
-	    if (allocated_stack)
-		myfree(stack, M_RT_STACK);
 	    continuation_in = continuation;
 	    continue;
 	}
@@ -1422,10 +1429,9 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		callee->parent = active_call;
 		active_call = callee;
 		free_jit_boundary_values(stack, out->deopt.stack_depth);
-		if (allocated_stack)
-		    myfree(stack, M_RT_STACK);
 		active = &callee->frame;
 		jit_profile_record_entry(active->program);
+		prepared_entry = 1;
 		continue;
 	    }
 	    if (!continuation) {
@@ -1470,16 +1476,12 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    if (!promotion || !execute_jit_commit_promotion(promotion))
 		panic("Native call-chain promotion failed");
 	    free_jit_boundary_values(stack, materialized_depth);
-	    if (allocated_stack)
-		myfree(stack, M_RT_STACK);
 	    free_jit_native_call_chain(active_call);
 	    out->continuation = 0;
 	    out->promoted = 1;
 	    return;
 	}
 
-	if (allocated_stack)
-	    myfree(stack, M_RT_STACK);
 	if (continuation && root->runtime_borrower == continuation) {
 	    if (!jit_native_frame_return_continuation_runtime(root,
 		    continuation))
@@ -1519,153 +1521,6 @@ call_verb2(Objid this, const char *vname
 	return error;
     return commit_verb_activation(&call, args);
 }
-
-#ifdef ENABLE_JIT
-static Var
-jit_direct_raw_var(int64_t raw, int type)
-{
-    Var value;
-
-    value.type = (var_type) type;
-    if (type == TYPE_STR)
-	value.v.str = (const char *) (intptr_t) raw;
-    else if (type == TYPE_LIST)
-	value.v.list = (Var *) (intptr_t) raw;
-#ifdef WAIF_CORE
-    else if (type == TYPE_WAIF)
-	value.v.waif = (Waif *) (intptr_t) raw;
-#endif
-    else
-	value.v.num = (Num) raw;
-    return value;
-}
-
-static int64_t
-jit_direct_var_raw(Var value)
-{
-    if (value.type == TYPE_FLOAT) {
-	double number = fl_unbox(value.v.fnum);
-	int64_t raw;
-
-	memcpy(&raw, &number, sizeof(raw));
-	return raw;
-    }
-    if (value.type == TYPE_STR)
-	return (int64_t) (intptr_t) value.v.str;
-    if (value.type == TYPE_LIST)
-	return (int64_t) (intptr_t) value.v.list;
-#ifdef WAIF_CORE
-    if (value.type == TYPE_WAIF)
-	return (int64_t) (intptr_t) value.v.waif;
-#endif
-    return value.v.num;
-}
-
-int
-execute_jit_direct_verb_call(JITExecutionContext *execution_context,
-			     JITNativeFrame *caller_frame,
-			     int64_t obj_raw, int obj_type,
-			     int64_t verb_raw, int verb_type,
-			     int64_t args_raw, int args_type,
-			     int *ticks, int *timed_out, enum error *error,
-			     int64_t *result_raw, int *result_type)
-{
-    Var obj = jit_direct_raw_var(obj_raw, obj_type);
-    Var verb = jit_direct_raw_var(verb_raw, verb_type);
-    Var args = jit_direct_raw_var(args_raw, args_type);
-    Var result = zero;
-    JITSourceLocation source_location;
-    JITDeoptState deopt;
-    JITContinuationFrame *continuation = 0;
-    JITNativeFrame callee_frame;
-    JITRunResult run_result;
-    Program *callee;
-    ResolvedVerbCall call;
-    Objid receiver;
-    Var call_args;
-    enum error call_error;
-    int saved_ticks = *ticks;
-    int saved_timed_out = *timed_out;
-    enum error saved_error = *error;
-
-    if (verb.type != TYPE_STR || args.type != TYPE_LIST)
-	return 0;
-    if (!execution_context || execution_context->current_frame != caller_frame
-	|| !jit_native_frame_verify_runtime(execution_context, caller_frame))
-	return 0;
-#ifdef WAIF_CORE
-    if (obj.type == TYPE_WAIF) {
-	if (!valid(obj.v.waif->class))
-	    return 0;
-	receiver = obj.v.waif->class;
-    } else
-#endif
-    {
-	if (obj.type != TYPE_OBJ || !valid(obj.v.obj))
-	    return 0;
-	receiver = obj.v.obj;
-    }
-
-    call_error = resolve_verb_call(receiver, verb.v.str
-	WAIF_COMMA_ARG(obj), 0, &call);
-    if (call_error != E_NONE)
-	return 0;
-    callee = call.program;
-    if (!callee->jit || !jit_program_is_direct_leaf(callee->jit))
-	return 0;
-    if (!jit_program_claim_native_entry(callee->jit))
-	return 0;
-
-    call_args = var_ref(args);
-    call_error = commit_verb_activation(&call, call_args);
-    if (call_error != E_NONE) {
-	free_var(call_args);
-	return 0;
-    }
-
-    execution_context->canonical_depth++;
-    if (!jit_execution_context_push_overlay(execution_context, &callee_frame,
-	callee->jit, RUN_ACTIV.rt_env, top_activ_stack, -1)) {
-	execution_context->canonical_depth--;
-	free_activation(&RUN_ACTIV, 0);
-	top_activ_stack--;
-	return 0;
-    }
-    if (!jit_native_frame_bind_activation(&callee_frame, &RUN_ACTIV)) {
-	jit_execution_context_pop_overlay(execution_context, &callee_frame);
-	execution_context->canonical_depth--;
-	free_activation(&RUN_ACTIV, 0);
-	top_activ_stack--;
-	return 0;
-    }
-
-    jit_profile_record_entry(callee->jit);
-    run_result = jit_program_execute_in_context(callee->jit,
-	    execution_context, &callee_frame, RUN_ACTIV.rt_env, &result, ticks,
-	    timed_out, error, &source_location, &deopt, RUN_ACTIV.base_rt_stack,
-	    RUN_ACTIV.progr, -1, 0, &continuation);
-    if (!jit_execution_context_pop_overlay(execution_context, &callee_frame))
-	panic("JIT direct leaf overlay did not detach cleanly");
-    execution_context->canonical_depth--;
-    if (run_result == JIT_RUN_RETURNED) {
-	jit_profile_record_completed(callee->jit);
-	*result_raw = jit_direct_var_raw(result);
-	*result_type = result.type;
-	free_activation(&RUN_ACTIV, 0);
-	top_activ_stack--;
-	return 1;
-    }
-    if (continuation)
-	jit_continuation_free(continuation);
-    free_var(result);
-    free_activation(&RUN_ACTIV, 0);
-    top_activ_stack--;
-    *ticks = saved_ticks;
-    *timed_out = saved_timed_out;
-    *error = saved_error;
-    return 0;
-}
-#endif
 
 
 /**** individual operation helpers ****/

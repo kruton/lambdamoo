@@ -3764,6 +3764,26 @@ do_fallback:
 }
 
 static void
+check_runtime_layout(JITProgram *program)
+{
+    JITRuntimeLayout *layout = &program->runtime_layout;
+    size_t raw_bytes = sizeof(Num) * (program->num_values
+	+ (program->value_tag_slots ? program->num_tag_slots : program->num_values));
+    size_t aligned_bytes = ((raw_bytes + sizeof(Var) - 1) / sizeof(Var))
+	* sizeof(Var);
+
+    check(layout->borrowed_offset == aligned_bytes
+	  && layout->owned_offset == aligned_bytes
+	     + sizeof(Var) * program->num_borrowed_locals
+	  && layout->capacities_offset == layout->owned_offset
+	     + sizeof(Var) * program->num_owned_slots
+	  && layout->states_offset == layout->capacities_offset
+	     + sizeof(unsigned) * program->num_owned_slots
+	  && layout->bytes == layout->states_offset + program->num_owned_slots,
+	  "compiled runtime layout differs from canonical storage layout");
+}
+
+static void
 check_differential(JITProgram *program, Var *env, int initial_ticks,
 		   int timed_out, const char *message)
 {
@@ -3808,6 +3828,8 @@ check_differential(JITProgram *program, Var *env, int initial_ticks,
 					&native_result, &native_ticks, &timed_out,
 					&native_error, &native_loc, &native_deopt,
 					native_deopt_stack);
+    if (program->state == JIT_STATE_COMPILED)
+	check_runtime_layout(program);
     reference_status = reference_execute(program, ref_env_copy ? ref_env_copy : env,
 					 &reference_result, &reference_ticks, &timed_out,
 					 &reference_error, &ref_loc, &ref_deopt,
@@ -7431,6 +7453,13 @@ test_continuation_capture_validation(void)
 	  && frame->retained_values[0].type == TYPE_STR
 	  && frame->retained_values[1].type == TYPE_LIST,
 	  "continuation capture did not retain complex values");
+    check(resume->recipe_valid && resume->num_capture_actions == 2
+	  && resume->capture_actions[0].value == 1
+	  && resume->capture_actions[0].tag_slot == -1
+	  && resume->capture_actions[1].value == 2
+	  && resume->num_required_homes == 1
+	  && resume->required_homes[0] == 0,
+	  "continuation capture compiled the wrong resume recipe");
     if (frame) {
 	JITProgramStats program_stats;
 	JITPoolStats pool_stats;
@@ -9243,6 +9272,48 @@ main(void)
 	jit_program_free(owned_call);
     }
 
+    /* Resume keys need not follow map order, and include the code unit. */
+    {
+	JITProgram *indexed = new_jit_program();
+	ResumeKey keys[] = { { 0, 0 }, { 2, 9 }, { 0, 9 }, { 2, 1 },
+			     { 2, 9 }, { 1, 7 }, { 1, 8 } };
+	ResumeKey missing = { 1, 9 };
+	int i;
+
+	indexed->num_deopt_maps = sizeof(keys) / sizeof(keys[0]);
+	indexed->deopt_maps = allocate(sizeof(JITDeoptMap) * indexed->num_deopt_maps);
+	for (i = 1; i < indexed->num_deopt_maps; i++) {
+	    JITDeoptMap *map = &indexed->deopt_maps[i];
+
+	    map->resume_key = keys[i];
+	    map->reason = JIT_DEOPT_VERB_CALL;
+	    map->stack_depth = 3;
+	    map->native_resume = allocate(sizeof(JITNativeResume));
+	    map->native_resume->valid = 1;
+	    map->native_resume->rehydratable = 1;
+	}
+	indexed->deopt_maps[5].native_resume->rehydratable = 0;
+	indexed->deopt_maps[6].stack_depth = 2;
+	check(jit_program_resume_map(indexed, keys[1]) == 1
+	      && jit_program_resume_map(indexed, keys[2]) == 2
+	      && jit_program_resume_map(indexed, keys[3]) == 3,
+	      "resume index lost unsorted keys or duplicate precedence");
+	check(jit_program_resume_map(indexed, missing) == -1
+	      && jit_program_resume_map(indexed, keys[0]) == -1
+	      && jit_program_resume_map(indexed, keys[5]) == -1
+	      && jit_program_resume_map(indexed, keys[6]) == -1,
+	      "resume index accepted an absent or ineligible key");
+	check(indexed->num_resume_map_entries == 4,
+	      "resume index retained ineligible maps");
+	jit_program_free(indexed);
+	indexed = new_jit_program();
+	check(jit_program_resume_map(indexed, missing) == -1
+	      && jit_program_resume_map(indexed, missing) == -1
+	      && indexed->resume_map_index_ready && !indexed->resume_map_index,
+	      "empty resume index was not retained");
+	jit_program_free(indexed);
+    }
+
     /* pass() VM call and native continuation tests */
     {
 	JITProgram *pass_prog = builtin_call_program(9);
@@ -9461,30 +9532,65 @@ main(void)
 	    jit_execution_context_init(&context, &root, call_prog, deep_env,
 		0, 1, 4, &ticks, &timed_out, &error, -1);
 	    context.lazy_verb_calls = 1;
+	    check(jit_program_execute_in_context(call_prog, &context,
+		&root, deep_env, &result, &ticks, &timed_out, &error, 0,
+		&deopt, deopt_stack, 2, -1, 0, &lazy_continuation, 1)
+		  == JIT_RUN_FALLBACK && ticks == 10 && !root.runtime_storage
+		  && deopt.map_id == -1
+		  && deopt.bytecode_pc == call_prog->deopt_maps[0].bytecode_pc,
+		  "uncompiled prepared entry did not preserve entry fallback");
+	    check(jit_program_compile(call_prog),
+		  "lazy prepared entry compilation failed");
 	    check(jit_program_execute_in_context(call_prog, &context, &root,
 		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
-		deopt_stack, 2, -1, 0, &lazy_continuation)
+		deopt_stack, 2, -1, 0, &lazy_continuation, 1)
 		  == JIT_RUN_CALL_VERB,
 		  "lazy verb call did not request a VM call");
 	    check(!lazy_continuation && root.runtime_storage
 		  && root.pending_resume_map == 1
 		  && call_prog->active_runtime_bytes > runtime_before,
 		  "lazy verb call eagerly created a continuation");
+	    check(!root.resume_roots && !root.resume_roots_capacity,
+		  "operand-only lazy resume allocated roots");
+	    {
+		JITResumeValue *value =
+		    &call_prog->deopt_maps[1].native_resume->values[1];
+		size_t runtime_bytes = call_prog->active_runtime_bytes;
+
+		/* Exercise root replacement separately from generated resume code. */
+		value->source = JIT_RESUME_STACK;
+		check(jit_native_frame_preserve_resume(&root, 1)
+		      && root.num_resume_roots == 1
+		      && root.resume_roots[0].type == TYPE_STR
+		      && !strcmp(root.resume_roots[0].v.str, "test"),
+		      "lazy resume failed to retain a complex root");
+		value->source = JIT_RESUME_OPERAND;
+		check(jit_native_frame_preserve_resume(&root, 1)
+		      && !root.resume_roots && !root.resume_roots_capacity
+		      && call_prog->active_runtime_bytes == runtime_bytes,
+		      "zero-root replacement leaked previous complex roots");
+	    }
 	    free_var(deopt_stack[1]);
 	    free_var(deopt_stack[2]);
 	    returned.type = TYPE_STR;
 	    returned.v.str = str_dup("lazy result");
 	    root.resume_result = returned;
 	    root.has_resume_result = 1;
+	    deopt.operation = 12345;
 	    check(jit_program_execute_in_context(call_prog, &context, &root,
 		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
-		deopt_stack, 2, 1, 0, 0) == JIT_RUN_RETURNED,
+		deopt_stack, 2, 1, 0, 0, 0) == JIT_RUN_RETURNED,
 		  "lazy verb call did not resume natively");
 	    check(result.type == TYPE_STR
 		  && !strcmp(result.v.str, "lazy result")
 		  && !root.runtime_storage && !root.pending_resume_map
 		  && call_prog->active_runtime_bytes == runtime_before,
 		  "lazy verb resume corrupted its result or runtime ownership");
+	    check(deopt.map_id == -1 && !deopt.materialized
+		  && deopt.boundary == JIT_BOUNDARY_NONE,
+		  "native return retained stale boundary metadata");
+	    check(deopt.operation == 12345,
+		  "native return eagerly initialized cold deopt metadata");
 	    free_var(result);
 	    check(jit_execution_context_finish(&context, &root),
 		  "lazy verb call root frame did not detach cleanly");
@@ -9495,7 +9601,7 @@ main(void)
 	    context.lazy_verb_calls = 1;
 	    check(jit_program_execute_in_context(call_prog, &context, &root,
 		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
-		deopt_stack, 2, -1, 0, &lazy_continuation)
+		deopt_stack, 2, -1, 0, &lazy_continuation, 0)
 		  == JIT_RUN_CALL_VERB && !lazy_continuation,
 		  "lazy continuation fallback setup failed");
 	    free_var(deopt_stack[1]);
@@ -9847,7 +9953,7 @@ main(void)
 		"compact return did not transfer its result to the continuation");
 	    check(jit_program_execute_in_context(call_prog, &context, &root,
 		deep_env, &result, &ticks, &timed_out, &error, 0, &deopt,
-		deopt_stack, 2, -1, continuation, 0) == JIT_RUN_RETURNED,
+		deopt_stack, 2, -1, continuation, 0, 0) == JIT_RUN_RETURNED,
 		"borrowed continuation runtime did not resume");
 	    check(root.runtime_storage && root.runtime_borrower == continuation
 		&& continuation->runtime_owner == &root
@@ -10355,6 +10461,17 @@ main(void)
 	    map->native_resume->values = allocate(sizeof(JITResumeValue));
 	    map->native_resume->values[0].value = 2;
 	    map->native_resume->values[0].source = JIT_RESUME_RESULT;
+
+	    hir_test_set_length_protected(0);
+	    check(jit_program_resume_map(str_length, map->resume_key) == -1,
+		  "unprotected specialized builtin exposed a resume map");
+	    hir_test_set_length_protected(1);
+	    check(jit_program_resume_map(str_length, map->resume_key) == 1,
+		  "resume index missed newly protected specialized builtin");
+	    hir_test_set_length_protected(0);
+	    check(jit_program_resume_map(str_length, map->resume_key) == -1,
+		  "resume index retained stale builtin protection");
+	    hir_test_set_length_protected(1);
 
 	    ticks = 10;
 	    check((jit_program_execute)(str_length, 0, &result, &ticks,
@@ -12222,6 +12339,14 @@ main(void)
 	      "deopt reason name unsupported_operation");
 
 	jit_profile_reset();
+	jit_profile_set_detail(0);
+	jit_profile_record_entry(profile_program);
+	jit_profile_record_completed(profile_program);
+	jit_profile_record_vm_call(profile_program);
+	jit_program_stats(profile_program, &stats);
+	check(stats.entries == 0 && stats.completions == 0 && stats.vm_calls == 0,
+	      "disabled detailed JIT profiling recorded per-program totals");
+	jit_profile_set_detail(1);
 	jit_profile_record_entry(profile_program);
 	jit_profile_record_entry(profile_program);
 	jit_profile_record_completed(profile_program);

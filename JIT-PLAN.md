@@ -25,6 +25,40 @@ This direction avoids lowering to bytecode and raising it back into a higher
 level IR. The bytecode decoder can still be added later as a compatibility or
 optimization frontend, but it is no longer the v1 compiler frontend.
 
+Detailed per-program native call, depth, and continuation profiling is disabled
+by default after it measured as material hot-path overhead on the deep SHA-256
+benchmark. Wizards can temporarily enable it with `jit_profile_detail(1)`.
+Aggregate counters, deoptimization diagnostics, live-frame accounting, and
+memory accounting remain unconditional. Detailed last-use timestamps consume
+the server's cached time instead of issuing a clock call on each native entry.
+
+### Unified activation-stack performance gate
+
+A September 5, 2026 prototype forced every native boundary through fully
+materialized interpreter activations, using the existing canonical resume path
+and ordinary interpreter call/unwind handling. It passed the JIT/HIR unit tests,
+the 73/73 testmoo census with zero deopts before emergency suspension, and a real
+Codepoint SHA suspension path. It did not pass the agreed performance gate.
+
+The compact native-chain baseline median was 8.867833 seconds for
+`#168:test2(3000)`. The canonical prototype warmed in 12.747875 seconds and its
+first profiled run took 13.656341 seconds, already more than 50% slower. A second
+profiled run was a noisy 18.213908 seconds. The 8,054-sample, zero-loss capture
+is `/tmp/test2-unified-stack.perf.data`, with native symbols in
+`/tmp/perf-2873847.map`. Native entry rose to 33.99% self-time, interpreter
+dispatch to 13.53%, and canonical call/unwind/resume work reappeared; allocator
+self-time was only 2.03%. This is structural crossing and materialization cost,
+not a storage-pool-sized regression.
+
+Consequently, the compact native chain remains the production architecture.
+The prototype selector was removed rather than shipping two execution models.
+The program-owned resume-map index and precomputed runtime layout remain useful,
+invalidation-safe groundwork. A future unified-stack attempt must first avoid
+full canonicalization on every hot native-to-native call or demonstrate a new
+mechanism within 5% of the compact baseline before removing continuation and
+promotion code. No database target pointers were cached and the persistent
+ResumeKey format was unchanged.
+
 ## 2. Core Principles
 
 * Preserve current `parse_program()` behavior and database compatibility.
@@ -64,6 +98,7 @@ The current branch has already established the first compiler backbone:
   `a8ab7c31cd5f9b23b77d84c60b3d83e62d9d304c`, at O0;
 * lazy, per-program native generation for a guarded multi-type tier;
 * native entry and return through the existing activation unwinder;
+* lazy caller continuation materialization for general JIT-to-JIT verb calls;
 * JIT state reporting through `verb_info()` and wizard-only `jit_compile()`;
 * read-only MIR output through `disassemble(..., "mir")`;
 * hexadecimal machine-code output through `disassemble(..., "machine")`;
@@ -654,15 +689,17 @@ consumes them.  It must not reconstruct them by replaying the caller.  After
 the dispatch commit point, no frame may retain a second owning copy of those
 call operands.
 
-Normal return produces a complete result `Var`.  The caller-resume record
-retains the exact `JITContinuationFrame` whose `JIT_RESUME_RESULT` entry names
-that value.  The trampoline moves the result into the continuation and only
-then destroys the callee frame.  This is the actual call-result ABI; it does not
-invent an owned-value home for a result that may be scalar or dynamically
-tagged.  Ordinary liveness homes remain authoritative for values live across
-the call.  An error or abort supplies no result; promotion reconstructs the
-caller as suspended after dispatch so the interpreter unwinder can deliver the
-exceptional outcome normally.
+Normal return produces a complete result `Var`.  On the general native verb
+path, the trampoline moves it into the suspended caller frame's unique
+`resume_result` slot and only then destroys the callee frame.  Generated code
+resumes through the exact pending map and consumes that complete `Var`; it does
+not invent a statically typed owner home for a result that may be scalar or
+dynamically tagged.  Ordinary liveness homes remain authoritative for other
+values live across the call.  Eager `JITContinuationFrame` result storage is
+still used by built-in bridges and standalone continuation APIs.  An error or
+abort supplies no result; promotion reconstructs the caller as suspended after
+dispatch so the interpreter unwinder can deliver the exceptional outcome
+normally.
 
 This convention reduces the amount of runtime continuation data, but it does
 not eliminate compiler analysis.  Forward must-availability proves that each
@@ -678,6 +715,217 @@ keep scalar values in callee-saved registers only if every promotion and
 runtime-helper safepoint has an exact recovery rule.  Complex owning `Var`
 values should continue to have authoritative frame homes; a register may cache
 their payload but never replace their ownership slot.
+
+#### Current lazy caller-resume implementation
+
+General JIT-to-JIT verb calls now defer allocation of a
+`JITContinuationFrame`.  At an eligible verb boundary,
+`jit_native_frame_preserve_resume()` leaves the native runtime allocation owned
+by the caller frame, records `pending_resume_map`, and eagerly references only
+the complex live values that are not already protected by authoritative owner
+homes.  Scalars remain in native runtime slots.  The call operands are still
+materialized and transferred through the ordinary shared verb resolver and
+environment constructor.
+
+The caller-resume record may therefore identify either an older eager
+continuation or a frame-owned pending map.  For the lazy form its result-home
+index is `UINT_MAX`: normal compact return moves the complete result into the
+caller's `resume_result`, and the trampoline re-enters generated code using the
+pending map.  Successful return releases the retained roots and runtime storage
+exactly once.  Runtime storage, retained-value arrays, and boundary snapshots
+are included in active runtime-byte accounting and checked by the native-frame
+verifier.
+
+Laziness does not weaken canonical fallback.  If dispatch cannot commit an
+eligible compact callee, `jit_native_frame_capture_continuation()` constructs
+the ordinary continuation from the preserved map and runtime storage, then
+releases the frame's temporary roots.  Genuine suspension, ordinary deopt,
+errors, aborts, and introspection continue through full-suffix promotion.  The
+built-in bridge deliberately retains its existing eager continuation path
+until its distinct continuation semantics are modeled by the same frame-owned
+scheme.
+
+Focused unit tests cover a continuation-free native call and return, result
+ownership, runtime-byte cleanup, and lazy-to-materialized fallback.  The
+separate deoptimization census completes 73 of 73 entries with zero deopts.
+On `codepoint.db`, `#168:test2(3000)` improved from 11.76 seconds before this
+change to 10.64 seconds.  Its `capital_sigma0` helper completed 959,845 native
+calls with zero continuation captures.  The enclosing `raw_hash` retained 2,969
+captures and promotions, corresponding to genuine suspension boundaries
+rather than ordinary helper calls.
+
+A warm-cache `perf` run measured 10.51 seconds with no lost samples.  Flat
+self-time was led by `jit_program_execute_in_context` (16.76%), general native
+chain driving (4.07%), verb lookup/preparation/dispatch (approximately 13% to
+15% including their supporting lookup functions), and allocator/free paths
+(more than 10%).  Lazy resume preservation itself was
+1.71%; continuation capture and materialization were not visible hotspots.
+The pending immediate C lookup improvements described in
+`VERB-LOOKUP-OPT.md` give the global verb cache a power-of-two size, test string
+pointer identity before case-insensitive comparison, key directly by receiver
+OID, and record the verb index in its handle.  Once those changes are validated,
+the next call-path optimization should remove the tentative direct-leaf lookup
+followed by a second general-dispatch lookup, then evaluate a guarded
+out-of-line monomorphic cache together with reusable native-frame/runtime
+storage.
+
+The direct-leaf experiment has since been removed.  It resolved non-leaf
+targets speculatively and then forced the compact dispatcher to resolve the
+same call again.  All native verb calls now use the compact trampoline and one
+shared resolution.  Warm `#168:test2(3000)` time fell from the 10.69-second
+post-lookup baseline to 9.07 seconds and then 8.75 seconds after the allocation
+and initialization changes, an approximately 18% improvement.
+
+The compact boundary now writes directly to its call-owned stack, which is
+allocated together with the `JITNativeCall` container.  Lazy resume roots are
+allocated only for complex live values not already protected by owner homes;
+scalar-only resumes retain the native runtime without allocating a root array.
+Full materialized-tag scanning and blanket tag-slot poisoning are verifier-only
+checks rather than production boundary work.  Generated code remains
+responsible for writing every dynamic tag before use.  The 73-entry
+deoptimization census still completes with zero deopts.
+
+This does not yet reach interpreter parity.  A verified interpreter-only build,
+with the same `-O3`, Unicode, WAIF, XML, integer-size, and networking options,
+ran `#168:test2(3000)` in 6.009164, 5.996587, and 5.990748 seconds after a
+discarded 5.765002-second warm-up.  Its median is **5.996587 seconds**.  The
+current JIT median of 8.143 seconds is therefore 2.146 seconds, or 35.8%, slower
+(1.36 times the interpreter runtime).
+
+A matching warmed interpreter `perf` capture is
+`/tmp/test2-interpreter.perf.data`: 1,872 samples with zero losses over a
+6.231252-second measured run.  Interpreter dispatch in `run` accounts for
+38.08% self-time; `call_verb2` accounts for 8.08%; `new_rt_env` and
+`free_rt_env` account for 3.07% and 3.34%.  By contrast, the current JIT profile
+is led by `jit_program_execute_in_context` at 17.14%, the native-chain driver at
+4.87%, resume preservation at 3.74%, and native verb dispatch at 3.05%.
+Compact return, push/commit, runtime release, and boundary extraction add
+several more percent.  The JIT has removed most interpreter dispatch, but has
+replaced it with enough entry, boundary, continuation, and compact-call work to
+remain slower.  Allocator replacement alone cannot close this gap because the
+cost includes initialization, validation, ownership, and metadata movement.
+
+The next non-region optimization sequence is:
+
+1. Split `jit_program_execute_in_context()` into a minimal common execution
+   path and a cold deoptimization/boundary path.  Normal compact calls and
+   returns should not initialize a complete `JITDeoptState`, copy map-zero
+   metadata, or materialize interpreter reconstruction data.  Construct those
+   fields lazily only for a guard failure, unsupported operation, suspension,
+   introspection, or promotion.  Exact PCs, ticks, live-value ownership, and
+   resume-map identity must remain available to the cold path.
+2. Compile a compact resume-preservation recipe for each resumable call site.
+   The recipe should directly identify scalar slots, independently owned
+   complex values, and values already protected by owner homes, avoiding
+   repeated runtime discovery of static source, type, and ownership facts.
+3. Fuse the cached compact-call fast path: validate the target, reserve the
+   next stable depth slot, bind the callee runtime, and enter it without
+   repeatedly packaging and unpackaging a general boundary result.  Keep the
+   general dispatcher as the miss and exceptional path.
+4. After simplifying initialization, add bounded stable depth-indexed reuse of
+   `JITNativeCall`, frame metadata, runtime slots, and compact environments.
+   Reuse must release every owning `Var`, must not move storage while a lazy
+   caller resume references it, and must copy promotable live state before a
+   slot is recycled.  Pool rotation must invalidate or detach every reference
+   to a retired entry.  Avoid clearing and rebuilding fields that the selected
+   compiled layout proves dead.
+5. Specialize native environment initialization to arguments, predefined
+   variables actually read, and locals required by a possible promotion.
+   Lazily construct the complete canonical environment for introspection,
+   suspension, or deoptimization.  Raw environment pooling without reducing
+   slot initialization and reference-count traffic is insufficient.
+6. Once boundary overhead is lower, inspect the deepest SHA-256 helpers for
+   arithmetic, indexing, and fixed-list operations that still call runtime
+   helpers.  Native code must eliminate useful interpreter work, not merely
+   replace opcode dispatch with equally expensive helper boundaries.
+
+The first step now has an initial implementation.  A normal native return
+resets only the externally meaningful neutral deopt fields, transfers the
+result, releases runtime ownership, and returns before status-location lookup,
+map selection, guard reporting, boundary classification, or interpreter stack
+materialization.  Complete map-zero state is still constructed for an entry
+fallback, and every non-return result retains the existing cold reconstruction
+path.  The owner-home state sweep remains on the return path because the
+current generated-code ABI does not maintain the parallel state array for all
+owned-value writes.
+
+The JIT and HIR unit tests and the 73-entry census pass with zero deopts.  After
+one discarded warm-up, three `#168:test2(3000)` runs took 8.259242, 8.281367,
+and 8.467369 seconds, median **8.281367 seconds**.  That is 1.7% above the prior
+8.143-second reference and does not establish a wall-clock improvement.  The
+zero-loss 2,873-sample capture `/tmp/test2-return-fast.perf.data` does show
+`jit_program_execute_in_context` falling from 17.14% to 15.02% self-time.
+Retain the split as simpler hot-path structure, but require another optimization
+and interleaved measurements before claiming speedup.
+
+Resume preservation now uses a compiled, program-owned recipe.  HIR
+finalization emits direct capture actions containing each value's runtime slot,
+fixed type or dynamic tag slot, plus a deduplicated list of owner homes that
+must remain live.  Scalar-only call sites have an empty recipe and take a
+constant-time path that only replaces old roots and records the pending resume
+map.  Lazy frame preservation and full continuation capture consume the same
+recipe while retaining runtime alias and owner-home deduplication.  Recipes are
+included in metadata accounting and released with their `JITNativeResume`, so
+program invalidation and pool rotation cannot leave them reachable.  This adds
+no database target cache or dispatch-epoch dependency.
+
+The JIT and HIR unit tests, normal optimized build, and 73-entry census pass
+with zero deopts.  After an 8.442495-second warm-up, five
+`#168:test2(3000)` runs took 8.124348, 8.065135, 13.165359, 7.850147, and
+8.064944 seconds.  The median is **8.065135 seconds**; the 13.165359-second run
+is a clear outlier, but remains included in the median.  This is 2.6% below the
+8.281367-second pre-recipe median and 1.0% below the earlier 8.143-second
+reference.  A profiled run took 8.290791 seconds.  The zero-loss 2,489-sample
+capture `/tmp/test2-resume-recipe.perf.data` shows
+`jit_native_frame_preserve_resume` falling from 3.89% to 3.05% self-time.
+Generated recipe dispatch itself is 0.45%; no compensating allocator increase
+is visible (`malloc` fell from 4.05% to 2.86%, subject to sampling variance).
+
+A call-site target cache remains deferred until the wide dispatch epoch and
+owned-target invalidation contract in `VERB-LOOKUP-OPT.md` are implemented.
+
+The global verb cache retains first-ancestor-with-verbs keys.  Lookup recomputes
+that ancestor before probing the cache, so `db_change_parent()` can still skip
+the global cache flush for childless objects without verbs.  The receiver-OID
+experiment has been removed.  A future receiver-key or call-site cache must
+invalidate on every relevant parent change, including those leaf objects.
+
+Such a call-site cache requires a stronger invalidation contract than the
+current global verb cache.  A `db_verb_handle` points into a global cache entry
+which is freed by `db_priv_affected_callable_verb_lookup()`, and a cached
+`Program *` may be freed when verb code is replaced.  The fast path may retain
+either pointer only as non-owning data and must compare a stable epoch before
+dereferencing it, in the single-threaded VM dispatch interval.  Alternatively,
+the cache must acquire an explicit stable reference and release it when the
+entry is cleared.
+
+Before adding the cache, every mutation that can change lookup or the selected
+program must advance that epoch before releasing old storage.  This includes
+verb addition, deletion, renaming, permission or argument-spec changes, verb
+program replacement, parent changes, object recycling, and any WAIF class or
+inheritance mutation affecting dispatch.  `db_set_verb_program()` currently
+does not invalidate callable-verb lookup, so guarding a cached `Program *` only
+with the present `db_verb_generation` would permit use after free.  Likewise,
+`db_priv_affected_callable_verb_lookup()` currently advances the generation
+only after the global verb-cache table exists; an independent JIT call-site
+cache must not depend on that incidental initialization order.
+
+Use a wide monotonic dispatch epoch or explicitly clear all call-site entries
+on wrap to prevent an ABA match.  JIT pool rotation, code invalidation, and
+program destruction must clear or make every associated entry unreachable.
+Cache hits must still validate receiver kind and identity, including the WAIF
+dispatch class, and must not bypass permission or protected-operation checks
+whose inputs were not included in the epoch.  Tests should mutate each item
+above between two calls at one hot site and verify that the second call cannot
+execute the old verb or dereference its program.
+
+Performance work should continue to use the verified 5.996587-second
+interpreter median above, rebuilding both configurations from the same source
+when behavior outside `#ifdef ENABLE_JIT` changes.  Each optimization should
+retain one discarded warm-up and multiple measured runs; profiles should be
+captured only after warm-up and report sample losses.  Recheck the interpreter
+control when compiler flags, database contents, hardware conditions, or shared
+runtime code change.
 
 Promotion itself is represented as a two-phase `JITPromotionPlan`.  Preparation
 walks and verifies the complete root-to-leaf chain, validates the leaf's exact
@@ -785,9 +1033,10 @@ second lookup to invoke it.
 
 `execute_jit_commit_prepared_verb_call()` is the move-only compact commit
 routine.  It first validates the prepared descriptor, target JIT program,
-caller continuation, result home, and combined interpreter/native depth.  A
-failure through this point leaves the descriptor and all of its references
-untouched.  Compact linkage then installs the descriptor's exact environment;
+caller resume ownership, result destination, and combined interpreter/native
+depth.  A failure through this point leaves the descriptor and all of its
+references untouched.  Compact linkage then installs the descriptor's exact
+environment;
 `jit_native_frame_take_prepared_invocation()` verifies that identity and moves
 the program, environment, receiver, player and permission identities, and verb
 metadata into the frame.  It marks `owns_invocation` and clears the complete
@@ -807,12 +1056,14 @@ failure can destroy the descriptor without consuming the caller's operands.
 The returned call object cannot be freed while linked into a context.
 
 `run()` now drives this publisher from an iterative native-call trampoline.
-Its caller-resume record retains the captured continuation, requires the
-caller frame to own that
-continuation's runtime at publication, and records the map's exact bytecode and
-error PCs.  Publication suspends the caller; normal return transfers the result
-to the retained continuation, destroys only the completed callee, and makes
-the caller current again.  A target is compiled before publication, so a
+For general verb calls, its caller-resume record names the caller frame's lazy
+pending map and inline result slot.  Older built-in and standalone paths may
+instead retain a captured continuation and require the caller frame to own
+that continuation's runtime at publication.  Both forms record the map's exact
+bytecode and error PCs.  Publication suspends the caller; normal return moves
+the result to the selected destination, destroys only the completed callee,
+and makes the caller current again.  A target is compiled before publication,
+so a
 compile failure remains a pre-publication fallback and never leaves an
 unmaterializable compact callee.  Runtime
 ownership at a captured boundary is now explicit: a fresh
@@ -857,8 +1108,8 @@ Only a dispatched continuation can represent the after-call native ABI.
 The initial `run()` driver supports repeated eligible verb dispatch and normal
 return through arbitrary compact depth.  It gives each active compact callee a
 separate materialization stack, transfers return values through the exact
-caller continuation, and retains the resumed caller's runtime borrower until
-the next native execution or promotion.  The driver now also admits an
+caller resume map, and retains the caller's frame-owned runtime until the next
+native execution or promotion.  The driver now also admits an
 explicitly registered, audited class of compact return-only built-ins.  The
 initial class is `typeof()`, `equal()`, and `value_bytes()`.  At such a boundary
 the frame adopts the caller continuation, moves the materialized argument list

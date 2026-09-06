@@ -263,6 +263,8 @@ extern void jit_profile_record_deopt(JITProgram *, Objid, const char *,
 extern void jit_profile_maybe_report(int);
 extern void jit_profile_report(void);
 extern void jit_profile_reset(void);
+extern int jit_profile_detail_enabled(void);
+extern void jit_profile_set_detail(int);
 extern void jit_pool_stats(JITPoolStats *);
 extern void jit_pool_reset(void);
 extern void jit_pool_maintain(void);
@@ -358,6 +360,8 @@ extern int jit_program_resume_map(JITProgram *, ResumeKey);
 extern int jit_program_has_location(JITProgram *);
 extern void jit_program_note_location(JITProgram *, Objid, unsigned);
 extern int jit_program_compile(JITProgram *);
+/* The last argument is true only for an uninterrupted entry immediately after
+   compact commit validated compilation.  Resumes must pass false. */
 extern JITRunResult jit_program_execute_in_context(JITProgram *,
 						   JITExecutionContext *,
 						   JITNativeFrame *, Var *, Var *,
@@ -365,7 +369,7 @@ extern JITRunResult jit_program_execute_in_context(JITProgram *,
 						   JITSourceLocation *, JITDeoptState *,
 						   Var *, Objid, int,
 						   JITContinuationFrame *,
-						   JITContinuationFrame **);
+						   JITContinuationFrame **, int);
 extern JITRunResult jit_program_execute(JITProgram *, Var *, Var *, int *, int *,
 				enum error *, JITSourceLocation *,
 				JITDeoptState *, Var *, Objid, int,

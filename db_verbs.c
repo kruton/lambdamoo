@@ -222,14 +222,19 @@ db_add_verb(Objid oid, const char *vnames, Objid owner, unsigned flags,
 }
 
 static Verbdef *
-find_verbdef_by_name(Object * o, const char *vname, int check_x_bit)
+find_verbdef_by_name(Object * o, const char *vname, int check_x_bit,
+		     unsigned *index_out)
 {
     Verbdef *v;
+    unsigned idx = 1;
 
-    for (v = o->verbdefs; v; v = v->next)
+    for (v = o->verbdefs; v; v = v->next, idx++)
 	if (verbcasecmp(v->name, vname)
 	    && (!check_x_bit || (v->perms & VF_EXEC)))
 	    break;
+
+    if (index_out)
+	*index_out = v ? idx : 0;
 
     return v;
 }
@@ -265,6 +270,7 @@ db_for_all_verbs(Objid oid,
 typedef struct {		/* Non-null db_verb_handles point to these */
     Objid definer;
     Verbdef *verbdef;
+    unsigned index;
 } handle;
 
 static Verbdef *
@@ -325,8 +331,10 @@ db_find_command_verb(Objid oid, const char *verb,
     static handle h;
     db_verb_handle vh;
 
-    for (o = dbpriv_find_object(oid); o; o = dbpriv_find_object(o->parent))
-	for (v = o->verbdefs; v; v = v->next) {
+    for (o = dbpriv_find_object(oid); o; o = dbpriv_find_object(o->parent)) {
+	unsigned idx = 1;
+
+	for (v = o->verbdefs; v; v = v->next, idx++) {
 	    db_arg_spec vdobj = (v->perms >> DOBJSHIFT) & OBJMASK;
 	    db_arg_spec viobj = (v->perms >> IOBJSHIFT) & OBJMASK;
 
@@ -336,11 +344,13 @@ db_find_command_verb(Objid oid, const char *verb,
 		&& (viobj == ASPEC_ANY || viobj == iobj)) {
 		h.definer = o->id;
 		h.verbdef = v;
+		h.index = idx;
 		vh.ptr = &h;
 
 		return vh;
 	    }
 	}
+    }
 
     vh.ptr = 0;
 
@@ -361,8 +371,7 @@ struct vc_entry {
 #ifdef RONG
     int generation;
 #endif
-    Objid oid_key;		/* Note that we proceed up the parent tree
-				   until we hit an object with verbs on it */
+    Objid oid_key;
     char *verbname;
     handle h;
     struct vc_entry *next;
@@ -529,24 +538,31 @@ db_find_callable_verb(Objid oid, const char *verb)
     new_vc->hash = hash;
     new_vc->oid_key = first_parent_with_verbs;
     new_vc->verbname = str_dup(verb);
+    new_vc->h.definer = NOTHING;
     new_vc->h.verbdef = NULL;
+    new_vc->h.index = 0;
     new_vc->next = vc_table[bucket];
     vc_table[bucket] = new_vc;
 #endif
 
-    for ( /* from above */ ; o; o = dbpriv_find_object(o->parent))
-	if ((v = find_verbdef_by_name(o, verb, 1)) != 0) {
+    for (; o; o = dbpriv_find_object(o->parent)) {
+	unsigned index = 0;
+
+	if ((v = find_verbdef_by_name(o, verb, 1, &index)) != 0) {
 #ifdef VERB_CACHE
 	    new_vc->h.definer = o->id;
 	    new_vc->h.verbdef = v;
+	    new_vc->h.index = index;
 	    vh.ptr = &new_vc->h;
 #else
 	    h.definer = o->id;
 	    h.verbdef = v;
+	    h.index = index;
 	    vh.ptr = &h;
 #endif
 	    return vh;
 	}
+    }
     /*
      * note that the verbcache has cleared h.verbdef, so it defaults to a
      * "miss" cache if the for loop doesn't win
@@ -578,6 +594,7 @@ db_find_defined_verb(Objid oid, const char *vname, int allow_numbers)
     if (v) {
 	h.definer = o->id;
 	h.verbdef = v;
+	h.index = i + 1;
 	vh.ptr = &h;
 
 	return vh;
@@ -600,6 +617,7 @@ db_find_indexed_verb(Objid oid, unsigned index)
 	if (++i == index) {
 	    h.definer = o->id;
 	    h.verbdef = v;
+	    h.index = index;
 	    vh.ptr = &h;
 
 	    return vh;
@@ -630,10 +648,12 @@ db_verb_index(db_verb_handle vh)
 
     if (!h)
 	return 0;
+    if (h->index)
+	return h->index;
     o = dbpriv_find_object(h->definer);
     for (v = o->verbdefs, index = 1; v; v = v->next, index++)
 	if (v == h->verbdef)
-	    return index;
+	    return (h->index = index);
     return 0;
 }
 

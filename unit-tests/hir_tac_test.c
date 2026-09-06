@@ -4873,7 +4873,9 @@ test_length_expr_in_stores_and_negatives(void)
     tac = lower_stmt(&names, &stmt_chained, &ctx, &cfg, &dom, &ssa);
     check_int("length in chained index store verify errors", hir_context_error_count(ctx), 0);
     check_int("length in chained index store deopt count",
-	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 1);
+	      hir_tac_count_kind(tac, HIR_TAC_DEOPT), 0);
+    check_int("length in chained index store index_set count",
+	      hir_tac_count_kind(tac, HIR_TAC_INDEX_SET), 1);
     hir_context_free(ctx);
 
     /* 4. Negative test: unindexed $ (e.g. x = $) */
