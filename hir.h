@@ -229,6 +229,7 @@ extern int hir_test_analyze_binary_nonconstant_cases(void);
 extern int hir_test_join_value_fact_cases(void);
 extern int hir_test_match_rotate32_and_cases(void);
 extern int hir_test_replace_ssa_value_uses(void);
+extern int hir_test_dead_code_elimination(void);
 extern int hir_test_current_version_cases(void);
 #ifdef HIR_DUMP_SSA
 extern int hir_test_dump_ssa_cases(void);

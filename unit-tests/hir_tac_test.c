@@ -123,6 +123,8 @@ test_ast_and_operation_tables(void)
 	      hir_test_match_rotate32_and_cases(), 13);
     check_int("SSA use replacement covers all operand homes",
 	      hir_test_replace_ssa_value_uses(), 12);
+    check_int("SSA dead-code elimination preserves implicit and effect uses",
+	      hir_test_dead_code_elimination(), 1);
     check_int("SSA local versioning covers implicit definitions",
 	      hir_test_current_version_cases(), 12);
 #ifdef HIR_DUMP_SSA
@@ -4923,7 +4925,7 @@ test_rotate32_optimization(void)
     check_int("rotate32 input verifies", hir_context_error_count(ctx), 0);
     plan = hir_optimize_ssa_for_backends(ctx, ssa);
     check_int("rotate32 optimization changed",
-	      hir_optimization_change_count(plan), 1);
+	      hir_optimization_change_count(plan), 2);
     check_int("rotate32 optimized SSA verifies", hir_verify_ssa(ctx, ssa), 1);
 #ifdef HIR_DUMP_SSA
     check_ssa_dump_contains("rotate32 optimized operation", ssa, "ROTL32");
@@ -5052,9 +5054,9 @@ test_rotate32_optimization_matrix(void)
     int variant;
 
     check_int("rotate32 accepts swapped or operands",
-	rotate32_variant_change_count(ROTATE32_SWAPPED_OR), 1);
+	rotate32_variant_change_count(ROTATE32_SWAPPED_OR), 2);
     check_int("rotate32 accepts a leading mask",
-	rotate32_variant_change_count(ROTATE32_MASK_FIRST), 1);
+	rotate32_variant_change_count(ROTATE32_MASK_FIRST), 2);
     for (variant = ROTATE32_WRONG_MODULUS;
 	 variant <= ROTATE32_NONCONSTANT_MASK; variant++)
 	check_int("malformed rotate32 pattern rejected",

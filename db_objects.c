@@ -701,8 +701,8 @@ db_change_parent(Objid oid, Objid parent)
 	/* The "no kids" rule is necessary because potentially one of the kids
 	   could have verbs on it--and that kid could have cache entries for
 	   THIS object's parentage. */
-	/* In any case, don't clear the cache. */
-	;
+	/* Keep the ancestor-key cache, but invalidate JIT call targets. */
+	dbpriv_invalidate_dispatch_cache();
     } else {
 	db_priv_affected_callable_verb_lookup();
     }

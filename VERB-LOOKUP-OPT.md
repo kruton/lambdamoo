@@ -299,7 +299,8 @@ with the same first ancestor to share positive and negative entries.  The
 receiver-OID experiment has been removed.  On a miss, lookup continues from
 that ancestor rather than repeating the walk.  Reparenting a childless object
 without verbs can still skip cache invalidation because the next lookup
-recomputes its ancestor key.
+recomputes its ancestor key.  It still advances the dispatch epoch to
+invalidate receiver-specific JIT call targets.
 
 ### 2.4 Dynamic Hashing and String Comparison on Cache Hits (Still Open)
 
@@ -594,15 +595,22 @@ Consider propagating depth maxima at return/promotion or batching timestamps,
 while preserving defined statistics and pool-recency behavior. Instrumentation
 should not add an O(depth) traversal to every ordinary native call.
 
-### 5.4 Keep target caching behind the lifetime contract
+### 5.4 Guard target caching with the lifetime contract
 
-Lookup, hashing, and name comparison now total 4.12% self-time. Even removing
-all three would save only roughly 4% of current sampled CPU work under an
-unchanged workload. A monomorphic target cache cannot by itself close the
-reported interpreter gap. Prefer the redundant scans, initialization, and
-runtime-storage work above first. If a target cache is later implemented,
-retain all mutation/epoch/wrap requirements in section 3.3; a cached raw
-`db_verb_handle` or `Program *` is still unsafe across invalidation.
+Lookup, hashing, and name comparison totaled 4.12% self-time.  The first
+out-of-line monomorphic cache now stores copied target metadata at each native
+resume site and guards its non-owning `Program *` and verb-name pointer with a
+64-bit dispatch epoch before dereferencing either.  Program replacement and
+owner changes join the existing callable-lookup mutation points; all advance
+the epoch before releasing affected storage, even if the global verb cache was
+never allocated.  Wrap permanently disables cache hits, avoiding an ABA
+match.  JIT pool validation still occurs at compact entry.
+
+The warmed `#168:test2(3000)` median improved from 8.065135 to 7.576318
+seconds (6.1%), while the 5.996587-second interpreter baseline remains 26.3%
+faster.  This confirms that target lookup was worth removing but cannot close
+the gap alone.  The next work remains selective environment initialization and
+fusing frame/runtime reservation with cached compact entry.
 
 For each implementation, compare complete warmed runs and allocation counts,
 verify suspension/return/error cleanup, and retain the native-frame verifier

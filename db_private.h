@@ -101,6 +101,8 @@ typedef struct Object {
 
 #ifdef VERB_CACHE
 
+extern void dbpriv_invalidate_dispatch_cache(void);
+
 /* Whenever anything is modified that could influence callable verb
  * lookup, this function must be called.
  */
@@ -115,6 +117,7 @@ extern void db_priv_affected_callable_verb_lookup(void);
 
 #else /* no cache */
 #define db_priv_affected_callable_verb_lookup()
+#define dbpriv_invalidate_dispatch_cache()
 #endif
 
 /*********** Objects ***********/

@@ -881,14 +881,32 @@ capture `/tmp/test2-resume-recipe.perf.data` shows
 Generated recipe dispatch itself is 0.45%; no compensating allocator increase
 is visible (`malloc` fell from 4.05% to 2.86%, subject to sampling variance).
 
-A call-site target cache remains deferred until the wide dispatch epoch and
-owned-target invalidation contract in `VERB-LOOKUP-OPT.md` are implemented.
+A first out-of-line monomorphic target cache is now implemented at resumable
+native verb-call sites.  It bypasses callable-verb lookup and repeated handle
+metadata queries when the receiver class, verb name, and a new 64-bit database
+dispatch epoch still match.  Cached database pointers are non-owning and are
+read only after the epoch comparison; the cache owns only its verb-name key.
+All existing callable-lookup invalidations now advance the epoch even before
+the global lookup table exists, and verb program and owner replacement also
+advance it before old storage can be released.  Epoch wrap disables cache hits
+instead of permitting an ABA match.
+
+After fixing WAIF cache hits to restore the actual receiver, a discarded
+8.093656-second warm-up and three `#168:test2(3000)` runs took 7.576318,
+7.739251, and 7.432518 seconds, median **7.576318 seconds**.  This is 6.1%
+below the 8.065135-second compiled-resume baseline, but remains 26.3% slower
+than the 5.996587-second interpreter median.  The target cache therefore earns
+its keep, but it does not implement the larger fused call-entry recipe:
+environment construction, frame/runtime allocation, and boundary packaging
+remain on every hit.
 
 The global verb cache retains first-ancestor-with-verbs keys.  Lookup recomputes
 that ancestor before probing the cache, so `db_change_parent()` can still skip
-the global cache flush for childless objects without verbs.  The receiver-OID
-experiment has been removed.  A future receiver-key or call-site cache must
-invalidate on every relevant parent change, including those leaf objects.
+the global cache flush for childless objects without verbs.  Those changes
+still advance the dispatch epoch to invalidate JIT call targets.  The
+receiver-OID global-cache experiment has been removed.  JIT call-site caches
+use the dispatch epoch to cover every relevant parent change, including those
+leaf objects.
 
 Such a call-site cache requires a stronger invalidation contract than the
 current global verb cache.  A `db_verb_handle` points into a global cache entry

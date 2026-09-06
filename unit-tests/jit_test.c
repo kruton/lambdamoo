@@ -2945,52 +2945,6 @@ float_singleton_program(void)
 }
 
 static JITProgram *
-dead_singleton_program(void)
-{
-    JITProgram *program = new_jit_program();
-    JITBlock *block = allocate(sizeof(JITBlock));
-    JITInstruction *element = instruction(HIR_TAC_CONST);
-    JITInstruction *singleton = instruction(HIR_TAC_UNARY);
-    JITInstruction *returned = instruction(HIR_TAC_CONST);
-    JITInstruction *ret = instruction(HIR_TAC_RETURN);
-
-    program->num_values = 4;
-    program->num_blocks = 1;
-    program->value_types = allocate(sizeof(var_type) * program->num_values);
-    program->value_is_tagged = allocate(program->num_values);
-    program->value_use_counts = allocate(sizeof(unsigned int)
-	* program->num_values);
-    program->value_escape_flags = allocate(program->num_values);
-    program->value_types[1] = TYPE_INT;
-    program->value_types[2] = TYPE_LIST;
-    program->value_types[3] = TYPE_INT;
-    program->value_use_counts[1] = 1;
-    program->value_use_counts[3] = 1;
-    program->value_escape_flags[3] = JIT_ESCAPE_RETURN;
-    set_program_owned_home(program, 2, 0);
-    add_entry_deopt_map(program);
-    program->blocks = program->last_block = block;
-    block->id = 1;
-    element->value = 1;
-    element->literal = 7;
-    element->literal_type = TYPE_INT;
-    element->next = singleton;
-    singleton->value = 2;
-    singleton->src1 = 1;
-    singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
-    singleton->next = returned;
-    returned->value = 3;
-    returned->literal = 9;
-    returned->literal_type = TYPE_INT;
-    returned->next = ret;
-    ret->src1 = 3;
-    ret->literal_type = TYPE_INT;
-    block->first = element;
-    block->last = ret;
-    return program;
-}
-
-static JITProgram *
 tagged_binary_program(HIROp op)
 {
     JITProgram *program = new_jit_program();
@@ -6793,8 +6747,8 @@ test_owned_value_predicates(void)
     types[2] = TYPE_LIST;
     uses[2] = 0;
     escapes[2] = JIT_ESCAPE_NONE;
-    check(jit_test_value_is_dead_owned_list(program, definition),
-	  "dead owned singleton list was not recognized");
+    check(!jit_test_value_is_dead_owned_list(program, definition),
+	  "SSA-eliminated singleton reached dead-list cleanup");
     definition->kind = HIR_TAC_BINARY;
     definition->op = HIR_OP_LIST_ADD_TAIL;
     check(jit_test_value_is_dead_owned_list(program, definition),
@@ -10898,19 +10852,6 @@ main(void)
 	      "float singleton returned the wrong value");
 	free_var(result);
 	jit_program_free(singleton);
-
-	JITProgram *dead_singleton = dead_singleton_program();
-	check(jit_test_value_is_dead_owned_list(dead_singleton,
-		dead_singleton->blocks->first->next),
-	      "unused singleton was not classified for disposal");
-	ticks = 10;
-	check(jit_program_execute(dead_singleton, 0, &result, &ticks,
-				  &timed_out, &error, 0, 0, 0)
-	      == JIT_RUN_RETURNED,
-	      "unused singleton list did not execute natively");
-	check(result.type == TYPE_INT && result.v.num == 9,
-	      "unused singleton list changed the following return");
-	jit_program_free(dead_singleton);
     }
 
     /* Type-transparent consumers accept every core user-visible runtime type. */

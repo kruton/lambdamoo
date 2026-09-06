@@ -359,6 +359,7 @@ db_find_command_verb(Objid oid, const char *verb,
 
 #ifdef VERB_CACHE
 int db_verb_generation = 0;
+static uint64_t dispatch_epoch = 1;
 
 int verbcache_hit = 0;
 int verbcache_neg_hit = 0;
@@ -382,12 +383,20 @@ struct vc_entry {
 static vc_entry *vc_table[VC_SIZE];
 
 void
+dbpriv_invalidate_dispatch_cache(void)
+{
+    if (dispatch_epoch != 0)
+	dispatch_epoch++;
+}
+
+void
 db_priv_affected_callable_verb_lookup(void)
 {
     int i;
     vc_entry *vc, *vc_next;
 
     db_verb_generation++;
+    dbpriv_invalidate_dispatch_cache();
 
     for (i = 0; i < VC_SIZE; i++) {
 	vc = vc_table[i];
@@ -399,6 +408,12 @@ db_priv_affected_callable_verb_lookup(void)
 	}
 	vc_table[i] = NULL;
     }
+}
+
+uint64_t
+db_dispatch_epoch(void)
+{
+    return dispatch_epoch;
 }
 
 #define VC_CACHE_STATS_MAX 16
@@ -703,6 +718,8 @@ db_set_verb_owner(db_verb_handle vh, Objid owner)
 {
     handle *h = (handle *) vh.ptr;
 
+    db_priv_affected_callable_verb_lookup();
+
     if (!h)
 	panic("DB_SET_VERB_OWNER: Null handle!");
 
@@ -755,9 +772,7 @@ db_set_verb_program(db_verb_handle vh, Program * program)
     handle *h = (handle *) vh.ptr;
     Verbdef *v;
 
-    /* Not necessary, since this was only here to cope with nonprogrammed verbs, and that turns out to be handled properly in modern servers. */
-
-    /* db_priv_affected_callable_verb_lookup(); */
+    db_priv_affected_callable_verb_lookup();
 
     if (!h)
 	panic("DB_SET_VERB_PROGRAM: Null handle!");

@@ -578,6 +578,7 @@ extern void db_set_verb_program(db_verb_handle, Program *);
 				 * Thus, the caller should program_ref() it if
 				 * it is to be persistent.
 				 */
+extern uint64_t db_dispatch_epoch(void);
 
 extern void db_verb_arg_specs(db_verb_handle h,
 			      db_arg_spec * dobj,
