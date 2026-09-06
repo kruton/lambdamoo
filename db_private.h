@@ -43,9 +43,14 @@ struct Verbdef {
 typedef struct Proplist Proplist;
 typedef struct Propdef Propdef;
 
+#define PROPERTY_CACHE 1
+
 struct Propdef {
     const char *name;
     int hash;
+#ifdef PROPERTY_CACHE
+    uint64_t id;
+#endif
 };
 #define BQM_DESCRIBE_Propdef(B,F,V,X)   (2 * V)
 
@@ -79,6 +84,9 @@ typedef struct Object {
     Verbdef *verbdefs;
     Proplist propdefs;
     Pval *propval;
+#ifdef PROPERTY_CACHE
+    struct PropertyLayout *prop_layout;
+#endif
 
 #ifdef WAIF_CORE
     struct WaifPropdefs *waif_propdefs;
@@ -137,6 +145,12 @@ extern Object *dbpriv_find_object(Objid);
 extern Propdef dbpriv_new_propdef(const char *name);
 
 extern int dbpriv_count_properties(Objid);
+
+#ifdef PROPERTY_CACHE
+extern void dbpriv_build_property_layouts(void);
+extern void dbpriv_release_property_layout(Object *);
+extern Pval *dbpriv_property_value_for_definition(Objid, uint64_t);
+#endif
 
 extern int dbpriv_check_properties_for_chparent(Objid oid,
 						Objid new_parent);

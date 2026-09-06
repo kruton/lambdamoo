@@ -244,8 +244,20 @@ write_object(Objid oid)
     nprops = dbpriv_count_properties(oid);
 
     dbio_write_intmax(nprops);
+#ifdef PROPERTY_CACHE
+    {
+	Object *p;
+
+	/* Preserve the database's local-first property-value ordering. */
+	for (p = o; p; p = dbpriv_find_object(p->parent))
+	    for (i = 0; i < p->propdefs.cur_length; i++)
+		write_propval(dbpriv_property_value_for_definition(
+			      oid, p->propdefs.l[i].id));
+    }
+#else
     for (i = 0; i < nprops; i++)
 	write_propval(o->propval + i);
+#endif
 }
 
 
@@ -597,6 +609,9 @@ read_db_file(void)
 	errlog("READ_DB_FILE: Errors in object hierarchies.\n");
 	return 0;
     }
+#ifdef PROPERTY_CACHE
+    dbpriv_build_property_layouts();
+#endif
     oklog("LOADING: Reading %"PRIdN" MOO verb programs...\n", nprogs);
     for (i = 1; i <= nprogs; i++) {
 	Objid oid;
