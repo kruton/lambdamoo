@@ -33,6 +33,7 @@
 #include "integer_arithmetic.h"
 #ifdef ENABLE_JIT
 #include "jit.h"
+#include "jit_internal.h"
 #endif
 #include "list.h"
 #include "log.h"
@@ -947,6 +948,11 @@ typedef struct {
     Var receiver;
 #endif
     const char *verb;
+    const char *verbname;
+    Objid progr;
+    Objid vloc;
+    unsigned verb_index;
+    unsigned debug;
 } ResolvedVerbCall;
 
 #ifdef ENABLE_JIT
@@ -985,8 +991,78 @@ resolve_verb_call(Objid this, const char *vname
     call->receiver = THIS;
 #endif
     call->verb = vname;
+    call->verbname = db_verb_names(call->handle);
+    call->progr = db_verb_owner(call->handle);
+    call->vloc = db_verb_definer(call->handle);
+    call->verb_index = db_verb_index(call->handle);
+    call->debug = (db_verb_flags(call->handle) & VF_DEBUG);
     return E_NONE;
 }
+
+#ifdef ENABLE_JIT
+static JITNativeResume *
+jit_native_call_resume(JITNativeFrame *caller, int map_id)
+{
+    if (!caller || !caller->program || map_id <= 0
+	|| map_id >= caller->program->num_deopt_maps)
+	return 0;
+    return caller->program->deopt_maps[map_id].native_resume;
+}
+
+static int
+resolve_cached_jit_verb_call(JITNativeFrame *caller, int map_id, Objid class,
+			     const char *vname, Objid this
+			     WAIF_COMMA_ARG(Var receiver),
+			     ResolvedVerbCall *call)
+{
+    JITNativeResume *resume = jit_native_call_resume(caller, map_id);
+    uint64_t epoch = db_dispatch_epoch();
+
+    if (!epoch || !resume || !resume->cached_program
+	|| resume->cached_dispatch_epoch != epoch
+	|| resume->cached_class != class
+	|| (resume->cached_verb != vname
+	    && strcmp(resume->cached_verb, vname) != 0))
+	return 0;
+    memset(call, 0, sizeof(*call));
+    call->program = resume->cached_program;
+    call->this = this;
+#ifdef WAIF_CORE
+    call->receiver = receiver;
+#endif
+    call->verb = resume->cached_verb;
+    call->verbname = resume->cached_verbname;
+    call->progr = resume->cached_progr;
+    call->vloc = resume->cached_vloc;
+    call->verb_index = resume->cached_verb_index;
+    call->debug = resume->cached_debug;
+    return 1;
+}
+
+static void
+cache_jit_verb_call(JITNativeFrame *caller, int map_id, Objid class,
+		    const ResolvedVerbCall *call)
+{
+    JITNativeResume *resume = jit_native_call_resume(caller, map_id);
+    const char *old_verb;
+    uint64_t epoch = db_dispatch_epoch();
+
+    if (!resume || !epoch)
+	return;
+    old_verb = resume->cached_verb;
+    resume->cached_program = call->program;
+    resume->cached_verb = str_ref(call->verb);
+    resume->cached_verbname = call->verbname;
+    resume->cached_class = class;
+    resume->cached_progr = call->progr;
+    resume->cached_vloc = call->vloc;
+    resume->cached_verb_index = call->verb_index;
+    resume->cached_debug = call->debug;
+    resume->cached_dispatch_epoch = epoch;
+    if (old_verb)
+	free_str(old_verb);
+}
+#endif
 
 static void
 prepare_verb_call_for_caller(PreparedVerbCall *prepared, Var *caller_env,
@@ -1010,12 +1086,12 @@ prepare_verb_call_for_caller(PreparedVerbCall *prepared, Var *caller_env,
 #ifdef WAIF_CORE
     prepared->receiver = var_ref(call->receiver);
 #endif
-    prepared->progr = db_verb_owner(call->handle);
-    prepared->vloc = db_verb_definer(call->handle);
-    prepared->verb_index = db_verb_index(call->handle);
+    prepared->progr = call->progr;
+    prepared->vloc = call->vloc;
+    prepared->verb_index = call->verb_index;
     prepared->verb = str_ref(call->verb);
-    prepared->verbname = str_ref(db_verb_names(call->handle));
-    prepared->debug = (db_verb_flags(call->handle) & VF_DEBUG);
+    prepared->verbname = str_ref(call->verbname);
+    prepared->debug = call->debug;
     prepared->env = env = new_rt_env(program->num_var_names);
     fill_in_rt_consts(env, program->version);
 
@@ -1180,8 +1256,13 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	    : (!caller->runtime_storage || !caller->owns_runtime
 	       || caller->pending_resume_map != map_id)))
 	return 0;
-    error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
-	&resolved);
+    if (!resolve_cached_jit_verb_call(caller, map_id, this, vname, this
+	WAIF_COMMA_ARG(THIS), &resolved)) {
+	error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
+	    &resolved);
+	if (error == E_NONE)
+	    cache_jit_verb_call(caller, map_id, this, &resolved);
+    }
     if (error != E_NONE) {
 	*error_out = error;
 	return 0;

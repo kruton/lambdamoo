@@ -3489,6 +3489,146 @@ next_modulus:
     return changes;
 }
 
+static int
+ssa_instr_is_dead_code_candidate(HIRSSAInstr *instr)
+{
+    /* The integer lattice drives folding but is not a runtime type proof.
+       Keep any operation which can signal a MOO error or mutate state. */
+    if (!ssa_defines_value(instr) || instr->error_label > 0)
+	return 0;
+
+    switch (instr->kind) {
+    case HIR_TAC_CONST:
+    case HIR_TAC_LOAD_ERROR:
+    case HIR_TAC_LOAD_LOCAL:
+    case HIR_TAC_PHI:
+	return 1;
+    case HIR_TAC_UNARY:
+	switch (instr->op) {
+	case HIR_OP_NOT:
+	case HIR_OP_TYPEOF:
+	case HIR_OP_MAKE_SINGLETON_LIST:
+	case HIR_OP_TICKS_LEFT:
+	case HIR_OP_SECONDS_LEFT:
+	case HIR_OP_TIME:
+	    return 1;
+	default:
+	    return 0;
+	}
+    case HIR_TAC_BINARY:
+	return instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE
+	    || instr->op == HIR_OP_AND || instr->op == HIR_OP_OR;
+    default:
+	return 0;
+    }
+}
+
+static void
+mark_ssa_live_value(unsigned char *live, int num_values, int value,
+		    int *worklist, int *worklist_count)
+{
+    if (value <= 0 || value >= num_values || live[value])
+	return;
+    live[value] = 1;
+    worklist[(*worklist_count)++] = value;
+}
+
+static void
+mark_ssa_instr_uses(HIRSSAInstr *instr, unsigned char *live, int num_values,
+		    int *worklist, int *worklist_count)
+{
+    HIRPhiArg *phi;
+    HIRParallelCopy *copy;
+    int i;
+
+    mark_ssa_live_value(live, num_values, instr->src1, worklist,
+			worklist_count);
+    mark_ssa_live_value(live, num_values, instr->src2, worklist,
+			worklist_count);
+    mark_ssa_live_value(live, num_values, instr->src3, worklist,
+			worklist_count);
+    for (i = 0; i < instr->num_stack_values; i++)
+	mark_ssa_live_value(live, num_values, instr->stack_values[i], worklist,
+			    worklist_count);
+    for (i = 0; i < instr->num_local_values; i++)
+	mark_ssa_live_value(live, num_values, instr->local_values[i], worklist,
+			    worklist_count);
+    for (phi = instr->phi_args; phi; phi = phi->next)
+	mark_ssa_live_value(live, num_values, phi->value, worklist,
+			    worklist_count);
+    for (copy = instr->copies; copy; copy = copy->next)
+	mark_ssa_live_value(live, num_values, copy->src, worklist,
+			    worklist_count);
+}
+
+static int
+eliminate_dead_ssa(HIRContext *ctx, HIRSSAProgram *ssa)
+{
+    HIRSSAInstr **definitions;
+    unsigned char *live;
+    int *worklist;
+    HIRSSABlock *block;
+    int worklist_count = 0;
+    int changes = 0;
+
+    definitions = hir_calloc(ctx, ctx->next_temp,
+			     sizeof(HIRSSAInstr *));
+    live = hir_calloc(ctx, ctx->next_temp, sizeof(unsigned char));
+    worklist = hir_alloc(ctx, (size_t) ctx->next_temp * sizeof(int));
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (ssa_defines_value(instr) && instr->value > 0
+		&& instr->value < ctx->next_temp)
+		definitions[instr->value] = instr;
+	    if (!ssa_instr_is_dead_code_candidate(instr))
+		mark_ssa_instr_uses(instr, live, ctx->next_temp, worklist,
+				    &worklist_count);
+	    if (instr == block->last)
+		break;
+	}
+    }
+
+    while (worklist_count > 0) {
+	int value = worklist[--worklist_count];
+	HIRSSAInstr *definition = definitions[value];
+
+	if (definition)
+	    mark_ssa_instr_uses(definition, live, ctx->next_temp, worklist,
+				&worklist_count);
+    }
+
+    for (block = ssa->blocks; block; block = block->next) {
+	HIRSSAInstr *instr = block->first;
+	HIRSSAInstr *previous = 0;
+
+	while (instr) {
+	    HIRSSAInstr *next = instr == block->last ? 0 : instr->next;
+
+	    if (ssa_instr_is_dead_code_candidate(instr)
+		&& instr->value > 0 && instr->value < ctx->next_temp
+		&& !live[instr->value]) {
+		if (previous)
+		    previous->next = next;
+		else
+		    block->first = next;
+		if (block->last == instr)
+		    block->last = previous;
+		ssa->num_instructions--;
+		ssa->num_values--;
+		changes++;
+	    } else {
+		previous = instr;
+	    }
+	    instr = next;
+	}
+    }
+
+    return changes;
+}
+
 HIROptimizationPlan *
 hir_optimize_ssa_for_backends(HIRContext *ctx, HIRSSAProgram *ssa)
 {
@@ -3566,6 +3706,7 @@ hir_optimize_ssa_for_backends(HIRContext *ctx, HIRSSAProgram *ssa)
     prune_cfg_blocks(ssa->cfg, reachable);
     prune_ssa_blocks(ssa, reachable);
     prune_phi_arguments(ssa, reachable);
+    plan->changes += eliminate_dead_ssa(ctx, ssa);
     return plan;
 }
 
@@ -14062,5 +14203,65 @@ hir_test_corrupt_out_ssa(HIRContext *ctx,
 	break;
     }
     return ssa;
+}
+
+int
+hir_test_dead_code_elimination(void)
+{
+    HIRContext *ctx = hir_context_new(0);
+    HIRSSAInstr *stack_keep = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 1);
+    HIRSSAInstr *local_keep = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 2);
+    HIRSSAInstr *dead_left = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 3);
+    HIRSSAInstr *dead_right = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 4);
+    HIRSSAInstr *dead_equal = new_test_ssa_instr(ctx, HIR_TAC_BINARY, 1040, 5);
+    HIRSSAInstr *dead_singleton = new_test_ssa_instr(ctx, HIR_TAC_UNARY, 1040, 9);
+    HIRSSAInstr *dividend = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 6);
+    HIRSSAInstr *divisor = new_test_ssa_instr(ctx, HIR_TAC_CONST, 1040, 7);
+    HIRSSAInstr *divide = new_test_ssa_instr(ctx, HIR_TAC_BINARY, 1040, 8);
+    HIRSSAInstr *tick = new_test_ssa_instr(ctx, HIR_TAC_TICK, 1040, 0);
+    HIRSSAInstr *ret = new_test_ssa_instr(ctx, HIR_TAC_RETURN0, 1040, 0);
+    HIRSSAProgram *ssa;
+    HIRSSAInstr *instr;
+    unsigned char found[10] = { 0 };
+    int changes;
+    int result;
+
+    ctx->next_temp = 10;
+    stack_keep->next = local_keep;
+    local_keep->next = dead_left;
+    dead_left->next = dead_right;
+    dead_right->next = dead_equal;
+    dead_equal->op = HIR_OP_EQ;
+    dead_equal->src1 = 3;
+    dead_equal->src2 = 4;
+    dead_equal->next = dead_singleton;
+    dead_singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
+    dead_singleton->src1 = 5;
+    dead_singleton->next = dividend;
+    dividend->next = divisor;
+    divisor->next = divide;
+    divide->op = HIR_OP_DIV;
+    divide->src1 = 6;
+    divide->src2 = 7;
+    divide->next = tick;
+    tick->num_stack_values = 1;
+    tick->stack_values = hir_alloc(ctx, sizeof(int));
+    tick->stack_values[0] = 1;
+    tick->num_local_values = 1;
+    tick->local_values = hir_alloc(ctx, sizeof(int));
+    tick->local_values[0] = 2;
+    tick->next = ret;
+    ssa = new_test_ssa_program(ctx, stack_keep, ret, 11, 9);
+
+    changes = eliminate_dead_ssa(ctx, ssa);
+    for (instr = ssa->blocks->first; instr; instr = instr->next)
+	if (instr->value > 0 && instr->value < 10)
+	    found[instr->value] = 1;
+    result = changes == 4 && ssa->num_instructions == 7
+	&& ssa->num_values == 5 && found[1] && found[2]
+	&& !found[3] && !found[4] && !found[5]
+	&& found[6] && found[7] && found[8] && !found[9];
+    hir_context_free(ctx);
+    return result;
 }
 #endif

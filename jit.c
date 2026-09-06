@@ -3196,12 +3196,10 @@ jit_value_is_dead_owned_list(JITProgram *program, JITInstruction *instr)
 	|| program->value_use_counts[instr->value] != 0
 	|| program->value_escape_flags[instr->value] != JIT_ESCAPE_NONE)
 	return 0;
-    return (instr->kind == HIR_TAC_UNARY
-	    && instr->op == HIR_OP_MAKE_SINGLETON_LIST)
-	|| (instr->kind == HIR_TAC_BINARY
-	    && (instr->op == HIR_OP_LIST_ADD_TAIL
-		|| instr->op == HIR_OP_LIST_APPEND
-		|| instr->op == HIR_OP_SUBLIST_FROM));
+    return instr->kind == HIR_TAC_BINARY
+	&& (instr->op == HIR_OP_LIST_ADD_TAIL
+	    || instr->op == HIR_OP_LIST_APPEND
+	    || instr->op == HIR_OP_SUBLIST_FROM);
 }
 
 static int
@@ -8132,6 +8130,8 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_boundary_ownership,
 			   M_PROGRAM);
 		if (program->deopt_maps[i].native_resume) {
+		    if (program->deopt_maps[i].native_resume->cached_verb)
+			free_str(program->deopt_maps[i].native_resume->cached_verb);
 		    if (program->deopt_maps[i].native_resume->capture_actions)
 			myfree(program->deopt_maps[i].native_resume->capture_actions,
 			       M_PROGRAM);

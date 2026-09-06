@@ -79,6 +79,15 @@ struct JITNativeResume {
     int *required_homes;
     int num_literals;
     JITResumeLiteral *literals;
+    uint64_t cached_dispatch_epoch;
+    Objid cached_class;
+    Program *cached_program;
+    const char *cached_verb;
+    const char *cached_verbname;
+    Objid cached_progr;
+    Objid cached_vloc;
+    unsigned cached_verb_index;
+    unsigned cached_debug;
     unsigned char valid;
     unsigned char rehydratable;
     unsigned char capture_classified;
