@@ -29,8 +29,9 @@ Contents
       [<code>%disabled</code>](#user-content-disabled),
       [<code>%implies</code>](#user-content-implies-other_keyword),
       [<code>%lib</code>](#user-content-lib-keyword-cpp_keyword),
+      [<code>%lib_list</code>](#user-content-lib_list-ls_keyword--keywordkeyword),
       [<code>%make</code>](#user-content-make-makefile_insert),
-      [<code>%option_set</code>](#user-content-option_set-os_keyword--keyword-keyword-),
+      [<code>%option_set</code>](#user-content-option_set-os_keyword--keywordkeyword),
       [<code>%option</code>](#user-content-option-keyword-cpp_keyword),
       [<code>%path</code>](#user-content-path-directory_path),
       [<code>%require</code>](#user-content-require-requirement_name),
@@ -965,12 +966,24 @@ to _keyword_ upcased, and the setting of `%cdefine`.
 
 Allowed subcmds are `%ac`, `%alt`, `=`, and `%build`
 
+#### `%lib_list` _ls_keyword_ `=` _keyword_[,_keyword_...]
+
+For `%require`, this declares a library search list _ls_keyword_ that,
+if included in a `--with-`_ew_name_`=` list expands as declared, i.e.,
+the libraries will be searched for in the order specified if this part
+of the search list is reached.
+
+If _ls_keyword_ is `yes`, then this declares the default search list
+(in which case `%ac_yes` should not be used).
+
+A `%lib_list` does __not__ get a cppname.
+
 #### `%make` _makefile_insert_
 
 For a `%build`, declare the additional dependencies and recipes to be
 included in `Makefile` if this build is selected.
 
-#### `%option_set` _os_keyword_ `=` _keyword_ [_keyword_ ...]
+#### `%option_set` _os_keyword_ `=` _keyword_[,_keyword_...]
 
 For an `%%extension`, this declares a option set _os_keyword_ that, if
 selected, implies all of the right-hand-side _keywords_.
