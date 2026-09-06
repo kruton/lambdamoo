@@ -93,6 +93,9 @@ dbpriv_new_object(void)
     ensure_new_object();
     o = objects[num_objects] = mymalloc(sizeof(Object), M_OBJECT);
     o->id = num_objects;
+#ifdef PROPERTY_CACHE
+    o->prop_layout = NULL;
+#endif
 #ifdef WAIF_CORE
     o->waif_propdefs = NULL;
 #endif
@@ -169,6 +172,9 @@ db_destroy_object(Objid oid)
 	myfree(o->propval, M_PVAL);
     if (o->propdefs.l)
 	myfree(o->propdefs.l, M_PROPDEF);
+#ifdef PROPERTY_CACHE
+    dbpriv_release_property_layout(o);
+#endif
 
     for (v = o->verbdefs; v; v = w) {
 	if (v->program)
@@ -293,6 +299,11 @@ db_object_bytes(Objid oid)
     Verbdef *v;
 
     count = BQM_SIZEOF(Object) + BQM_SIZEOF_PTR_TO(Object);
+#if BYTE_QUOTA_MODEL == BQM_HW
+#ifdef PROPERTY_CACHE
+    count -= sizeof(o->prop_layout);
+#endif
+#endif
     count += memo_strlen(o->name) + 1;
 
     for (v = o->verbdefs; v; v = v->next) {
@@ -303,6 +314,11 @@ db_object_bytes(Objid oid)
     }
 
     count += BQM_SIZEOF(Propdef) * o->propdefs.cur_length;
+#if BYTE_QUOTA_MODEL == BQM_HW
+#ifdef PROPERTY_CACHE
+    count -= sizeof(o->propdefs.l[0].id) * o->propdefs.cur_length;
+#endif
+#endif
     for (i = 0; i < o->propdefs.cur_length; i++)
 	count += memo_strlen(o->propdefs.l[i].name) + 1;
 

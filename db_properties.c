@@ -27,6 +27,171 @@
 #include "utils.h"
 #include "waif.h"
 
+#ifdef PROPERTY_CACHE
+typedef struct {
+    uint64_t id;
+    const char *name;
+    int hash;
+    Object *definer;
+} PropertyDescriptor;
+
+struct PropertyLayout {
+    unsigned refs;
+    int count;
+    int table_size;
+    PropertyDescriptor *descriptors;
+    int *name_index;
+    int *id_index;
+};
+
+/* Property IDs exist only in memory.  Layouts use parent-first slots so that
+ * inherited properties retain their slot in every derived layout. */
+static uint64_t next_property_id = 1;
+
+static struct PropertyLayout *
+ref_layout(struct PropertyLayout *layout)
+{
+    if (layout)
+	layout->refs++;
+    return layout;
+}
+
+static void
+free_layout(struct PropertyLayout *layout)
+{
+    int i;
+
+    if (!layout || --layout->refs != 0)
+	return;
+    for (i = 0; i < layout->count; i++)
+	free_str(layout->descriptors[i].name);
+    myfree(layout->descriptors, M_PROPERTY_LAYOUT);
+    myfree(layout->name_index, M_PROPERTY_LAYOUT);
+    myfree(layout->id_index, M_PROPERTY_LAYOUT);
+    myfree(layout, M_PROPERTY_LAYOUT);
+}
+
+void
+dbpriv_release_property_layout(Object *o)
+{
+    free_layout(o->prop_layout);
+    o->prop_layout = NULL;
+}
+
+static int
+layout_slot_for_id(const struct PropertyLayout *layout, uint64_t id)
+{
+    int bucket, slot;
+
+    if (!layout)
+	return -1;
+    bucket = (unsigned) id & (layout->table_size - 1);
+    while ((slot = layout->id_index[bucket]) != -1) {
+	if (layout->descriptors[slot].id == id)
+	    return slot;
+	bucket = (bucket + 1) & (layout->table_size - 1);
+    }
+    return -1;
+}
+
+static int
+layout_slot_for_name(const struct PropertyLayout *layout, const char *name,
+		    int hash)
+{
+    int bucket, slot;
+
+    if (!layout)
+	return -1;
+    bucket = (unsigned) hash & (layout->table_size - 1);
+    while ((slot = layout->name_index[bucket]) != -1) {
+	PropertyDescriptor *d = &layout->descriptors[slot];
+
+	if (d->hash == hash
+	    && (d->name == name || !mystrcasecmp(d->name, name)))
+	    return slot;
+	bucket = (bucket + 1) & (layout->table_size - 1);
+    }
+    return -1;
+}
+
+static void
+rebuild_name_index(struct PropertyLayout *layout)
+{
+    int i;
+
+    for (i = 0; i < layout->table_size; i++)
+	layout->name_index[i] = -1;
+    for (i = 0; i < layout->count; i++) {
+	int bucket = (unsigned) layout->descriptors[i].hash
+	    & (layout->table_size - 1);
+
+	while (layout->name_index[bucket] != -1)
+	    bucket = (bucket + 1) & (layout->table_size - 1);
+	layout->name_index[bucket] = i;
+    }
+}
+
+static void
+rebuild_id_index(struct PropertyLayout *layout)
+{
+    int i;
+
+    for (i = 0; i < layout->table_size; i++)
+	layout->id_index[i] = -1;
+    for (i = 0; i < layout->count; i++) {
+	int bucket = (unsigned) layout->descriptors[i].id
+	    & (layout->table_size - 1);
+
+	while (layout->id_index[bucket] != -1)
+	    bucket = (bucket + 1) & (layout->table_size - 1);
+	layout->id_index[bucket] = i;
+    }
+}
+
+static struct PropertyLayout *
+make_layout(Object *owner, struct PropertyLayout *parent)
+{
+    struct PropertyLayout *layout;
+    int inherited = parent ? parent->count : 0;
+    int count = inherited + owner->propdefs.cur_length;
+    int i;
+
+    if (owner->propdefs.cur_length == 0)
+	return ref_layout(parent);
+    if (count == 0)
+	return NULL;
+
+    layout = mymalloc(sizeof(*layout), M_PROPERTY_LAYOUT);
+    layout->refs = 1;
+    layout->count = count;
+    layout->descriptors = mymalloc(count * sizeof(PropertyDescriptor),
+				  M_PROPERTY_LAYOUT);
+    for (i = 0; i < inherited; i++) {
+	layout->descriptors[i] = parent->descriptors[i];
+	layout->descriptors[i].name = str_ref(parent->descriptors[i].name);
+    }
+    for (i = 0; i < owner->propdefs.cur_length; i++) {
+	Propdef *p = &owner->propdefs.l[i];
+	PropertyDescriptor *d = &layout->descriptors[inherited + i];
+
+	d->id = p->id;
+	d->name = str_ref(p->name);
+	d->hash = p->hash;
+	d->definer = owner;
+    }
+
+    for (layout->table_size = 8; layout->table_size < count * 2;
+	 layout->table_size *= 2)
+	;
+    layout->name_index = mymalloc(layout->table_size * sizeof(int),
+				  M_PROPERTY_LAYOUT);
+    layout->id_index = mymalloc(layout->table_size * sizeof(int),
+				M_PROPERTY_LAYOUT);
+    rebuild_name_index(layout);
+    rebuild_id_index(layout);
+    return layout;
+}
+#endif /* PROPERTY_CACHE */
 
 Propdef
 dbpriv_new_propdef(const char *name)
@@ -35,6 +200,9 @@ dbpriv_new_propdef(const char *name)
 
     newprop.name = str_ref(name);
     newprop.hash = str_hash(name);
+#ifdef PROPERTY_CACHE
+    newprop.id = next_property_id++;
+#endif
     return newprop;
 }
 
@@ -44,11 +212,86 @@ dbpriv_count_properties(Objid oid)
     Object *o;
     int nprops = 0;
 
-    for (o = dbpriv_find_object(oid); o; o = dbpriv_find_object(o->parent))
+    o = dbpriv_find_object(oid);
+#ifdef PROPERTY_CACHE
+    if (o && o->prop_layout)
+	return o->prop_layout->count;
+#endif
+    for (; o; o = dbpriv_find_object(o->parent))
 	nprops += o->propdefs.cur_length;
 
     return nprops;
 }
+
+#ifdef PROPERTY_CACHE
+Pval *
+dbpriv_property_value_for_definition(Objid oid, uint64_t id)
+{
+    Object *o = dbpriv_find_object(oid);
+    int slot = layout_slot_for_id(o->prop_layout, id);
+
+    if (slot < 0)
+	panic("Property definition missing from object layout");
+    return &o->propval[slot];
+}
+
+static int
+legacy_property_position(Object *o, uint64_t id)
+{
+    int position = 0;
+
+    for (; o; o = dbpriv_find_object(o->parent)) {
+	int i;
+
+	for (i = 0; i < o->propdefs.cur_length; i++, position++)
+	    if (o->propdefs.l[i].id == id)
+		return position;
+    }
+    return -1;
+}
+
+static void
+build_loaded_layouts(Object *o, struct PropertyLayout *parent)
+{
+    Pval *old_values = o->propval;
+    int count, i;
+    Objid child;
+
+    /* Database files store values local-first; live layouts are parent-first. */
+    o->prop_layout = make_layout(o, parent);
+    count = o->prop_layout ? o->prop_layout->count : 0;
+    if (count) {
+	Pval *new_values = mymalloc(count * sizeof(Pval), M_PVAL);
+
+	for (i = 0; i < count; i++) {
+	    int old_slot = legacy_property_position(
+		o, o->prop_layout->descriptors[i].id);
+
+	    if (old_slot < 0)
+		panic("Invalid property layout while loading database");
+	    new_values[i] = old_values[old_slot];
+	}
+	o->propval = new_values;
+	myfree(old_values, M_PVAL);
+    }
+    for (child = o->child; child != NOTHING;
+	 child = dbpriv_find_object(child)->sibling)
+	build_loaded_layouts(dbpriv_find_object(child), o->prop_layout);
+}
+
+void
+dbpriv_build_property_layouts(void)
+{
+    Objid oid;
+
+    for (oid = 0; oid <= db_last_used_objid(); oid++) {
+	Object *o = dbpriv_find_object(oid);
+
+	if (o && o->parent == NOTHING)
+	    build_loaded_layouts(o, NULL);
+    }
+}
+#endif /* PROPERTY_CACHE */
 
 static int
 property_defined_at_or_below(const char *pname, int phash, Objid oid)
@@ -62,7 +305,8 @@ property_defined_at_or_below(const char *pname, int phash, Objid oid)
 
     for (i = 0; i < length; i++)
 	if (props->l[i].hash == phash
-	    && !mystrcasecmp(props->l[i].name, pname))
+	    && (props->l[i].name == pname
+		|| !mystrcasecmp(props->l[i].name, pname)))
 	    return 1;
 
     for (c = dbpriv_find_object(oid)->child;
@@ -74,6 +318,195 @@ property_defined_at_or_below(const char *pname, int phash, Objid oid)
     return 0;
 }
 
+#ifdef PROPERTY_CACHE
+static void
+invalidate_property_waifs(Object *o)
+{
+#ifdef WAIF_CORE
+    free_waif_propdefs(o->waif_propdefs);
+    o->waif_propdefs = NULL;
+#else
+    (void) o;
+#endif
+}
+
+static void
+install_property_layout(Object *o, struct PropertyLayout *layout, Pval *values)
+{
+    struct PropertyLayout *old_layout = o->prop_layout;
+    Pval *old_values = o->propval;
+
+    o->prop_layout = layout;
+    o->propval = values;
+    if (old_values)
+	myfree(old_values, M_PVAL);
+    free_layout(old_layout);
+    invalidate_property_waifs(o);
+}
+
+static void
+rename_property_in_layouts(Object *o,
+			   struct PropertyLayout *shared_parent_layout,
+			   uint64_t id, const char *name, int hash)
+{
+    struct PropertyLayout *layout = o->prop_layout;
+    Objid child;
+
+    /* A child with no local definitions shares its parent's layout.  Update
+     * each distinct layout just once, in place; renaming cannot move slots. */
+    if (layout != shared_parent_layout) {
+	int slot = layout_slot_for_id(layout, id);
+
+	if (slot < 0)
+	    panic("Renamed property is not present in descendant layout");
+	free_str(layout->descriptors[slot].name);
+	layout->descriptors[slot].name = str_ref(name);
+	layout->descriptors[slot].hash = hash;
+	rebuild_name_index(layout);
+    }
+
+    for (child = o->child; child != NOTHING;
+	 child = dbpriv_find_object(child)->sibling)
+	rename_property_in_layouts(dbpriv_find_object(child), layout, id,
+				   name, hash);
+}
+
+static void
+insert_property_slot(Object *o, uint64_t added_id, Object *added_definer,
+		     const Pval *added_value)
+{
+    struct PropertyLayout *old_layout = o->prop_layout;
+    struct PropertyLayout *parent_layout = NULL;
+    Pval *old_values = o->propval;
+    struct PropertyLayout *new_layout;
+    Pval *new_values;
+    int old_count = old_layout ? old_layout->count : 0;
+    int new_count, added_slot, i;
+    Objid child;
+
+    if (o->parent != NOTHING)
+	parent_layout = dbpriv_find_object(o->parent)->prop_layout;
+    new_layout = make_layout(o, parent_layout);
+    new_count = new_layout ? new_layout->count : 0;
+    added_slot = layout_slot_for_id(new_layout, added_id);
+    if (new_count != old_count + 1 || added_slot < 0)
+	panic("Invalid property layout while adding property");
+
+    new_values = mymalloc(new_count * sizeof(Pval), M_PVAL);
+    for (i = 0; i < added_slot; i++)
+	new_values[i] = old_values[i];
+    for (i = added_slot + 1; i < new_count; i++)
+	new_values[i] = old_values[i - 1];
+
+    if (o == added_definer) {
+	new_values[added_slot] = *added_value;
+	new_values[added_slot].var = var_ref(added_value->var);
+	if (new_values[added_slot].perms & PF_CHOWN)
+	    new_values[added_slot].owner = o->owner;
+    } else {
+	Object *parent = dbpriv_find_object(o->parent);
+	int parent_slot = layout_slot_for_id(parent->prop_layout, added_id);
+
+	if (parent_slot < 0)
+	    panic("New property is not present in parent layout");
+	new_values[added_slot] = parent->propval[parent_slot];
+	new_values[added_slot].var.type = TYPE_CLEAR;
+	if (new_values[added_slot].perms & PF_CHOWN)
+	    new_values[added_slot].owner = o->owner;
+    }
+
+    install_property_layout(o, new_layout, new_values);
+
+    for (child = o->child; child != NOTHING;
+	 child = dbpriv_find_object(child)->sibling)
+	insert_property_slot(dbpriv_find_object(child), added_id,
+			     added_definer, added_value);
+}
+
+static void
+remove_property_slot(Object *o, uint64_t deleted_id)
+{
+    struct PropertyLayout *old_layout = o->prop_layout;
+    struct PropertyLayout *parent_layout = NULL;
+    Pval *old_values = o->propval;
+    struct PropertyLayout *new_layout;
+    Pval *new_values;
+    int old_count = old_layout ? old_layout->count : 0;
+    int new_count, deleted_slot, i;
+    Objid child;
+
+    deleted_slot = layout_slot_for_id(old_layout, deleted_id);
+    if (deleted_slot < 0)
+	panic("Deleted property is not present in old layout");
+    if (o->parent != NOTHING)
+	parent_layout = dbpriv_find_object(o->parent)->prop_layout;
+    new_layout = make_layout(o, parent_layout);
+    new_count = new_layout ? new_layout->count : 0;
+    if (new_count != old_count - 1)
+	panic("Invalid property layout while deleting property");
+
+    new_values = new_count ? mymalloc(new_count * sizeof(Pval), M_PVAL) : NULL;
+    for (i = 0; i < deleted_slot; i++)
+	new_values[i] = old_values[i];
+    for (i = deleted_slot; i < new_count; i++)
+	new_values[i] = old_values[i + 1];
+    free_var(old_values[deleted_slot].var);
+    install_property_layout(o, new_layout, new_values);
+
+    for (child = o->child; child != NOTHING;
+	 child = dbpriv_find_object(child)->sibling)
+	remove_property_slot(dbpriv_find_object(child), deleted_id);
+}
+
+static void
+remap_reparented_subtree(Object *o)
+{
+    struct PropertyLayout *old_layout = o->prop_layout;
+    struct PropertyLayout *parent_layout = NULL;
+    Pval *old_values = o->propval;
+    struct PropertyLayout *new_layout;
+    Pval *new_values;
+    int old_count = old_layout ? old_layout->count : 0;
+    int new_count, i;
+    Objid child;
+
+    if (o->parent != NOTHING)
+	parent_layout = dbpriv_find_object(o->parent)->prop_layout;
+    new_layout = make_layout(o, parent_layout);
+    new_count = new_layout ? new_layout->count : 0;
+    new_values = new_count ? mymalloc(new_count * sizeof(Pval), M_PVAL) : NULL;
+
+    for (i = 0; i < new_count; i++) {
+	PropertyDescriptor *d = &new_layout->descriptors[i];
+	int old_slot = layout_slot_for_id(old_layout, d->id);
+
+	if (old_slot >= 0)
+	    new_values[i] = old_values[old_slot];
+	else if (o->parent != NOTHING) {
+	    Object *parent = dbpriv_find_object(o->parent);
+	    int parent_slot = layout_slot_for_id(parent->prop_layout, d->id);
+
+	    if (parent_slot < 0)
+		panic("New property is not present in parent layout");
+	    new_values[i] = parent->propval[parent_slot];
+	    new_values[i].var.type = TYPE_CLEAR;
+	    if (new_values[i].perms & PF_CHOWN)
+		new_values[i].owner = o->owner;
+	} else
+	    panic("New local property has no initial value");
+    }
+
+    for (i = 0; i < old_count; i++)
+	if (layout_slot_for_id(new_layout,
+			      old_layout->descriptors[i].id) < 0)
+	    free_var(old_values[i].var);
+    install_property_layout(o, new_layout, new_values);
+
+    for (child = o->child; child != NOTHING;
+	 child = dbpriv_find_object(child)->sibling)
+	remap_reparented_subtree(dbpriv_find_object(child));
+}
+#else
 static void
 insert_prop(Objid oid, int pos, Pval pval)
 {
@@ -123,6 +556,7 @@ insert_prop_recursively(Objid root, int root_pos, Pval pv)
 	insert_prop_recursively(c, new_prop_count + root_pos, pv);
     }
 }
+#endif /* PROPERTY_CACHE */
 
 int
 db_add_propdef(Objid oid, const char *pname, Var value, Objid owner,
@@ -158,7 +592,13 @@ db_add_propdef(Objid oid, const char *pname, Var value, Objid owner,
     pval.owner = owner;
     pval.perms = flags;
 
+#ifdef PROPERTY_CACHE
+    insert_property_slot(o,
+			 o->propdefs.l[o->propdefs.cur_length - 1].id,
+			 o, &pval);
+#else
     insert_prop_recursively(oid, o->propdefs.cur_length - 1, pval);
+#endif
 
     return 1;
 }
@@ -192,7 +632,8 @@ db_rename_propdef(Objid oid, const char *old, const char *new)
 	Propdef p;
 
 	p = props->l[i];
-	if (p.hash == hash && !mystrcasecmp(p.name, old)) {
+	if (p.hash == hash
+	    && (p.name == old || !mystrcasecmp(p.name, old))) {
 	    if (mystrcasecmp(old, new) != 0) {	/* Not changing just the case */
 		h = db_find_property(oid, new, 0);
 		if (h.ptr
@@ -205,6 +646,10 @@ db_rename_propdef(Objid oid, const char *old, const char *new)
 	    free_str(props->l[i].name);
 	    props->l[i].name = str_ref(new);
 	    props->l[i].hash = str_hash(new);
+#ifdef PROPERTY_CACHE
+	    rename_property_in_layouts(dbpriv_find_object(oid), NULL, p.id,
+				       props->l[i].name, props->l[i].hash);
+#endif
 
 	    return 1;
 	}
@@ -213,6 +658,7 @@ db_rename_propdef(Objid oid, const char *old, const char *new)
     return 0;
 }
 
+#ifndef PROPERTY_CACHE
 static void
 remove_prop(Objid oid, int pos)
 {
@@ -258,6 +704,7 @@ remove_prop_recursively(Objid root, int root_pos)
 	remove_prop_recursively(c, new_prop_count + root_pos);
     }
 }
+#endif /* !PROPERTY_CACHE */
 
 int
 db_delete_propdef(Objid oid, const char *pname)
@@ -272,7 +719,8 @@ db_delete_propdef(Objid oid, const char *pname)
 	Propdef p;
 
 	p = props->l[i];
-	if (p.hash == hash && !mystrcasecmp(p.name, pname)) {
+	if (p.hash == hash
+	    && (p.name == pname || !mystrcasecmp(p.name, pname))) {
 	    if (p.name)
 		free_str(p.name);
 
@@ -295,7 +743,11 @@ db_delete_propdef(Objid oid, const char *pname)
 		    props->l[j - 1] = props->l[j];
 
 	    props->cur_length--;
+#ifdef PROPERTY_CACHE
+	    remove_property_slot(dbpriv_find_object(oid), p.id);
+#else
 	    remove_prop_recursively(oid, i);
+#endif
 
 	    return 1;
 	}
@@ -408,7 +860,10 @@ db_find_property(Objid oid, const char *name, Var * value)
 #undef _ENTRY
     };
     static int ptable_init = 0;
-    int i, n;
+    int i;
+#ifndef PROPERTY_CACHE
+    int n;
+#endif
     db_prop_handle h;
     int hash = str_hash(name);
     Object *o;
@@ -420,7 +875,9 @@ db_find_property(Objid oid, const char *name, Var * value)
     }
     h.definer = NOTHING;
     for (i = 0; i < (int)Arraysize(ptable); i++) {
-	if (ptable[i].hash == hash && !mystrcasecmp(name, ptable[i].name)) {
+	if (ptable[i].hash == hash
+	    && (name == ptable[i].name
+		|| !mystrcasecmp(name, ptable[i].name))) {
 	    static Objid ret;
 
 	    ret = oid;
@@ -433,6 +890,28 @@ db_find_property(Objid oid, const char *name, Var * value)
     }
 
     h.built_in = BP_NONE;
+#ifdef PROPERTY_CACHE
+    o = dbpriv_find_object(oid);
+    i = layout_slot_for_name(o->prop_layout, name, hash);
+    if (i >= 0) {
+	PropertyDescriptor *d = &o->prop_layout->descriptors[i];
+	Pval *prop = &o->propval[i];
+
+	h.definer = d->definer->id;
+	h.ptr = prop;
+	if (value) {
+	    while (prop->var.type == TYPE_CLEAR) {
+		o = dbpriv_find_object(o->parent);
+		if (!o || !o->prop_layout || i >= o->prop_layout->count
+		    || o->prop_layout->descriptors[i].id != d->id)
+		    panic("Broken inherited property layout");
+		prop = &o->propval[i];
+	    }
+	    *value = prop->var;
+	}
+	return h;
+    }
+#else
     n = 0;
     for (o = dbpriv_find_object(oid); o; o = dbpriv_find_object(o->parent)) {
 	Proplist *props = &(o->propdefs);
@@ -441,7 +920,8 @@ db_find_property(Objid oid, const char *name, Var * value)
 
 	for (i = 0; i < length; i++, n++) {
 	    if (defs[i].hash == hash
-		&& !mystrcasecmp(defs[i].name, name)) {
+		&& (defs[i].name == name
+		    || !mystrcasecmp(defs[i].name, name))) {
 		Pval *prop;
 
 		h.definer = o->id;
@@ -460,6 +940,7 @@ db_find_property(Objid oid, const char *name, Var * value)
 	    }
 	}
     }
+#endif /* PROPERTY_CACHE */
 
     h.ptr = 0;
     return h;
@@ -591,6 +1072,7 @@ db_property_allows(db_prop_handle h, Objid progr, db_prop_flag flag)
 	    || is_wizard(progr));
 }
 
+#ifndef PROPERTY_CACHE
 static void
 fix_props(Objid oid, int parent_local, int old, int new, int common)
 {
@@ -637,6 +1119,7 @@ fix_props(Objid oid, int parent_local, int old, int new, int common)
     for (c = me->child; c != NOTHING; c = dbpriv_find_object(c)->sibling)
 	fix_props(c, local, old, new, common);
 }
+#endif /* !PROPERTY_CACHE */
 
 int
 dbpriv_check_properties_for_chparent(Objid oid, Objid new_parent)
@@ -662,6 +1145,10 @@ dbpriv_check_properties_for_chparent(Objid oid, Objid new_parent)
 void
 dbpriv_fix_properties_after_chparent(Objid oid, Objid old_parent)
 {
+#ifdef PROPERTY_CACHE
+    (void) old_parent;
+    remap_reparented_subtree(dbpriv_find_object(oid));
+#else
     Objid o1, o2, common, new_parent;
     int common_props, old_props, new_props;
 
@@ -685,6 +1172,7 @@ dbpriv_fix_properties_after_chparent(Objid oid, Objid old_parent)
     new_props = dbpriv_count_properties(new_parent) - common_props;
 
     fix_props(oid, 0, old_props, new_props, common_props);
+#endif
 }
 
 
