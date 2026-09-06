@@ -156,9 +156,16 @@ keywords.c: keywords.gperf
 		--lookup-function-name=find_keyword \
 		--output-file="$@" $<
 
-bf_register.h bf_register.c: bf_register.lastrun ;
-bf_register.lastrun: bf_register.h.in bf_register.c.in bf_register.sh $(COMMON_CSRCS) $(XT_CSRCS) Makefile
-	sh $(abs_srcdir)/bf_register.sh $(abs_srcdir) $(COMMON_CSRCS) -- $(ALL_XT_CSRCS) -- $(XT_CSRCS)
+BF_REGISTER_CMD = sh $(abs_srcdir)/bf_register.sh $(abs_srcdir) $(COMMON_CSRCS) -- $(ALL_XT_CSRCS) -- $(XT_CSRCS)
+
+bf_register.h: bf_register.lastrun
+	@test -f $@ || $(BF_REGISTER_CMD)
+
+bf_register.c: bf_register.h
+	@test -f $@ || $(BF_REGISTER_CMD)
+
+bf_register.lastrun: bf_register.h.in bf_register.c.in bf_register.sh $(COMMON_CSRCS) $(ALL_XT_CSRCS) Makefile
+	$(BF_REGISTER_CMD)
 
 # the only dependences we have to add are
 # those on files that are automatically generated
