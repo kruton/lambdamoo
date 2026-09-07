@@ -24,6 +24,7 @@ static void check(int, const char *);
 extern void hir_test_set_length_protected(int);
 extern void hir_test_set_builtin_property(enum bi_prop);
 extern void hir_test_set_builtin_property_protected(enum bi_prop, int);
+extern void hir_test_set_dispatch_epoch(uint64_t);
 extern void hir_test_set_property(Var);
 extern void hir_test_set_property_allowed(int);
 extern void hir_test_set_resume_point(const ResumePoint *);
@@ -881,6 +882,48 @@ get_prop_program(void)
 }
 
 static JITProgram *
+region_get_prop_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *receiver = instruction(HIR_TAC_CONST);
+    JITInstruction *property = instruction(HIR_TAC_CONST);
+    JITInstruction *get = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    const char *property_name = str_dup("minint");
+
+    program->num_values = 4;
+    program->num_vars = 1;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_OBJ;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_INT;
+    use_compact_tag_slots(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+
+    receiver->value = 1;
+    receiver->literal = 0;
+    receiver->literal_type = TYPE_OBJ;
+    receiver->next = property;
+    property->value = 2;
+    property->literal = (intptr_t) property_name;
+    property->literal_type = TYPE_STR;
+    property->next = get;
+    get->value = 3;
+    get->src1 = 1;
+    get->src2 = 2;
+    get->op = HIR_OP_GET_PROP;
+    get->next = ret;
+    ret->src1 = 3;
+    block->first = receiver;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 deep_guard_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -1217,6 +1260,400 @@ call_verb_program(void)
     return_instr->literal_type = TYPE_ANY;
     block->first = load_obj;
     block->last = return_instr;
+    return program;
+}
+
+static JITProgram *
+region_bitxor_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *left = instruction(HIR_TAC_BINARY);
+    JITInstruction *two = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_BINARY);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *coalesced_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *parallel = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *bitxor = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITCopy *left_copy = allocate(sizeof(JITCopy));
+    JITCopy *right_copy = allocate(sizeof(JITCopy));
+
+    program->num_values = 9;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    args->value = 1;
+    args->local_id = SLOT_ARGS;
+    args->next = one;
+    one->value = 2;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = left;
+    left->value = 3;
+    left->op = HIR_OP_INDEX;
+    left->src1 = 1;
+    left->src2 = 2;
+    left->next = two;
+    two->value = 4;
+    two->literal_type = TYPE_INT;
+    two->literal = 2;
+    two->next = right;
+    right->value = 5;
+    right->op = HIR_OP_INDEX;
+    right->src1 = 1;
+    right->src2 = 4;
+    right->next = tick;
+    tick->tick_batch_count = 2;
+    tick->next = coalesced_tick;
+    coalesced_tick->tick_batch_count = (unsigned char) -1;
+    coalesced_tick->next = parallel;
+    parallel->copies = left_copy;
+    parallel->next = bitxor;
+    left_copy->dst = 6;
+    left_copy->src = 3;
+    left_copy->next = right_copy;
+    right_copy->dst = 7;
+    right_copy->src = 5;
+    bitxor->value = 8;
+    bitxor->op = HIR_OP_BITXOR;
+    bitxor->src1 = 6;
+    bitxor->src2 = 7;
+    bitxor->next = ret;
+    ret->src1 = 8;
+    block->first = args;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+region_put_prop_program(int terminal)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *object = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *property = instruction(HIR_TAC_CONST);
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *rhs = instruction(HIR_TAC_BINARY);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *put = instruction(HIR_TAC_PUT_PROP);
+    JITInstruction *extra_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+    const char *property_name = str_dup("region_effect");
+
+    program->num_values = 7;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_OBJ;
+    program->value_types[2] = TYPE_STR;
+    program->value_types[3] = TYPE_LIST;
+    program->value_types[4] = TYPE_INT;
+    program->value_types[5] = TYPE_INT;
+    program->value_types[6] = TYPE_INT;
+    use_compact_tag_slots(program);
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    map->reason = JIT_DEOPT_PROPERTY_WRITE;
+    map->stack_depth = 3;
+    map->stack_values = allocate(sizeof(int) * map->stack_depth);
+    map->stack_values[0] = 1;
+    map->stack_values[1] = 2;
+    map->stack_values[2] = 5;
+    program->num_deopt_maps = 2;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    object->value = 1;
+    object->local_id = SLOT_THIS;
+    object->literal_type = TYPE_OBJ;
+    object->next = property;
+    property->value = 2;
+    property->literal_type = TYPE_STR;
+    property->literal = (Num) (intptr_t) property_name;
+    property->next = args;
+    args->value = 3;
+    args->local_id = SLOT_ARGS;
+    args->literal_type = TYPE_LIST;
+    args->next = one;
+    one->value = 4;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = rhs;
+    rhs->value = 5;
+    rhs->op = HIR_OP_INDEX;
+    rhs->src1 = 3;
+    rhs->src2 = 4;
+    rhs->next = tick;
+    tick->next = put;
+    put->value = 6;
+    put->src1 = 1;
+    put->src2 = 2;
+    put->deopt_map = 1;
+    put->next = terminal ? ret : extra_tick;
+    extra_tick->next = ret;
+    ret->src1 = 6;
+    ret->literal_type = TYPE_INT;
+    block->first = object;
+    block->last = ret;
+    if (terminal)
+	myfree(extra_tick, M_PROGRAM);
+    return program;
+}
+
+static JITProgram *
+region_compound_program(void)
+{
+    JITProgram *program = region_bitxor_program();
+    JITInstruction *bitxor = program->blocks->first;
+    JITInstruction *complement;
+
+    while (bitxor && bitxor->next != program->blocks->last)
+	bitxor = bitxor->next;
+    complement = instruction(HIR_TAC_UNARY);
+    complement->value = 9;
+    complement->op = HIR_OP_COMPLEMENT;
+    complement->src1 = bitxor->value;
+    complement->next = program->blocks->last;
+    bitxor->next = complement;
+    program->blocks->last->src1 = complement->value;
+    program->num_values = 10;
+    return program;
+}
+
+static JITProgram *
+region_deopt_program(void)
+{
+    JITProgram *program = region_bitxor_program();
+    JITInstruction *shift = program->blocks->first;
+    JITInstruction *exit = program->blocks->last;
+    JITDeoptMap *map;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->reason = JIT_DEOPT_UNSUPPORTED_OP;
+    map->bytecode_pc = map->error_pc = 73;
+    map->stack_depth = 1;
+    map->stack_values = allocate(sizeof(int));
+    map->stack_types = allocate(sizeof(var_type));
+    map->stack_values[0] = 7;
+    map->stack_types[0] = TYPE_INT;
+    while (shift->next != exit)
+	shift = shift->next;
+    shift->op = HIR_OP_SHL;
+    shift->deopt_map = 1;
+    exit->kind = HIR_TAC_DEOPT;
+    exit->deopt_map = 1;
+    exit->bytecode_pc = 73;
+    return program;
+}
+
+static JITProgram *
+region_divide_program(void)
+{
+    JITProgram *program = region_bitxor_program();
+    JITInstruction *divide = program->blocks->first;
+    JITInstruction *ret = program->blocks->last;
+    JITDeoptMap *map;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->reason = JIT_DEOPT_ARITHMETIC_TYPE;
+    map->bytecode_pc = map->error_pc = 73;
+    map->stack_depth = 2;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_types = allocate(sizeof(var_type) * 2);
+    map->stack_values[0] = 6;
+    map->stack_values[1] = 7;
+    map->stack_types[0] = TYPE_INT;
+    map->stack_types[1] = TYPE_INT;
+    while (divide->next != ret)
+	divide = divide->next;
+    divide->op = HIR_OP_DIV;
+    divide->deopt_map = 1;
+    divide->bytecode_pc = 73;
+    return program;
+}
+
+static JITProgram *
+region_conditional_shift_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *entry = allocate(sizeof(JITBlock));
+    JITBlock *truth = allocate(sizeof(JITBlock));
+    JITBlock *falsehood = allocate(sizeof(JITBlock));
+    JITBlock *join = allocate(sizeof(JITBlock));
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *left = instruction(HIR_TAC_BINARY);
+    JITInstruction *two = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_BINARY);
+    JITInstruction *entry_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *branch = instruction(HIR_TAC_BRANCH_FALSE);
+    JITInstruction *truth_tick = instruction(HIR_TAC_TICK);
+    JITInstruction *shift = instruction(HIR_TAC_BINARY);
+    JITInstruction *truth_copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *truth_jump = instruction(HIR_TAC_JUMP);
+    JITInstruction *false_copy = instruction(HIR_TAC_PARALLEL_COPY);
+    JITInstruction *false_jump = instruction(HIR_TAC_JUMP);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITCopy *truth_value = allocate(sizeof(JITCopy));
+    JITCopy *false_value = allocate(sizeof(JITCopy));
+
+    program->num_values = 8;
+    program->num_blocks = 4;
+    add_entry_deopt_map(program);
+    program->blocks = entry;
+    program->last_block = join;
+    entry->id = 1;
+    entry->successors[0] = 3;
+    entry->successors[1] = 2;
+    entry->num_successors = 2;
+    entry->next = truth;
+    args->value = 1;
+    args->local_id = SLOT_ARGS;
+    args->next = one;
+    one->value = 2;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = left;
+    left->value = 3;
+    left->op = HIR_OP_INDEX;
+    left->src1 = 1;
+    left->src2 = 2;
+    left->next = two;
+    two->value = 4;
+    two->literal_type = TYPE_INT;
+    two->literal = 2;
+    two->next = right;
+    right->value = 5;
+    right->op = HIR_OP_INDEX;
+    right->src1 = 1;
+    right->src2 = 4;
+    right->next = entry_tick;
+    entry_tick->next = branch;
+    branch->src1 = 5;
+    entry->first = args;
+    entry->last = branch;
+    truth->id = 2;
+    truth->successors[0] = 4;
+    truth->num_successors = 1;
+    truth->next = falsehood;
+    truth_tick->next = shift;
+    shift->value = 6;
+    shift->op = HIR_OP_SHR;
+    shift->src1 = 3;
+    shift->src2 = 5;
+    shift->next = truth_copy;
+    truth_value->dst = 7;
+    truth_value->src = 6;
+    truth_copy->copies = truth_value;
+    truth_copy->next = truth_jump;
+    truth->first = truth_tick;
+    truth->last = truth_jump;
+    falsehood->id = 3;
+    falsehood->successors[0] = 4;
+    falsehood->num_successors = 1;
+    falsehood->next = join;
+    false_value->dst = 7;
+    false_value->src = 3;
+    false_copy->copies = false_value;
+    false_copy->next = false_jump;
+    falsehood->first = false_copy;
+    falsehood->last = false_jump;
+    join->id = 4;
+    ret->src1 = 7;
+    join->first = join->last = ret;
+    return program;
+}
+
+static JITProgram *
+region_recursive_call_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *left = instruction(HIR_TAC_BINARY);
+    JITInstruction *two = instruction(HIR_TAC_CONST);
+    JITInstruction *right = instruction(HIR_TAC_BINARY);
+    JITInstruction *receiver = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *singleton = instruction(HIR_TAC_UNARY);
+    JITInstruction *tail = instruction(HIR_TAC_BINARY);
+    JITInstruction *tick = instruction(HIR_TAC_TICK);
+    JITInstruction *call = instruction(HIR_TAC_CALL_VERB);
+    JITInstruction *bitxor = instruction(HIR_TAC_BINARY);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 12;
+    program->num_blocks = 1;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    memset(&program->deopt_maps[1], 0, sizeof(JITDeoptMap));
+    program->num_deopt_maps = 2;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    args->value = 1;
+    args->local_id = SLOT_ARGS;
+    args->next = one;
+    one->value = 2;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = left;
+    left->value = 3;
+    left->op = HIR_OP_INDEX;
+    left->src1 = 1;
+    left->src2 = 2;
+    left->next = two;
+    two->value = 4;
+    two->literal_type = TYPE_INT;
+    two->literal = 2;
+    two->next = right;
+    right->value = 5;
+    right->op = HIR_OP_INDEX;
+    right->src1 = 1;
+    right->src2 = 4;
+    right->next = receiver;
+    receiver->value = 6;
+    receiver->local_id = SLOT_THIS;
+    receiver->next = singleton;
+    singleton->value = 7;
+    singleton->op = HIR_OP_MAKE_SINGLETON_LIST;
+    singleton->src1 = 3;
+    singleton->next = tail;
+    tail->value = 8;
+    tail->op = HIR_OP_LIST_ADD_TAIL;
+    tail->src1 = 7;
+    tail->src2 = 5;
+    tail->next = tick;
+    tick->next = call;
+    call->value = 9;
+    call->src1 = 6;
+    call->src3 = 8;
+    call->deopt_map = 1;
+    call->next = bitxor;
+    bitxor->value = 10;
+    bitxor->op = HIR_OP_BITXOR;
+    bitxor->src1 = 9;
+    bitxor->src2 = 3;
+    bitxor->next = ret;
+    ret->src1 = 10;
+    block->first = args;
+    block->last = ret;
     return program;
 }
 
@@ -3308,6 +3745,38 @@ nested_loop_branch_program(void)
     return program;
 }
 
+static JITProgram *
+region_loop_program(void)
+{
+    JITProgram *program = nested_loop_branch_program();
+    JITBlock *header = program->blocks->next;
+    JITInstruction *guard = instruction(HIR_TAC_GUARD_TYPE);
+    JITDeoptMap *map;
+
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->reason = JIT_DEOPT_TYPE_GUARD;
+    map->bytecode_pc = map->error_pc = 73;
+    map->stack_depth = 2;
+    map->stack_values = allocate(sizeof(int) * 2);
+    map->stack_types = allocate(sizeof(var_type) * 2);
+    map->stack_values[0] = 5;
+    map->stack_values[1] = 6;
+    map->stack_types[0] = TYPE_INT;
+    map->stack_types[1] = TYPE_INT;
+    guard->src1 = 6;
+    guard->guarded_operands = 1;
+    guard->guarded_type_masks[0] = JIT_TYPE_MASK(TYPE_INT);
+    guard->deopt_map = 1;
+    guard->bytecode_pc = 73;
+    guard->next = header->first->next;
+    header->first->next = guard;
+    return program;
+}
+
 static JITBlock *
 find_block(JITProgram *program, int id)
 {
@@ -4729,11 +5198,45 @@ typed_deopt_program(var_type type, int tagged)
     return program;
 }
 
+static JITProgram *
+region_cfg_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *entry = allocate(sizeof(JITBlock));
+    JITBlock *lower = allocate(sizeof(JITBlock));
+    JITBlock *higher = allocate(sizeof(JITBlock));
+    JITBlock *unreachable = allocate(sizeof(JITBlock));
+
+    program->num_blocks = 4;
+    program->blocks = entry;
+    program->last_block = unreachable;
+    entry->id = 1;
+    lower->id = 2;
+    higher->id = 3;
+    unreachable->id = 4;
+    entry->next = lower;
+    lower->next = higher;
+    higher->next = unreachable;
+    entry->first = entry->last = instruction(HIR_TAC_JUMP);
+    lower->first = lower->last = instruction(HIR_TAC_RETURN0);
+    higher->first = higher->last = instruction(HIR_TAC_JUMP);
+    unreachable->first = unreachable->last = instruction(HIR_TAC_JUMP);
+    entry->num_successors = 1;
+    entry->successors[0] = 3;
+    higher->num_successors = 1;
+    higher->successors[0] = 2;
+    unreachable->num_successors = 1;
+    unreachable->successors[0] = 4;
+    return program;
+}
+
 static void
 test_program_metadata_api(void)
 {
     JITProgram *program = arithmetic_program();
     JITProgram *nonleaf = call_verb_program();
+    JITProgram *guard = tagged_guard_instruction_program();
+    JITProgram *region_cfg = region_cfg_program();
     JITProgram *unsupported;
 
     check(jit_program_state(0) == JIT_STATE_UNSUPPORTED,
@@ -4756,8 +5259,264 @@ test_program_metadata_api(void)
     check(jit_program_is_direct_leaf(program)
 	  && jit_program_is_direct_leaf(program),
 	  "leaf classification or its cache is wrong");
+    check(jit_program_is_region_leaf(program),
+	  "bounded acyclic leaf was not accepted for region stitching");
     check(!jit_program_is_direct_leaf(nonleaf),
 	  "verb-calling program was classified as a leaf");
+    check(!jit_program_is_region_leaf(nonleaf),
+	  "verb-calling program was accepted for region stitching");
+    check(jit_program_is_region_leaf(guard),
+	  "restartable guard exit was rejected for region stitching");
+    check(jit_program_is_region_leaf(region_cfg),
+	  "acyclic edge to a lower-numbered block was mistaken for a loop");
+
+    {
+	int leaf;
+	unsigned hits;
+	int complete = 0;
+	int i;
+
+	for (i = 0; i < 16; i++)
+	    complete = jit_region_site_record_hit(guard, 1, program);
+	check(jit_region_site_status(guard, 1, &leaf, &hits, 0)
+	      && leaf > 0 && hits == 16 && !complete,
+	      "region side-table did not select a hot leaf edge");
+	jit_region_site_reset(guard, 1);
+	check(!jit_region_site_status(guard, 1, &leaf, &hits, 0)
+	      && leaf == 0 && hits == 0,
+	      "region side-table reset retained stale target hotness");
+	complete = jit_region_site_record_hit(guard, 1, nonleaf);
+	check(complete
+	      && !jit_region_site_status(guard, 1, &leaf, &hits, 0)
+	      && leaf < 0 && hits == 0,
+	      "ineligible region target did not stop profiling");
+	jit_region_site_reset(guard, 1);
+    }
+    {
+	JITProgram *straight_program = region_bitxor_program();
+	JITProgram *compound_program = region_compound_program();
+	JITProgram *deopt_program = region_deopt_program();
+	JITProgram *divide_program = region_divide_program();
+	JITProgram *conditional_program = region_conditional_shift_program();
+	JITProgram *loop_program = region_loop_program();
+	JITProgram *recursive_program = region_recursive_call_program();
+	JITProgram *put_program = region_put_prop_program(1);
+	JITProgram *nonterminal_put_program = region_put_prop_program(0);
+	JITProgram *get_program = region_get_prop_program();
+	Program *conditional_target = allocate(sizeof(Program));
+	int nodes, guards;
+	int blocks, instructions, branches, returns;
+	int exits, exit_values;
+
+	check(jit_test_region_cfg(straight_program, &blocks, &instructions,
+		&branches, &returns)
+	      && blocks == 1 && instructions == 3
+	      && branches == 0 && returns == 1,
+	      "region CFG did not import a straight-line callee");
+	check(jit_test_region_cfg(compound_program, &blocks, &instructions,
+		&branches, &returns)
+	      && blocks == 1 && instructions == 4
+	      && branches == 0 && returns == 1,
+	      "region CFG did not retain compound SSA instructions");
+	check(jit_test_region_cfg_exits(deopt_program, &exits, &exit_values)
+	      && exits == 2 && exit_values == 2,
+	      "region CFG did not retain an exact internal side-exit snapshot");
+	check(jit_test_region_cfg_exits(divide_program, &exits, &exit_values)
+	      && exits == 1 && exit_values == 2,
+	      "region CFG did not retain an exact arithmetic side-exit snapshot");
+	check(jit_test_region_cfg(conditional_program, &blocks, &instructions,
+		&branches, &returns)
+	      && blocks == 4 && instructions == 5
+	      && branches == 1 && returns == 1,
+	      "region CFG did not import a complete conditional callee");
+	check(jit_test_region_cfg(loop_program, &blocks, &instructions,
+		&branches, &returns)
+	      && blocks == 7 && instructions == 11
+	      && branches == 2 && returns == 1,
+	      "region CFG did not import a guarded loop backedge");
+	check(jit_test_region_cfg_exits(loop_program, &exits, &exit_values)
+	      && exits == 1 && exit_values == 2,
+	      "region loop did not retain its exact periodic checkpoint");
+	check(jit_program_is_region_leaf(put_program)
+	      && jit_test_region_cfg(put_program, &blocks, &instructions,
+		  &branches, &returns)
+	      && blocks == 1 && instructions == 2
+	      && branches == 0 && returns == 1,
+	      "region CFG did not import a terminal property write");
+	check(!jit_program_is_region_leaf(nonterminal_put_program)
+	      && !jit_test_region_cfg(nonterminal_put_program, &blocks,
+		  &instructions, &branches, &returns),
+	      "region CFG accepted work after a committed property write");
+	check(jit_test_region_cfg(get_program, &blocks, &instructions,
+		&branches, &returns)
+	      && blocks == 1 && instructions == 1
+	      && branches == 0 && returns == 1,
+	      "region CFG did not import an integer property read");
+	conditional_target->jit = conditional_program;
+	jit_test_region_site_select(recursive_program, 1, conditional_target, 2);
+	check(jit_test_region_cfg_calls(recursive_program, &guards, &nodes)
+	      && guards == 1 && nodes == 1,
+	      "region CFG did not recursively import a monomorphic callee");
+	{
+	    JITProgram *chain[4];
+	    Program targets[4] = { { 0 }, { 0 }, { 0 }, { 0 } };
+	    int depth;
+
+	    for (depth = 0; depth < 4; depth++)
+		chain[depth] = region_recursive_call_program();
+	    for (depth = 0; depth < 4; depth++) {
+		targets[depth].jit = depth == 3
+		    ? conditional_program : chain[depth + 1];
+		jit_test_region_site_select(chain[depth], 1,
+		    &targets[depth], 2);
+	    }
+	    check(jit_test_region_cfg_calls(chain[0], &guards, &nodes)
+		  && guards == 4 && nodes == 4,
+		  "region CFG did not import four monomorphic call levels");
+	    for (depth = 0; depth < 4; depth++)
+		jit_program_free(chain[depth]);
+	}
+	jit_program_free(straight_program);
+	jit_program_free(compound_program);
+	jit_program_free(deopt_program);
+	jit_program_free(divide_program);
+	jit_program_free(conditional_program);
+	jit_program_free(loop_program);
+	jit_program_free(recursive_program);
+	jit_program_free(put_program);
+	jit_program_free(nonterminal_put_program);
+	jit_program_free(get_program);
+	myfree(conditional_target, M_PROGRAM);
+    }
+    {
+	JITProgram *root = new_jit_program();
+	JITProgram *target = typed_deopt_program(TYPE_INT, 0);
+	Program bytecode = { 0 };
+	activation callee = { 0 };
+	Var env[1];
+	Var stack[1];
+	int ticks = 10;
+
+	bytecode.num_var_names = 1;
+	bytecode.jit = target;
+	target->bytecode_program = &bytecode;
+	callee.prog = &bytecode;
+	callee.rt_env = env;
+	callee.base_rt_stack = callee.top_rt_stack = stack;
+	callee.rt_stack_size = 1;
+	callee.temp.type = TYPE_NONE;
+	env[0].type = TYPE_STR;
+	env[0].v.str = str_dup("old local");
+	check(jit_test_region_exit_materialize(root, target, &bytecode, 1, 1,
+		42, 3, &callee, &ticks),
+	      "exact region side exit did not materialize its callee");
+	check(ticks == 7 && callee.pc == 71 && callee.error_pc == 71
+	      && callee.rt_env[0].type == TYPE_INT
+	      && callee.rt_env[0].v.num == 42
+	      && callee.top_rt_stack == callee.base_rt_stack + 1
+	      && callee.base_rt_stack[0].type == TYPE_INT
+	      && callee.base_rt_stack[0].v.num == 42,
+	      "exact region side exit restored the wrong state or ticks");
+	while (callee.top_rt_stack > callee.base_rt_stack)
+	    free_var(*--callee.top_rt_stack);
+	free_var(env[0]);
+	target->bytecode_program = 0;
+	jit_program_free(root);
+	jit_program_free(target);
+    }
+    {
+	JITProgram *root = new_jit_program();
+	JITProgram *parent = typed_deopt_program(TYPE_INT, 0);
+	JITProgram *target = typed_deopt_program(TYPE_INT, 0);
+	JITDeoptMap *parent_map = &parent->deopt_maps[1];
+	Program parent_bytecode = { 0 };
+	Program target_bytecode = { 0 };
+	ResumePoint point = { 0 };
+	activation parent_activation = { 0 };
+	activation target_activation = { 0 };
+	Var parent_env[1], target_env[1];
+	Var parent_stack[1], target_stack[1];
+	Var args = { .type = TYPE_NONE };
+	int ticks = 10;
+
+	parent_map->reason = JIT_DEOPT_VERB_CALL;
+	parent_map->resume_key.code_unit = 0;
+	parent_map->resume_key.site = 9;
+	parent_map->stack_depth = 3;
+	parent_map->stack_values = myrealloc(parent_map->stack_values,
+	    sizeof(int) * 3, M_PROGRAM);
+	parent_map->stack_types = myrealloc(parent_map->stack_types,
+	    sizeof(var_type) * 3, M_PROGRAM);
+	parent_bytecode.num_var_names = target_bytecode.num_var_names = 1;
+	parent_bytecode.jit = parent;
+	target_bytecode.jit = target;
+	parent->bytecode_program = &parent_bytecode;
+	target->bytecode_program = &target_bytecode;
+	parent_activation.prog = &parent_bytecode;
+	parent_activation.rt_env = parent_env;
+	parent_activation.base_rt_stack =
+	    parent_activation.top_rt_stack = parent_stack;
+	parent_activation.rt_stack_size = 1;
+	parent_activation.temp.type = TYPE_NONE;
+	target_activation.prog = &target_bytecode;
+	target_activation.rt_env = target_env;
+	target_activation.base_rt_stack =
+	    target_activation.top_rt_stack = target_stack;
+	target_activation.rt_stack_size = 1;
+	target_activation.temp.type = TYPE_NONE;
+	parent_env[0].type = target_env[0].type = TYPE_STR;
+	parent_env[0].v.str = str_dup("old parent");
+	target_env[0].v.str = str_dup("old target");
+	point.key = parent_map->resume_key;
+	point.pc = 77;
+	point.error_pc = 78;
+	point.kind = RP_CALL;
+	hir_test_set_resume_point(&point);
+	check(jit_test_region_exit_chain(root, parent, &parent_bytecode, 1,
+		target, &target_bytecode, 1, &parent_activation,
+		&target_activation, &ticks, &args),
+	      "nested region side exit did not materialize its frame chain");
+	check(ticks == 7 && parent_env[0].type == TYPE_INT
+	      && parent_env[0].v.num == 41 && parent_activation.pc == 77
+	      && parent_activation.error_pc == 78
+	      && parent_activation.resume_key.site == point.key.site
+	      && args.type == TYPE_LIST && args.v.list[0].v.num == 1
+	      && args.v.list[1].type == TYPE_INT && args.v.list[1].v.num == 43
+	      && target_env[0].type == TYPE_INT && target_env[0].v.num == 42
+	      && target_activation.top_rt_stack
+		 == target_activation.base_rt_stack + 1
+	      && target_stack[0].type == TYPE_INT
+	      && target_stack[0].v.num == 42
+	      && target_activation.pc == 71 && target_activation.error_pc == 71,
+	      "nested region side exit restored incorrect frames or arguments");
+	hir_test_set_resume_point(0);
+	free_var(args);
+	while (parent_activation.top_rt_stack
+	       > parent_activation.base_rt_stack)
+	    free_var(*--parent_activation.top_rt_stack);
+	while (target_activation.top_rt_stack
+	       > target_activation.base_rt_stack)
+	    free_var(*--target_activation.top_rt_stack);
+	free_var(parent_env[0]);
+	free_var(target_env[0]);
+	parent->bytecode_program = target->bytecode_program = 0;
+	jit_program_free(root);
+	jit_program_free(parent);
+	jit_program_free(target);
+    }
+    check(jit_rt_region_guard(17, TYPE_OBJ, 17, 1),
+	  "region dispatch guard rejected matching object receiver");
+    check(!jit_rt_region_guard(17, TYPE_OBJ, 18, 1),
+	  "region dispatch guard accepted a different receiver class");
+    hir_test_set_dispatch_epoch(2);
+    check(!jit_rt_region_guard(17, TYPE_OBJ, 17, 1),
+	  "region dispatch guard accepted an invalidated dispatch epoch");
+    hir_test_set_dispatch_epoch(1);
+    region_cfg->blocks->next->first->kind = HIR_TAC_JUMP;
+    region_cfg->blocks->next->num_successors = 1;
+    region_cfg->blocks->next->successors[0] = 3;
+    check(!jit_program_is_region_leaf(region_cfg),
+	  "reachable CFG cycle was accepted for region stitching");
     check(jit_program_anchor_count(program) == program->num_resume_anchors
 	  && jit_program_anchor_count(0) == 0,
 	  "resume anchor accessor is wrong");
@@ -4799,6 +5558,8 @@ test_program_metadata_api(void)
     program->state = JIT_STATE_PENDING;
 
     jit_program_free(unsupported);
+    jit_program_free(region_cfg);
+    jit_program_free(guard);
     jit_program_free(nonleaf);
     jit_program_free(program);
 }
@@ -5580,8 +6341,9 @@ test_perf_map_and_manual_rotation(void)
 	  "manual pool rotation request was not recorded");
     jit_pool_maintain();
     jit_pool_policy_stats(&policy);
-    check(!policy.rotation_pending,
-	  "manual pool rotation request was not completed");
+    check(!policy.rotation_pending
+	  && policy.region_specialization_rotations == 0,
+	  "manual pool rotation did not reset specialization tiers");
     jit_program_free(program);
     jit_program_free(anonymous);
 }
@@ -5833,8 +6595,11 @@ test_native_resume_constant_lowering(void)
 	    program->value_types[2] = TYPE_FLOAT;
 	    program->value_is_tagged[2] = 0;
 	} else if (types[i] == TYPE_STR) {
+	    const char *resume_literal;
+
 	    literal.v.str = str_dup("constant resume");
-	    resume->literals[0].literal = (Num) (intptr_t) literal.v.str;
+	    resume_literal = str_ref(literal.v.str);
+	    resume->literals[0].literal = (Num) (intptr_t) resume_literal;
 	    program->value_types[2] = TYPE_ANY;
 	    program->value_is_tagged[2] = 1;
 	} else {

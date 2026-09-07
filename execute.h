@@ -126,7 +126,7 @@ extern enum error call_verb2(Objid obj, const char *vname
 #ifdef ENABLE_JIT
 extern int execute_jit_commit_prepared_verb_call(
 	struct JITExecutionContext *, struct JITNativeFrame *,
-	struct JITCallerResume *, PreparedVerbCall *, int);
+	struct JITCallerResume *, PreparedVerbCall *, int, int);
 extern int execute_jit_dispatch_native_verb_call(
 	struct JITExecutionContext *, struct JITNativeFrame *, Objid,
 	const char * WAIF_COMMA_ARG(Var), Var *, enum error *, int, unsigned,

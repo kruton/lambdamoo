@@ -43,8 +43,14 @@
 /* Bound asynchronous timeout latency within long straight-line blocks. */
 #define JIT_TIMEOUT_CHECK_TICK_INTERVAL 16
 #define JIT_NATIVE_RETURNED_OWNED (JIT_RUN_ABORT_SECONDS + 1)
+#define JIT_REGION_HOT_THRESHOLD 16
 
 static int jit_runtime_value_slots(JITProgram *);
+static void jit_program_release_ir(JITProgram *, int);
+static int jit_program_restore_ir(JITProgram *);
+static void jit_region_site_mark_spliced(JITProgram *, int);
+static int jit_region_site_snapshot(JITProgram *, int, Program **, Objid *,
+	uint64_t *);
 
 static int
 jit_deopt_map_bridges_builtin(JITDeoptMap *map)
@@ -375,11 +381,37 @@ jit_rt_fixed_list_append_owned(Var *owned_values, unsigned *home_capacities,
     return res.v.list;
 }
 
+Var *
+jit_rt_fixed_list_store(Var *list, int index, int64_t elem_raw, int elem_type)
+{
+    assert(list && index > 1 && list[0].v.num == index - 1);
+    list[index] = var_ref(raw_to_var(elem_raw, elem_type));
+    list[0].v.num = index;
+    return list;
+}
+
 void
 jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
 {
     free_var(owned_values[value]);
     owned_values[value] = raw_to_var(raw, type);
+}
+
+void
+jit_rt_owned_move(Var *owned_values, int destination, int source)
+{
+    if (destination == source)
+	return;
+    free_var(owned_values[destination]);
+    owned_values[destination] = owned_values[source];
+    owned_values[source].type = TYPE_NONE;
+    owned_values[source].v.num = 0;
+}
+
+Var *
+jit_rt_make_empty_list(void)
+{
+    return new_list(0).v.list;
 }
 
 void
@@ -497,6 +529,22 @@ jit_rt_list_in(int64_t elem_raw, int elem_type, Var *list)
     return ismember(elem, l, 0);
 }
 
+int64_t
+jit_rt_region_guard(int64_t receiver_raw, int receiver_type,
+		    int64_t receiver_class, int64_t dispatch_epoch)
+{
+    if ((uint64_t) dispatch_epoch != db_dispatch_epoch())
+	return 0;
+    if (receiver_type == TYPE_OBJ)
+	return (Objid) receiver_raw == (Objid) receiver_class;
+#ifdef WAIF_CORE
+    if (receiver_type == TYPE_WAIF && receiver_raw)
+	return ((Waif *) (intptr_t) receiver_raw)->class
+	    == (Objid) receiver_class;
+#endif
+    return 0;
+}
+
 int
 jit_rt_get_prop_typed(int64_t receiver_raw, int receiver_type,
 		      const char *pname, int64_t progr_num, int64_t *out_raw,
@@ -570,6 +618,24 @@ jit_rt_get_prop(int64_t oid_num, const char *pname, int64_t progr_num,
 {
     return jit_rt_get_prop_typed(oid_num, TYPE_OBJ, pname, progr_num,
 				 out_raw, out_type, err_out);
+}
+
+int64_t
+jit_rt_get_prop_int(int64_t receiver_raw, int receiver_type,
+		    const char *pname, int64_t progr_num, int32_t *err_out)
+{
+    int64_t raw = 0;
+    int64_t type = TYPE_NONE;
+
+    if (!jit_rt_get_prop_typed(receiver_raw, receiver_type, pname, progr_num,
+	    &raw, &type, err_out))
+	return 0;
+    if (type != TYPE_INT) {
+	free_var(raw_to_var(raw, type));
+	*err_out = E_TYPE;
+	return 0;
+    }
+    return raw;
 }
 
 int
@@ -1072,6 +1138,7 @@ jit_execution_context_finish(JITExecutionContext *context,
     root->state = JIT_FRAME_DETACHED;
     context->root_frame = 0;
     context->current_frame = 0;
+    jit_execution_context_free_runtime_pool(context);
     return 1;
 }
 
@@ -1273,6 +1340,72 @@ jit_native_frame_release_resume_roots(JITNativeFrame *frame)
     frame->pending_resume_map = 0;
 }
 
+typedef struct JITRuntimePoolBlock {
+    struct JITRuntimePoolBlock *next;
+    size_t capacity;
+} JITRuntimePoolBlock;
+
+#define JIT_RUNTIME_POOL_LIMIT 32
+#define JIT_RUNTIME_POOL_BYTE_LIMIT (256 * 1024)
+
+static void *
+jit_runtime_storage_acquire(JITExecutionContext *context, size_t bytes)
+{
+    JITRuntimePoolBlock **link;
+    JITRuntimePoolBlock *block;
+    size_t capacity = bytes ? bytes : sizeof(Num);
+
+    link = (JITRuntimePoolBlock **) &context->runtime_pool;
+    while (*link && (*link)->capacity < capacity)
+	link = &(*link)->next;
+    if (*link) {
+	block = *link;
+	*link = block->next;
+	context->runtime_pool_count--;
+    } else {
+	return mymalloc(capacity, M_PROGRAM);
+    }
+    return block;
+}
+
+static void
+jit_runtime_storage_recycle_sized(JITExecutionContext *context, void *storage,
+				  size_t capacity)
+{
+    JITRuntimePoolBlock *block;
+
+    if (!storage)
+	return;
+    if (context && capacity >= sizeof(*block)
+	&& capacity <= JIT_RUNTIME_POOL_BYTE_LIMIT
+	&& context->runtime_pool_count < JIT_RUNTIME_POOL_LIMIT) {
+	block = storage;
+	block->capacity = capacity ? capacity : sizeof(Num);
+	block->next = context->runtime_pool;
+	context->runtime_pool = block;
+	context->runtime_pool_count++;
+    } else
+	myfree(storage, M_PROGRAM);
+}
+
+void
+jit_execution_context_free_runtime_pool(JITExecutionContext *context)
+{
+    JITRuntimePoolBlock *block;
+
+    if (!context)
+	return;
+    block = context->runtime_pool;
+    context->runtime_pool = 0;
+    context->runtime_pool_count = 0;
+    while (block) {
+	JITRuntimePoolBlock *next = block->next;
+
+	myfree(block, M_PROGRAM);
+	block = next;
+    }
+}
+
 void
 jit_native_frame_release_runtime(JITNativeFrame *frame)
 {
@@ -1297,7 +1430,8 @@ jit_native_frame_release_runtime(JITNativeFrame *frame)
     if (frame->has_resume_result)
 	free_var(frame->resume_result);
     frame->program->active_runtime_bytes -= frame->runtime_bytes;
-    myfree(frame->runtime_storage, M_PROGRAM);
+    jit_runtime_storage_recycle_sized(frame->context, frame->runtime_storage,
+				      frame->runtime_bytes);
     jit_native_frame_unbind_runtime(frame);
 }
 
@@ -1767,13 +1901,15 @@ typedef struct JITPool {
 static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
 #define JIT_DEFAULT_HOT_THRESHOLD 32
 #define JIT_DEFAULT_MAX_POOL_BYTES ((size_t) 256 * 1024 * 1024)
+#define JIT_MAX_REGION_SPECIALIZATION_ROTATIONS 4
 
 typedef enum {
     JIT_ROTATION_NONE,
     JIT_ROTATION_MEMORY_LIMIT,
     JIT_ROTATION_MANUAL,
     JIT_ROTATION_POLICY_CHANGE,
-    JIT_ROTATION_PROTECTION_CHANGE
+    JIT_ROTATION_PROTECTION_CHANGE,
+    JIT_ROTATION_REGION_SPECIALIZATION
 } JITRotationReason;
 
 typedef struct {
@@ -1781,12 +1917,13 @@ typedef struct {
     time_t generation_started_at;
     uint64_t rotations;
     unsigned hot_threshold;
+    unsigned region_specialization_rotations;
     JITRotationReason pending_reason;
     JITRotationReason last_reason;
 } JITPoolPolicy;
 
 static JITPoolPolicy jit_pool_policy = {
-    JIT_DEFAULT_MAX_POOL_BYTES, 0, 0, JIT_DEFAULT_HOT_THRESHOLD,
+    JIT_DEFAULT_MAX_POOL_BYTES, 0, 0, JIT_DEFAULT_HOT_THRESHOLD, 0,
     JIT_ROTATION_NONE, JIT_ROTATION_NONE
 };
 static uint64_t next_module_serial = 0;
@@ -1831,6 +1968,8 @@ jit_rotation_reason_name(JITRotationReason reason)
 	return "policy-change";
     case JIT_ROTATION_PROTECTION_CHANGE:
 	return "protection-change";
+    case JIT_ROTATION_REGION_SPECIALIZATION:
+	return "region-specialization";
     case JIT_ROTATION_NONE:
     default:
 	return "none";
@@ -1854,6 +1993,13 @@ jit_pool_request_rotation_reason(JITRotationReason reason)
 {
     if (jit_pool_policy.pending_reason == JIT_ROTATION_NONE)
 	jit_pool_policy.pending_reason = reason;
+}
+
+static int
+jit_pool_rotation_blocks_native_entry(void)
+{
+    return jit_pool_policy.pending_reason != JIT_ROTATION_NONE
+	&& jit_pool_policy.pending_reason != JIT_ROTATION_REGION_SPECIALIZATION;
 }
 
 int
@@ -1913,12 +2059,17 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_make_singleton_list", (void *) jit_rt_make_singleton_list);
     MIR_load_external(context, "jit_rt_make_fixed_list_head",
 		      (void *) jit_rt_make_fixed_list_head);
+    MIR_load_external(context, "jit_rt_make_empty_list",
+		      (void *) jit_rt_make_empty_list);
     MIR_load_external(context, "jit_rt_list_append", (void *) jit_rt_list_append);
     MIR_load_external(context, "jit_rt_list_append_owned",
 		      (void *) jit_rt_list_append_owned);
     MIR_load_external(context, "jit_rt_fixed_list_append_owned",
 		      (void *) jit_rt_fixed_list_append_owned);
+    MIR_load_external(context, "jit_rt_fixed_list_store",
+		      (void *) jit_rt_fixed_list_store);
     MIR_load_external(context, "jit_rt_owned_replace", (void *) jit_rt_owned_replace);
+    MIR_load_external(context, "jit_rt_owned_move", (void *) jit_rt_owned_move);
     MIR_load_external(context, "jit_rt_discard_owned",
 		      (void *) jit_rt_discard_owned);
     MIR_load_external(context, "jit_rt_retain_raw",
@@ -1928,9 +2079,13 @@ jit_load_externals(MIR_context_t context)
 		      (void *) jit_rt_list_nested_index_set);
     MIR_load_external(context, "jit_rt_sublist_from", (void *) jit_rt_sublist_from);
     MIR_load_external(context, "jit_rt_list_in", (void *) jit_rt_list_in);
+    MIR_load_external(context, "jit_rt_region_guard",
+		      (void *) jit_rt_region_guard);
     MIR_load_external(context, "jit_rt_get_prop", (void *) jit_rt_get_prop);
     MIR_load_external(context, "jit_rt_get_prop_typed",
 		      (void *) jit_rt_get_prop_typed);
+    MIR_load_external(context, "jit_rt_get_prop_int",
+		      (void *) jit_rt_get_prop_int);
     MIR_load_external(context, "jit_rt_put_prop", (void *) jit_rt_put_prop);
     MIR_load_external(context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
     MIR_load_external(context, "jit_rt_time", (void *) jit_rt_time);
@@ -2059,6 +2214,12 @@ jit_pool_rotate(JITRotationReason reason, int log_rotation)
 	jit_shared_pool.generation = 1;
     jit_pool_policy.generation_started_at = now;
     jit_pool_policy.pending_reason = JIT_ROTATION_NONE;
+    if (reason == JIT_ROTATION_REGION_SPECIALIZATION) {
+	if (jit_pool_policy.region_specialization_rotations < UINT_MAX)
+	    jit_pool_policy.region_specialization_rotations++;
+    }
+    else
+	jit_pool_policy.region_specialization_rotations = 0;
     if (log_rotation) {
 	jit_pool_policy.rotations++;
 	jit_pool_policy.last_reason = reason;
@@ -2139,6 +2300,8 @@ jit_pool_policy_stats(JITPoolPolicyStats *stats)
     if (stats->generation_started_at > 0 && now >= stats->generation_started_at)
 	stats->generation_age = now - stats->generation_started_at;
     stats->hot_threshold = jit_pool_policy.hot_threshold;
+    stats->region_specialization_rotations =
+	jit_pool_policy.region_specialization_rotations;
     stats->rotation_pending
 	= jit_pool_policy.pending_reason != JIT_ROTATION_NONE;
     stats->last_rotation_reason
@@ -2213,14 +2376,20 @@ typedef struct {
     MIR_item_t import_singleton_list;
     MIR_item_t proto_fixed_list_head;
     MIR_item_t import_fixed_list_head;
+    MIR_item_t proto_empty_list;
+    MIR_item_t import_empty_list;
     MIR_item_t proto_list_append;
     MIR_item_t import_list_append;
     MIR_item_t proto_list_append_owned;
     MIR_item_t import_list_append_owned;
     MIR_item_t proto_fixed_list_append_owned;
     MIR_item_t import_fixed_list_append_owned;
+    MIR_item_t proto_fixed_list_store;
+    MIR_item_t import_fixed_list_store;
     MIR_item_t proto_owned_replace;
     MIR_item_t import_owned_replace;
+    MIR_item_t proto_owned_move;
+    MIR_item_t import_owned_move;
     MIR_item_t proto_discard_owned;
     MIR_item_t import_discard_owned;
     MIR_item_t proto_retain_raw;
@@ -2233,8 +2402,12 @@ typedef struct {
     MIR_item_t import_sublist_from;
     MIR_item_t proto_list_in;
     MIR_item_t import_list_in;
+    MIR_item_t proto_region_guard;
+    MIR_item_t import_region_guard;
     MIR_item_t proto_get_prop;
     MIR_item_t import_get_prop;
+    MIR_item_t proto_get_prop_int;
+    MIR_item_t import_get_prop_int;
     MIR_item_t proto_put_prop;
     MIR_item_t import_put_prop;
     MIR_item_t proto_seconds_left;
@@ -2707,10 +2880,24 @@ jit_runtime_type_from_db_type(var_type type)
 }
 
 static int
-jit_runtime_value_slots(JITProgram *program)
+jit_runtime_base_value_slots(JITProgram *program)
 {
     return program->num_values + (program->value_tag_slots
 	? program->num_tag_slots : program->num_values);
+}
+
+static int
+jit_runtime_value_slots(JITProgram *program)
+{
+    return jit_runtime_base_value_slots(program)
+	+ program->num_region_exit_values;
+}
+
+static size_t
+jit_region_exit_value_offset(JITProgram *program, int slot)
+{
+    return (size_t) (jit_runtime_base_value_slots(program) + slot)
+	* sizeof(Num);
 }
 
 static void
@@ -2870,10 +3057,8 @@ append_materialized_value(MIRBuild *build, JITProgram *program, int value,
 }
 
 static void
-append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
-			 MIR_reg_t *values, MIR_reg_t deopt_map_out,
-			 MIR_reg_t deopt_values, MIR_reg_t status UNUSED_,
-			 MIR_label_t common_return UNUSED_, JITRunResult result)
+append_materialized_values(MIRBuild *build, JITProgram *program, int map_id,
+			   MIR_reg_t *values, MIR_reg_t deopt_values)
 {
     JITDeoptMap *map = &program->deopt_maps[map_id];
     unsigned char *materialized = mymalloc(program->num_values, M_PROGRAM);
@@ -2912,6 +3097,15 @@ append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
 	    values, deopt_values);
     }
     myfree(materialized, M_PROGRAM);
+}
+
+static void
+append_materialized_exit(MIRBuild *build, JITProgram *program, int map_id,
+			 MIR_reg_t *values, MIR_reg_t deopt_map_out,
+			 MIR_reg_t deopt_values, MIR_reg_t status UNUSED_,
+			 MIR_label_t common_return UNUSED_, JITRunResult result)
+{
+    append_materialized_values(build, program, map_id, values, deopt_values);
     append(build, MIR_new_insn(build->context, MIR_MOV,
 			      MIR_new_mem_op(build->context, MIR_T_I32,
 					     0, deopt_map_out, 0, 1),
@@ -3151,6 +3345,2224 @@ jit_fixed_list_tail_has_fresh_capacity(JITProgram *program,
     }
     return instr == tail && tail->src1 == value
 	&& program->value_owned_slots[tail->value] == owner;
+}
+
+#define JIT_REGION_MAX_ARGUMENTS 4
+#define JIT_REGION_MAX_DEPTH 4
+#define JIT_REGION_MAX_BLOCKS 32
+#define JIT_REGION_MAX_INSTRUCTIONS 128
+#define JIT_REGION_MAX_VALUES 128
+#define JIT_REGION_MAX_COPIES 128
+#define JIT_REGION_MAX_CALLS 8
+#define JIT_REGION_MAX_LOOPS 4
+#define JIT_REGION_TICK_CHUNK 1024
+
+typedef struct JITRegionCFG JITRegionCFG;
+
+typedef enum {
+    JIT_REGION_VALUE_ARGUMENT,
+    JIT_REGION_VALUE_CONSTANT,
+    JIT_REGION_VALUE_TEMPORARY
+} JITRegionCFGValueKind;
+
+typedef struct {
+    JITRegionCFGValueKind kind;
+    int argument;
+    int source_value;
+    Num constant;
+    var_type type;
+    int owner;
+} JITRegionCFGValue;
+
+typedef struct {
+    int target_value;
+    int region_value;
+} JITRegionCFGSnapshotValue;
+
+typedef struct {
+    int map;
+    int num_values;
+    JITRegionCFGSnapshotValue *values;
+} JITRegionCFGSnapshot;
+
+typedef struct {
+    int dst;
+    int src;
+} JITRegionCFGCopy;
+
+typedef struct {
+    HIRTacKind kind;
+    HIROp op;
+    int value;
+    int src1;
+    int src2;
+    int copy_base;
+    int num_copies;
+    int call;
+    unsigned ticks;
+    int loop_check;
+    int list_index;
+    int list_capacity;
+    const char *property;
+    JITRegionCFGSnapshot exit;
+} JITRegionCFGInstruction;
+
+typedef struct {
+    JITRegionCFG *target;
+    Objid receiver_class;
+    uint64_t dispatch_epoch;
+    const char *verb;
+    JITRegionCFGSnapshot caller;
+    int num_arguments;
+    int arguments[JIT_REGION_MAX_ARGUMENTS];
+} JITRegionCFGCall;
+
+typedef enum {
+    JIT_REGION_CFG_JUMP,
+    JIT_REGION_CFG_BRANCH,
+    JIT_REGION_CFG_RETURN,
+    JIT_REGION_CFG_EXIT
+} JITRegionCFGTerminator;
+
+typedef struct {
+    int instruction_base;
+    int num_instructions;
+    JITRegionCFGTerminator terminator;
+    int condition;
+    int result;
+    int false_successor;
+    int true_successor;
+    int loop_header;
+    int loop_check;
+    JITRegionCFGSnapshot exit;
+} JITRegionCFGBlock;
+
+struct JITRegionCFG {
+    JITProgram *program;
+    JITRegionCFGValue values[JIT_REGION_MAX_VALUES];
+    JITRegionCFGInstruction instructions[JIT_REGION_MAX_INSTRUCTIONS];
+    JITRegionCFGCopy copies[JIT_REGION_MAX_COPIES];
+    JITRegionCFGCall calls[JIT_REGION_MAX_CALLS];
+    JITRegionCFGBlock blocks[JIT_REGION_MAX_BLOCKS];
+    int num_values;
+    int num_instructions;
+    int num_copies;
+    int num_calls;
+    int num_blocks;
+    int num_arguments;
+    int num_loops;
+    int has_effect;
+    int owner_base;
+    int num_owners;
+    int entry;
+};
+
+typedef struct {
+    int target_value;
+    int runtime_slot;
+} JITRegionExitValue;
+
+typedef struct {
+    JITProgram *target;
+    Program *bytecode_program;
+    const char *verb;
+    Objid receiver_class;
+    int map;
+    int dispatched;
+    int num_values;
+    JITRegionExitValue *values;
+    int num_arguments;
+    int argument_slots[JIT_REGION_MAX_ARGUMENTS];
+} JITRegionExitFrame;
+
+struct JITRegionExit {
+    uint64_t dispatch_epoch;
+    int caller_map;
+    int tick_slot;
+    int num_frames;
+    JITRegionExitFrame *frames;
+};
+
+#define JIT_REGION_EXIT_ENCODE(id) (-2 - (id))
+#define JIT_REGION_EXIT_DECODE(map) (-2 - (map))
+
+static void
+jit_program_clear_region_exits(JITProgram *program)
+{
+    int i;
+
+    if (!program)
+	return;
+    for (i = 0; i < program->num_region_exits; i++) {
+	JITRegionExit *exit = &program->region_exits[i];
+	int frame;
+
+	for (frame = 0; frame < exit->num_frames; frame++) {
+	    if (exit->frames[frame].verb)
+		free_str(exit->frames[frame].verb);
+	    if (exit->frames[frame].values)
+		myfree(exit->frames[frame].values, M_PROGRAM);
+	}
+	if (exit->frames)
+	    myfree(exit->frames, M_PROGRAM);
+    }
+    if (program->region_exits)
+	myfree(program->region_exits, M_PROGRAM);
+    program->region_exits = 0;
+    program->num_region_exits = 0;
+    program->region_exit_capacity = 0;
+    program->num_region_exit_values = 0;
+    if (program->num_region_owned_slots) {
+	if (program->num_region_owned_slots > program->num_owned_slots)
+	    panic("Region owner-slot count exceeds program owner slots");
+	program->num_owned_slots -= program->num_region_owned_slots;
+	program->num_region_owned_slots = 0;
+    }
+    for (i = 0; i < program->num_region_literals; i++)
+	free_str(program->region_literals[i]);
+    if (program->region_literals)
+	myfree(program->region_literals, M_PROGRAM);
+    program->region_literals = 0;
+    program->num_region_literals = 0;
+    program->region_literal_capacity = 0;
+}
+
+static const char *
+jit_region_literal_register(JITProgram *program, const char *literal)
+{
+    int i;
+
+    for (i = 0; i < program->num_region_literals; i++)
+	if (!strcmp(program->region_literals[i], literal))
+	    return program->region_literals[i];
+    if (program->num_region_literals == program->region_literal_capacity) {
+	int capacity = program->region_literal_capacity
+	    ? program->region_literal_capacity * 2 : 4;
+
+	program->region_literals = myrealloc(program->region_literals,
+	    sizeof(const char *) * capacity, M_PROGRAM);
+	program->region_literal_capacity = capacity;
+    }
+    program->region_literals[program->num_region_literals] = str_ref(literal);
+    return program->region_literals[program->num_region_literals++];
+}
+
+typedef struct {
+    JITRegionCFG *region;
+    JITRegionCFGCall *call;
+    int *arguments;
+    MIR_reg_t *caller_values;
+    MIR_op_t *actuals;
+    MIR_reg_t *region_values;
+} JITRegionExitPath;
+
+static void
+jit_region_exit_frame_register(JITProgram *program, JITRegionExitFrame *frame,
+	JITRegionCFG *region, JITRegionCFGSnapshot *snapshot, int dispatched,
+	JITRegionCFGCall *call)
+{
+    int i;
+
+    frame->target = region->program;
+    frame->bytecode_program = region->program->bytecode_program;
+    frame->map = snapshot->map;
+    frame->dispatched = dispatched;
+    frame->num_values = snapshot->num_values;
+    if (frame->num_values)
+	frame->values = mymalloc(sizeof(JITRegionExitValue)
+	    * frame->num_values, M_PROGRAM);
+    for (i = 0; i < frame->num_values; i++) {
+	frame->values[i].target_value = snapshot->values[i].target_value;
+	frame->values[i].runtime_slot = program->num_region_exit_values++;
+    }
+    if (!call)
+	return;
+    frame->verb = str_ref(call->verb);
+    frame->receiver_class = call->receiver_class;
+    frame->num_arguments = call->num_arguments;
+    for (i = 0; i < frame->num_arguments; i++)
+	frame->argument_slots[i] = program->num_region_exit_values++;
+}
+
+static int
+jit_region_exit_register(JITProgram *program, JITRegionExitPath *path,
+	int depth, JITRegionCFG *region, JITRegionCFGSnapshot *snapshot,
+	int caller_map)
+{
+    JITRegionExit *exit;
+    int frame;
+
+    if (!program || depth < 0 || depth > JIT_REGION_MAX_DEPTH
+	|| !region || !region->program
+	|| !region->program->bytecode_program || snapshot->map <= 0
+	|| snapshot->map >= region->program->num_deopt_maps
+	|| caller_map <= 0 || caller_map >= program->num_deopt_maps)
+	return -1;
+    for (frame = 0; frame < depth; frame++)
+	if (!path[frame].region || !path[frame].region->program
+	    || !path[frame].region->program->bytecode_program
+	    || !path[frame].call || !path[frame].call->verb
+	    || path[frame].call->caller.map <= 0)
+	    return -1;
+    if (program->num_region_exits == program->region_exit_capacity) {
+	int capacity = program->region_exit_capacity
+	    ? program->region_exit_capacity * 2 : 4;
+
+	program->region_exits = program->region_exits
+	    ? myrealloc(program->region_exits,
+		sizeof(JITRegionExit) * capacity, M_PROGRAM)
+	    : mymalloc(sizeof(JITRegionExit) * capacity, M_PROGRAM);
+	memset(program->region_exits + program->region_exit_capacity, 0,
+	    sizeof(JITRegionExit) * (capacity - program->region_exit_capacity));
+	program->region_exit_capacity = capacity;
+    }
+    exit = &program->region_exits[program->num_region_exits];
+    memset(exit, 0, sizeof(*exit));
+    exit->dispatch_epoch = db_dispatch_epoch();
+    exit->caller_map = caller_map;
+    exit->tick_slot = program->num_region_exit_values++;
+    exit->num_frames = depth + 1;
+    exit->frames = mymalloc(sizeof(JITRegionExitFrame) * exit->num_frames,
+	M_PROGRAM);
+    memset(exit->frames, 0,
+	sizeof(JITRegionExitFrame) * exit->num_frames);
+    for (frame = 0; frame < depth; frame++)
+	jit_region_exit_frame_register(program, &exit->frames[frame],
+	    path[frame].region, &path[frame].call->caller, 1,
+	    path[frame].call);
+    jit_region_exit_frame_register(program, &exit->frames[depth], region,
+	snapshot, 0, 0);
+    return program->num_region_exits++;
+}
+
+static int jit_region_is_this(JITProgram *, int, int);
+
+static int
+jit_fixed_list_values(JITProgram *program, int list_value, int *arguments,
+		      int *count)
+{
+    JITInstruction *definition = jit_value_definition(program, list_value);
+
+    if (!definition)
+	return 0;
+    if (definition->kind == HIR_TAC_UNARY
+	&& definition->op == HIR_OP_MAKE_SINGLETON_LIST) {
+	if (*count != 0)
+	    return 0;
+	arguments[(*count)++] = definition->src1;
+	return 1;
+    }
+    if (definition->kind != HIR_TAC_BINARY
+	|| definition->op != HIR_OP_LIST_ADD_TAIL
+	|| !jit_fixed_list_values(program, definition->src1, arguments, count)
+	|| *count >= JIT_REGION_MAX_ARGUMENTS)
+	return 0;
+    arguments[(*count)++] = definition->src2;
+    return 1;
+}
+
+static int
+jit_region_cfg_supported_binary(HIROp op)
+{
+    return op == HIR_OP_ADD || op == HIR_OP_SUB || op == HIR_OP_MUL
+	|| op == HIR_OP_DIV || op == HIR_OP_MOD
+	|| op == HIR_OP_EQ || op == HIR_OP_NE || op == HIR_OP_LT
+	|| op == HIR_OP_LE || op == HIR_OP_GT || op == HIR_OP_GE
+	|| op == HIR_OP_BITOR || op == HIR_OP_BITXOR || op == HIR_OP_BITAND
+	|| op == HIR_OP_SHL || op == HIR_OP_SHR || op == HIR_OP_LSHR;
+}
+
+static int
+jit_region_cfg_argument_index(JITProgram *program, int value)
+{
+    JITInstruction *definition = jit_value_definition(program, value);
+    JITInstruction *base;
+    Num index;
+
+    if (!definition || definition->kind != HIR_TAC_BINARY
+	|| definition->op != HIR_OP_INDEX)
+	return 0;
+    base = jit_value_definition(program, definition->src1);
+    if (!base || base->kind != HIR_TAC_LOAD_LOCAL
+	|| base->local_id != SLOT_ARGS
+	|| !integer_constant_value(program, definition->src2, &index)
+	|| index <= 0 || index > JIT_REGION_MAX_ARGUMENTS)
+	return 0;
+    return (int) index;
+}
+
+static int
+jit_region_cfg_fold_binary(HIROp op, Num left, Num right, Num *result)
+{
+    switch (op) {
+    case HIR_OP_EQ:
+	*result = left == right;
+	return 1;
+    case HIR_OP_NE:
+	*result = left != right;
+	return 1;
+    case HIR_OP_LT:
+	*result = left < right;
+	return 1;
+    case HIR_OP_LE:
+	*result = left <= right;
+	return 1;
+    case HIR_OP_GT:
+	*result = left > right;
+	return 1;
+    case HIR_OP_GE:
+	*result = left >= right;
+	return 1;
+    default:
+	return 0;
+    }
+}
+
+static int
+jit_region_cfg_add_value(JITRegionCFG *region, JITRegionCFGValueKind kind,
+			 int argument, int source_value, Num constant,
+			 var_type type)
+{
+    JITRegionCFGValue *value;
+    int i;
+
+    for (i = 0; i < region->num_values; i++) {
+	value = &region->values[i];
+	if (value->kind == kind && value->argument == argument
+	    && value->source_value == source_value
+	    && value->constant == constant && value->type == type)
+	    return i;
+    }
+    if (region->num_values >= JIT_REGION_MAX_VALUES)
+	return -1;
+    value = &region->values[region->num_values++];
+    value->kind = kind;
+    value->argument = argument;
+    value->source_value = source_value;
+    value->constant = constant;
+    value->type = type;
+    value->owner = -1;
+    return region->num_values - 1;
+}
+
+static int
+jit_region_cfg_value(JITProgram *program, JITRegionCFG *region,
+		     int *value_map, int value)
+{
+    JITInstruction *definition;
+    Num constant;
+    int argument;
+
+    if (value <= 0 || value >= program->num_values)
+	return -1;
+    if (value_map[value] >= 0)
+	return value_map[value];
+    definition = jit_value_definition(program, value);
+    argument = jit_region_cfg_argument_index(program, value);
+    if (argument)
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_ARGUMENT, argument, value, 0, TYPE_INT);
+    else if (integer_constant_value(program, value, &constant))
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_CONSTANT, 0, value, constant, TYPE_INT);
+    else if (definition && definition->kind == HIR_TAC_CONST
+	     && definition->literal_type == TYPE_OBJ)
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_CONSTANT, 0, value, definition->literal, TYPE_OBJ);
+    else if (definition && definition->kind == HIR_TAC_CONST
+	     && definition->literal_type == TYPE_LIST
+	     && definition->literal) {
+	Var *list = (Var *) (intptr_t) definition->literal;
+
+	if (list[0].v.num != 0)
+	    return -1;
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_TEMPORARY, value, value, 0, TYPE_LIST);
+    }
+    else if (definition && definition->kind == HIR_TAC_UNARY
+	     && definition->op == HIR_OP_LENGTH) {
+	JITInstruction *source = jit_value_definition(program,
+	    definition->src1);
+
+	if (!source || source->kind != HIR_TAC_LOAD_LOCAL
+	    || source->local_id != SLOT_ARGS)
+	    return -1;
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_CONSTANT, 0, value, region->num_arguments,
+	    TYPE_INT);
+    } else if (definition && definition->kind == HIR_TAC_BINARY) {
+	int left = jit_region_cfg_value(program, region, value_map,
+	    definition->src1);
+	int right = jit_region_cfg_value(program, region, value_map,
+	    definition->src2);
+
+	if (left < 0 || right < 0
+	    || region->values[left].kind != JIT_REGION_VALUE_CONSTANT
+	    || region->values[right].kind != JIT_REGION_VALUE_CONSTANT
+	    || !jit_region_cfg_fold_binary(definition->op,
+		region->values[left].constant, region->values[right].constant,
+		&constant))
+	    goto ordinary_value;
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_CONSTANT, 0, value, constant, TYPE_INT);
+    }
+    else if (definition && (definition->kind == HIR_TAC_LOAD_LOCAL
+			    || definition->kind == HIR_TAC_CONST
+			    || (definition->kind == HIR_TAC_BINARY
+				&& definition->op == HIR_OP_INDEX)))
+	return -1;
+    else {
+ordinary_value:
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_TEMPORARY, value, value, 0,
+	    program->value_types && program->value_is_tagged
+	    && !program->value_is_tagged[value]
+	    ? program->value_types[value] : TYPE_ANY);
+    }
+    return value_map[value];
+}
+
+static int
+jit_region_cfg_mark_blocks(JITBlock **blocks, int max_block,
+			   unsigned char *state, int *block_map,
+			   JITRegionCFG *region, int id)
+{
+    JITBlock *block;
+    int successor;
+
+    if (id <= 0 || id > max_block || !(block = blocks[id]))
+	return 0;
+    if (state[id] == 1) {
+	JITRegionCFGBlock *header = &region->blocks[block_map[id]];
+
+	if (!header->loop_header) {
+	    if (region->num_loops >= JIT_REGION_MAX_LOOPS)
+		return 0;
+	    header->loop_header = 1;
+	    region->num_loops++;
+	}
+	return 1;
+    }
+    if (state[id] == 2)
+	return 1;
+    if (region->num_blocks >= JIT_REGION_MAX_BLOCKS)
+	return 0;
+    state[id] = 1;
+    block_map[id] = region->num_blocks++;
+    for (successor = 0; successor < block->num_successors; successor++)
+	if (!jit_region_cfg_mark_blocks(blocks, max_block, state, block_map,
+		region, block->successors[successor]))
+	    return 0;
+    state[id] = 2;
+    return 1;
+}
+
+static int
+jit_region_cfg_add_instruction(JITRegionCFG *region, HIRTacKind kind,
+			       HIROp op, int value, int src1, int src2)
+{
+    JITRegionCFGInstruction *instruction;
+
+    if (region->num_instructions >= JIT_REGION_MAX_INSTRUCTIONS)
+	return 0;
+    instruction = &region->instructions[region->num_instructions++];
+    memset(instruction, 0, sizeof(*instruction));
+    instruction->kind = kind;
+    instruction->op = op;
+    instruction->value = value;
+    instruction->src1 = src1;
+    instruction->src2 = src2;
+    return 1;
+}
+
+static void
+jit_region_cfg_clear(JITRegionCFG *region)
+{
+    int block;
+    int call;
+    int instruction;
+
+    for (block = 0; block < region->num_blocks; block++)
+	if (region->blocks[block].exit.values) {
+	    myfree(region->blocks[block].exit.values, M_PROGRAM);
+	    region->blocks[block].exit.values = 0;
+	}
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++)
+	if (region->instructions[instruction].exit.values) {
+	    myfree(region->instructions[instruction].exit.values, M_PROGRAM);
+	    region->instructions[instruction].exit.values = 0;
+	}
+
+    for (call = 0; call < region->num_calls; call++) {
+	if (region->calls[call].caller.values) {
+	    myfree(region->calls[call].caller.values, M_PROGRAM);
+	    region->calls[call].caller.values = 0;
+	}
+	if (region->calls[call].target) {
+	    jit_region_cfg_clear(region->calls[call].target);
+	    myfree(region->calls[call].target, M_PROGRAM);
+	    region->calls[call].target = 0;
+	}
+    }
+    region->num_calls = 0;
+}
+
+static int jit_region_cfg_depth(JITProgram *, JITRegionCFG *, int, int);
+
+static var_type
+jit_region_cfg_return_type(JITRegionCFG *region)
+{
+    var_type type = TYPE_NONE;
+    int block;
+
+    for (block = 0; block < region->num_blocks; block++)
+	if (region->blocks[block].terminator == JIT_REGION_CFG_RETURN) {
+	    int result = region->blocks[block].result;
+	    var_type result_type;
+
+	    if (result < 0 || result >= region->num_values)
+		return TYPE_ANY;
+	    result_type = region->values[result].type;
+	    if (type == TYPE_NONE)
+		type = result_type;
+	    else if (type != result_type)
+		return TYPE_ANY;
+	}
+    return type;
+}
+
+static int
+jit_region_cfg_snapshot_value(JITProgram *program, JITRegionCFG *region,
+			      JITRegionCFGSnapshot *snapshot, int *value_map,
+			      int target_value, var_type type)
+{
+    int region_value;
+    int i;
+
+    if (target_value <= 0 || target_value >= program->num_values
+	|| (type != TYPE_INT && type != TYPE_ANY))
+	return 0;
+
+    for (i = 0; i < snapshot->num_values; i++)
+	if (snapshot->values[i].target_value == target_value)
+	    return 1;
+    if (snapshot->num_values >= JIT_REGION_MAX_VALUES
+	|| (region_value = jit_region_cfg_value(program, region, value_map,
+		target_value)) < 0)
+	return 0;
+    snapshot->values[snapshot->num_values].target_value = target_value;
+    snapshot->values[snapshot->num_values].region_value = region_value;
+    snapshot->num_values++;
+    return 1;
+}
+
+static int
+jit_region_cfg_snapshot_depth(JITProgram *program, JITRegionCFG *region,
+		       JITRegionCFGSnapshot *snapshot, int *value_map, int map_id,
+		       unsigned stack_depth)
+{
+    JITDeoptMap *map;
+    int i;
+
+    if (map_id <= 0 || map_id >= program->num_deopt_maps)
+	return 0;
+    map = &program->deopt_maps[map_id];
+    if (stack_depth > map->stack_depth)
+	return 0;
+    snapshot->values = mymalloc(sizeof(JITRegionCFGSnapshotValue)
+	* JIT_REGION_MAX_VALUES, M_PROGRAM);
+    for (i = 0; i < map->num_locals; i++) {
+	int value = jit_deopt_map_local_value(program, map, i);
+	JITInstruction *definition;
+
+	if (value <= 0)
+	    continue;
+	definition = jit_value_definition(program, value);
+	if (definition && definition->kind == HIR_TAC_LOAD_LOCAL
+	    && definition->local_id == i)
+	    continue;
+	if (!jit_region_cfg_snapshot_value(program, region, snapshot, value_map,
+		value, jit_deopt_map_local_type(program, map, i)))
+	    goto fail;
+    }
+    for (i = 0; i < (int) stack_depth; i++) {
+	ResumeStackSlot slot = map->stack_slots
+	    ? map->stack_slots[i]
+	    : (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
+
+	if (slot.kind == RSS_VALUE
+	    && !jit_region_cfg_snapshot_value(program, region, snapshot, value_map,
+		map->stack_values[i], jit_deopt_map_stack_type(program, map, i)))
+	    goto fail;
+    }
+    snapshot->map = map_id;
+    return 1;
+
+fail:
+    myfree(snapshot->values, M_PROGRAM);
+    memset(snapshot, 0, sizeof(*snapshot));
+    return 0;
+}
+
+static int
+jit_region_cfg_snapshot(JITProgram *program, JITRegionCFG *region,
+		       JITRegionCFGSnapshot *snapshot, int *value_map, int map_id)
+{
+    if (map_id <= 0 || map_id >= program->num_deopt_maps)
+	return 0;
+    return jit_region_cfg_snapshot_depth(program, region, snapshot, value_map,
+	map_id, program->deopt_maps[map_id].stack_depth);
+}
+
+static int
+jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
+	JITBlock *block, int *value_map, int *block_map, int depth)
+{
+    JITRegionCFGBlock *region_block = &region->blocks[block_map[block->id]];
+    JITInstruction *instr;
+    int loop_header = region_block->loop_header;
+
+    memset(region_block, 0, sizeof(*region_block));
+    region_block->loop_header = loop_header;
+    region_block->instruction_base = region->num_instructions;
+    region_block->condition = -1;
+    region_block->result = -1;
+    region_block->false_successor = -1;
+    region_block->true_successor = -1;
+    for (instr = block->first; instr; instr = instr->next) {
+	int value;
+	int src1;
+	int src2;
+
+	switch (instr->kind) {
+	case HIR_TAC_LOAD_LOCAL:
+	    if (instr->local_id != SLOT_ARGS && instr->local_id != SLOT_THIS)
+		return 0;
+	    break;
+	case HIR_TAC_CONST:
+	    if (instr->literal_type == TYPE_INT
+		&& jit_region_cfg_value(program, region, value_map,
+		    instr->value) < 0)
+		return 0;
+	    if (instr->literal_type == TYPE_LIST) {
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		if (value < 0 || region->values[value].type != TYPE_LIST
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, -1, -1))
+		    return 0;
+	    }
+	    break;
+	case HIR_TAC_TICK:
+	    {
+		unsigned ticks = instr->tick_batch_count
+		    ? instr->tick_batch_count : 1;
+
+		if (instr->tick_batch_count == (unsigned char) -1)
+		    break;
+		if (!jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, -1, -1, -1))
+		    return 0;
+		region->instructions[region->num_instructions - 1].ticks = ticks;
+	    }
+	    break;
+	case HIR_TAC_PARALLEL_COPY:
+	    {
+		JITRegionCFGInstruction *copy_instruction;
+		JITCopy *copy;
+
+		if (region->num_instructions >= JIT_REGION_MAX_INSTRUCTIONS)
+		    return 0;
+		copy_instruction =
+		    &region->instructions[region->num_instructions++];
+		memset(copy_instruction, 0, sizeof(*copy_instruction));
+		copy_instruction->kind = HIR_TAC_PARALLEL_COPY;
+		copy_instruction->copy_base = region->num_copies;
+		for (copy = instr->copies; copy; copy = copy->next) {
+		    int dst = jit_region_cfg_value(program, region, value_map,
+			copy->dst);
+		    int src = jit_region_cfg_value(program, region, value_map,
+			copy->src);
+
+		    if (dst < 0 || src < 0)
+			return 0;
+		    if (dst == src)
+			continue;
+		    if (region->values[dst].kind
+			!= JIT_REGION_VALUE_TEMPORARY
+			|| region->num_copies >= JIT_REGION_MAX_COPIES)
+			return 0;
+		    region->copies[region->num_copies].dst = dst;
+		    region->copies[region->num_copies].src = src;
+		    region->values[dst].type = region->values[src].type;
+		    region->num_copies++;
+		    copy_instruction->num_copies++;
+		}
+		if (!copy_instruction->num_copies)
+		    region->num_instructions--;
+	    }
+	    break;
+	case HIR_TAC_UNARY:
+	    if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
+		src1 = jit_region_cfg_value(program, region, value_map,
+		    instr->src1);
+		if (src1 < 0 || region->values[src1].type != TYPE_LIST)
+		    return 0;
+		value_map[instr->value] = src1;
+		break;
+	    }
+	    if (instr->op == HIR_OP_MAKE_SINGLETON_LIST) {
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		src1 = jit_region_cfg_value(program, region, value_map,
+		    instr->src1);
+		if (value < 0 || src1 < 0
+		    || region->values[src1].type != TYPE_INT
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, -1))
+		    return 0;
+		region->values[value].type = TYPE_LIST;
+		region->instructions[region->num_instructions - 1].list_capacity
+		    = jit_fixed_list_capacity(program, instr);
+		break;
+	    }
+	    if (instr->op == HIR_OP_LENGTH) {
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		if (value < 0 || region->values[value].kind
+		    != JIT_REGION_VALUE_CONSTANT)
+		    return 0;
+		break;
+	    }
+	    if (instr->op != HIR_OP_COMPLEMENT)
+		return 0;
+	    value = jit_region_cfg_value(program, region, value_map,
+		instr->value);
+	    src1 = jit_region_cfg_value(program, region, value_map,
+		instr->src1);
+	    if (value < 0 || src1 < 0
+		|| region->values[value].kind != JIT_REGION_VALUE_TEMPORARY
+		|| !jit_region_cfg_add_instruction(region, instr->kind,
+		    instr->op, value, src1, -1))
+		return 0;
+	    region->values[value].type = TYPE_INT;
+	    break;
+	case HIR_TAC_BINARY:
+	    if (instr->op == HIR_OP_GET_PROP) {
+		JITInstruction *property = jit_value_definition(program,
+		    instr->src2);
+
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		src1 = jit_region_cfg_value(program, region, value_map,
+		    instr->src1);
+		if (value < 0 || src1 < 0
+		    || region->values[src1].type != TYPE_OBJ
+		    || !property || property->kind != HIR_TAC_CONST
+		    || property->literal_type != TYPE_STR || !property->literal
+		    || region->values[value].kind
+		       != JIT_REGION_VALUE_TEMPORARY
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, -1))
+		    return 0;
+		region->values[value].type = TYPE_INT;
+		region->instructions[region->num_instructions - 1].property =
+		    (const char *) (intptr_t) property->literal;
+		break;
+	    }
+	    if (instr->op == HIR_OP_LIST_ADD_TAIL
+		|| instr->op == HIR_OP_LIST_APPEND) {
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		src1 = jit_region_cfg_value(program, region, value_map,
+		    instr->src1);
+		src2 = jit_region_cfg_value(program, region, value_map,
+		    instr->src2);
+		if (value < 0 || src1 < 0 || src2 < 0
+		    || region->values[src1].type != TYPE_LIST
+		    || (instr->op == HIR_OP_LIST_ADD_TAIL
+			&& region->values[src2].type != TYPE_INT)
+		    || (instr->op == HIR_OP_LIST_APPEND
+			&& region->values[src2].type != TYPE_LIST)
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, src2))
+		    return 0;
+		region->values[value].type = TYPE_LIST;
+		if (instr->op == HIR_OP_LIST_ADD_TAIL)
+		    region->instructions[region->num_instructions - 1].list_index
+			= jit_fixed_list_tail_index(program, instr);
+		break;
+	    }
+	    value = jit_region_cfg_value(program, region, value_map,
+		instr->value);
+	    if (value >= 0
+		&& region->values[value].kind == JIT_REGION_VALUE_CONSTANT)
+		break;
+	    if (instr->op == HIR_OP_INDEX
+		&& value >= 0
+		&& region->values[value].kind == JIT_REGION_VALUE_ARGUMENT)
+		break;
+	    if (!jit_region_cfg_supported_binary(instr->op))
+		return 0;
+	    src1 = jit_region_cfg_value(program, region, value_map,
+		instr->src1);
+	    src2 = jit_region_cfg_value(program, region, value_map,
+		instr->src2);
+	    if (value < 0 || src1 < 0 || src2 < 0
+		|| region->values[value].kind != JIT_REGION_VALUE_TEMPORARY
+		|| ((instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
+		     || instr->op == HIR_OP_LSHR)
+		    && region->values[src2].kind == JIT_REGION_VALUE_CONSTANT
+		    && (region->values[src2].constant < 0
+			|| region->values[src2].constant
+			   >= (Num) (sizeof(Num) * CHAR_BIT)))
+		|| !jit_region_cfg_add_instruction(region, instr->kind,
+		    instr->op, value, src1, src2))
+		return 0;
+	    region->values[value].type = TYPE_INT;
+	    if ((((instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
+		   || instr->op == HIR_OP_LSHR)
+		  && region->values[src2].kind != JIT_REGION_VALUE_CONSTANT)
+		 || ((instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD)
+		     && (region->values[src2].kind
+			 != JIT_REGION_VALUE_CONSTANT
+			 || region->values[src2].constant == 0)))
+		&& instr->deopt_map > 0)
+		(void) jit_region_cfg_snapshot(program, region,
+		    &region->instructions[region->num_instructions - 1].exit,
+		    value_map, instr->deopt_map);
+	    if ((instr->op == HIR_OP_DIV || instr->op == HIR_OP_MOD)
+		&& (region->values[src2].kind != JIT_REGION_VALUE_CONSTANT
+		    || region->values[src2].constant == 0)
+		&& instr->deopt_map <= 0)
+		return 0;
+	    break;
+	case HIR_TAC_CALL_VERB:
+	    {
+		JITRegionCFGCall *region_call;
+		JITRegionCFGInstruction *region_instruction;
+		Program *target_program;
+		JITDeoptMap *call_map;
+		JITNativeResume *resume;
+		Objid receiver_class;
+		uint64_t dispatch_epoch;
+		int arguments[JIT_REGION_MAX_ARGUMENTS];
+		int argument_count = 0;
+		int call_index;
+		int argument;
+
+		memset(arguments, 0, sizeof(arguments));
+		if (depth >= JIT_REGION_MAX_DEPTH
+		    || region->num_calls >= JIT_REGION_MAX_CALLS
+		    || !jit_region_is_this(program, instr->src1, 0)
+		    || !jit_fixed_list_values(program, instr->src3, arguments,
+			&argument_count)
+		    || !jit_region_site_status(program, instr->deopt_map,
+			0, 0, 0)
+		    || !jit_region_site_snapshot(program, instr->deopt_map,
+			&target_program, &receiver_class, &dispatch_epoch)
+		    || dispatch_epoch != db_dispatch_epoch()
+		    || !target_program || !target_program->jit)
+		    return 0;
+		call_map = &program->deopt_maps[instr->deopt_map];
+		resume = call_map->native_resume;
+		if (call_map->reason != JIT_DEOPT_VERB_CALL
+		    || jit_call_stack_operands(call_map) != 3
+		    || !call_map->resume_key.site || !resume || !resume->valid
+		    || !resume->cached_verb
+		    || resume->cached_dispatch_epoch != dispatch_epoch
+		    || resume->cached_program != target_program)
+		    return 0;
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		if (value < 0
+		    || region->values[value].kind
+		       != JIT_REGION_VALUE_TEMPORARY)
+		    return 0;
+		call_index = region->num_calls++;
+		region_call = &region->calls[call_index];
+		memset(region_call, 0, sizeof(*region_call));
+		region_call->receiver_class = receiver_class;
+		region_call->dispatch_epoch = dispatch_epoch;
+		region_call->verb = resume->cached_verb;
+		region_call->num_arguments = argument_count;
+		for (argument = 0; argument < argument_count; argument++) {
+		    region_call->arguments[argument] = jit_region_cfg_value(
+			program, region, value_map, arguments[argument]);
+			if (region_call->arguments[argument] < 0)
+			    return 0;
+		}
+		if (!jit_region_cfg_snapshot_depth(program, region,
+			&region_call->caller, value_map, instr->deopt_map,
+			call_map->stack_depth - 3))
+		    return 0;
+		region_call->target = mymalloc(sizeof(*region_call->target),
+		    M_PROGRAM);
+		memset(region_call->target, 0, sizeof(*region_call->target));
+		if (!jit_region_cfg_depth(target_program->jit,
+			region_call->target, depth + 1, argument_count)
+		    || !jit_region_cfg_add_instruction(region,
+			HIR_TAC_CALL_VERB, 0, value, call_index, -1))
+		    return 0;
+		region->values[value].type =
+		    jit_region_cfg_return_type(region_call->target);
+		if (region->values[value].type != TYPE_INT
+		    && region->values[value].type != TYPE_LIST)
+		    return 0;
+		region_instruction =
+		    &region->instructions[region->num_instructions - 1];
+		region_instruction->call = call_index;
+	    }
+	    break;
+	case HIR_TAC_PUT_PROP:
+	    {
+		JITInstruction *property;
+		JITDeoptMap *map;
+		int rhs;
+
+		if (depth != 0 || region->has_effect
+		    || block->num_successors != 0 || instr->next != block->last
+		    || !instr->next || instr->next->kind != HIR_TAC_RETURN
+		    || instr->next->src1 != instr->value
+		    || !jit_region_is_this(program, instr->src1, 0)
+		    || instr->deopt_map <= 0
+		    || instr->deopt_map >= program->num_deopt_maps)
+		    return 0;
+		property = jit_value_definition(program, instr->src2);
+		map = &program->deopt_maps[instr->deopt_map];
+		if (!property || property->kind != HIR_TAC_CONST
+		    || property->literal_type != TYPE_STR || !property->literal
+		    || map->reason != JIT_DEOPT_PROPERTY_WRITE
+		    || map->stack_depth < 1 || !map->stack_values)
+		    return 0;
+		rhs = map->stack_values[map->stack_depth - 1];
+		if (instr->value <= 0 || instr->value >= program->num_values
+		    || rhs <= 0 || rhs >= program->num_values
+		    || !program->value_types
+		    || (value = jit_region_cfg_value(program, region, value_map,
+			rhs)) < 0)
+		    return 0;
+		if (region->values[value].kind != JIT_REGION_VALUE_ARGUMENT
+		    && ((program->value_is_tagged
+			 && program->value_is_tagged[rhs])
+			|| program->value_types[rhs] != TYPE_INT))
+		    return 0;
+		value_map[instr->value] = value;
+		if (!jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, -1, -1))
+		    return 0;
+		region->instructions[region->num_instructions - 1].property =
+		    (const char *) (intptr_t) property->literal;
+		region->has_effect = 1;
+	    }
+	    break;
+	case HIR_TAC_GUARD_TYPE:
+	    {
+		int guard_values[JIT_MAX_GUARD_OPERANDS] = {
+		    instr->src1, instr->src2
+		};
+		int operand;
+
+		for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS;
+		     operand++)
+		    if (instr->guarded_operands & (1U << operand)) {
+			int guarded = jit_region_cfg_value(program, region,
+			    value_map, guard_values[operand]);
+
+			if (guarded < 0
+			    || !(instr->guarded_type_masks[operand]
+				 & JIT_TYPE_MASK(TYPE_INT)))
+			    return 0;
+		    }
+		if (region_block->loop_header && !region_block->loop_check) {
+		    JITRegionCFGInstruction *loop_check;
+
+		    if (!jit_region_cfg_add_instruction(region, instr->kind,
+			    instr->op, -1, -1, -1))
+			return 0;
+		    loop_check =
+			&region->instructions[region->num_instructions - 1];
+		    loop_check->loop_check = 1;
+		    (void) jit_region_cfg_snapshot(program, region,
+			&loop_check->exit, value_map, instr->deopt_map);
+		    region_block->loop_check = 1;
+		}
+	    }
+	    break;
+	case HIR_TAC_DEOPT:
+	    jit_region_cfg_snapshot(program, region, &region_block->exit, value_map,
+		instr->deopt_map);
+	    region_block->terminator = JIT_REGION_CFG_EXIT;
+	    goto finished;
+	case HIR_TAC_RETURN0:
+	    region_block->terminator = JIT_REGION_CFG_EXIT;
+	    goto finished;
+	case HIR_TAC_LABEL:
+	case HIR_TAC_JUMP:
+	    break;
+	case HIR_TAC_BRANCH_FALSE:
+	    if (instr != block->last || block->num_successors != 2
+		|| (region_block->condition = jit_region_cfg_value(program,
+		    region, value_map, instr->src1)) < 0)
+		return 0;
+	    region_block->terminator = JIT_REGION_CFG_BRANCH;
+	    region_block->false_successor = block_map[block->successors[0]];
+	    region_block->true_successor = block_map[block->successors[1]];
+	    break;
+	case HIR_TAC_RETURN:
+	    if (instr != block->last
+		|| (region_block->result = jit_region_cfg_value(program, region,
+		    value_map, instr->src1)) < 0)
+		return 0;
+	    region_block->terminator = JIT_REGION_CFG_RETURN;
+	    break;
+	default:
+	    return 0;
+	}
+	if (instr == block->last)
+	    break;
+    }
+finished:
+    region_block->num_instructions = region->num_instructions
+	- region_block->instruction_base;
+    if (region_block->loop_header && !region_block->loop_check)
+	return 0;
+    if (region_block->condition >= 0 || region_block->result >= 0
+	|| region_block->terminator == JIT_REGION_CFG_EXIT)
+	return 1;
+    if (block->num_successors != 1)
+	return 0;
+    region_block->terminator = JIT_REGION_CFG_JUMP;
+    region_block->true_successor = block_map[block->successors[0]];
+    return region_block->true_successor >= 0;
+}
+
+static int
+jit_region_cfg_depth(JITProgram *program, JITRegionCFG *region, int depth,
+		     int num_arguments)
+{
+    JITBlock *block;
+    JITBlock **blocks = 0;
+    unsigned char *state = 0;
+    int *block_map = 0;
+    int *value_map = 0;
+    int max_block = 0;
+    int release_ir;
+    int valid = 0;
+
+    if (!program || !program->eligible)
+	return 0;
+    memset(region, 0, sizeof(*region));
+    region->program = program;
+    region->num_arguments = num_arguments;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    if (!program->blocks || max_block <= 0)
+	goto done;
+    blocks = mymalloc((max_block + 1) * sizeof(*blocks), M_PROGRAM);
+    state = mymalloc(max_block + 1, M_PROGRAM);
+    block_map = mymalloc((max_block + 1) * sizeof(*block_map), M_PROGRAM);
+    value_map = mymalloc(program->num_values * sizeof(*value_map), M_PROGRAM);
+    memset(blocks, 0, (max_block + 1) * sizeof(*blocks));
+    memset(state, 0, max_block + 1);
+    memset(block_map, -1, (max_block + 1) * sizeof(*block_map));
+    memset(value_map, -1, program->num_values * sizeof(*value_map));
+    for (block = program->blocks; block; block = block->next) {
+	if (block->id <= 0 || block->id > max_block || blocks[block->id])
+	    goto done;
+	blocks[block->id] = block;
+    }
+    if (!jit_region_cfg_mark_blocks(blocks, max_block, state, block_map,
+	    region, program->blocks->id))
+	goto done;
+    region->entry = block_map[program->blocks->id];
+    for (block = program->blocks; block; block = block->next)
+	if (block_map[block->id] >= 0
+	    && !jit_region_cfg_import_block(program, region, block, value_map,
+		block_map, depth))
+	    goto done;
+    valid = region->num_blocks > 0;
+
+done:
+    if (value_map)
+	myfree(value_map, M_PROGRAM);
+    if (block_map)
+	myfree(block_map, M_PROGRAM);
+    if (state)
+	myfree(state, M_PROGRAM);
+    if (blocks)
+	myfree(blocks, M_PROGRAM);
+    if (!valid)
+	jit_region_cfg_clear(region);
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    return valid;
+}
+
+#ifdef JIT_TESTING
+static int
+jit_region_cfg(JITProgram *program, JITRegionCFG *region)
+{
+    return jit_region_cfg_depth(program, region, 0,
+	JIT_REGION_MAX_ARGUMENTS);
+}
+#endif
+
+static int
+jit_region_is_this(JITProgram *program, int value, int depth)
+{
+    JITInstruction *definition;
+    JITBlock *block;
+    int matched = 0;
+
+    if (value <= 0 || value >= program->num_values
+	|| depth >= program->num_values)
+	return 0;
+    definition = jit_value_definition(program, value);
+    if (definition && definition->kind == HIR_TAC_LOAD_LOCAL)
+	return definition->local_id == SLOT_THIS;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->kind == HIR_TAC_PARALLEL_COPY)
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->dst == value) {
+			if (!jit_region_is_this(program, copy->src, depth + 1))
+			    return 0;
+			matched = 1;
+		    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return matched;
+}
+
+static int
+jit_region_cfg_call(JITProgram *program, JITInstruction *call,
+		    JITRegionCFG *region, int *arguments, int *argument_count,
+		    Objid *receiver_class, uint64_t *dispatch_epoch)
+{
+    Program *target_program;
+
+    *argument_count = 0;
+    if (!call || call->kind != HIR_TAC_CALL_VERB
+	|| call->deopt_map <= 0 || call->deopt_map >= program->num_deopt_maps
+	|| !jit_region_site_status(program, call->deopt_map, 0, 0, 0)
+	|| !call->src3
+	|| !jit_region_site_snapshot(program, call->deopt_map,
+	    &target_program, receiver_class, dispatch_epoch)
+	|| *dispatch_epoch != db_dispatch_epoch()
+	|| !target_program || !target_program->jit
+	|| !jit_fixed_list_values(program, call->src3, arguments,
+	    argument_count)
+	|| !jit_region_cfg_depth(target_program->jit, region, 0,
+	    *argument_count))
+	return 0;
+    return 1;
+}
+
+static int
+jit_region_cfg_call_supported(JITProgram *program, JITInstruction *call)
+{
+    JITRegionCFG region;
+    int arguments[JIT_REGION_MAX_ARGUMENTS];
+    int argument_count;
+    Objid receiver_class;
+    uint64_t dispatch_epoch;
+    int supported;
+
+    memset(arguments, 0, sizeof(arguments));
+    supported = jit_region_cfg_call(program, call, &region, arguments,
+	&argument_count, &receiver_class, &dispatch_epoch);
+    if (supported)
+	jit_region_cfg_clear(&region);
+    return supported;
+}
+
+static JITInstruction *
+jit_region_deferred_list_tail(JITProgram *program, JITInstruction *call)
+{
+    JITInstruction *tail;
+    JITInstruction *between;
+    int head;
+
+    if (!call || call->kind != HIR_TAC_CALL_VERB || call->src3 <= 0
+	|| call->src3 >= program->num_values || !program->value_types
+	|| !program->value_is_tagged || !program->value_ownership
+	|| !program->value_owned_slots || !program->value_use_counts
+	|| !program->value_escape_flags)
+	return 0;
+    tail = jit_value_definition(program, call->src3);
+    if (!tail || tail->kind != HIR_TAC_BINARY
+	|| tail->op != HIR_OP_LIST_ADD_TAIL || tail->value != call->src3
+	|| program->value_use_counts[tail->value] != 1
+	|| program->value_is_tagged[tail->value]
+	|| program->value_types[tail->value] != TYPE_LIST
+	|| tail->src1 <= 0 || tail->src1 >= program->num_values
+	|| program->value_is_tagged[tail->src1]
+	|| program->value_types[tail->src1] != TYPE_LIST
+	|| tail->src2 <= 0 || tail->src2 >= program->num_values
+	|| (!(program->value_is_tagged[tail->src2])
+	    && program->value_types[tail->src2] != TYPE_INT)
+	|| (program->value_is_tagged[tail->src2]
+	    && (program->value_ownership[tail->src2] == JIT_OWNERSHIP_OWNED
+		|| program->value_ownership[tail->src2]
+		   == JIT_OWNERSHIP_OWNED_PROPERTY)))
+	return 0;
+    head = tail->src1;
+    if (program->value_ownership[head] != JIT_OWNERSHIP_OWNED
+	|| program->value_use_counts[head] != 1
+	|| (program->value_escape_flags[head]
+	    & (JIT_ESCAPE_RETURN | JIT_ESCAPE_CALL | JIT_ESCAPE_STORE
+	       | JIT_ESCAPE_MERGE | JIT_ESCAPE_MULTIPLE_USES))
+	|| program->value_owned_slots[head] < 0
+	|| program->value_owned_slots[tail->value]
+	   != program->value_owned_slots[head])
+	return 0;
+    for (between = tail->next; between && between != call;
+	 between = between->next)
+	if (between->kind != HIR_TAC_TICK)
+	    return 0;
+    if (between != call)
+	return 0;
+    return tail;
+}
+
+#ifdef JIT_TESTING
+int
+jit_test_region_cfg(JITProgram *program, int *blocks, int *instructions,
+		    int *branches, int *returns)
+{
+    JITRegionCFG region;
+    int block;
+
+    if (!jit_region_cfg(program, &region))
+	return 0;
+    *blocks = region.num_blocks;
+    *instructions = region.num_instructions;
+    *branches = 0;
+    *returns = 0;
+    for (block = 0; block < region.num_blocks; block++) {
+	if (region.blocks[block].terminator == JIT_REGION_CFG_BRANCH)
+	    (*branches)++;
+	else if (region.blocks[block].terminator == JIT_REGION_CFG_RETURN)
+	    (*returns)++;
+    }
+    jit_region_cfg_clear(&region);
+    return 1;
+}
+
+static void
+jit_test_region_cfg_call_counts(JITRegionCFG *region, int depth,
+				int *calls, int *maximum_depth)
+{
+    int call;
+
+    if (depth > *maximum_depth)
+	*maximum_depth = depth;
+    for (call = 0; call < region->num_calls; call++) {
+	(*calls)++;
+	jit_test_region_cfg_call_counts(region->calls[call].target, depth + 1,
+	    calls, maximum_depth);
+    }
+}
+
+int
+jit_test_region_cfg_calls(JITProgram *program, int *calls,
+			  int *maximum_depth)
+{
+    JITRegionCFG region;
+
+    if (!jit_region_cfg(program, &region))
+	return 0;
+    *calls = 0;
+    *maximum_depth = 0;
+    jit_test_region_cfg_call_counts(&region, 0, calls, maximum_depth);
+    jit_region_cfg_clear(&region);
+    return 1;
+}
+
+int
+jit_test_region_cfg_exits(JITProgram *program, int *exits, int *values)
+{
+    JITRegionCFG region;
+    int block;
+    int instruction;
+
+    if (!jit_region_cfg(program, &region))
+	return 0;
+    *exits = 0;
+    *values = 0;
+    for (block = 0; block < region.num_blocks; block++)
+	if (region.blocks[block].exit.map > 0) {
+	    (*exits)++;
+	    *values += region.blocks[block].exit.num_values;
+	}
+    for (instruction = 0; instruction < region.num_instructions;
+	 instruction++)
+	if (region.instructions[instruction].exit.map > 0) {
+	    (*exits)++;
+	    *values += region.instructions[instruction].exit.num_values;
+	}
+    jit_region_cfg_clear(&region);
+    return 1;
+}
+#endif
+
+static MIR_op_t
+jit_region_cfg_operand(MIRBuild *build, JITRegionCFG *region, int value,
+	int *arguments, MIR_reg_t *caller_values, MIR_op_t *actuals,
+	MIR_reg_t *region_values)
+{
+    JITRegionCFGValue *region_value = &region->values[value];
+
+    if (region_value->kind == JIT_REGION_VALUE_ARGUMENT) {
+	if (actuals)
+	    return actuals[region_value->argument - 1];
+	return MIR_new_reg_op(build->context,
+	    caller_values[arguments[region_value->argument - 1]]);
+    }
+    if (region_value->kind == JIT_REGION_VALUE_CONSTANT)
+	return MIR_new_int_op(build->context, region_value->constant);
+    return MIR_new_reg_op(build->context, region_values[value]);
+}
+
+static int
+jit_region_cfg_assign_owners(JITProgram *root_program, JITRegionCFG *region)
+{
+    int value;
+    int call;
+    int instruction;
+
+    region->owner_base = root_program->num_owned_slots;
+    region->num_owners = region->program->num_owned_slots;
+    root_program->num_owned_slots += region->num_owners;
+    root_program->num_region_owned_slots += region->num_owners;
+    for (value = 0; value < region->num_values; value++)
+	if (region->values[value].type == TYPE_LIST) {
+	    int owner = jit_resolve_owner_slot(region->program,
+		region->values[value].source_value);
+
+	    if (owner >= 0)
+		region->values[value].owner = region->owner_base + owner;
+	    else {
+		region->values[value].owner = root_program->num_owned_slots++;
+		root_program->num_region_owned_slots++;
+		region->num_owners++;
+	    }
+	}
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++) {
+	JITRegionCFGInstruction *instr = &region->instructions[instruction];
+
+	if (instr->kind == HIR_TAC_BINARY
+	    && instr->op == HIR_OP_LIST_ADD_TAIL)
+	    region->values[instr->value].owner = region->values[instr->src1].owner;
+	else if (instr->kind == HIR_TAC_PARALLEL_COPY) {
+	    int copy;
+
+	    for (copy = 0; copy < instr->num_copies; copy++) {
+		JITRegionCFGCopy *item = &region->copies[instr->copy_base + copy];
+
+		if (region->values[item->src].type == TYPE_LIST) {
+		    region->values[item->dst].type = TYPE_LIST;
+		    region->values[item->dst].owner =
+			region->values[item->src].owner;
+		}
+	    }
+	}
+    }
+    for (call = 0; call < region->num_calls; call++)
+	if (!jit_region_cfg_assign_owners(root_program,
+		region->calls[call].target))
+	    return 0;
+    return 1;
+}
+
+static int
+jit_region_cfg_return_owner(JITRegionCFG *region, int result)
+{
+    if (result < 0 || result >= region->num_values
+	|| region->values[result].type != TYPE_LIST)
+	return -1;
+    return region->values[result].owner;
+}
+
+static void
+append_region_deferred_tail(MIRBuild *build, JITProgram *program,
+	JITInstruction *deferred_tail, MIR_reg_t *values,
+	MIR_reg_t deopt_values, MIR_reg_t owned_values, int *copy_serial)
+{
+    MIR_reg_t raw;
+    MIR_op_t type;
+
+    if (!deferred_tail)
+	return;
+    raw = append_raw_value(build, program, values, deferred_tail->src2,
+	deopt_values, copy_serial);
+    type = program->value_is_tagged[deferred_tail->src2]
+	? MIR_new_mem_op(build->context, MIR_T_I32,
+	    jit_tag_offset(program, deferred_tail->src2), deopt_values, 0, 1)
+	: MIR_new_int_op(build->context, TYPE_INT);
+    append(build, MIR_new_call_insn(build->context, 9,
+	MIR_new_ref_op(build->context, build->proto_list_append_owned),
+	MIR_new_ref_op(build->context, build->import_list_append_owned),
+	MIR_new_reg_op(build->context, values[deferred_tail->value]),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_int_op(build->context,
+	    program->value_owned_slots[deferred_tail->src1]),
+	MIR_new_reg_op(build->context, values[deferred_tail->src1]),
+	MIR_new_reg_op(build->context, raw), type));
+}
+
+static void
+append_region_exit_frame(MIRBuild *build, JITRegionExitFrame *frame,
+	JITRegionCFGSnapshot *snapshot, JITRegionExitPath *source,
+	JITProgram *root_program, MIR_reg_t deopt_values)
+{
+    int value;
+
+    for (value = 0; value < snapshot->num_values; value++)
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context,
+		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		jit_region_exit_value_offset(root_program,
+		    frame->values[value].runtime_slot), deopt_values, 0, 1),
+	    jit_region_cfg_operand(build, source->region,
+		snapshot->values[value].region_value, source->arguments,
+		source->caller_values, source->actuals,
+		source->region_values)));
+    if (source->call)
+	for (value = 0; value < source->call->num_arguments; value++)
+	    append(build, MIR_new_insn(build->context, MIR_MOV,
+		MIR_new_mem_op(build->context,
+		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		    jit_region_exit_value_offset(root_program,
+			frame->argument_slots[value]), deopt_values, 0, 1),
+		jit_region_cfg_operand(build, source->region,
+		    source->call->arguments[value], source->arguments,
+		    source->caller_values, source->actuals,
+		    source->region_values)));
+}
+
+static void
+append_region_exact_exit(MIRBuild *build, JITRegionCFG *region,
+	JITRegionCFGSnapshot *snapshot, int exit_id, int *arguments,
+	MIR_reg_t *caller_values, MIR_op_t *actuals, MIR_reg_t *region_values,
+	JITRegionExitPath *path, int depth,
+	MIR_reg_t path_ticks, MIR_label_t cold, JITProgram *root_program,
+	MIR_reg_t deopt_values, MIR_reg_t owned_values, MIR_reg_t tick_result,
+	MIR_reg_t deopt_map_out, int caller_map, JITInstruction *deferred_tail,
+	int *copy_serial)
+{
+    JITRegionExit *exit = &root_program->region_exits[exit_id];
+    JITRegionExitPath source;
+    int frame;
+
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context,
+	    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+	    jit_region_exit_value_offset(root_program, exit->tick_slot),
+	    deopt_values, 0, 1),
+	MIR_new_reg_op(build->context, path_ticks)));
+    for (frame = 0; frame < depth; frame++)
+	append_region_exit_frame(build, &exit->frames[frame],
+	    &path[frame].call->caller, &path[frame], root_program,
+	    deopt_values);
+    memset(&source, 0, sizeof(source));
+    source.region = region;
+    source.arguments = arguments;
+    source.caller_values = caller_values;
+    source.actuals = actuals;
+    source.region_values = region_values;
+    append_region_exit_frame(build, &exit->frames[depth], snapshot, &source,
+	root_program, deopt_values);
+    append(build, MIR_new_insn(build->context, MIR_BLE,
+	MIR_new_label_op(build->context, cold),
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_reg_op(build->context, path_ticks)));
+    append_region_deferred_tail(build, root_program, deferred_tail,
+	caller_values, deopt_values, owned_values, copy_serial);
+    append_materialized_values(build, root_program, caller_map,
+	caller_values, deopt_values);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, deopt_map_out, 0, 1),
+	MIR_new_int_op(build->context, JIT_REGION_EXIT_ENCODE(exit_id))));
+    return_shared_status(build, JIT_RUN_REGION_EXIT);
+}
+
+static void
+append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
+	int *arguments, MIR_reg_t *caller_values, MIR_op_t *actuals,
+	MIR_reg_t path_ticks, MIR_label_t cold, MIR_op_t result,
+	MIR_label_t continuation, JITProgram *root_program,
+	MIR_reg_t deopt_values, MIR_reg_t owned_values, MIR_reg_t tick_result,
+	MIR_reg_t timed_out, MIR_reg_t receiver, MIR_reg_t progr,
+	MIR_reg_t error_out, MIR_reg_t deopt_map_out, int caller_map,
+	JITInstruction *deferred_tail, JITRegionExitPath *path, int depth,
+	int result_owner, int *copy_serial)
+{
+    MIR_label_t labels[JIT_REGION_MAX_BLOCKS];
+    MIR_label_t instruction_exits[JIT_REGION_MAX_INSTRUCTIONS];
+    MIR_reg_t region_values[JIT_REGION_MAX_VALUES];
+    int instruction_exit_ids[JIT_REGION_MAX_INSTRUCTIONS];
+    int block;
+    int instruction_index;
+    int value;
+    char name[32];
+
+    memset(region_values, 0, sizeof(region_values));
+    for (value = 0; value < region->num_values; value++)
+	if (region->values[value].kind == JIT_REGION_VALUE_TEMPORARY) {
+	    sprintf(name, "region_value%d", (*copy_serial)++);
+	    region_values[value] = new_reg(build, name);
+	}
+    for (block = 0; block < region->num_blocks; block++)
+	labels[block] = MIR_new_label(build->context);
+    memset(instruction_exits, 0, sizeof(instruction_exits));
+    memset(instruction_exit_ids, -1, sizeof(instruction_exit_ids));
+    for (instruction_index = 0;
+	 instruction_index < region->num_instructions;
+	 instruction_index++)
+	if (region->instructions[instruction_index].exit.map > 0) {
+	    int exit_id = jit_region_exit_register(root_program, path, depth,
+		region, &region->instructions[instruction_index].exit,
+		caller_map);
+
+	    if (exit_id >= 0) {
+		instruction_exits[instruction_index] =
+		    MIR_new_label(build->context);
+		instruction_exit_ids[instruction_index] = exit_id;
+	    }
+	}
+    append(build, MIR_new_insn(build->context, MIR_JMP,
+	MIR_new_label_op(build->context, labels[region->entry])));
+
+    for (block = 0; block < region->num_blocks; block++) {
+	JITRegionCFGBlock *region_block = &region->blocks[block];
+	append(build, labels[block]);
+	for (instruction_index = region_block->instruction_base;
+	     instruction_index < region_block->instruction_base
+		+ region_block->num_instructions; instruction_index++) {
+	    JITRegionCFGInstruction *instruction =
+		&region->instructions[instruction_index];
+	    MIR_op_t dst;
+	    MIR_op_t src1;
+	    MIR_op_t src2;
+
+	    if (instruction->kind == HIR_TAC_TICK) {
+		append(build, MIR_new_insn(build->context, MIR_ADD,
+		    MIR_new_reg_op(build->context, path_ticks),
+		    MIR_new_reg_op(build->context, path_ticks),
+		    MIR_new_int_op(build->context, instruction->ticks)));
+		continue;
+	    }
+	    if (instruction->loop_check) {
+		MIR_label_t exact = instruction_exits[instruction_index];
+
+		if (!exact)
+		    exact = cold;
+		append(build, MIR_new_insn(build->context, MIR_BNE,
+		    MIR_new_label_op(build->context, exact),
+		    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+			timed_out, 0, 1),
+		    MIR_new_int_op(build->context, 0)));
+		append(build, MIR_new_insn(build->context, MIR_BLE,
+		    MIR_new_label_op(build->context, cold),
+		    MIR_new_reg_op(build->context, tick_result),
+		    MIR_new_reg_op(build->context, path_ticks)));
+		append(build, MIR_new_insn(build->context, MIR_BGE,
+		    MIR_new_label_op(build->context, exact),
+		    MIR_new_reg_op(build->context, path_ticks),
+		    MIR_new_int_op(build->context, JIT_REGION_TICK_CHUNK)));
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_PARALLEL_COPY) {
+		MIR_reg_t temps[JIT_REGION_MAX_COPIES];
+		int copy;
+
+		for (copy = 0; copy < instruction->num_copies; copy++) {
+		    JITRegionCFGCopy *region_copy = &region->copies[
+			instruction->copy_base + copy];
+
+		    sprintf(name, "region_copy%d", (*copy_serial)++);
+		    temps[copy] = new_reg(build, name);
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_reg_op(build->context, temps[copy]),
+			jit_region_cfg_operand(build, region,
+			    region_copy->src, arguments, caller_values,
+			    actuals, region_values)));
+		}
+		for (copy = 0; copy < instruction->num_copies; copy++) {
+		    JITRegionCFGCopy *region_copy = &region->copies[
+			instruction->copy_base + copy];
+
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_reg_op(build->context,
+			    region_values[region_copy->dst]),
+			MIR_new_reg_op(build->context, temps[copy])));
+		}
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_CONST
+		&& region->values[instruction->value].type == TYPE_LIST) {
+		int owner = region->values[instruction->value].owner;
+
+		append(build, MIR_new_call_insn(build->context, 3,
+		    MIR_new_ref_op(build->context, build->proto_empty_list),
+		    MIR_new_ref_op(build->context, build->import_empty_list),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value])));
+		append(build, MIR_new_call_insn(build->context, 6,
+		    MIR_new_ref_op(build->context, build->proto_owned_replace),
+		    MIR_new_ref_op(build->context, build->import_owned_replace),
+		    MIR_new_reg_op(build->context, owned_values),
+		    MIR_new_int_op(build->context, owner),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    MIR_new_int_op(build->context, TYPE_LIST)));
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_UNARY
+		&& instruction->op == HIR_OP_MAKE_SINGLETON_LIST) {
+		int owner = region->values[instruction->value].owner;
+		MIR_op_t source = jit_region_cfg_operand(build, region,
+		    instruction->src1, arguments, caller_values, actuals,
+		    region_values);
+
+		if (instruction->list_capacity > 1)
+		    append(build, MIR_new_call_insn(build->context, 6,
+			MIR_new_ref_op(build->context,
+			    build->proto_fixed_list_head),
+			MIR_new_ref_op(build->context,
+			    build->import_fixed_list_head),
+			MIR_new_reg_op(build->context,
+			    region_values[instruction->value]), source,
+			MIR_new_int_op(build->context, TYPE_INT),
+			MIR_new_int_op(build->context,
+			    instruction->list_capacity)));
+		else
+		    append(build, MIR_new_call_insn(build->context, 5,
+			MIR_new_ref_op(build->context,
+			    build->proto_singleton_list),
+			MIR_new_ref_op(build->context,
+			    build->import_singleton_list),
+			MIR_new_reg_op(build->context,
+			    region_values[instruction->value]), source,
+			MIR_new_int_op(build->context, TYPE_INT)));
+		append(build, MIR_new_call_insn(build->context, 6,
+		    MIR_new_ref_op(build->context, build->proto_owned_replace),
+		    MIR_new_ref_op(build->context, build->import_owned_replace),
+		    MIR_new_reg_op(build->context, owned_values),
+		    MIR_new_int_op(build->context, owner),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    MIR_new_int_op(build->context, TYPE_LIST)));
+		if (instruction->list_capacity > 1)
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_mem_op(build->context, MIR_T_I32,
+			    owner * sizeof(unsigned), build->home_capacities,
+			    0, 1),
+			MIR_new_int_op(build->context,
+			    instruction->list_capacity)));
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_BINARY
+		&& instruction->op == HIR_OP_LIST_ADD_TAIL) {
+		int owner = region->values[instruction->src1].owner;
+		MIR_op_t list = jit_region_cfg_operand(build, region,
+		    instruction->src1, arguments, caller_values, actuals,
+		    region_values);
+		MIR_op_t element = jit_region_cfg_operand(build, region,
+		    instruction->src2, arguments, caller_values, actuals,
+		    region_values);
+
+		if (owner < 0 || owner != region->values[instruction->value].owner)
+		    panic("Region list-tail ownership was not coalesced");
+		if (instruction->list_index > 1)
+		    append(build, MIR_new_call_insn(build->context, 7,
+			MIR_new_ref_op(build->context,
+			    build->proto_fixed_list_store),
+			MIR_new_ref_op(build->context,
+			    build->import_fixed_list_store),
+			MIR_new_reg_op(build->context,
+			    region_values[instruction->value]),
+			list,
+			MIR_new_int_op(build->context,
+			    instruction->list_index), element,
+			MIR_new_int_op(build->context, TYPE_INT)));
+		else
+		    append(build, MIR_new_call_insn(build->context, 9,
+			MIR_new_ref_op(build->context,
+			    build->proto_list_append_owned),
+			MIR_new_ref_op(build->context,
+			    build->import_list_append_owned),
+			MIR_new_reg_op(build->context,
+			    region_values[instruction->value]),
+			MIR_new_reg_op(build->context, owned_values),
+			MIR_new_reg_op(build->context, build->home_capacities),
+			MIR_new_int_op(build->context, owner), list, element,
+			MIR_new_int_op(build->context, TYPE_INT)));
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_BINARY
+		&& instruction->op == HIR_OP_LIST_APPEND) {
+		int owner = region->values[instruction->value].owner;
+
+		append(build, MIR_new_call_insn(build->context, 6,
+		    MIR_new_ref_op(build->context, build->proto_list_concat),
+		    MIR_new_ref_op(build->context, build->import_list_concat),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    jit_region_cfg_operand(build, region, instruction->src1,
+			arguments, caller_values, actuals, region_values),
+		    jit_region_cfg_operand(build, region, instruction->src2,
+			arguments, caller_values, actuals, region_values),
+		    MIR_new_reg_op(build->context, error_out)));
+		append(build, MIR_new_call_insn(build->context, 6,
+		    MIR_new_ref_op(build->context, build->proto_owned_replace),
+		    MIR_new_ref_op(build->context, build->import_owned_replace),
+		    MIR_new_reg_op(build->context, owned_values),
+		    MIR_new_int_op(build->context, owner),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    MIR_new_int_op(build->context, TYPE_LIST)));
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_BINARY
+		&& instruction->op == HIR_OP_GET_PROP) {
+		MIR_label_t normal = MIR_new_label(build->context);
+		const char *property = jit_region_literal_register(root_program,
+		    instruction->property);
+
+		append(build, MIR_new_call_insn(build->context, 8,
+		    MIR_new_ref_op(build->context, build->proto_get_prop_int),
+		    MIR_new_ref_op(build->context, build->import_get_prop_int),
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    jit_region_cfg_operand(build, region, instruction->src1,
+			arguments, caller_values, actuals, region_values),
+		    MIR_new_int_op(build->context, TYPE_OBJ),
+		    MIR_new_int_op(build->context, (intptr_t) property),
+		    MIR_new_reg_op(build->context, progr),
+		    MIR_new_reg_op(build->context, error_out)));
+		append(build, MIR_new_insn(build->context, MIR_BEQ,
+		    MIR_new_label_op(build->context, normal),
+		    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+			error_out, 0, 1),
+		    MIR_new_int_op(build->context, E_NONE)));
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+			error_out, 0, 1),
+		    MIR_new_int_op(build->context, E_NONE)));
+		append(build, MIR_new_insn(build->context, MIR_JMP,
+		    MIR_new_label_op(build->context, cold)));
+		append(build, normal);
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_CALL_VERB) {
+		JITRegionCFGCall *region_call =
+		    &region->calls[instruction->call];
+		MIR_op_t nested_actuals[JIT_REGION_MAX_ARGUMENTS];
+		MIR_label_t nested_continuation =
+		    MIR_new_label(build->context);
+		int argument;
+
+		for (argument = 0; argument < region_call->num_arguments;
+		     argument++)
+		    nested_actuals[argument] = jit_region_cfg_operand(build,
+			region, region_call->arguments[argument], arguments,
+			caller_values, actuals, region_values);
+		path[depth].region = region;
+		path[depth].call = region_call;
+		path[depth].arguments = arguments;
+		path[depth].caller_values = caller_values;
+		path[depth].actuals = actuals;
+		path[depth].region_values = region_values;
+		append_region_cfg_body(build, region_call->target, arguments,
+		    caller_values, nested_actuals, path_ticks, cold,
+		    MIR_new_reg_op(build->context,
+			region_values[instruction->value]),
+		    nested_continuation, root_program, deopt_values, owned_values,
+		    tick_result, timed_out, receiver, progr, error_out,
+		    deopt_map_out, caller_map, deferred_tail, path, depth + 1,
+		    region->values[instruction->value].owner, copy_serial);
+		append(build, nested_continuation);
+		continue;
+	    }
+	    if (instruction->kind == HIR_TAC_PUT_PROP) {
+		MIR_label_t committed = MIR_new_label(build->context);
+		MIR_reg_t put_ok;
+		const char *property = jit_region_literal_register(root_program,
+		    instruction->property);
+
+		append(build, MIR_new_insn(build->context, MIR_BLE,
+		    MIR_new_label_op(build->context, cold),
+		    MIR_new_reg_op(build->context, tick_result),
+		    MIR_new_reg_op(build->context, path_ticks)));
+		sprintf(name, "region_put%d", (*copy_serial)++);
+		put_ok = new_reg(build, name);
+		append(build, MIR_new_call_insn(build->context, 9,
+		    MIR_new_ref_op(build->context, build->proto_put_prop),
+		    MIR_new_ref_op(build->context, build->import_put_prop),
+		    MIR_new_reg_op(build->context, put_ok),
+		    MIR_new_reg_op(build->context, receiver),
+		    MIR_new_int_op(build->context, (intptr_t) property),
+		    MIR_new_reg_op(build->context, progr),
+		    jit_region_cfg_operand(build, region, instruction->value,
+			arguments, caller_values, actuals, region_values),
+		    MIR_new_int_op(build->context, TYPE_INT),
+		    MIR_new_reg_op(build->context, error_out)));
+		append(build, MIR_new_insn(build->context, MIR_BGT,
+		    MIR_new_label_op(build->context, committed),
+		    MIR_new_reg_op(build->context, put_ok),
+		    MIR_new_int_op(build->context, 0)));
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_mem_op(build->context, MIR_T_I32, 0,
+			error_out, 0, 1),
+		    MIR_new_int_op(build->context, E_NONE)));
+		append(build, MIR_new_insn(build->context, MIR_JMP,
+		    MIR_new_label_op(build->context, cold)));
+		append(build, committed);
+		continue;
+	    }
+	    dst = MIR_new_reg_op(build->context,
+		region_values[instruction->value]);
+	    src1 = jit_region_cfg_operand(build, region, instruction->src1,
+		arguments, caller_values, actuals, region_values);
+	    if (instruction->kind == HIR_TAC_UNARY)
+		append(build, MIR_new_insn(build->context, MIR_XOR,
+		    dst, src1, MIR_new_int_op(build->context, -1)));
+	    else {
+		src2 = jit_region_cfg_operand(build, region,
+		    instruction->src2, arguments, caller_values, actuals,
+		    region_values);
+		if (instruction->op == HIR_OP_DIV
+		    || instruction->op == HIR_OP_MOD) {
+		    MIR_label_t exceptional =
+			instruction_exits[instruction_index]
+			? instruction_exits[instruction_index] : cold;
+		    MIR_label_t normal = MIR_new_label(build->context);
+		    MIR_label_t done = MIR_new_label(build->context);
+
+		    append(build, MIR_new_insn(build->context, MIR_BF,
+			MIR_new_label_op(build->context, exceptional), src2));
+		    append(build, MIR_new_insn(build->context, MIR_BNE,
+			MIR_new_label_op(build->context, normal), src2,
+			MIR_new_int_op(build->context, -1)));
+		    append(build, instruction->op == HIR_OP_DIV
+			? MIR_new_insn(build->context, MIR_NEG, dst, src1)
+			: MIR_new_insn(build->context, MIR_MOV, dst,
+			    MIR_new_int_op(build->context, 0)));
+		    append(build, MIR_new_insn(build->context, MIR_JMP,
+			MIR_new_label_op(build->context, done)));
+		    append(build, normal);
+		    append(build, MIR_new_insn(build->context,
+			binary_code(instruction->op), dst, src1, src2));
+		    append(build, done);
+		} else {
+		    if (instruction->op == HIR_OP_SHL
+			|| instruction->op == HIR_OP_SHR
+			|| instruction->op == HIR_OP_LSHR) {
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+			    MIR_new_label_op(build->context,
+				instruction_exits[instruction_index]
+				? instruction_exits[instruction_index] : cold), src2,
+			    MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_insn(build->context, MIR_BGE,
+			    MIR_new_label_op(build->context,
+				instruction_exits[instruction_index]
+				? instruction_exits[instruction_index] : cold), src2,
+			    MIR_new_int_op(build->context,
+				sizeof(Num) * CHAR_BIT)));
+		    }
+		    append(build, MIR_new_insn(build->context,
+			binary_code(instruction->op), dst, src1, src2));
+		}
+	    }
+	}
+    if (region_block->terminator == JIT_REGION_CFG_RETURN) {
+	int source_owner = jit_region_cfg_return_owner(region,
+	    region_block->result);
+
+	if (source_owner >= 0 && result_owner >= 0)
+	    append(build, MIR_new_call_insn(build->context, 5,
+		MIR_new_ref_op(build->context, build->proto_owned_move),
+		MIR_new_ref_op(build->context, build->import_owned_move),
+		MIR_new_reg_op(build->context, owned_values),
+		MIR_new_int_op(build->context, result_owner),
+		MIR_new_int_op(build->context, source_owner)));
+	append(build, MIR_new_insn(build->context, MIR_MOV, result,
+		jit_region_cfg_operand(build, region, region_block->result,
+		    arguments, caller_values, actuals, region_values)));
+	    append(build, MIR_new_insn(build->context, MIR_JMP,
+		MIR_new_label_op(build->context, continuation)));
+	} else if (region_block->terminator == JIT_REGION_CFG_BRANCH) {
+	    append(build, MIR_new_insn(build->context, MIR_BF,
+		MIR_new_label_op(build->context,
+		    labels[region_block->false_successor]),
+		jit_region_cfg_operand(build, region,
+		    region_block->condition, arguments, caller_values,
+		    actuals, region_values)));
+	    append(build, MIR_new_insn(build->context, MIR_JMP,
+		MIR_new_label_op(build->context,
+		    labels[region_block->true_successor])));
+	} else if (region_block->terminator == JIT_REGION_CFG_EXIT) {
+	    int exit_id = jit_region_exit_register(root_program, path, depth,
+		region, &region_block->exit, caller_map);
+
+	    if (exit_id >= 0) {
+		append_region_exact_exit(build, region, &region_block->exit,
+		    exit_id, arguments, caller_values, actuals, region_values,
+		    path, depth,
+		    path_ticks, cold, root_program, deopt_values, owned_values,
+		    tick_result, deopt_map_out, caller_map, deferred_tail,
+		    copy_serial);
+		continue;
+	    }
+	    append(build, MIR_new_insn(build->context, MIR_JMP,
+		MIR_new_label_op(build->context, cold)));
+	}
+	else
+	    append(build, MIR_new_insn(build->context, MIR_JMP,
+		MIR_new_label_op(build->context,
+		    labels[region_block->true_successor])));
+    }
+    for (instruction_index = 0; instruction_index < region->num_instructions;
+	 instruction_index++)
+	if (instruction_exits[instruction_index]) {
+	    append(build, instruction_exits[instruction_index]);
+	    append_region_exact_exit(build, region,
+		&region->instructions[instruction_index].exit,
+		instruction_exit_ids[instruction_index], arguments, caller_values,
+		actuals, region_values, path, depth, path_ticks, cold, root_program,
+		deopt_values, owned_values, tick_result, deopt_map_out,
+		caller_map, deferred_tail, copy_serial);
+	}
+}
+
+static void
+append_region_cfg_dependency_guards(MIRBuild *build, JITRegionCFG *region,
+	MIR_reg_t receiver, MIR_op_t receiver_type, Objid root_class,
+	uint64_t root_epoch, MIR_label_t cold, int *copy_serial)
+{
+    int call;
+
+    for (call = 0; call < region->num_calls; call++) {
+	JITRegionCFGCall *region_call = &region->calls[call];
+
+	if (region_call->receiver_class != root_class
+	    || region_call->dispatch_epoch != root_epoch) {
+	    MIR_reg_t guard;
+	    char name[32];
+
+	    sprintf(name, "region_guard%d", (*copy_serial)++);
+	    guard = new_reg(build, name);
+	    append(build, MIR_new_call_insn(build->context, 7,
+		MIR_new_ref_op(build->context, build->proto_region_guard),
+		MIR_new_ref_op(build->context, build->import_region_guard),
+		MIR_new_reg_op(build->context, guard),
+		MIR_new_reg_op(build->context, receiver), receiver_type,
+		MIR_new_int_op(build->context,
+		    region_call->receiver_class),
+		MIR_new_int_op(build->context,
+		    region_call->dispatch_epoch)));
+	    append(build, MIR_new_insn(build->context, MIR_BF,
+		MIR_new_label_op(build->context, cold),
+		MIR_new_reg_op(build->context, guard)));
+	}
+	append_region_cfg_dependency_guards(build, region_call->target,
+	    receiver, receiver_type, root_class, root_epoch, cold,
+	    copy_serial);
+    }
+}
+
+static int
+append_region_cfg_call(MIRBuild *build, JITProgram *program,
+	JITInstruction *call, MIR_reg_t *values, MIR_reg_t tick_result,
+	MIR_reg_t timed_out, MIR_reg_t progr, MIR_reg_t error_out,
+	MIR_reg_t owned_values, MIR_reg_t deopt_map_out, MIR_reg_t deopt_values,
+	MIR_reg_t status, MIR_label_t common_return, MIR_label_t continuation,
+	JITInstruction *deferred_tail, int *copy_serial)
+{
+    JITRegionCFG region;
+    JITDeoptMap *map;
+    MIR_label_t cold;
+    MIR_label_t success;
+    MIR_reg_t dispatch_guard;
+    MIR_reg_t path_ticks;
+    MIR_op_t receiver_type;
+    JITRegionExitPath path[JIT_REGION_MAX_DEPTH + 1];
+    int arguments[JIT_REGION_MAX_ARGUMENTS];
+    unsigned char guarded_arguments[JIT_REGION_MAX_ARGUMENTS];
+    int argument_count;
+    var_type result_type;
+    int result_owner = -1;
+    int node;
+    int operand;
+    Objid receiver_class;
+    uint64_t dispatch_epoch;
+    char name[32];
+
+    memset(arguments, 0, sizeof(arguments));
+    memset(path, 0, sizeof(path));
+    if (!continuation)
+	return 0;
+    if (!jit_region_cfg_call(program, call, &region, arguments,
+	    &argument_count, &receiver_class, &dispatch_epoch))
+	return 0;
+    result_type = jit_region_cfg_return_type(&region);
+    if (call->value <= 0 || call->value >= program->num_values
+	|| call->src1 <= 0 || call->src1 >= program->num_values
+	|| (result_type != TYPE_INT && result_type != TYPE_LIST)
+	|| (!program->value_is_tagged[call->value]
+	    && program->value_types[call->value] != result_type))
+	goto fail;
+    for (node = 0; node < region.num_values; node++) {
+	JITRegionCFGValue *region_value = &region.values[node];
+
+	if (region_value->kind == JIT_REGION_VALUE_ARGUMENT) {
+	    int argument = region_value->argument;
+	    int value;
+
+	    if (argument <= 0 || argument > argument_count)
+		goto fail;
+	    value = arguments[argument - 1];
+	    if (value <= 0 || value >= program->num_values
+		|| (!program->value_is_tagged[value]
+		    && program->value_types[value] != TYPE_INT))
+		goto fail;
+	}
+    }
+    if (result_type == TYPE_LIST)
+	result_owner = jit_resolve_owner_slot(program, call->value);
+    if (!jit_region_cfg_assign_owners(program, &region))
+	goto fail;
+
+    cold = MIR_new_label(build->context);
+    success = MIR_new_label(build->context);
+    sprintf(name, "region_guard%d", (*copy_serial)++);
+    dispatch_guard = new_reg(build, name);
+    receiver_type = program->value_is_tagged[call->src1]
+	? MIR_new_mem_op(build->context, MIR_T_I32,
+	    jit_tag_offset(program, call->src1), deopt_values, 0, 1)
+	: MIR_new_int_op(build->context, program->value_types[call->src1]);
+    append(build, MIR_new_call_insn(build->context, 7,
+	MIR_new_ref_op(build->context, build->proto_region_guard),
+	MIR_new_ref_op(build->context, build->import_region_guard),
+	MIR_new_reg_op(build->context, dispatch_guard),
+	MIR_new_reg_op(build->context, values[call->src1]),
+	receiver_type,
+	MIR_new_int_op(build->context, receiver_class),
+	MIR_new_int_op(build->context, dispatch_epoch)));
+    append(build, MIR_new_insn(build->context, MIR_BF,
+	MIR_new_label_op(build->context, cold),
+	MIR_new_reg_op(build->context, dispatch_guard)));
+    append_region_cfg_dependency_guards(build, &region, values[call->src1],
+	receiver_type, receiver_class, dispatch_epoch, cold, copy_serial);
+
+    memset(guarded_arguments, 0, sizeof(guarded_arguments));
+    for (node = 0; node < region.num_values; node++)
+	if (region.values[node].kind == JIT_REGION_VALUE_ARGUMENT
+	    && !guarded_arguments[region.values[node].argument - 1]) {
+	    int argument = region.values[node].argument;
+	    int value = arguments[argument - 1];
+
+	    guarded_arguments[argument - 1] = 1;
+	    if (program->value_is_tagged[value])
+		append(build, MIR_new_insn(build->context, MIR_BNE,
+		    MIR_new_label_op(build->context, cold),
+		    MIR_new_mem_op(build->context, MIR_T_I32,
+			jit_tag_offset(program, value), deopt_values, 0, 1),
+		    MIR_new_int_op(build->context, TYPE_INT)));
+	}
+    append(build, MIR_new_insn(build->context, MIR_BNE,
+	MIR_new_label_op(build->context, cold),
+	MIR_new_mem_op(build->context, MIR_T_I32, 0, timed_out, 0, 1),
+	MIR_new_int_op(build->context, 0)));
+
+    sprintf(name, "region_ticks%d", (*copy_serial)++);
+    path_ticks = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_MOV,
+	MIR_new_reg_op(build->context, path_ticks),
+	MIR_new_int_op(build->context, 0)));
+    append_region_cfg_body(build, &region, arguments, values, 0, path_ticks,
+	cold, MIR_new_reg_op(build->context, values[call->value]), success,
+	program, deopt_values, owned_values, tick_result, timed_out,
+	values[call->src1], progr, error_out, deopt_map_out, call->deopt_map,
+	deferred_tail, path, 0, result_owner, copy_serial);
+    append(build, success);
+    append(build, MIR_new_insn(build->context, MIR_BLE,
+	MIR_new_label_op(build->context, cold),
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_reg_op(build->context, path_ticks)));
+    append(build, MIR_new_insn(build->context, MIR_SUB,
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_reg_op(build->context, tick_result),
+	MIR_new_reg_op(build->context, path_ticks)));
+    if (program->value_is_tagged[call->value])
+	append(build, MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_mem_op(build->context, MIR_T_I32,
+		jit_tag_offset(program, call->value), deopt_values, 0, 1),
+	    MIR_new_int_op(build->context, result_type)));
+    map = &program->deopt_maps[call->deopt_map];
+    for (operand = 0; map->stack_boundary_ownership
+	 && operand < (int) map->stack_depth; operand++)
+	if (map->stack_boundary_ownership[operand]
+	    == JIT_BOUNDARY_VALUE_RELEASE_AFTER_RESUME) {
+	    int value = map->stack_values[operand];
+	    int owner = map->stack_owner_slots
+		? map->stack_owner_slots[operand] : -1;
+	    int raw_value = deferred_tail && value == deferred_tail->value
+		&& owner >= 0 ? deferred_tail->src1 : value;
+	    MIR_reg_t raw = append_raw_value(build, program, values, raw_value,
+		deopt_values, copy_serial);
+
+	    append(build, MIR_new_call_insn(build->context, 6,
+		MIR_new_ref_op(build->context, build->proto_discard_owned),
+		MIR_new_ref_op(build->context, build->import_discard_owned),
+		MIR_new_reg_op(build->context, owned_values),
+		MIR_new_int_op(build->context, owner),
+		MIR_new_reg_op(build->context, raw),
+		MIR_new_int_op(build->context, TYPE_LIST)));
+	}
+    append(build, MIR_new_insn(build->context, MIR_JMP,
+	MIR_new_label_op(build->context, continuation)));
+    append(build, cold);
+    append_region_deferred_tail(build, program, deferred_tail, values,
+	deopt_values, owned_values, copy_serial);
+    append_materialized_exit(build, program, call->deopt_map, values,
+	deopt_map_out, deopt_values, status, common_return, JIT_RUN_CALL_VERB);
+    jit_region_site_mark_spliced(program, call->deopt_map);
+    jit_region_cfg_clear(&region);
+    return 1;
+
+fail:
+    jit_region_cfg_clear(&region);
+    return 0;
+}
+
+static int
+append_region_call(MIRBuild *build, JITProgram *program,
+	JITInstruction *call, MIR_reg_t *values, MIR_reg_t tick_result,
+	MIR_reg_t timed_out, MIR_reg_t progr, MIR_reg_t error_out,
+	MIR_reg_t owned_values, MIR_reg_t deopt_map_out, MIR_reg_t deopt_values,
+	MIR_reg_t status, MIR_label_t common_return, MIR_label_t continuation,
+	JITInstruction *deferred_tail, int *copy_serial)
+{
+    return append_region_cfg_call(build, program, call, values, tick_result,
+	timed_out, progr, error_out, owned_values, deopt_map_out, deopt_values,
+	status, common_return, continuation, deferred_tail, copy_serial);
 }
 
 typedef enum {
@@ -3676,6 +6088,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     MIR_reg_t continuation_values, owned_values;
     MIR_reg_t tick_result, timeout_value, status;
     MIR_reg_t *values;
+    unsigned char *deferred_region_lists;
     MIR_label_t *labels;
     MIR_label_t *resume_entries, *resume_continuations;
     MIR_label_t fallback;
@@ -3759,6 +6172,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	MIR_T_I32, "elem_type", MIR_T_I32, "capacity");
     build->import_fixed_list_head = MIR_new_import(build->context,
 	"jit_rt_make_fixed_list_head");
+    build->proto_empty_list = MIR_new_proto(build->context,
+	"proto_empty_list", 1, &res_p, 0);
+    build->import_empty_list = MIR_new_import(build->context,
+	"jit_rt_make_empty_list");
 
     build->proto_list_append = MIR_new_proto(build->context, "proto_list_append", 1, &res_p, 3,
 					     MIR_T_P, "l", MIR_T_I64, "elem_raw",
@@ -3777,12 +6194,22 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	MIR_T_I32, "elem_type");
     build->import_fixed_list_append_owned = MIR_new_import(build->context,
 	"jit_rt_fixed_list_append_owned");
+    build->proto_fixed_list_store = MIR_new_proto(build->context,
+	"proto_fixed_list_store", 1, &res_p, 4, MIR_T_P, "list",
+	MIR_T_I32, "index", MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+    build->import_fixed_list_store = MIR_new_import(build->context,
+	"jit_rt_fixed_list_store");
 
     build->proto_owned_replace = MIR_new_proto(build->context,
 	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
 	MIR_T_I32, "value", MIR_T_I64, "raw", MIR_T_I32, "type");
     build->import_owned_replace = MIR_new_import(build->context,
 	"jit_rt_owned_replace");
+    build->proto_owned_move = MIR_new_proto(build->context,
+	"proto_owned_move", 0, 0, 3, MIR_T_P, "owned_values",
+	MIR_T_I32, "destination", MIR_T_I32, "source");
+    build->import_owned_move = MIR_new_import(build->context,
+	"jit_rt_owned_move");
     build->proto_discard_owned = MIR_new_proto(build->context,
 	"proto_discard_owned", 0, 0, 4, MIR_T_P, "owned_values",
 	MIR_T_I32, "owner", MIR_T_I64, "raw", MIR_T_I32, "type");
@@ -3814,12 +6241,25 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					 MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type", MIR_T_P, "l");
     build->import_list_in = MIR_new_import(build->context, "jit_rt_list_in");
 
+    build->proto_region_guard = MIR_new_proto(build->context,
+	"proto_region_guard", 1, &res_i64, 4, MIR_T_I64, "receiver_raw",
+	MIR_T_I32, "receiver_type", MIR_T_I64, "receiver_class",
+	MIR_T_I64, "dispatch_epoch");
+    build->import_region_guard = MIR_new_import(build->context,
+	"jit_rt_region_guard");
+
     build->proto_get_prop = MIR_new_proto(build->context, "proto_get_prop", 1, &res_i32, 7,
 					  MIR_T_I64, "receiver", MIR_T_I32, "receiver_type",
 					  MIR_T_P, "pname", MIR_T_I64, "progr",
 					  MIR_T_P, "out_raw", MIR_T_P, "out_type", MIR_T_P, "err");
     build->import_get_prop = MIR_new_import(build->context,
 					    "jit_rt_get_prop_typed");
+    build->proto_get_prop_int = MIR_new_proto(build->context,
+	"proto_get_prop_int", 1, &res_i64, 5, MIR_T_I64, "receiver",
+	MIR_T_I32, "receiver_type", MIR_T_P, "pname", MIR_T_I64, "progr",
+	MIR_T_P, "err");
+    build->import_get_prop_int = MIR_new_import(build->context,
+	"jit_rt_get_prop_int");
 
     build->proto_put_prop = MIR_new_proto(build->context, "proto_put_prop", 1, &res_i32, 6,
 					  MIR_T_I64, "oid", MIR_T_P, "pname", MIR_T_I64, "progr",
@@ -3907,6 +6347,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
     values = mymalloc(sizeof(MIR_reg_t) * program->num_values, M_PROGRAM);
     memset(values, 0, sizeof(MIR_reg_t) * program->num_values);
+    deferred_region_lists = mymalloc(program->num_values, M_PROGRAM);
+    memset(deferred_region_lists, 0, program->num_values);
     for (i = 1; i < program->num_values; i++) {
 	char name[32];
 	sprintf(name, "v%d", i);
@@ -3952,6 +6394,23 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		       &program->deopt_maps[instr->deopt_map])) {
 		resume_entries[instr->deopt_map] = MIR_new_label(build->context);
 		resume_continuations[instr->deopt_map] = MIR_new_label(build->context);
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CALL_VERB && instr->deopt_map > 0
+		&& instr->deopt_map < program->num_deopt_maps
+		&& resume_continuations[instr->deopt_map]) {
+		JITInstruction *tail;
+
+		tail = jit_region_deferred_list_tail(program, instr);
+		if (tail && jit_region_cfg_call_supported(program, instr))
+		    deferred_region_lists[tail->value] = 1;
 	    }
 	    if (instr == block->last)
 		break;
@@ -4090,6 +6549,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 	    append(build, labels[block->id]);
 	    for (instr = block->first; instr; instr = instr->next) {
+		if (instr->value > 0 && instr->value < program->num_values
+		    && deferred_region_lists[instr->value]) {
+		    if (instr == block->last)
+			break;
+		    continue;
+		}
 		append_source_marker(build, instr, &source_marker_serial);
 		switch (instr->kind) {
 		case HIR_TAC_LOAD_ERROR:
@@ -7621,9 +10086,17 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      common_return);
 		    break;
 		case HIR_TAC_CALL_VERB:
-		    append_materialized_exit(build, program, instr->deopt_map,
-			values, deopt_map_out, deopt_values, status,
-			common_return, JIT_RUN_CALL_VERB);
+		    if (!(instr->deopt_map > 0
+			&& instr->deopt_map < program->num_deopt_maps
+		    && append_region_call(build, program, instr, values,
+			tick_result, timed_out, progr, error_out, owned_values,
+			deopt_map_out, deopt_values, status, common_return,
+			    resume_continuations[instr->deopt_map],
+			    jit_region_deferred_list_tail(program, instr),
+			    &copy_serial)))
+			append_materialized_exit(build, program, instr->deopt_map,
+			    values, deopt_map_out, deopt_values, status,
+			    common_return, JIT_RUN_CALL_VERB);
 		    if (instr->deopt_map > 0
 			&& instr->deopt_map < program->num_deopt_maps
 			&& resume_continuations[instr->deopt_map])
@@ -7872,6 +10345,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     append(build, MIR_new_ret_insn(build->context, 1,
 				  MIR_new_reg_op(build->context, status)));
     finish_build(build);
+    myfree(deferred_region_lists, M_PROGRAM);
     myfree(resume_continuations, M_PROGRAM);
     myfree(resume_entries, M_PROGRAM);
     myfree(labels, M_PROGRAM);
@@ -7906,6 +10380,7 @@ jit_program_release_native(JITProgram *program)
     program->native_function = 0;
     program->machine_code = 0;
     program->machine_code_len = 0;
+    jit_program_clear_region_exits(program);
 }
 
 static void
@@ -8072,6 +10547,8 @@ jit_program_restore_ir(JITProgram *program)
 void
 jit_program_free(JITProgram *program)
 {
+    JITRegionSite *region_site;
+
     if (!program)
 	return;
 
@@ -8130,6 +10607,8 @@ jit_program_free(JITProgram *program)
 		    myfree(program->deopt_maps[i].stack_boundary_ownership,
 			   M_PROGRAM);
 		if (program->deopt_maps[i].native_resume) {
+		    int literal;
+
 		    if (program->deopt_maps[i].native_resume->cached_verb)
 			free_str(program->deopt_maps[i].native_resume->cached_verb);
 		    if (program->deopt_maps[i].native_resume->capture_actions)
@@ -8141,6 +10620,25 @@ jit_program_free(JITProgram *program)
 		    if (program->deopt_maps[i].native_resume->values)
 			myfree(program->deopt_maps[i].native_resume->values,
 			       M_PROGRAM);
+		    for (literal = 0;
+			 literal < program->deopt_maps[i].native_resume->num_literals;
+			 literal++) {
+			JITResumeLiteral *resume_literal =
+			    &program->deopt_maps[i].native_resume->literals[literal];
+
+			if (resume_literal->literal_type == TYPE_STR
+			    || resume_literal->literal_type == TYPE_LIST
+#ifdef WAIF_CORE
+			    || resume_literal->literal_type == TYPE_WAIF
+#endif
+			    ) {
+			    Var value;
+
+			    value.type = resume_literal->literal_type;
+			    value.v.num = resume_literal->literal;
+			    free_var(value);
+			}
+		    }
 		    if (program->deopt_maps[i].native_resume->literals)
 			myfree(program->deopt_maps[i].native_resume->literals,
 			       M_PROGRAM);
@@ -8169,6 +10667,13 @@ jit_program_free(JITProgram *program)
 	myfree(program->borrowed_local_slots, M_PROGRAM);
     if (program->usage)
 	myfree(program->usage, M_PROGRAM);
+    region_site = program->region_sites;
+    while (region_site) {
+	JITRegionSite *next = region_site->next;
+
+	myfree(region_site, M_PROGRAM);
+	region_site = next;
+    }
     jit_program_free_retained_constants(program);
     if (program->reason)
 	free_str(program->reason);
@@ -8224,6 +10729,26 @@ jit_program_metadata_bytes(JITProgram *program)
 	bytes += sizeof(int) * program->num_borrowed_locals;
     if (program->usage)
 	bytes += sizeof(JITProgramUsage);
+    {
+	JITRegionSite *site;
+
+	for (site = program->region_sites; site; site = site->next)
+	    bytes += sizeof(*site);
+    }
+    bytes += sizeof(JITRegionExit) * program->region_exit_capacity;
+
+    bytes += sizeof(const char *) * program->region_literal_capacity;
+    for (i = 0; i < program->num_region_literals; i++)
+	bytes += memo_strlen(program->region_literals[i]) + 1;
+    for (i = 0; i < program->num_region_exits; i++) {
+	JITRegionExit *exit = &program->region_exits[i];
+	int frame;
+
+	bytes += sizeof(JITRegionExitFrame) * exit->num_frames;
+	for (frame = 0; frame < exit->num_frames; frame++)
+	    bytes += sizeof(JITRegionExitValue)
+		* exit->frames[frame].num_values;
+    }
     for (i = 0; i < program->num_deopt_maps; i++) {
 	JITDeoptMap *map = &program->deopt_maps[i];
 	int owns_state = !program->reconstruction_states
@@ -8399,6 +10924,17 @@ jit_program_is_eligible(JITProgram *program)
     return program && program->eligible;
 }
 
+uint64_t
+jit_program_compiled_generation(JITProgram *program)
+{
+    return program && program->state == JIT_STATE_COMPILED
+	&& program->native_function
+	&& program->pool_generation == jit_shared_pool.generation
+	&& program->protection_generation == builtin_protection_generation()
+	&& !jit_pool_rotation_blocks_native_entry()
+	? program->pool_generation : 0;
+}
+
 int
 jit_program_may_error(JITProgram *program)
 {
@@ -8443,6 +10979,300 @@ jit_program_is_direct_leaf(JITProgram *program)
     return direct_leaf;
 }
 
+static int
+jit_region_leaf_loop_header(JITProgram *program, JITBlock *block)
+{
+    JITInstruction *instr;
+
+    for (instr = block->first; instr; instr = instr->next) {
+	if (instr->kind == HIR_TAC_GUARD_TYPE && instr->deopt_map > 0
+	    && instr->deopt_map < program->num_deopt_maps)
+	    return 1;
+	if (instr == block->last)
+	    break;
+    }
+    return 0;
+}
+
+static int
+jit_region_leaf_terminal_put(JITBlock *block, JITInstruction *instr)
+{
+    JITInstruction *ret = instr->next;
+
+    return block->num_successors == 0 && ret && ret == block->last
+	&& ret->kind == HIR_TAC_RETURN && ret->src1 == instr->value;
+}
+
+static int
+jit_region_leaf_visit(JITProgram *program, JITBlock **blocks,
+		      unsigned char *colors, int max_block, int id,
+		      int *instructions, int allow_verb_calls)
+{
+    JITBlock *block;
+    JITInstruction *instr;
+    int successor;
+
+    if (id <= 0 || id > max_block || !blocks[id])
+	return 0;
+    if (colors[id] == 1)
+	return jit_region_leaf_loop_header(program, blocks[id]);
+    if (colors[id] == 2)
+	return 1;
+    colors[id] = 1;
+    block = blocks[id];
+    for (instr = block->first; instr; instr = instr->next) {
+	if (++*instructions > 128
+	    || instr->kind == HIR_TAC_CALL
+	    || (instr->kind == HIR_TAC_CALL_VERB && !allow_verb_calls)
+	    || (instr->kind == HIR_TAC_PUT_PROP
+		&& !jit_region_leaf_terminal_put(block, instr))
+	    || instr->kind == HIR_TAC_INDEX_SET
+	    || instr->kind == HIR_TAC_RANGE_SET
+	    || (instr->kind == HIR_TAC_UNARY
+		&& (instr->op == HIR_OP_FORK
+		    || instr->op == HIR_OP_TICKS_LEFT
+		    || instr->op == HIR_OP_SECONDS_LEFT
+		    || instr->op == HIR_OP_TIME
+		    || instr->op == HIR_OP_GET_PROP)))
+	    return 0;
+	if (instr == block->last)
+	    break;
+    }
+    for (successor = 0; successor < block->num_successors; successor++)
+	if (!jit_region_leaf_visit(program, blocks, colors, max_block,
+		block->successors[successor], instructions, allow_verb_calls))
+	    return 0;
+    colors[id] = 2;
+    return 1;
+}
+
+static int
+jit_program_is_region_kind(JITProgram *program, int allow_verb_calls)
+{
+    JITBlock *block;
+    JITBlock **blocks;
+    unsigned char *colors;
+    int instructions = 0;
+    int max_block = 0;
+    int release_ir;
+    int eligible = 0;
+
+    if (!program || !program->eligible)
+	return 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
+    for (block = program->blocks; block; block = block->next)
+	if (block->id > max_block)
+	    max_block = block->id;
+    if (!program->blocks || max_block <= 0)
+	goto done;
+    blocks = mymalloc((max_block + 1) * sizeof(JITBlock *), M_PROGRAM);
+    colors = mymalloc(max_block + 1, M_PROGRAM);
+    memset(blocks, 0, (max_block + 1) * sizeof(JITBlock *));
+    memset(colors, 0, max_block + 1);
+    for (block = program->blocks; block; block = block->next) {
+	if (block->id <= 0 || block->id > max_block || blocks[block->id])
+	    goto free_arrays;
+	blocks[block->id] = block;
+    }
+    eligible = jit_region_leaf_visit(program, blocks, colors, max_block,
+	    program->blocks->id, &instructions, allow_verb_calls);
+
+free_arrays:
+    myfree(colors, M_PROGRAM);
+    myfree(blocks, M_PROGRAM);
+done:
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    return eligible;
+}
+
+int
+jit_program_is_region_leaf(JITProgram *program)
+{
+    return jit_program_is_region_kind(program, 0);
+}
+
+static int
+jit_program_is_recursive_region_candidate(JITProgram *program)
+{
+    JITBlock *block;
+    int calls = 0;
+    int release_ir;
+    int eligible = 0;
+
+    if (!jit_program_is_region_kind(program, 1))
+	return 0;
+    release_ir = !program->blocks;
+    if (release_ir && !jit_program_restore_ir(program))
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_CALL_VERB) {
+		int arguments[JIT_REGION_MAX_ARGUMENTS];
+		int count = 0;
+
+		if (++calls > JIT_REGION_MAX_CALLS
+		    || !jit_region_is_this(program, instr->src1, 0)
+		    || !jit_fixed_list_values(program, instr->src3,
+			arguments, &count))
+		    goto done;
+	    }
+	    if (instr == block->last)
+		break;
+	}
+    }
+    eligible = calls > 0;
+done:
+    if (release_ir)
+	jit_program_release_ir(program, 0);
+    return eligible;
+}
+
+static JITRegionSite *
+jit_region_site(JITProgram *program, int map_id, int create)
+{
+    JITRegionSite *site;
+
+    if (!program || map_id <= 0 || map_id >= program->num_deopt_maps)
+	return 0;
+    for (site = program->region_sites; site; site = site->next)
+	if (site->map_id == map_id)
+	    return site;
+    if (!create)
+	return 0;
+    site = mymalloc(sizeof(*site), M_PROGRAM);
+    memset(site, 0, sizeof(*site));
+    site->map_id = map_id;
+    site->next = program->region_sites;
+    program->region_sites = site;
+    return site;
+}
+
+#ifdef JIT_TESTING
+void
+jit_test_region_site_select(JITProgram *program, int map_id,
+	Program *target_program, Objid receiver_class)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 1);
+    JITDeoptMap *map = &program->deopt_maps[map_id];
+
+    site->leaf = 1;
+    site->hits = JIT_REGION_HOT_THRESHOLD;
+    site->target_program = target_program;
+    site->dispatch_epoch = db_dispatch_epoch();
+    site->receiver_class = receiver_class;
+    map->reason = JIT_DEOPT_VERB_CALL;
+    map->stack_depth = 3;
+    map->resume_key.site = 1;
+    if (!map->native_resume) {
+	map->native_resume = mymalloc(sizeof(JITNativeResume), M_PROGRAM);
+	memset(map->native_resume, 0, sizeof(JITNativeResume));
+    }
+    map->native_resume->valid = 1;
+    map->native_resume->cached_program = target_program;
+    map->native_resume->cached_dispatch_epoch = site->dispatch_epoch;
+    if (map->native_resume->cached_verb)
+	free_str(map->native_resume->cached_verb);
+    map->native_resume->cached_verb = str_dup("test_region");
+}
+#endif
+
+void
+jit_region_site_reset(JITProgram *program, int map_id)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 0);
+
+    if (!site)
+	return;
+    site->leaf = 0;
+    site->hits = 0;
+    site->rotation_requested = 0;
+    site->spliced_generation = 0;
+    site->target_program = 0;
+    site->dispatch_epoch = 0;
+    site->receiver_class = NOTHING;
+}
+
+int
+jit_region_site_record_hit(JITProgram *program, int map_id,
+			   JITProgram *target)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 1);
+
+    if (!site)
+	return 0;
+    if (!site->leaf)
+	site->leaf = (jit_program_is_region_leaf(target)
+	    || jit_program_is_recursive_region_candidate(target)) ? 1 : -1;
+    if (site->leaf < 0 || site->hits == UCHAR_MAX)
+	return 1;
+    site->hits++;
+    if (site->hits >= JIT_REGION_HOT_THRESHOLD && !site->target_program) {
+	JITNativeResume *resume = program->deopt_maps[map_id].native_resume;
+
+	if (resume && resume->cached_program
+	    && resume->cached_program->jit == target
+	    && resume->cached_dispatch_epoch) {
+	    site->target_program = resume->cached_program;
+	    site->dispatch_epoch = resume->cached_dispatch_epoch;
+	    site->receiver_class = resume->cached_class;
+	}
+    }
+    if (site->hits >= JIT_REGION_HOT_THRESHOLD
+	&& site->target_program
+	&& !site->rotation_requested
+	&& jit_pool_policy.region_specialization_rotations
+	       < JIT_MAX_REGION_SPECIALIZATION_ROTATIONS
+	&& program->state == JIT_STATE_COMPILED) {
+	site->rotation_requested = 1;
+	jit_pool_request_rotation_reason(JIT_ROTATION_REGION_SPECIALIZATION);
+    }
+    return site->hits >= JIT_REGION_HOT_THRESHOLD && site->target_program;
+}
+
+static int
+jit_region_site_snapshot(JITProgram *program, int map_id,
+			 Program **target_program, Objid *receiver_class,
+			 uint64_t *dispatch_epoch)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 0);
+
+    if (!site || !site->target_program || !site->dispatch_epoch)
+	return 0;
+    *target_program = site->target_program;
+    *receiver_class = site->receiver_class;
+    *dispatch_epoch = site->dispatch_epoch;
+    return 1;
+}
+
+int
+jit_region_site_status(JITProgram *program, int map_id, int *leaf,
+		       unsigned *hits, uint64_t *spliced_generation)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 0);
+
+    if (leaf)
+	*leaf = site ? site->leaf : 0;
+    if (hits)
+	*hits = site ? site->hits : 0;
+    if (spliced_generation)
+	*spliced_generation = site ? site->spliced_generation : 0;
+    return site && site->leaf > 0 && site->hits >= JIT_REGION_HOT_THRESHOLD;
+}
+
+static void
+jit_region_site_mark_spliced(JITProgram *program, int map_id)
+{
+    JITRegionSite *site = jit_region_site(program, map_id, 0);
+
+    if (site)
+	site->spliced_generation = jit_shared_pool.generation;
+}
+
 static void
 jit_program_sync_warmup(JITProgram *program)
 {
@@ -8466,7 +11296,7 @@ jit_program_admit_interpreter_entry(JITProgram *program)
     if (program->warmup_count < jit_pool_policy.hot_threshold)
 	program->warmup_count++;
     return program->warmup_count >= jit_pool_policy.hot_threshold
-	&& jit_pool_policy.pending_reason == JIT_ROTATION_NONE;
+	&& !jit_pool_rotation_blocks_native_entry();
 }
 
 int
@@ -8477,7 +11307,7 @@ jit_program_claim_native_entry(JITProgram *program)
     if (program->state == JIT_STATE_COMPILED)
 	return 1;
     if (program->state != JIT_STATE_PENDING
-	|| jit_pool_policy.pending_reason != JIT_ROTATION_NONE)
+	|| jit_pool_rotation_blocks_native_entry())
 	return 0;
     jit_program_sync_warmup(program);
     if ((unsigned) program->warmup_count + 1
@@ -8667,6 +11497,7 @@ jit_program_compile(JITProgram *program)
     if (!jit_program_restore_ir(program))
 	return 0;
     jit_program_find_borrowed_locals(program);
+    jit_program_clear_region_exits(program);
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
@@ -9727,6 +12558,281 @@ jit_continuation_materialize_boundary(activation *a, Var *boundary,
     return 1;
 }
 
+static JITRegionExitValue *
+jit_region_exit_value(JITRegionExitFrame *frame, int target_value)
+{
+    int i;
+
+    for (i = 0; i < frame->num_values; i++)
+	if (frame->values[i].target_value == target_value)
+	    return &frame->values[i];
+    return 0;
+}
+
+int
+jit_region_exit_frame_count(JITProgram *program, int exit_id)
+{
+    if (!program || exit_id < 0 || exit_id >= program->num_region_exits
+	|| program->region_exits[exit_id].dispatch_epoch != db_dispatch_epoch())
+	return 0;
+    return program->region_exits[exit_id].num_frames;
+}
+
+int
+jit_region_exit_materialize(JITProgram *program, int exit_id, int frame_id,
+	JITContinuationFrame *continuation, activation *a, int *ticks)
+{
+    JITRegionExit *exit;
+    JITRegionExitFrame *frame;
+    JITDeoptMap *map;
+    const ResumePoint *point = 0;
+    unsigned stack_depth;
+    Num path_ticks;
+    int i;
+
+    if (!program || exit_id < 0 || exit_id >= program->num_region_exits
+	|| !continuation || continuation->program != program
+	|| !continuation->deopt_values || !a || !a->prog || !a->rt_env
+	|| !a->base_rt_stack || !a->top_rt_stack || !ticks)
+	return 0;
+    exit = &program->region_exits[exit_id];
+    if (exit->dispatch_epoch != db_dispatch_epoch()
+	|| frame_id < 0 || frame_id >= exit->num_frames)
+	return 0;
+    frame = &exit->frames[frame_id];
+    if (!frame->target || a->prog != frame->bytecode_program
+	|| a->prog->jit != frame->target || frame->map <= 0
+	|| frame->map >= frame->target->num_deopt_maps)
+	return 0;
+    map = &frame->target->deopt_maps[frame->map];
+    stack_depth = map->stack_depth;
+    if (frame->dispatched) {
+	if (jit_call_stack_operands(map) != 3 || stack_depth < 3
+	    || !(point = resume_point_for_key(a->prog, map->resume_key)))
+	    return 0;
+	stack_depth -= 3;
+    } else if (frame_id != exit->num_frames - 1)
+	return 0;
+    if (map->num_locals > (int) a->prog->num_var_names
+	|| stack_depth > (unsigned) a->rt_stack_size)
+	return 0;
+    for (i = 0; i < (int) stack_depth; i++) {
+	ResumeStackSlot slot = map->stack_slots
+	    ? map->stack_slots[i]
+	    : (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
+
+	if (slot.kind == RSS_VALUE
+	    && !jit_region_exit_value(frame, map->stack_values[i]))
+	    return 0;
+    }
+    path_ticks = continuation->deopt_values[
+	jit_runtime_base_value_slots(program) + exit->tick_slot];
+    if (path_ticks < 0 || path_ticks >= *ticks)
+	return 0;
+    for (i = 0; i < map->num_locals; i++) {
+	int target_value = jit_deopt_map_local_value(frame->target, map, i);
+	JITRegionExitValue *value = jit_region_exit_value(frame, target_value);
+
+	if (value) {
+	    Var materialized;
+
+	    materialized.type = TYPE_INT;
+	    materialized.v.num = continuation->deopt_values[
+		jit_runtime_base_value_slots(program) + value->runtime_slot];
+	    free_var(a->rt_env[i]);
+	    a->rt_env[i] = materialized;
+	}
+    }
+    while (a->top_rt_stack > a->base_rt_stack)
+	free_var(*--a->top_rt_stack);
+    for (i = 0; i < (int) stack_depth; i++) {
+	ResumeStackSlot slot = map->stack_slots
+	    ? map->stack_slots[i]
+	    : (ResumeStackSlot){ .kind = RSS_VALUE, .data = 0 };
+	Var materialized;
+
+	if (slot.kind == RSS_VALUE) {
+	    JITRegionExitValue *value = jit_region_exit_value(frame,
+		map->stack_values[i]);
+
+	    materialized.type = TYPE_INT;
+	    materialized.v.num = continuation->deopt_values[
+		jit_runtime_base_value_slots(program) + value->runtime_slot];
+	} else {
+	    materialized.type = slot.kind == RSS_CATCH ? TYPE_CATCH
+		: slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
+	    materialized.v.num = slot.data;
+	}
+	*a->top_rt_stack++ = materialized;
+    }
+    if (frame->dispatched) {
+	a->pc = point->pc;
+	a->error_pc = point->error_pc;
+	a->resume_key = point->key;
+    } else {
+	*ticks -= (int) path_ticks;
+	a->pc = map->bytecode_pc;
+	a->error_pc = map->error_pc;
+	a->resume_key = invalid_resume_key();
+    }
+    free_var(a->temp);
+    a->temp.type = TYPE_NONE;
+    a->temp.v.num = 0;
+    return 1;
+}
+
+int
+jit_region_exit_call(JITProgram *program, int exit_id, int frame_id,
+	JITContinuationFrame *continuation, Var *args, Objid *receiver_class,
+	const char **verb)
+{
+    JITRegionExit *exit;
+    JITRegionExitFrame *frame;
+    int i;
+
+    if (!program || exit_id < 0 || exit_id >= program->num_region_exits
+	|| !continuation || continuation->program != program
+	|| !continuation->deopt_values || !args || !receiver_class || !verb)
+	return 0;
+    exit = &program->region_exits[exit_id];
+    if (exit->dispatch_epoch != db_dispatch_epoch()
+	|| frame_id < 0 || frame_id >= exit->num_frames - 1)
+	return 0;
+    frame = &exit->frames[frame_id];
+    if (!frame->dispatched || !frame->verb || frame->num_arguments < 0
+	|| frame->num_arguments > JIT_REGION_MAX_ARGUMENTS)
+	return 0;
+    *args = new_list(frame->num_arguments);
+    for (i = 0; i < frame->num_arguments; i++) {
+	args->v.list[i + 1].type = TYPE_INT;
+	args->v.list[i + 1].v.num = continuation->deopt_values[
+	    jit_runtime_base_value_slots(program) + frame->argument_slots[i]];
+    }
+    *receiver_class = frame->receiver_class;
+    *verb = frame->verb;
+    return 1;
+}
+
+#ifdef JIT_TESTING
+int
+jit_test_region_exit_materialize(JITProgram *program, JITProgram *target,
+	Program *bytecode_program, int target_map, int target_value, Num raw,
+	Num path_ticks, activation *a, int *ticks)
+{
+    JITContinuationFrame continuation;
+    Num *deopt_values;
+    int slots;
+    int result;
+
+    if (!program || !target || !bytecode_program)
+	return 0;
+    jit_program_clear_region_exits(program);
+    program->region_exits = mymalloc(sizeof(JITRegionExit), M_PROGRAM);
+    memset(program->region_exits, 0, sizeof(JITRegionExit));
+    program->num_region_exits = program->region_exit_capacity = 1;
+    program->num_region_exit_values = 2;
+    program->region_exits[0].dispatch_epoch = db_dispatch_epoch();
+    program->region_exits[0].tick_slot = 0;
+    program->region_exits[0].num_frames = 1;
+    program->region_exits[0].frames = mymalloc(sizeof(JITRegionExitFrame),
+	M_PROGRAM);
+    memset(program->region_exits[0].frames, 0,
+	sizeof(JITRegionExitFrame));
+    program->region_exits[0].frames[0].target = target;
+    program->region_exits[0].frames[0].bytecode_program = bytecode_program;
+    program->region_exits[0].frames[0].map = target_map;
+    program->region_exits[0].frames[0].num_values = 1;
+    program->region_exits[0].frames[0].values =
+	mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
+    program->region_exits[0].frames[0].values[0].target_value = target_value;
+    program->region_exits[0].frames[0].values[0].runtime_slot = 1;
+    slots = jit_runtime_value_slots(program);
+    deopt_values = mymalloc(sizeof(Num) * slots, M_PROGRAM);
+    memset(deopt_values, 0, sizeof(Num) * slots);
+    deopt_values[jit_runtime_base_value_slots(program)] = path_ticks;
+    deopt_values[jit_runtime_base_value_slots(program) + 1] = raw;
+    memset(&continuation, 0, sizeof(continuation));
+    continuation.program = program;
+    continuation.deopt_values = deopt_values;
+    result = jit_region_exit_materialize(program, 0, 0, &continuation, a,
+	ticks);
+    myfree(deopt_values, M_PROGRAM);
+    jit_program_clear_region_exits(program);
+    return result;
+}
+
+int
+jit_test_region_exit_chain(JITProgram *program, JITProgram *parent,
+	Program *parent_bytecode, int parent_map, JITProgram *target,
+	Program *target_bytecode, int target_map, activation *parent_activation,
+	activation *target_activation, int *ticks, Var *args)
+{
+    JITContinuationFrame continuation;
+    JITRegionExit *exit;
+    Num *deopt_values;
+    Objid receiver_class;
+    const char *verb;
+    int slots;
+    int result;
+
+    if (!program || !parent || !parent_bytecode || !target
+	|| !target_bytecode || !parent_activation || !target_activation
+	|| !ticks || !args)
+	return 0;
+    jit_program_clear_region_exits(program);
+    program->region_exits = mymalloc(sizeof(JITRegionExit), M_PROGRAM);
+    memset(program->region_exits, 0, sizeof(JITRegionExit));
+    program->num_region_exits = program->region_exit_capacity = 1;
+    program->num_region_exit_values = 4;
+    exit = &program->region_exits[0];
+    exit->dispatch_epoch = db_dispatch_epoch();
+    exit->tick_slot = 0;
+    exit->num_frames = 2;
+    exit->frames = mymalloc(sizeof(JITRegionExitFrame) * 2, M_PROGRAM);
+    memset(exit->frames, 0, sizeof(JITRegionExitFrame) * 2);
+    exit->frames[0].target = parent;
+    exit->frames[0].bytecode_program = parent_bytecode;
+    exit->frames[0].verb = str_dup("nested_region");
+    exit->frames[0].receiver_class = 2;
+    exit->frames[0].map = parent_map;
+    exit->frames[0].dispatched = 1;
+    exit->frames[0].num_values = 1;
+    exit->frames[0].values = mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
+    exit->frames[0].values[0].target_value = 1;
+    exit->frames[0].values[0].runtime_slot = 1;
+    exit->frames[0].num_arguments = 1;
+    exit->frames[0].argument_slots[0] = 2;
+    exit->frames[1].target = target;
+    exit->frames[1].bytecode_program = target_bytecode;
+    exit->frames[1].map = target_map;
+    exit->frames[1].num_values = 1;
+    exit->frames[1].values = mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
+    exit->frames[1].values[0].target_value = 1;
+    exit->frames[1].values[0].runtime_slot = 3;
+    slots = jit_runtime_value_slots(program);
+    deopt_values = mymalloc(sizeof(Num) * slots, M_PROGRAM);
+    memset(deopt_values, 0, sizeof(Num) * slots);
+    deopt_values[jit_runtime_base_value_slots(program)] = 3;
+    deopt_values[jit_runtime_base_value_slots(program) + 1] = 41;
+    deopt_values[jit_runtime_base_value_slots(program) + 2] = 43;
+    deopt_values[jit_runtime_base_value_slots(program) + 3] = 42;
+    memset(&continuation, 0, sizeof(continuation));
+    continuation.program = program;
+    continuation.deopt_values = deopt_values;
+    result = jit_region_exit_frame_count(program, 0) == 2
+	&& jit_region_exit_materialize(program, 0, 0, &continuation,
+	    parent_activation, ticks)
+	&& jit_region_exit_call(program, 0, 0, &continuation, args,
+	    &receiver_class, &verb)
+	&& receiver_class == 2 && !strcmp(verb, "nested_region")
+	&& jit_region_exit_materialize(program, 0, 1, &continuation,
+	    target_activation, ticks);
+    myfree(deopt_values, M_PROGRAM);
+    jit_program_clear_region_exits(program);
+    return result;
+}
+#endif
+
 void
 jit_continuation_materialize_all(void)
 {
@@ -9890,6 +12996,7 @@ jit_initialize_deopt(JITProgram *program, JITDeoptState *deopt, int entry)
 	return;
     memset(deopt, 0, sizeof(*deopt));
     deopt->map_id = -1;
+    deopt->region_exit = -1;
     deopt->builtin_func = -1;
     deopt->operation = -1;
     deopt->guard_local[0] = deopt->guard_local[1] = -1;
@@ -9917,6 +13024,7 @@ jit_initialize_return_deopt(JITDeoptState *deopt)
     if (!deopt)
 	return;
     deopt->map_id = -1;
+    deopt->region_exit = -1;
     deopt->materialized = 0;
     deopt->boundary = JIT_BOUNDARY_NONE;
 }
@@ -9937,6 +13045,7 @@ jit_program_execute_in_context(JITProgram *program,
     NativeFunction function;
     int64_t native_result;
     int deopt_map = -1;
+    int region_exit = -1;
     Num *deopt_values;
     Var *borrowed_locals = 0;
     Var *owned_values = 0;
@@ -10021,8 +13130,8 @@ jit_program_execute_in_context(JITProgram *program,
 	    borrowed_locals = (Var *) ((char *) runtime_storage
 		+ program->runtime_layout.borrowed_offset);
     } else {
-	runtime_storage = mymalloc(runtime_bytes ? runtime_bytes : sizeof(Num),
-				   M_PROGRAM);
+	runtime_storage = jit_runtime_storage_acquire(execution_context,
+					      runtime_bytes);
 	deopt_values = runtime_storage;
 	/* Float lowering uses raw slot zero as its native 0.0 constant. */
 	deopt_values[0] = 0;
@@ -10074,6 +13183,15 @@ jit_program_execute_in_context(JITProgram *program,
 			     : native_frame->has_resume_result
 			       ? &native_frame->resume_result : 0,
 			     owned_values);
+    if (native_result == JIT_RUN_REGION_EXIT) {
+	region_exit = JIT_REGION_EXIT_DECODE(deopt_map);
+	if (region_exit < 0 || region_exit >= program->num_region_exits) {
+	    native_result = JIT_RUN_FALLBACK;
+	    deopt_map = -1;
+	} else {
+	    deopt_map = program->region_exits[region_exit].caller_map;
+	}
+    }
     if (continuation_in && continuation_in->has_result) {
 	continuation_in->has_result = 0;
 	continuation_in->result.type = TYPE_NONE;
@@ -10102,7 +13220,8 @@ jit_program_execute_in_context(JITProgram *program,
 	    for (i = 0; i < program->num_owned_slots; i++)
 		free_var(owned_values[i]);
 	    program->active_runtime_bytes -= runtime_bytes;
-	    myfree(runtime_storage, M_PROGRAM);
+	    jit_runtime_storage_recycle_sized(execution_context, runtime_storage,
+					      runtime_bytes);
 	}
 	if (!runtime_borrowed_from_frame)
 	    jit_native_frame_unbind_runtime(native_frame);
@@ -10129,6 +13248,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    ? JIT_HOME_EMPTY : JIT_HOME_OWNED;
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
+	|| native_result == JIT_RUN_REGION_EXIT
 	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
 	JITDeoptMap *map;
 	Var *stack_values = 0;
@@ -10158,13 +13278,15 @@ jit_program_execute_in_context(JITProgram *program,
 	jit_validate_materialized_tags(program, map, deopt_values);
 #endif
 	materialized_depth = map->stack_depth;
-	if (native_result == JIT_RUN_CALL_VERB && continuation_out
+	if ((native_result == JIT_RUN_CALL_VERB
+	     || native_result == JIT_RUN_REGION_EXIT) && continuation_out
 	    && (map->reason == JIT_DEOPT_VERB_CALL
 		|| jit_deopt_map_bridges_builtin(map))) {
 	    int operands = jit_call_stack_operands(map);
 	    JITContinuationFrame *frame = 0;
 
-	    if (execution_context->lazy_verb_calls
+	    if (native_result == JIT_RUN_CALL_VERB
+		&& execution_context->lazy_verb_calls
 		&& map->reason == JIT_DEOPT_VERB_CALL && operands >= 0
 		&& (unsigned) operands <= map->stack_depth
 		&& jit_native_frame_preserve_resume(native_frame, deopt_map)) {
@@ -10281,6 +13403,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    deopt->ticks_charged = map->ticks_charged;
 	    deopt->builtin_func = map->builtin_func;
 	    deopt->operation = map->operation;
+	    deopt->region_exit = region_exit;
 	    memcpy(deopt->guard_value, map->guard_value,
 		   sizeof(deopt->guard_value));
 	    memcpy(deopt->guard_local, map->guard_local,
@@ -10292,7 +13415,8 @@ jit_program_execute_in_context(JITProgram *program,
 						      env, deopt_values,
 						      owned_values, home_states, i);
 	    deopt->reason = map->reason;
-	    if (native_result == JIT_RUN_CALL_VERB) {
+	    if (native_result == JIT_RUN_CALL_VERB
+		|| native_result == JIT_RUN_REGION_EXIT) {
 		if (suspend_zero_boundary)
 		    deopt->boundary = JIT_BOUNDARY_SUSPEND_ZERO;
 		else if (map->reason == JIT_DEOPT_VERB_CALL)
@@ -10359,10 +13483,11 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
     if (release_ir && !jit_program_restore_ir(program))
 	return 0;
     snprintf(line, sizeof(line),
-	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d reconstruction-states=%d potential-exits=%u elided-exits=%u type-guards=%u eliminated-type-guards=%u",
+	     "HIR values=%d tag-slots=%d runtime-slots=%d blocks=%d deopt-maps=%d reconstruction-states=%d region-exits=%d region-exit-values=%d potential-exits=%u elided-exits=%u type-guards=%u eliminated-type-guards=%u",
 	     program->num_values, program->num_tag_slots,
 	     jit_runtime_value_slots(program), program->num_blocks,
 	     program->num_deopt_maps, program->num_reconstruction_states,
+	     program->num_region_exits, program->num_region_exit_values,
 	     program->potential_exit_sites,
 	     program->elided_exit_sites, program->type_guard_sites,
 	     program->eliminated_type_guard_sites);
@@ -10449,6 +13574,23 @@ jit_program_dump_hir(JITProgram *program, void (*add_line)(const char *, void *)
 		JITNativeResume *resume =
 		    program->deopt_maps[instr->deopt_map].native_resume;
 		int j;
+
+		if (instr->kind == HIR_TAC_CALL_VERB) {
+		    int region_leaf;
+		    unsigned region_hits;
+		    uint64_t spliced_generation;
+
+		    jit_region_site_status(program, instr->deopt_map,
+			&region_leaf, &region_hits, &spliced_generation);
+		    snprintf(line, sizeof(line),
+			     "    region target=%s leaf=%d hits=%u generation=%" PRIu64
+			     " spliced=%d",
+			     resume->cached_verb ? resume->cached_verb : "-",
+			     region_leaf, region_hits,
+			     resume->cached_jit_generation,
+			     spliced_generation == program->pool_generation);
+		    add_line(line, data);
+		}
 
 		for (j = 0; j < resume->num_values; j++) {
 		    JITResumeValue *value = &resume->values[j];

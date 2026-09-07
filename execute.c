@@ -964,6 +964,9 @@ struct JITNativeCall {
     unsigned stack_capacity;
     size_t accounted_bytes;
 };
+
+#define JIT_NATIVE_CALL_POOL_LIMIT 32
+#define JIT_NATIVE_CALL_POOL_STACK_LIMIT 4096
 #endif
 
 static enum error
@@ -1059,6 +1062,7 @@ cache_jit_verb_call(JITNativeFrame *caller, int map_id, Objid class,
     resume->cached_verb_index = call->verb_index;
     resume->cached_debug = call->debug;
     resume->cached_dispatch_epoch = epoch;
+    resume->cached_jit_generation = 0;
     if (old_verb)
 	free_str(old_verb);
 }
@@ -1199,21 +1203,22 @@ execute_jit_commit_prepared_verb_call(JITExecutionContext *context,
 				      JITNativeFrame *frame,
 				      JITCallerResume *resume,
 				      PreparedVerbCall *prepared,
-				      int entry_map)
+				      int entry_map, int compiled_entry)
 {
     JITProgram *program;
 
     if (!context || !frame || !resume || !prepared || !prepared->program
 	|| !prepared->env || !prepared->verb || !prepared->verbname
-	|| !(program = prepared->program->jit)
-	|| !jit_program_is_eligible(program))
+	|| !(program = prepared->program->jit))
 	return 0;
     jit_program_note_location(program, prepared->vloc,
 	prepared->verb_index);
-    if (!jit_program_claim_native_entry(program))
-	return 0;
-    if (!jit_program_compile(program))
-	return 0;
+    if (!compiled_entry) {
+	if (!jit_program_is_eligible(program)
+	    || !jit_program_claim_native_entry(program)
+	    || !jit_program_compile(program))
+	    return 0;
+    }
     if (!jit_execution_context_push_compact(context, frame, program,
 	prepared->env, resume, entry_map))
 	return 0;
@@ -1241,6 +1246,9 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
     PreparedVerbCall prepared;
     enum error error = E_NONE;
     unsigned stack_capacity;
+    uint64_t compiled_generation;
+    int cached_resolution;
+    JITNativeResume *resume_recipe;
 
     if (call_out)
 	*call_out = 0;
@@ -1256,8 +1264,16 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	    : (!caller->runtime_storage || !caller->owns_runtime
 	       || caller->pending_resume_map != map_id)))
 	return 0;
-    if (!resolve_cached_jit_verb_call(caller, map_id, this, vname, this
-	WAIF_COMMA_ARG(THIS), &resolved)) {
+    resume_recipe = jit_native_call_resume(caller, map_id);
+    cached_resolution = resolve_cached_jit_verb_call(caller, map_id, this,
+	vname, this WAIF_COMMA_ARG(THIS), &resolved);
+    if (!cached_resolution) {
+	if (!resume_recipe
+	    || resume_recipe->cached_dispatch_epoch != db_dispatch_epoch()) {
+	    jit_region_site_reset(caller->program, map_id);
+	    if (resume_recipe)
+		resume_recipe->region_profile_complete = 0;
+	}
 	error = resolve_verb_call(this, vname WAIF_COMMA_ARG(THIS), 0,
 	    &resolved);
 	if (error == E_NONE)
@@ -1268,14 +1284,28 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	return 0;
     }
     stack_capacity = MAX(resolved.program->main_vector.max_stack, 1);
-    native_call = mymalloc(sizeof(*native_call)
-	+ sizeof(Var) * stack_capacity, M_VM);
+    {
+	struct JITNativeCall **link =
+	    (struct JITNativeCall **) &context->native_call_pool;
+
+	while (*link && (*link)->stack_capacity < stack_capacity)
+	    link = &(*link)->parent;
+	if (*link) {
+	    native_call = *link;
+	    *link = native_call->parent;
+	    context->native_call_pool_count--;
+	} else {
+	    native_call = mymalloc(sizeof(*native_call)
+		+ sizeof(Var) * stack_capacity, M_VM);
+	    native_call->stack = (Var *) (native_call + 1);
+	    native_call->stack_capacity = stack_capacity;
+	}
+    }
+    stack_capacity = native_call->stack_capacity;
     /* Compact push initializes the frame; failure frees this raw allocation
        without inspecting it.  Initialize the remaining fields explicitly. */
     native_call->parent = 0;
     native_call->accounted_bytes = 0;
-    native_call->stack = (Var *) (native_call + 1);
-    native_call->stack_capacity = stack_capacity;
     native_call->resume.caller = caller;
     native_call->resume.continuation = continuation;
     native_call->resume.map_id = map_id;
@@ -1288,13 +1318,34 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	caller->receiver,
 #endif
 	caller->this, caller->player, caller->progr, &resolved, *args);
+    compiled_generation = jit_program_compiled_generation(
+	resolved.program->jit);
     if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
-	&native_call->resume, &prepared, 0)) {
+	&native_call->resume, &prepared, 0,
+	cached_resolution && resume_recipe
+	&& resume_recipe->cached_jit_generation
+	   == compiled_generation)) {
 	prepared.env[SLOT_ARGS].type = TYPE_NONE;
 	prepared.env[SLOT_ARGS].v.num = 0;
 	discard_prepared_verb_call(&prepared);
-	myfree(native_call, M_VM);
+	if (native_call->stack_capacity <= JIT_NATIVE_CALL_POOL_STACK_LIMIT
+	    && context->native_call_pool_count < JIT_NATIVE_CALL_POOL_LIMIT) {
+	    native_call->parent = context->native_call_pool;
+	    context->native_call_pool = native_call;
+	    context->native_call_pool_count++;
+	} else
+	    myfree(native_call, M_VM);
 	return 0;
+    }
+    if (resume_recipe) {
+	if (!compiled_generation)
+	    compiled_generation = jit_program_compiled_generation(
+		resolved.program->jit);
+	resume_recipe->cached_jit_generation = compiled_generation;
+	if (cached_resolution && !resume_recipe->region_profile_complete)
+	    resume_recipe->region_profile_complete =
+		jit_region_site_record_hit(caller->program, map_id,
+		    resolved.program->jit);
     }
     args->type = TYPE_NONE;
     args->v.num = 0;
@@ -1325,6 +1376,44 @@ execute_jit_free_native_call(struct JITNativeCall *call)
     jit_native_frame_release_runtime(&call->frame);
     jit_native_frame_release_invocation(&call->frame);
     myfree(call, M_VM);
+}
+
+static void
+recycle_jit_native_call(JITExecutionContext *context,
+			struct JITNativeCall *call)
+{
+    if (!context || !call)
+	return;
+    if (call->frame.context || call->frame.caller || call->frame.callee)
+	panic("Recycling a linked native verb call");
+    jit_profile_native_frame_released(&call->frame, call->accounted_bytes);
+    jit_native_frame_release_runtime(&call->frame);
+    jit_native_frame_release_invocation(&call->frame);
+    if (call->stack_capacity <= JIT_NATIVE_CALL_POOL_STACK_LIMIT
+	&& context->native_call_pool_count < JIT_NATIVE_CALL_POOL_LIMIT) {
+	call->parent = context->native_call_pool;
+	context->native_call_pool = call;
+	context->native_call_pool_count++;
+    } else
+	myfree(call, M_VM);
+}
+
+static void
+free_jit_native_call_pool(JITExecutionContext *context)
+{
+    struct JITNativeCall *call;
+
+    if (!context)
+	return;
+    call = context->native_call_pool;
+    context->native_call_pool = 0;
+    context->native_call_pool_count = 0;
+    while (call) {
+	struct JITNativeCall *next = call->parent;
+
+	myfree(call, M_VM);
+	call = next;
+    }
 }
 
 typedef struct {
@@ -1457,7 +1546,7 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		&out->value))
 		panic("Native verb return could not resume its caller");
 	    jit_profile_record_native_return(context->current_frame);
-	    execute_jit_free_native_call(completed);
+	    recycle_jit_native_call(context, completed);
 	    active = context->current_frame;
 	    continuation_in = active->runtime_borrower;
 	    if (!continuation_in)
@@ -1525,6 +1614,8 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 
 	if (active_call) {
 	    struct JITActivationPromotion *promotion;
+	    int region_exit = out->result == JIT_RUN_REGION_EXIT;
+	    unsigned boundary_value;
 
 	    if (out->deopt.map_id < 0 && out->result == JIT_RUN_FALLBACK
 		&& active->current_map == 0) {
@@ -1540,6 +1631,12 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 		&& !jit_native_frame_adopt_continuation_runtime(active,
 		    continuation))
 		panic("Native boundary continuation ownership is invalid");
+	    if (region_exit
+		&& (!continuation || out->deopt.boundary != JIT_BOUNDARY_VERB
+		    || out->deopt.stack_depth != 3
+		    || !jit_native_frame_continuation_matches(active,
+			out->deopt.map_id)))
+		panic("Compact region exit lacks its exact call continuation");
 	    if (continuation
 		&& out->deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO) {
 		stack[0] = new_list(1);
@@ -1549,16 +1646,33 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	    } else
 		materialized_depth = out->deopt.materialized || continuation
 		    ? out->deopt.stack_depth : 0;
-	    if (out->deopt.map_id > 0
+	    /* An exact region exit keeps its runtime in the continuation.  Promote
+	       the physical chain without publishing a duplicate boundary stack. */
+	    if (!region_exit && out->deopt.map_id > 0
 		&& !jit_native_frame_capture_boundary(active, stack,
 		    materialized_depth, out->deopt.map_id))
 		panic("Native boundary capture failed before promotion");
 	    promotion = execute_jit_prepare_promotion(context);
 	    if (!promotion || !execute_jit_commit_promotion(promotion))
 		panic("Native call-chain promotion failed");
+	    if (region_exit) {
+		if (RUN_ACTIV.jit_continuation != continuation
+		    || RUN_ACTIV.top_rt_stack != RUN_ACTIV.base_rt_stack
+		    || materialized_depth > (unsigned) RUN_ACTIV.rt_stack_size)
+		    panic("Compact region exit promotion lost its continuation");
+		for (boundary_value = 0;
+		     boundary_value < materialized_depth; boundary_value++) {
+		    *RUN_ACTIV.top_rt_stack++ = stack[boundary_value];
+		    stack[boundary_value].type = TYPE_NONE;
+		    stack[boundary_value].v.num = 0;
+		}
+		out->continuation = continuation;
+	    } else
+		out->continuation = 0;
 	    free_jit_boundary_values(stack, materialized_depth);
 	    free_jit_native_call_chain(active_call);
-	    out->continuation = 0;
+	    free_jit_native_call_pool(context);
+	    jit_execution_context_free_runtime_pool(context);
 	    out->promoted = 1;
 	    return;
 	}
@@ -1573,6 +1687,7 @@ run_jit_native_chain(JITExecutionContext *context, JITNativeFrame *root,
 	if (!jit_execution_context_finish(context, root))
 	    panic("JIT root execution context did not detach cleanly");
 	out->continuation = continuation;
+	free_jit_native_call_pool(context);
 	return;
     }
 }
@@ -1883,7 +1998,8 @@ do {								\
 		PUSH_ERROR(jit_error);
 		goto next_opcode;
 	    } else if (jit_result == JIT_RUN_FALLBACK
-		       || jit_result == JIT_RUN_CALL_VERB) {
+		       || jit_result == JIT_RUN_CALL_VERB
+		       || jit_result == JIT_RUN_REGION_EXIT) {
 		if (jit_result == JIT_RUN_CALL_VERB && continuation
 		    && deopt.boundary == JIT_BOUNDARY_SUSPEND_ZERO) {
 		    activation *caller = &RUN_ACTIV;
@@ -1969,7 +2085,8 @@ do {								\
 			return OUTCOME_ABORTED;
 		    }
 		}
-		if (jit_result == JIT_RUN_CALL_VERB && continuation
+		if ((jit_result == JIT_RUN_CALL_VERB
+		     || jit_result == JIT_RUN_REGION_EXIT) && continuation
 		    && deopt.boundary == JIT_BOUNDARY_VERB) {
 		    activation *caller = &RUN_ACTIV;
 		    enum error err = E_NONE;
@@ -1977,7 +2094,19 @@ do {								\
 		    Var verb = RUN_ACTIV.base_rt_stack[1];
 		    Var args = RUN_ACTIV.base_rt_stack[2];
 		    Objid class = NOTHING;
+		    int region_frames = 0;
 		    int operand;
+
+		    if (jit_result == JIT_RUN_REGION_EXIT) {
+			region_frames = jit_region_exit_frame_count(caller->prog->jit,
+			    deopt.region_exit);
+			if (region_frames <= 0
+			    || (UNum) region_frames
+			       > max_stack_size - top_activ_stack - 1) {
+			    jit_result = JIT_RUN_CALL_VERB;
+			    deopt.region_exit = -1;
+			}
+		    }
 
 		    for (operand = 0; operand < 3; operand++) {
 			RUN_ACTIV.base_rt_stack[operand].type = TYPE_NONE;
@@ -2019,7 +2148,38 @@ do {								\
 			free_var(verb);
 			jit_continuation_attach(continuation, caller);
 			jit_continuation_mark_dispatched(continuation);
-			jit_profile_record_vm_call(caller->prog->jit);
+			if (jit_result == JIT_RUN_REGION_EXIT) {
+			    int frame;
+
+			    for (frame = 0; frame < region_frames; frame++) {
+				Var nested_args;
+				Objid nested_class;
+				const char *nested_verb;
+
+				LOAD_STATE_VARIABLES();
+				if (!jit_region_exit_materialize(caller->prog->jit,
+					deopt.region_exit, frame, continuation,
+					&RUN_ACTIV, &ticks_remaining))
+				    panic("JIT region side-exit materialization failed");
+				LOAD_STATE_VARIABLES();
+				if (frame + 1 == region_frames)
+				    break;
+				if (!jit_region_exit_call(caller->prog->jit,
+					deopt.region_exit, frame, continuation,
+					&nested_args, &nested_class, &nested_verb))
+				    panic("JIT region side-exit call reconstruction failed");
+				STORE_STATE_VARIABLES();
+				err = call_verb2(nested_class, nested_verb
+				    WAIF_COMMA_ARG(RUN_ACTIV.THIS), nested_args, 0);
+				if (err != E_NONE) {
+				    free_var(nested_args);
+				    panic("JIT region side-exit call dispatch changed");
+				}
+			    }
+			    jit_profile_record_deopt(caller->prog->jit,
+				caller->vloc, caller->verbname, &deopt);
+			} else
+			    jit_profile_record_vm_call(caller->prog->jit);
 			LOAD_STATE_VARIABLES();
 			goto next_opcode;
 		    }
@@ -2042,7 +2202,8 @@ do {								\
 		    LOAD_STATE_VARIABLES();
 		    goto next_opcode;
 		}
-		if (jit_result == JIT_RUN_FALLBACK)
+		if (jit_result == JIT_RUN_FALLBACK
+		    || jit_result == JIT_RUN_REGION_EXIT)
 		    jit_profile_record_deopt(RUN_ACTIV.prog->jit, RUN_ACTIV.vloc,
 					     RUN_ACTIV.verbname, &deopt);
 		else

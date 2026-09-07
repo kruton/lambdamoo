@@ -900,6 +900,558 @@ its keep, but it does not implement the larger fused call-entry recipe:
 environment construction, frame/runtime allocation, and boundary packaging
 remain on every hit.
 
+The first storage-reuse slice now keeps fully detached `JITNativeCall`
+containers and their adjacent boundary stacks in the execution context for the
+duration of one native chain.  Reuse is bounded to 32 containers and refuses
+to retain stacks larger than 4,096 `Var` slots.  Return cleanup still releases
+all invocation and runtime ownership before a container enters the pool;
+promotion drains both active and pooled containers, and normal root return
+drains the pool after detaching the execution context.  Thus no pooled pointer
+survives suspension, promotion, task switching, or JIT pool rotation.
+
+This slice is correctness groundwork, not a measured win.  After a discarded
+7.873468-second warm-up, three `#168:test2(3000)` runs took 7.576133,
+7.655436, and 7.785279 seconds, median **7.655436 seconds**.  That is 1.0%
+above the 7.576318-second target-cache median and is within observed run noise.
+A broader sparse-environment experiment was removed after Codepoint exposed
+that native local-update helpers can mutate canonical user-local slots outside
+the SSA ownership table.  Future lazy environments require an explicit
+initialized/written-slot recipe plus materialization before promotion copies;
+prefix-only initialization is not safe.
+
+Runtime scratch storage now uses a second bounded, per-chain pool.  A normal
+native return first releases every borrowed local and owned home, then stores
+the capacity and free-list link in the now-empty allocation itself.  The pool
+retains at most 32 blocks and rejects blocks larger than 256 KiB.  Cold exits
+and continuations keep the existing ownership transfer, while promotion and
+root detachment drain all unused blocks.  Because the metadata overlays only
+cleaned storage, this removes the runtime block's malloc/free pair without
+adding a metadata allocation or weakening cleanup.
+
+The Codepoint timings did not prove a wall-clock improvement.  Warmed samples
+ranged from 7.471220 to 8.914383 seconds under noticeable host variance; the
+best result is slightly below the 7.576318-second target-cache median, but the
+sample median is not.  Keep this as bounded allocator-work elimination and
+remeasure under perf or a quieter host before attributing a speedup.
+
+The first region-JIT foundation targets one monomorphic boundary and one
+restartable leaf callee.  `HIR_TAC_CALL_VERB` now retains its argument-list SSA
+operand explicitly instead of recovering it from a deoptimization stack map.
+Each native-resume call site also classifies the resolved compiled target.  A
+sparse, program-owned side table keyed by deoptimization-map ID counts
+saturating monomorphic hits and selects hot leaf edges after 16 hits.  Generated
+code contains no profiling counter or counter update.  After dispatch
+invalidation, the next cache miss resets the side-table entry before lookup,
+including when lookup fails; program teardown releases every entry.
+
+An experimental synchronous native-call bridge was rejected during this step.
+It avoided the ordinary boundary but corrupted a suspended caller's
+reconstruction state when a later cold exit promoted the chain.  Region lowering
+must therefore splice the selected callee SSA into the caller and retain the
+caller's original map as the cold side exit; recursively invoking the callee's
+standalone native function is not an acceptable substitute.  Initial region
+eligibility is deliberately narrow: guards and deopts are restartable, but
+calls, writes, forks, observable
+time/tick reads, reachable CFG cycles, and bodies over 128 JIT instructions are
+rejected.  Cycle detection now uses a three-color walk of the reachable CFG;
+block numbering and layout no longer cause acyclic edges to lower-numbered
+blocks to be rejected.  This is intended to admit Codepoint's active `Ch`,
+`Maj`, and `XOR` implementations while excluding `ROTR32`, whose body still
+crosses `SHR` and `SHL` verb boundaries.  The first stitched lowering may
+therefore restart an internally failing callee at the original caller call
+boundary; support for composite caller/callee cold-exit reconstruction is
+deferred.
+
+The first actual splice now recognizes leaf returns consisting of `BITOR`,
+`BITXOR`, `BITAND`, `SHL`, `SHR`, or `LSHR`.  It traces operands through
+out-of-SSA parallel copies to constant `args[n]` indexes, maps those indexes to
+the caller's fixed-list SSA construction, and emits the operation into the
+caller.  Tagged integer, timeout, available-tick, and shift-count checks branch
+to the unchanged materialized verb-call boundary before any callee ticks are
+charged.  The success path charges the callee's path-invariant tick count,
+releases the now-consumed call argument list, and jumps directly to the caller's
+existing resume continuation.  The selected bytecode program, receiver class,
+and dispatch epoch live in the side table, not generated code.  The generated
+entry calls a small guard which compares the current dispatch epoch and derives
+the receiver class from either an object or WAIF before entering the splice.
+Epoch changes clear the selection; a miss caused only by a different receiver
+class preserves it and takes the guarded cold path.
+
+Crossing the side-table threshold requests specialization only after the caller
+already has native code.  A pending region rotation does not disable the active
+generation, allowing the remainder of the current task to populate its side
+tables.  Pool maintenance performs the request after native frames have
+unwound, and the next compilation emits the splice.  At most one
+region-specialization rotation is permitted before an independently requested
+pool rotation, preventing newly hot sites from causing a rotation storm.  HIR
+dumps report whether each selected site was spliced in the current pool
+generation.
+
+Live Codepoint validation shows both `XOR` boundaries in `small_sigma0` with
+`spliced=1`; `ROTR32` remains ineligible and `SHR` is eligible but does not yet
+match the narrow return recipe.  Using `ftime()`, one confirmed pre-splice run
+was 6.644641 seconds.  Confirmed XOR-spliced runs were 10.927545, 5.956115, and
+6.172528 seconds.  The first was evidently affected by cold work or host noise;
+the two warmed results are promising, but the sample is too variable to claim a
+stable improvement or an interpreter win.
+
+The splice now defers the final fixed-list tail which feeds a selected region
+call when that tail is uniquely used, consumes one owner home, contains no
+owned element, and is separated from the call only by tick instructions.  The
+hot path releases the still-live list head directly.  A guard failure first
+reconstructs the omitted tail with the ordinary ownership-aware append helper,
+then enters the original materialized call boundary.  Live MIR for both
+`small_sigma0` XOR sites confirms that the fixed-list append is absent before
+the region guard and the general append exists only in the cold block.
+Replacing the selected `#508:XOR` verb with identical source after warming
+advanced the dispatch epoch and a subsequent `test2(3000)` completed through
+the invalidation path, exercising cold argument reconstruction without a stale
+target or ownership failure.
+
+Return recipes are no longer limited to one binary instruction.  They retain a
+bounded, 16-node SSA expression DAG containing argument leaves, integer
+constants, unary complement, and integer bitwise or shift operations.  Each
+distinct tagged argument is guarded once; constant and argument shift counts
+are validated before ticks are charged.  Composite shift counts remain cold so
+no partial expression evaluation precedes a failing guard.  A focused test
+covers a copied-argument binary result followed by unary complement.  Codepoint
+still produces only the existing XOR splices in this workload: `SHR` has a
+real conditional CFG and path-dependent tick charge, while `ROTR32` crosses
+additional verb boundaries.  After a 6.539968-second warm-up, two `ftime()`
+samples were 6.045644 and 6.018655 seconds.  This is consistent with removing
+work but is not enough sampling to claim a stable improvement over the earlier
+5.956115 and 6.172528-second pair.
+
+Region recipes now admit one bounded conditional diamond.  The matcher selects
+a unique branch whose two pure, acyclic arms directly merge into the return,
+while continuing to cap the combined SSA expression DAG at 16 nodes.  Emission
+branches on an integer argument or constant, checks all arm-specific shift and
+tick guards before charging that arm's complete path tick total, and rejoins at
+the caller continuation.  Thus any guard failure still reaches the original
+call boundary without partially charged callee ticks.  A focused test covers
+the `SHR` shape with asymmetric false/true totals of one and two ticks.
+
+Live Codepoint HIR confirms that the `small_sigma0` to `SHR` edge now reports
+`spliced=1`, in addition to the two existing `XOR` edges.  After a
+5.646302-second specialization run, three warmed `ftime()` samples took
+4.891584, 4.666073, and 4.771731 seconds, median **4.771731 seconds**.  This is
+20.42% faster than the verified 5.996587-second interpreter median and 18.43%
+faster than the preceding 5.849567-second JIT median, subject to the same host
+variance caveat.  The deoptimization census remains 73/73 completed with zero
+VM calls and zero deoptimizations.
+
+Recipes can now recursively substitute monomorphic verb-call results to a
+maximum depth of two while retaining one combined 16-node SSA budget.  The
+first slice accepts fixed integer argument lists and nested calls on the
+callee's `this`; it maps each nested argument leaf to the enclosing expression,
+merges one nested conditional into false/true result alternatives, accumulates
+path-specific tick totals, and retains the nested dispatch snapshots.  Because
+the dispatch epoch is global and these calls retain the same receiver, an outer
+class/epoch guard also validates identical nested guards without emitting
+duplicate runtime calls.  Candidate profiling remains side-table-only and is
+limited to small acyclic bodies whose verb calls have this bounded shape.
+
+The recursive expression vocabulary adds wrapping integer `ADD` and `SUB`, plus
+`MOD` by a positive constant.  This follows `integer_arithmetic()`, which
+defines add and subtract in unsigned bits and converts the wrapped result back
+to `Num`; a signed-overflow side exit would be incorrect.  Composite shift
+counts containing bounded add/sub expressions are evaluated and range-checked
+before any path ticks are charged.  A focused test recursively substitutes a
+conditional shift call and verifies the resulting node, guard, and asymmetric
+tick totals.
+
+Live Codepoint HIR now reports both `small_sigma0` to `ROTR32` boundaries with
+`spliced=1`, alongside the existing `SHR` and `XOR` boundaries.  After a
+5.176306-second specialization run, three warmed `ftime()` samples took
+4.009967, 4.064607, and 4.107872 seconds, median **4.064607 seconds**.  This is
+32.22% faster than the verified 5.996587-second interpreter median and 14.82%
+faster than the preceding 4.771731-second bounded-conditional median, subject
+to host variance.  Replacing `#508:SHL` with identical source and then running
+`test2(300)` completed in 0.851124 seconds, exercising recursive dispatch-epoch
+invalidation and the cold boundary.  The deoptimization census remains 73/73
+completed with zero VM calls and zero deoptimizations.
+
+Migration from expression recipes to general regions is complete for the
+current bounded stitching feature. A bounded
+region CFG now imports a complete acyclic leaf callee rather than recovering
+only the expression feeding its return. The imported representation has its
+own values, instructions, parallel-copy groups, basic blocks, branch and return
+terminators, and per-block tick totals. MIR lowering allocates region-local
+registers, emits the cloned control flow, preserves simultaneous copies, and
+supports multiple return blocks. Path ticks accumulate in a region-local
+register and are checked and charged only at a successful return, so the
+original caller call boundary remains a valid cold exit while the imported
+operations are pure.
+
+The CFG path accepts wrapping
+integer add/subtract, positive-constant modulo, complement, bit operations,
+shifts, arbitrary acyclic arrangements of up to 32 blocks, 128 instructions,
+128 values, and 128 copied operands. Integer argument and shift-count guards,
+the timeout guard, the monomorphic receiver/dispatch-epoch guard, deferred
+argument-list reconstruction, and caller-boundary ownership release remain
+unchanged.
+
+A focused test imports the existing conditional shift helper as four region
+blocks with three cloned instructions, one branch, and one return. The full
+build and deoptimization census pass with 73/73 completions, zero VM calls, and
+zero deoptimizations. After correcting CFG argument mapping so join copies
+remain real region temporaries, live Codepoint validation produced a
+4.903833-second specialization run and warmed `test2(3000)` samples of
+4.095650, 4.291562, and 4.100930 seconds, median **4.100930 seconds**. This
+shows that migrating the straight-line and conditional leaf splices to CFG
+lowering retains approximately the existing 4.064607-second recipe speed.
+Replacing `#508:SHR` with identical source and running `test2(300)` completed
+in 0.853880 seconds through dispatch invalidation.
+
+Recursive CFG splicing now retains a selected monomorphic call as a nested
+region, maps its fixed argument list to enclosing region values, and emits the
+nested blocks directly into the caller's MIR. Every nested return moves its
+result into the enclosing call value and jumps to an emitted continuation.
+Nested regions share one path-tick accumulator, so only the outer successful
+return commits the complete dynamic tick total. Shift-count guards, including
+`ROTR32`'s computed `32 - n`, execute at the guarded instruction while all
+preceding region work remains pure and uncharged. Nested target assumptions are
+validated against the side-table dispatch snapshots; the global epoch lets an
+identical outer receiver/class guard cover matching nested dependencies.
+
+The importer specializes the callee's argument-count validation from the
+known fixed call list: `length(args)` and its integer comparisons fold to
+constants. Internal integer type guards are discharged only when their
+accepted mask includes `TYPE_INT`; root argument tags are checked before
+region entry, while nested arguments are mapped from already checked arguments,
+integer constants, or integer region temporaries. Remaining deopt blocks are
+explicit CFG exits to the restartable outer call boundary.
+
+The bespoke expression DAG builder, conditional matcher, recursive expression
+substitution, recipe MIR emitter, and their tests have now been removed. All
+region stitching uses the CFG representation. Focused tests cover
+straight-line and compound instruction imports, a four-block conditional, and
+a recursively imported monomorphic conditional callee. On a recipe-free live
+build, both `small_sigma0` to `ROTR32` sites, the `SHR` site, and both `XOR`
+sites report `spliced=1`. The specialization run took 5.122666 seconds; warmed
+`test2(3000)` samples took 4.124574, 9.153380, 4.344014, and 4.158605 seconds.
+Discarding the recurring host-noise outlier gives a median of **4.158605
+seconds**. Replacing nested dependency `#508:SHL` and running `test2(300)`
+completed in 0.907310 seconds through invalidation.
+
+The first exact side-exit slice is now implemented for a root stitched callee.
+Explicit deopt blocks and dynamic shift-count guards retain an SSA snapshot of
+the target deopt map.  Lowering assigns their live integer values and path tick
+count cold-only runtime slots, emits out-of-line stores, and returns a compact
+region-exit identifier.  The VM performs the original call once, attaches the
+ordinary caller continuation, rewrites the new callee activation to the exact
+map and PC, restores locals, operand stack, and handler markers, and charges
+the stored ticks.  No exit identifier, profiling counter, or snapshot store is
+initialized on the successful generated path.  Region-exit descriptors and
+their value-slot mappings are program-owned side-table data and are discarded
+with native code on invalidation.
+
+Live HIR for the direct `small_sigma0` to `SHR` splice reports 69 runtime slots
+instead of its 66 value-and-tag base slots, demonstrating one real guard
+snapshot with a tick slot and two live integer slots.  A fresh specialization
+run took 5.276054 seconds; warmed `test2(3000)` samples took 4.144873,
+4.489222, and 4.348315 seconds, median **4.348315 seconds**.  That is 27.5%
+faster than the verified 5.996587-second interpreter median, with the spread
+still reflecting host noise.
+
+Exact exits now carry a bounded frame-chain descriptor for every omitted
+activation in a recursively stitched region. Each enclosing frame records its
+post-call resume map, receiver class, verb, fixed argument slots, and the live
+SSA snapshot preceding the call; the final frame records the exact inner deopt
+map. Cold MIR stubs store every frame snapshot, the fixed nested arguments, and
+the accumulated path ticks in program-owned runtime slots. The VM dispatches
+the original outer call once, restores each omitted caller as a dispatched
+continuation, recreates each nested activation, and finally materializes the
+exact inner PC, error PC, locals, operand stack, and handler markers. Aggregate
+ticks are charged once at the leaf. The generated success path still performs
+no snapshot stores or exit-identifier initialization.
+
+A live forced shift-count failure reconstructed the complete traceback through
+`#508:SHL`, `#508:ROTR32`, and the stitched probe caller, demonstrating that the
+logical omitted activations are visible to ordinary exception handling. Live
+HIR for `small_sigma0` reports 99 runtime slots, five region exits, and 33
+region-exit values, compared with 69 slots and three exact values before nested
+frame snapshots. After a 5.170866-second specialization run, five isolated
+warmed `test2(3000)` samples were 4.450057, 4.360649, 9.293383, 4.166577, and
+4.358727 seconds, median **4.360649 seconds**. The 9.293383-second host-noise
+outlier does not change the median. This is 27.3% faster than the verified
+5.996587-second interpreter baseline.
+
+Pool-rotation stress exposed a lifetime error in compact-resume constants:
+resume literal metadata borrowed strings and lists from the compiler IR, while
+recompilation correctly freed the previous retained IR constants. Resume
+literals now own their own references independently of each generated-code
+generation. Three forced rotations followed by recompilation and repeated
+`#430:hash("")` execution complete under AddressSanitizer without an error.
+This ownership is required for invalidation safety because continuations and
+the stable deopt maps can outlive the IR generation which populated them.
+
+Exact region exits now compose through compact native-chain frames as well.
+The compact leaf keeps ownership of the captured region continuation while the
+physical native chain is promoted. Promotion transfers that continuation to
+the canonical leaf activation and moves the already materialized three call
+operands into its interpreter stack; the existing frame-chain materializer then
+dispatches the outer region call once and reconstructs all omitted logical
+activations. Ordinary compact boundaries retain their existing owned boundary
+snapshot path.
+
+A live compiled wrapper made one compact native call into a stitched probe and
+forced the probe's nested shift-count exit. The traceback reconstructed
+`#508:SHL`, `#508:ROTR32`, the probe, and the wrapper. Detailed counters showed
+one native-chain call and one promotion in the wrapper, one exact region deopt
+and promotion in the probe, and no VM-call fallback. The same test completed
+under AddressSanitizer without an error. A fresh post-change benchmark took
+5.163614 seconds to specialize; five isolated warmed `test2(3000)` samples were
+4.199058, 4.416472, 4.184089, 4.300811, and 4.214599 seconds, median
+**4.214599 seconds**. This is 29.7% faster than the verified 5.996587-second
+interpreter baseline. Because compact exact exits are cold and do not alter the
+successful generated path, the difference from the previous 4.360649-second
+median is host variance rather than an attributed speedup.
+
+The generalized importer now also accepts integer multiplication, division,
+modulo, and comparisons. Dynamic division and modulo retain the instruction's
+exact pre-operation snapshot and branch to it when the divisor is zero; a
+missing snapshot makes that splice ineligible. Divisors of negative one are
+lowered without a hardware overflow trap: division uses wrapping negation and
+modulo returns zero, matching the interpreter for the minimum integer. These
+operations are rollback-safe because every exceptional exit occurs before the
+operation is committed. Focused tests verify that a dynamic divide retains its
+two live operands in one exact side exit.
+
+A live stitched divide probe returned the expected positive and signed values.
+A zero divisor reconstructed `region_divide` at the exact failing instruction,
+followed by `region_divide_probe` in the traceback. The equivalent modulo tests
+returned zero for a divisor of negative one and reconstructed the same
+divide-by-zero traceback shape. The 73-case deopt census still completed with
+zero VM calls and zero deopts. A fresh `test2(3000)` specialization run took
+5.019771 seconds; five warmed samples measured with `ftime()` were 4.292957,
+4.203981, 4.232841, 4.432694, and 4.373943 seconds, median **4.292957 seconds**.
+That is 28.4% faster than the verified 5.996587-second interpreter baseline.
+The successful SHA-256 path did not gain new operations in this change, so the
+difference from the previous median remains host variance.
+
+The generalized CFG now admits bounded loop backedges. The reachable-CFG walk
+accepts a cycle only when its active header contains a reconstructable type
+guard, and the importer permits at most four loop headers within the existing
+32-block and 128-instruction limits. SSA parallel copies remain edge-local, so
+the existing MIR labels and jumps directly implement loop-carried values rather
+than unrolling or invoking a standalone callee.
+
+Ticks are now retained as ordered region instructions instead of one aggregate
+per block. This makes an exact exit's charged prefix independent of later ticks
+in the same block. Coalesced tick members marked with the `-1` sentinel are
+skipped just as they are in whole-verb lowering; treating that sentinel as 255
+was caught during live checkpoint validation. Each loop header uses its guard
+map as an exact checkpoint, checks the asynchronous timeout flag and remaining
+tick budget, and leaves the stitched region after 1,024 accumulated ticks so
+long loops cannot defer task accounting indefinitely. A checkpoint restores
+the loop-carried locals and stack at the guard PC and charges only the executed
+tick prefix. If too few ticks remain to materialize that prefix, the pure
+region takes its restartable outer cold path.
+
+A live four-block `while` callee reported `leaf=1`, `spliced=1`, one region
+exit, and four cold runtime slots. Five iterations completed with zero deopts,
+returned 10, and consumed 48 ticks versus 46 for a direct call. One thousand
+iterations returned 499500, consumed 7015 ticks versus 7011 directly, and took
+one exact checkpoint. One million iterations produced the ordinary
+`loop_target` out-of-ticks traceback through `loop_probe`. Reprogramming the
+target reset the side-table selection to `leaf=0`, `hits=0`, `spliced=0`, and
+the stale dispatch guard safely fell back. The short native loop and the
+1,000-iteration exact-checkpoint path also completed under AddressSanitizer
+without an error.
+
+The 73-case deopt census still completed with zero VM calls and zero deopts. A
+fresh `test2(3000)` specialization run took 5.439692 seconds; five warmed
+samples measured with `ftime()` were 4.276651, 4.333998, 4.412341, 4.239095,
+and 4.279731 seconds, median **4.279731 seconds**. That is 28.6% faster than the
+verified 5.996587-second interpreter baseline. The SHA-256 region graph does
+not contain a loop splice, so the small change from the preceding median is
+host variance rather than an attributed loop speedup.
+
+The first effectful-region slice admits a terminal integer property write of
+the form `return this.<constant> = value`. It is deliberately restricted to the
+root imported callee: nested effects and any instruction after the write remain
+ineligible. The generated path checks timeout and the complete accumulated tick
+budget before calling `jit_rt_put_prop()`. A helper failure is therefore still
+pre-commit: it clears the temporary error and takes the ordinary restartable
+call boundary. A helper success is the commit point; only the return and the
+already-proven tick subtraction follow it, so no post-commit path can restart
+or duplicate the write.
+
+Property-name constants embedded in generated MIR own independent references
+in root-program side metadata. They are deduplicated, included in metadata
+accounting, and released with region exits whenever native code is invalidated
+or its pool generation is discarded. Thus rebuilding and freeing the target IR
+cannot leave native code holding its string. Focused tests accept the terminal
+shape and reject even a tick between the write and return. Live Codepoint tests
+reported `leaf=1` and `spliced=1`, returned and stored 41 and 77 without a
+deopt, and routed a missing property through the ordinary `E_PROPNF` traceback
+without changing an existing property. Reprogramming the target returned the
+new result and reset the site to `leaf=0`, `hits=0`, `spliced=0`. Both the
+stitched write after pool rotation and its unit tests complete under
+AddressSanitizer without an error; the 73-case deopt census remains 73/73 with
+zero VM calls and zero deopts.
+
+A clean server under the former single-rotation policy specialized
+`test2(3000)` in 5.245272 seconds. Five serial
+warmed `ftime()` samples were 4.411878, 4.419884, 4.461317, 4.346843, and
+4.301243 seconds, median **4.411878 seconds**. This is 26.4% faster than the
+verified 5.996587-second interpreter baseline. A separate workload with much
+more mature recursive region side-table state later produced a 2.130534-second
+pool-regeneration run and warmed samples of 1.680925, 1.574638, 1.685164,
+1.639803, and 1.659531 seconds, median **1.659531 seconds**. That experimental
+state is promising but is not the canonical baseline until its warmup sequence
+is reproduced from a clean server. Six earlier commands submitted concurrently
+through the telnet sequencer are not benchmark evidence; their 13--20 second
+wall times reflect contention and are excluded.
+
+The clean/mature discrepancy was caused by the pool policy, not hidden code
+generation: `region_specialization_rotated` permanently suppressed another
+automatic region rebuild after the first tier. Inner call sites which became
+hot in the rebuilt generation could therefore affect an outer region only
+after a manual rotation. The policy now tracks a bounded specialization-tier
+count and initially permitted two automatic region rotations, matching the
+then-current maximum recursive import depth. Each side-table site still
+requests at most one rotation, and manual, policy, protection, or memory
+rotations reset the tier count, so specialization cannot become an unbounded
+rebuild loop. The count is reported as `region_specialization_rotations` by
+`jit_pool_policy()`.
+
+On a new clean server, both region rotations occurred during the initial
+`test2(3000)` execution and then stopped at generation 3. That specialization
+run took 3.008894 seconds. Seven subsequent serial `ftime()` runs took
+2.375740, 2.381830, 2.444767, 2.525115, 2.500230, 2.371684, and 2.537267
+seconds, median **2.444767 seconds**. This is 59.2% faster than the verified
+5.996587-second interpreter baseline and requires no manual rotation. An ASan
+run likewise reported generation 3, exactly two completed specialization
+rotations, no pending rotation, and no sanitizer report after `test2(3000)`.
+
+The bounded recursive importer now admits four monomorphic call levels and up
+to eight call sites per imported verb. The specialization policy
+correspondingly allows at most four automatic region rotations; this preserves
+a finite compile budget while allowing hotness discovered in each newly
+compiled generation to propagate through the complete SHA-256 helper chain. A
+focused unit test builds and imports a four-call synthetic chain. On a clean server, the initial
+`test2(3000)` run took 3.081048 seconds and stopped at generation 5 with exactly
+four region-specialization rotations. Five subsequent serial `ftime()` samples
+were 1.669595, 1.632985, 1.624622, 1.681541, and 1.710528 seconds, median
+**1.669595 seconds**. This is 72.2% faster than the verified 5.996587-second
+interpreter baseline and reproduces the former manually matured result without
+manual rotation. The 73-case deoptimization census remains 73/73 with zero VM
+calls and zero deoptimizations. The same clean specialization reached
+generation 5 under AddressSanitizer, completed `test2(3000)`, and produced no
+sanitizer report; the ASan unit suite also passes with leak detection disabled.
+
+A fresh 10-second profile of the four-tier steady state captured 1,892 cycle
+samples with zero losses while `test2(3000)` completed in 1.873964 seconds
+under sampling. Self-time was 11.56% in
+`jit_program_execute_in_context()`, 8.71% in continuation capture, 7.21% in
+native-frame resume preservation, 2.35% in the native-chain runner, and 1.82%
+in native verb dispatch. HIR inspection identifies a concrete surviving hot
+boundary: `raw_hash` calls `words_to_bebytes`, whose call site is hot and
+monomorphic but not spliced; `words_to_bebytes` likewise has an unspliced hot
+call to `word_to_bebytes`. These helpers construct and return lists, while the
+current region value model admits only unowned integers. The next generalized
+region slice should therefore model owned list temporaries and list-return
+ownership explicitly, then import singleton/list-tail construction and list
+append with exact pre-operation exits. That removes a per-hash continuation
+boundary rather than merely increasing recursion bounds again.
+
+The owned-list slice is now implemented in the generalized CFG importer. Region
+values carry their result type and an owned-runtime home; empty, singleton, and
+fixed-capacity list construction, list-tail updates, concatenation, parallel
+copies, nested list returns, and root list returns transfer those homes without
+publishing interpreter activations. The remaining `word_to_bebytes` rejection
+was its `$minint` property read. Regions now import integer property reads and
+perform the lookup and permission check on every execution. Only the property
+name is retained with the compiled program, so property changes require no new
+cache-invalidation epoch; a lookup error or non-integer result returns to the
+original cold call boundary. After a manual pool rotation refreshed the stale
+generation, `words_to_bebytes` reported `spliced=1`. Three warmed
+`test2(3000)` samples were 1.842516, 1.880201, and 1.897170 seconds, median
+**1.880201 seconds**. The focused JIT suite includes an integer-property region
+import regression, and the 73-case deoptimization census remains 73/73 with
+zero VM calls and zero deoptimizations. The next measurement should profile
+this list-return region specifically and determine whether its additional list
+ownership helpers offset the eliminated continuation boundary.
+
+The refreshed `spliced=1` profile captured 360 cycle samples with zero losses
+while `test2(3000)` completed in 1.849137 seconds. The dominant list-specific
+cost was `jit_rt_fixed_list_append_owned()` at 2.04%; the one-time owner-home
+registration was only 0.87% in `jit_rt_owned_replace()`. Generalized regions
+already prove that fixed-list tail indices are sequential and that the
+fixed-capacity allocation remains in its owner home, so their lowering now uses
+a direct region-only fixed-list store rather than repeating owner, alias, and
+capacity checks for every element. Five warmed samples after that change were
+1.813773, 1.806057, 1.852443, 1.862822, and 1.816188 seconds, median
+**1.816188 seconds**, a 3.4% improvement over the preceding 1.880201-second
+median. The ordinary continuation-capable list helper remains unchanged for
+non-region lowering. The ASan unit suite passes, and a clean ASan server reached
+the refreshed `spliced=1` list region and completed `test2(3000)` without a
+sanitizer report.
+
+A bounded 12-second `perf record` of one single-tier clean-server warmed run
+captured 4,764
+cycle samples with zero losses in 0.711 MB. The profiled run took 4.743839
+seconds under sampling. Self-time remains concentrated in native boundary
+machinery rather than the new property path: `jit_program_execute_in_context()`
+was 17.98%, continuation capture 5.60%, native-frame resume preservation 5.30%,
+the native-chain runner 4.76%, and native verb dispatch 3.61%. This confirms
+that terminal property effects add coverage but do not explain SHA-256 time;
+larger stitched regions that eliminate those boundaries remain the relevant
+performance direction.
+
+A subsequent 12-second profile of the bounded two-tier steady state captured
+2,479 cycle samples with zero losses while `test2(3000)` completed in 2.458905
+seconds. Self-time was 12.96% in `jit_program_execute_in_context()`, 11.81% in
+continuation capture, 5.51% in native-frame resume preservation, 3.56% in the
+native-chain runner, and 2.08% in native verb dispatch. The additional region
+tier substantially reduces total wall time and execution-context share, but
+continuation capture is now the largest remaining boundary cost alongside the
+execution-context entry path. The next performance work should extend regions
+across more of those surviving boundaries, or avoid eagerly capturing a
+continuation when the generated path can prove that it will return normally.
+
+The next effect milestone should generalize commit-aware lowering without
+weakening this invariant: either provide an exact post-commit continuation at
+the instruction after an effect, or prove structurally that no later operation
+can fail, suspend, or fall back. Loop coverage can then expand beyond
+integer-only guarded headers while retaining exact checkpoints and the same
+invalidation rules.
+
+A post-splice profile made two remaining bookkeeping costs explicit.  The
+6.386720-second capture `/tmp/test2-region-dag.perf.data` contains 1,921 samples
+with zero losses.  `jit_region_site_record_hit()` was 2.53% self-time even
+after sites had reached their final state, and repeated
+`jit_program_compiled_generation()` validation was 2.21%.  Native resume
+recipes now cache only a non-counter completion bit: an ineligible target or a
+hot site with a captured target snapshot stops calling the side-table recorder.
+Dispatch-epoch invalidation clears the bit together with the side-table entry.
+The region hit counter itself remains exclusively in the program-owned side
+table.  Native dispatch also reuses one generation result on its normal path,
+rechecking only when entry compilation was actually required.
+
+After a discarded 6.328547-second warm-up, three unprofiled `test2(3000)` runs
+took 5.815099, 5.849567, and 6.008439 seconds, median **5.849567 seconds**.  This
+is 2.45% faster than the verified 5.996587-second interpreter median, although
+the historical host variance still calls for interleaved confirmation before
+treating it as a durable win.  The follow-up profiled run took 5.995333 seconds;
+`/tmp/test2-region-profile-opt.perf.data` contains 1,814 samples with zero
+losses.  The saturated region recorder disappeared from the profile, while the
+single remaining generation validation was 1.82% self-time.  Replacing
+`#508:XOR` with identical source and rerunning the benchmark also completed,
+confirming that dispatch invalidation re-enables profiling and takes the cold
+path safely.
+
+Backend SSA optimization now also performs transitive dead-code elimination.
+Returns, branches, calls, writes, ticks, deopts, guards, and possibly-raising
+operations form the initial root set; explicit operands plus local and stack
+reconstruction snapshots are traced through definitions and phi arguments.
+Unused constants, loads, phis, and universally non-raising pure operations are
+then unlinked before SSA destruction.  Arithmetic remains rooted unless prior
+constant folding has made it a constant, because the integer analysis lattice
+is not a general runtime type proof.
+
 The global verb cache retains first-ancestor-with-verbs keys.  Lookup recomputes
 that ancestor before probing the cache, so `db_change_parent()` can still skip
 the global cache flush for childless objects without verbs.  Those changes
