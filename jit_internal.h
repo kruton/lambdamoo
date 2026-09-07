@@ -11,12 +11,14 @@ typedef struct JITCopy JITCopy;
 typedef struct JITInstruction JITInstruction;
 typedef struct JITBlock JITBlock;
 typedef struct JITDeoptMap JITDeoptMap;
+typedef struct JITRegionExit JITRegionExit;
 typedef struct JITReconstructionState JITReconstructionState;
 typedef struct JITResumeValue JITResumeValue;
 typedef struct JITResumeCaptureAction JITResumeCaptureAction;
 typedef struct JITNativeResume JITNativeResume;
 typedef struct JITLocalValue JITLocalValue;
 typedef struct JITProgramUsage JITProgramUsage;
+typedef struct JITRegionSite JITRegionSite;
 
 typedef enum {
     JIT_RESUME_LOCAL,
@@ -88,10 +90,12 @@ struct JITNativeResume {
     Objid cached_vloc;
     unsigned cached_verb_index;
     unsigned cached_debug;
+    uint64_t cached_jit_generation;
     unsigned char valid;
     unsigned char rehydratable;
     unsigned char capture_classified;
     unsigned char recipe_valid;
+    unsigned char region_profile_complete;
 };
 
 struct JITContinuationFrame {
@@ -275,6 +279,18 @@ struct JITProgramUsage {
     uint64_t native_chain_max_depth;
 };
 
+struct JITRegionSite {
+    JITRegionSite *next;
+    Program *target_program;
+    uint64_t dispatch_epoch;
+    Objid receiver_class;
+    int map_id;
+    signed char leaf;
+    unsigned char hits;
+    unsigned char rotation_requested;
+    uint64_t spliced_generation;
+};
+
 typedef struct {
     ResumeKey key;
     int map_id;
@@ -346,6 +362,15 @@ struct JITProgram {
     uint64_t active_native_frames;
     size_t active_native_frame_bytes;
     unsigned protection_generation;
+    JITRegionSite *region_sites;
+    JITRegionExit *region_exits;
+    int num_region_exits;
+    int region_exit_capacity;
+    int num_region_exit_values;
+    int num_region_owned_slots;
+    const char **region_literals;
+    int num_region_literals;
+    int region_literal_capacity;
     JITProgramUsage *usage;
     uint32_t compile_attempts;
     uint32_t compile_successes;
@@ -356,6 +381,10 @@ struct JITProgram {
 };
 
 extern void jit_analyze_owned_last_uses(JITProgram *);
+extern void jit_region_site_reset(JITProgram *, int);
+extern int jit_region_site_record_hit(JITProgram *, int, JITProgram *);
+extern int jit_region_site_status(JITProgram *, int, int *, unsigned *,
+	uint64_t *);
 
 static inline __attribute__((always_inline)) int
 jit_resolve_owner_slot(JITProgram *program, int value)
@@ -444,12 +473,15 @@ extern Var *jit_rt_list_range_ref(Var *, int64_t, int64_t, int32_t *);
 extern Var *jit_rt_list_concat(Var *, Var *, int32_t *);
 extern Var *jit_rt_make_singleton_list(int64_t, int);
 extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
+extern Var *jit_rt_make_empty_list(void);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
 extern Var *jit_rt_list_append_owned(Var *, unsigned *, int, Var *, int64_t,
 				     int);
 extern Var *jit_rt_fixed_list_append_owned(Var *, unsigned *, int, Var *, int,
 					   int64_t, int);
+extern Var *jit_rt_fixed_list_store(Var *, int, int64_t, int);
 extern void jit_rt_owned_replace(Var *, int, int64_t, int);
+extern void jit_rt_owned_move(Var *, int, int);
 extern void jit_rt_discard_owned(Var *, int, int64_t, int);
 extern void jit_rt_retain_raw(int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,
@@ -458,9 +490,12 @@ extern Var *jit_rt_list_nested_index_set(Var *, int, int64_t, int64_t,
 					 int64_t, int, int32_t *);
 extern Var *jit_rt_sublist_from(Var *, int64_t);
 extern int64_t jit_rt_list_in(int64_t, int, Var *);
+extern int64_t jit_rt_region_guard(int64_t, int, int64_t, int64_t);
 extern int jit_rt_get_prop(int64_t, const char *, int64_t, int64_t *, int64_t *, int32_t *);
 extern int jit_rt_get_prop_typed(int64_t, int, const char *, int64_t,
 				 int64_t *, int64_t *, int32_t *);
+extern int64_t jit_rt_get_prop_int(int64_t, int, const char *, int64_t,
+				   int32_t *);
 extern int jit_rt_put_prop(int64_t, const char *, int64_t, int64_t, int, int32_t *);
 extern int64_t jit_rt_seconds_left(void);
 extern int64_t jit_rt_time(void);
@@ -486,6 +521,15 @@ extern JITContinuationFrame *jit_test_continuation_capture(JITProgram *, int,
 	JITContinuationFrame *);
 extern int jit_test_deopt_map_is_suspend_zero(JITProgram *, JITDeoptMap *,
 	Num *, Var *, unsigned char *);
+extern int jit_test_region_cfg(JITProgram *, int *, int *, int *, int *);
+extern int jit_test_region_cfg_calls(JITProgram *, int *, int *);
+extern int jit_test_region_cfg_exits(JITProgram *, int *, int *);
+extern int jit_test_region_exit_materialize(JITProgram *, JITProgram *,
+	Program *, int, int, Num, Num, struct activation *, int *);
+extern int jit_test_region_exit_chain(JITProgram *, JITProgram *, Program *,
+	int, JITProgram *, Program *, int, struct activation *,
+	struct activation *, int *, Var *);
+extern void jit_test_region_site_select(JITProgram *, int, Program *, Objid);
 #endif
 
 #endif /* !JIT_Internal_H */

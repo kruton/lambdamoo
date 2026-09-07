@@ -112,6 +112,10 @@ struct JITExecutionContext {
     int *task_timed_out;
     enum error *pending_error;
     int lazy_verb_calls;
+    void *native_call_pool;
+    unsigned native_call_pool_count;
+    void *runtime_pool;
+    unsigned runtime_pool_count;
 };
 
 typedef void (*JITPromotionMaterializer) (JITNativeFrame *,
@@ -127,6 +131,7 @@ typedef enum {
 typedef enum {
     JIT_RUN_FALLBACK,
     JIT_RUN_CALL_VERB,
+    JIT_RUN_REGION_EXIT,
     JIT_RUN_RETURNED,
     JIT_RUN_ERROR,
     JIT_RUN_ABORT_TICKS,
@@ -171,6 +176,7 @@ typedef struct {
     int ticks_charged;
     int builtin_func;
     int operation;
+    int region_exit;
     int guard_value[JIT_MAX_GUARD_OPERANDS];
     int guard_local[JIT_MAX_GUARD_OPERANDS];
     JITTypeMask guard_expected[JIT_MAX_GUARD_OPERANDS];
@@ -245,6 +251,7 @@ typedef struct {
     time_t generation_started_at;
     time_t generation_age;
     unsigned hot_threshold;
+    unsigned region_specialization_rotations;
     int rotation_pending;
     const char *last_rotation_reason;
 } JITPoolPolicyStats;
@@ -317,6 +324,7 @@ extern int jit_native_frame_return_continuation_runtime(
 	JITNativeFrame *, JITContinuationFrame *);
 extern int jit_native_frame_continuation_matches(const JITNativeFrame *, int);
 extern void jit_native_frame_release_runtime(JITNativeFrame *);
+extern void jit_execution_context_free_runtime_pool(JITExecutionContext *);
 extern void jit_native_frame_unbind_runtime(JITNativeFrame *);
 extern int jit_native_frame_preserve_resume(JITNativeFrame *, int);
 extern JITContinuationFrame *jit_native_frame_capture_continuation(
@@ -347,8 +355,10 @@ extern const char *jit_program_state_name(JITProgram *);
 extern const char *jit_program_reason(JITProgram *);
 extern const char *jit_program_diagnostic(JITProgram *);
 extern int jit_program_is_eligible(JITProgram *);
+extern uint64_t jit_program_compiled_generation(JITProgram *);
 extern int jit_program_may_error(JITProgram *);
 extern int jit_program_is_direct_leaf(JITProgram *);
+extern int jit_program_is_region_leaf(JITProgram *);
 extern int jit_program_admit_interpreter_entry(JITProgram *);
 extern int jit_program_claim_native_entry(JITProgram *);
 extern unsigned jit_program_warmup_count(JITProgram *);
@@ -381,7 +391,12 @@ extern void jit_continuation_attach(JITContinuationFrame *, struct activation *)
 extern void jit_continuation_relocate(JITContinuationFrame *, struct activation *);
 extern int jit_continuation_materialize(struct activation *);
 extern int jit_continuation_materialize_boundary(struct activation *, Var *,
-						 unsigned);
+						  unsigned);
+extern int jit_region_exit_frame_count(JITProgram *, int);
+extern int jit_region_exit_materialize(JITProgram *, int, int,
+	JITContinuationFrame *, struct activation *, int *);
+extern int jit_region_exit_call(JITProgram *, int, int,
+	JITContinuationFrame *, Var *, Objid *, const char **);
 extern void jit_continuation_free(JITContinuationFrame *);
 extern void jit_continuation_materialize_all(void);
 extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),

@@ -7439,6 +7439,19 @@ jit_resume_source(JITProgram *program, JITDeoptMap *map,
 		literal = &native_resume->literals[resume->index];
 		literal->literal = instr->literal;
 		literal->literal_type = instr->literal_type;
+		if (literal->literal_type == TYPE_STR
+		    || literal->literal_type == TYPE_LIST
+#ifdef WAIF_CORE
+		    || literal->literal_type == TYPE_WAIF
+#endif
+		    ) {
+		    Var value;
+
+		    value.type = literal->literal_type;
+		    value.v.num = literal->literal;
+		    value = var_ref(value);
+		    literal->literal = value.v.num;
+		}
 		return 1;
 	    }
 	    if (instr == block->last)
@@ -11946,6 +11959,7 @@ lower_expr(HIRContext *ctx, HIRTacProgram *program, HIRExpr *expr)
 	    call_tac->dst = new_temp(ctx);
 	    call_tac->src1 = obj_temp;
 	    call_tac->src2 = verb_temp;
+	    call_tac->src3 = args_temp;
 	    call_tac->resume_key = expr->u.verb_call.resume_key;
 	    call_tac->bytecode_pc = expr->bytecode_pc;
 	    snapshot_lower_stack(ctx, call_tac);

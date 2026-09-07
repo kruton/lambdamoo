@@ -17,6 +17,7 @@
 #include <string.h>
 
 static unsigned test_protection_generation = 1;
+static uint64_t test_dispatch_epoch = 1;
 static int test_length_protected;
 static enum bi_prop test_builtin_property;
 static Var test_property = { .type = TYPE_INT, .v.num = 123 };
@@ -24,6 +25,20 @@ static int test_property_allowed = 1;
 static const ResumePoint *test_resume_point;
 static JITProgram *test_compiled_jit_program;
 Var zero = { .type = TYPE_INT, .v.num = 0 };
+
+void hir_test_set_dispatch_epoch(uint64_t);
+
+uint64_t
+db_dispatch_epoch(void)
+{
+    return test_dispatch_epoch;
+}
+
+void
+hir_test_set_dispatch_epoch(uint64_t epoch)
+{
+    test_dispatch_epoch = epoch;
+}
 
 Program *
 program_ref(Program *program)

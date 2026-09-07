@@ -612,6 +612,20 @@ faster.  This confirms that target lookup was worth removing but cannot close
 the gap alone.  The next work remains selective environment initialization and
 fusing frame/runtime reservation with cached compact entry.
 
+A bounded per-chain pool now reuses detached native-call containers and their
+adjacent boundary stacks, but does not retain invocation or runtime ownership.
+Its 7.655436-second median did not improve on the 7.576318-second cache result.
+Cleaned, capacity-tagged runtime blocks are now retained in a separate bounded
+per-chain pool.  The free-list metadata overlays the inactive runtime storage,
+so reuse removes the large block's allocator pair without allocating a pool
+node.  It retains at most 32 blocks of at most 256 KiB and is drained on
+promotion and root detachment.  Cold continuation ownership is unchanged.
+Observed `test2` samples ranged from 7.471220 to 8.914383 seconds and therefore
+do not yet demonstrate a wall-clock improvement over the 7.576318-second
+target-cache median.  Selective environments must wait for compiler-produced
+initialized and written slot sets rather than assuming that all user-local
+slots remain untouched by native helper calls.
+
 For each implementation, compare complete warmed runs and allocation counts,
 verify suspension/return/error cleanup, and retain the native-frame verifier
 configuration for correctness checks. Rerun a same-source interpreter control

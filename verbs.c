@@ -411,7 +411,7 @@ static Var
 jit_pool_policy_metadata(void)
 {
     JITPoolPolicyStats stats;
-    Var metadata = new_list(13);
+    Var metadata = new_list(14);
     Var value;
 
     jit_pool_policy_stats(&stats);
@@ -434,12 +434,15 @@ jit_pool_policy_metadata(void)
 					      stats.generation_started_at);
     metadata.v.list[10] = jit_metadata_num_pair("generation_age",
 					       stats.generation_age);
-    metadata.v.list[11] = jit_metadata_num_pair("rotation_pending",
+    metadata.v.list[11] = jit_metadata_num_pair(
+	"region_specialization_rotations",
+	stats.region_specialization_rotations);
+    metadata.v.list[12] = jit_metadata_num_pair("rotation_pending",
 					       stats.rotation_pending);
-    metadata.v.list[12] = jit_metadata_num_pair("rotations", stats.rotations);
+    metadata.v.list[13] = jit_metadata_num_pair("rotations", stats.rotations);
     value.type = TYPE_STR;
     value.v.str = str_dup(stats.last_rotation_reason);
-    metadata.v.list[13] = jit_metadata_pair("last_rotation_reason", value);
+    metadata.v.list[14] = jit_metadata_pair("last_rotation_reason", value);
     return metadata;
 }
 #endif
