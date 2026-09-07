@@ -1322,7 +1322,7 @@ execute_jit_dispatch_native_verb_call(JITExecutionContext *context,
 	resolved.program->jit);
     if (!execute_jit_commit_prepared_verb_call(context, &native_call->frame,
 	&native_call->resume, &prepared, 0,
-	cached_resolution && resume_recipe
+	compiled_generation && cached_resolution && resume_recipe
 	&& resume_recipe->cached_jit_generation
 	   == compiled_generation)) {
 	prepared.env[SLOT_ARGS].type = TYPE_NONE;

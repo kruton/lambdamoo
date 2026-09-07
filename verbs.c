@@ -305,7 +305,7 @@ static Var
 jit_metadata(JITProgram *program)
 {
     JITProgramStats stats;
-    Var metadata = new_list(44);
+    Var metadata = new_list(47);
     Var value;
 
     jit_program_stats(program, &stats);
@@ -404,6 +404,12 @@ jit_metadata(JITProgram *program)
 					       jit_program_warmup_count(program));
     metadata.v.list[44] = jit_metadata_num_pair("warmup_generation",
 					       jit_program_warmup_generation(program));
+    metadata.v.list[45] = jit_metadata_num_pair("pool_index",
+	stats.pool_index);
+    metadata.v.list[46] = jit_metadata_num_pair("residency_heat",
+	stats.residency_heat);
+    metadata.v.list[47] = jit_metadata_num_pair("residency_heat_epoch",
+	stats.residency_heat_epoch);
     return metadata;
 }
 
@@ -411,7 +417,7 @@ static Var
 jit_pool_policy_metadata(void)
 {
     JITPoolPolicyStats stats;
-    Var metadata = new_list(14);
+    Var metadata = new_list(18);
     Var value;
 
     jit_pool_policy_stats(&stats);
@@ -443,6 +449,14 @@ jit_pool_policy_metadata(void)
     value.type = TYPE_STR;
     value.v.str = str_dup(stats.last_rotation_reason);
     metadata.v.list[14] = jit_metadata_pair("last_rotation_reason", value);
+    metadata.v.list[15] = jit_metadata_num_pair("effective_hot_threshold",
+	stats.effective_hot_threshold);
+    metadata.v.list[16] = jit_metadata_num_pair("context_count",
+	stats.context_count);
+    metadata.v.list[17] = jit_metadata_num_pair("activity_requests",
+	stats.activity_requests);
+    metadata.v.list[18] = jit_metadata_num_pair("activity_epoch",
+	stats.activity_epoch);
     return metadata;
 }
 #endif

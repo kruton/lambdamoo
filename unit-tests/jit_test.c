@@ -13234,6 +13234,14 @@ main(void)
 	jit_pool_policy_stats(&policy_stats);
 	check(policy_stats.rotation_pending,
 	      "lowering the populated JIT pool limit did not request rotation");
+	check(jit_pool_set_policy(3, 0),
+	      "failed to disable a pending JIT pool limit");
+	jit_pool_policy_stats(&policy_stats);
+	check(!policy_stats.rotation_pending,
+	      "raising the JIT pool limit did not cancel pending eviction");
+	check(jit_pool_set_policy(3, pool_stats.total_native_allocated_bytes
+				       + pool_stats.total_mir_heap_bytes),
+	      "failed to restore constrained JIT pool policy");
 
 	/* Reset pool and verify invalidation of active programs */
 	check(!jit_program_admit_interpreter_entry(cold)
@@ -13274,6 +13282,126 @@ main(void)
 	jit_shutdown();
 	jit_pool_stats(&pool_stats);
 	check(pool_stats.active_programs == 0, "pool active programs not zero after shutdown");
+    }
+    {
+	JITProgram *programs[5];
+	JITProgramStats program_stats[5];
+	JITPoolStats before, after;
+	JITPoolPolicyStats policy_before, policy_after;
+	unsigned compiled = 0, pending = 0;
+	int i, j;
+
+	check(jit_pool_set_policy(32, 0),
+	      "failed to disable the JIT pool limit for context test");
+	for (i = 0; i < 5; i++) {
+	    programs[i] = binary_program(10 + i, 2, HIR_OP_DIV);
+	    check(programs[i] != 0,
+		  "failed to create program for multi-context pool test");
+	}
+	for (i = 0; i < 4; i++) {
+	    check(jit_program_compile(programs[i]),
+		  "failed to compile multi-context pool program");
+	    jit_program_stats(programs[i], &program_stats[i]);
+	    check(program_stats[i].pool_index >= 0
+		  && program_stats[i].pool_index < 4,
+		  "compiled program has no context assignment");
+	    for (j = 0; j < i; j++)
+		check(program_stats[i].pool_index != program_stats[j].pool_index,
+		      "initial programs did not spread across contexts");
+	}
+
+	/* Merely observing policy state must not age an inactive verb. */
+	for (i = 0; i < 32; i++)
+	    jit_profile_record_entry(programs[0]);
+	jit_program_stats(programs[0], &program_stats[0]);
+	jit_pool_policy_stats(&policy_before);
+	jit_pool_policy_stats(&policy_after);
+	jit_program_stats(programs[0], &program_stats[1]);
+	check(policy_before.activity_epoch == policy_after.activity_epoch
+	      && program_stats[0].residency_heat
+		 == program_stats[1].residency_heat,
+	      "inactive pool observation decayed residency heat");
+
+	/* Dispatch activity, rather than wall time, advances the decay epoch. */
+	for (i = 0; i < 4096; i++)
+	    jit_profile_record_entry(programs[1]);
+	jit_pool_policy_stats(&policy_after);
+	jit_program_stats(programs[0], &program_stats[1]);
+	check(policy_after.activity_epoch > policy_before.activity_epoch
+	      && program_stats[1].residency_heat
+		 < program_stats[0].residency_heat,
+	      "dispatch activity did not age an inactive program");
+
+	jit_pool_stats(&before);
+	check(jit_pool_set_policy(32,
+	      before.total_native_allocated_bytes + before.total_mir_heap_bytes
+	      + 1), "failed to constrain the multi-context pool");
+	check(jit_program_compile(programs[4]),
+	      "failed to compile pool eviction trigger");
+	jit_pool_policy_stats(&policy_before);
+	check(policy_before.rotation_pending,
+	      "crossing the multi-context budget did not request eviction");
+	jit_pool_maintain();
+	jit_pool_stats(&after);
+	for (i = 0; i < 5; i++) {
+	    if (jit_program_state(programs[i]) == JIT_STATE_COMPILED)
+		compiled++;
+	    else if (jit_program_state(programs[i]) == JIT_STATE_PENDING)
+		pending++;
+	}
+	check(after.active_programs == compiled && compiled >= 3
+	      && pending >= 1,
+	      "budget eviction did not preserve unaffected contexts");
+	jit_pool_policy_stats(&policy_after);
+	check(!policy_after.rotation_pending
+	      && !strcmp(policy_after.last_rotation_reason, "memory-limit"),
+	      "partial context eviction did not complete cleanly");
+
+	check(jit_pool_set_policy(32, (size_t) 256 * 1024 * 1024),
+	      "failed to restore default policy after context test");
+	for (i = 0; i < 5; i++)
+	    jit_program_free(programs[i]);
+	jit_shutdown();
+    }
+    {
+	JITProgram *roots[2];
+	JITProgram *target = binary_program(4, 2, HIR_OP_ADD);
+	JITPoolPolicyStats before, after;
+	Program target_program = { 0 };
+	int i;
+
+	target_program.jit = target;
+	for (i = 0; i < 2; i++) {
+	    roots[i] = binary_program(10 + i, 2, HIR_OP_ADD);
+	    check(jit_program_compile(roots[i]),
+		  "failed to compile region specialization pool test");
+	    roots[i]->deopt_maps = myrealloc(roots[i]->deopt_maps,
+		sizeof(JITDeoptMap) * 2, M_PROGRAM);
+	    memset(&roots[i]->deopt_maps[1], 0, sizeof(JITDeoptMap));
+	    roots[i]->num_deopt_maps = 2;
+	    jit_test_region_site_select(roots[i], 1, &target_program, 2);
+	}
+	jit_pool_policy_stats(&before);
+	check(jit_region_site_record_hit(roots[0], 1, target),
+	      "hot region site did not request specialization");
+	jit_pool_maintain();
+	jit_pool_policy_stats(&after);
+	check(jit_program_state(roots[0]) == JIT_STATE_PENDING
+	      && after.rotations == before.rotations,
+	      "region specialization rotated unrelated contexts");
+
+	check(jit_region_site_record_hit(roots[1], 1, target),
+	      "second hot region site did not request specialization");
+	hir_test_set_dispatch_epoch(2);
+	jit_pool_maintain();
+	check(jit_program_state(roots[1]) == JIT_STATE_COMPILED,
+	      "stale specialization invalidated current native code");
+	hir_test_set_dispatch_epoch(1);
+
+	for (i = 0; i < 2; i++)
+	    jit_program_free(roots[i]);
+	jit_program_free(target);
+	jit_shutdown();
     }
     {
 	JITProgram *program = new_jit_program();

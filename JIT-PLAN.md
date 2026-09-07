@@ -2214,40 +2214,83 @@ attempts/results/time, persistent metadata bytes, runtime materialization
 storage, and generated machine-code bytes. `accounted_bytes` is included by
 `program_bytes()` and uses the proportional share of executable pages reported
 by `native_allocated_bytes`, reflecting actual code-holder page utilization
-and alignment across the shared context. All compiled verbs reside in a
-generation-based shared `MIR_context` pool where generator scratch memory is
-reclaimed immediately via `MIR_gen_finish()`, eliminating duplicate per-verb
-context baselines. Whole-pool invalidation (`jit_pool_reset()`) cleanly reclaims
-executable memory and MIR modules when built-in protections change or the pool
-rotates, resetting active programs back to pending.
+and alignment within their MIR context. Compiled verbs are distributed across
+four generation-based `MIR_context` pools where generator scratch memory is
+reclaimed immediately via `MIR_gen_finish()`. This bounds the granularity of
+ordinary memory-pressure eviction without returning every compiled verb to the
+interpreter. Whole-pool invalidation (`jit_pool_reset()`) remains available for
+manual reset and built-in protection changes.
 
-The shared pool uses a pending-only hot-verb policy. A pending program has a
-one-byte saturating warmup counter stored in existing `JITProgram` padding;
-compiled programs clear it and native entries do not update it. The existing
-pool-generation field is also the counter epoch while a program is pending, so
-rotation lazily resets cold candidates without adding another generation field.
+The pools use a pending-only hot-verb policy. A pending program has a one-byte
+saturating warmup counter and a persistent saturating residency heat value.
 The default threshold is 32 calls. Native call dispatch claims only the call
-which reaches the threshold; earlier calls fall back and are counted once by
-their interpreter activation. This keeps policy accounting out of generated
-MIR and leaves any future monomorphic call-site profiling as separate,
-site-specific state.
+which reaches the threshold; earlier calls fall back and are counted by their
+interpreter activation. Native eviction preserves heat and detailed per-verb
+usage statistics, so an evicted hot verb is immediately eligible for lazy
+recompilation instead of starting from cold.
+
+Residency heat has no wall-clock decay. An activity epoch advances after
+`max(4096, hot_threshold * max(resident_programs, 1))` JIT admission or native
+entry observations. A verb first observed after one or more elapsed epochs
+updates its heat once per epoch with `floor(7 * heat / 8)`. Therefore a server
+which is idle for days loses no hot set, while sustained unrelated activity
+gradually makes old entries cheaper to evict. The effective admission threshold
+moves by one eighth per activity epoch: toward the configured threshold below
+the fill target, and upward under compilation demand above the target. This is
+the pool equivalent of a demand-adjusted difficulty rather than a timer.
 
 The default pool limit is 256 MiB of reclaimable memory, defined as MIR heap
-plus executable allocation. Crossing it defers a whole-pool rotation to the
-safe server-loop boundary after ready tasks finish and prevents more automatic
-compilation in the meantime. `jit_pool_policy()` reads or atomically updates
-the runtime-only `hot_threshold` and `max_pool_bytes` settings;
+plus executable allocation. For four contexts the low watermark is
+`limit - limit / (2 * 4)`, or 87.5% of the limit. Crossing the limit defers one
+context eviction to the safe server-loop boundary; maintenance requests
+another context eviction only if the remainder is still above the low
+watermark. The victim is the context with the least normalized residency heat
+per reclaimable byte. Changing the byte budget uses this partial eviction path
+instead of flushing the pool. `jit_pool_policy()` reads or updates the
+runtime-only `hot_threshold` and `max_pool_bytes` settings;
 `jit_pool_rotate()` requests a manual rotation. Both are wizard-only. A zero
 byte limit disables automatic rotation, and an explicit `jit_compile()` remains
 a wizard override of hotness.
 
-Every completed non-shutdown rotation writes one `JIT_POOL_ROTATE` log line.
-It records the reason, old and new generations, seconds since the prior
-rotation or initial pool creation, active program count, machine-code, native,
-MIR-heap and total reclaimable bytes, and the effective limit and threshold.
-The policy result also exposes generation age, pending state, rotation count,
-and the last completed reason so administrators can tune the threshold and
-memory cap from observed workloads.
+Every completed non-shutdown full rotation writes one `JIT_POOL_ROTATE` log
+line; a partial eviction writes `JIT_POOL_EVICT` with its context and before and
+after sizes. The policy result exposes generation age, pending state, eviction
+or rotation count, configured and effective thresholds, context count, activity
+epoch, and the last completed reason. `verb_info()` exposes each compiled
+program's context index and normalized residency heat.
+
+Region specialization no longer rotates a global pool or stops after a fixed
+number of rotations. A hot site queues its compiled root and any compiled
+caller regions which transitively contain it; maintenance invalidates only
+those native programs. Dispatch epochs are checked both while traversing the
+region graph and again before invalidation, so a verb-definition change cannot
+dereference or publish a stale cached target. Profiles and unrelated compiled
+programs survive the rebuild.
+
+Background compilation is not yet enabled. The current restore path decompiles
+bytecode and rebuilds HIR/SSA while mutating `JITProgram`, and MOO values,
+strings, and `Program` references use execution-thread-owned reference counts.
+A `JITCompileSnapshot` which deep-copied that graph at the hotness transition
+would move much of compilation back onto the execution thread. The safe next
+boundary is an immutable compiler image prepared when a verb is installed (or
+incrementally while it is interpreted), plus a small request which pins the
+root and transitive region targets on the execution thread. A worker can then
+own one MIR context and return a detached artifact; safe-point publication must
+revalidate the program identity, protection generation, dispatch epoch, and
+pool generation before atomically replacing the native entry. Until that
+representation exists, compilation remains synchronous rather than exposing
+mutable VM state to a worker.
+
+The initial multi-context Codepoint validation used a fresh disposable server
+and one discarded warm-up. Four subsequent `#168:test2(3000)` runs took
+1.795095, 1.825232, 1.800091, and 1.741048 seconds, with a 1.797593-second
+median. At the end the pool held 34 compiled programs, 215,728 bytes of used
+machine code, 471,040 bytes of native allocation, and 24,739,390 bytes of MIR
+heap (25,210,430 reclaimable bytes total). It remained at logical generation 1
+with zero rotations, zero region-specialization rotations, and no pending
+eviction while the activity epoch advanced to 1,916. This specifically
+validates that specialization and unrelated dispatch activity do not consume a
+small global rotation allowance before the SHA workload becomes hot.
 
 All 6,319 verbs in the current testmoo.db eligibility census compile successfully.
 There are no remaining top-level `unsupported-program`,

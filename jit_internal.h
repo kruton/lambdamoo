@@ -337,6 +337,7 @@ struct JITProgram {
     void *native_function;
     void *machine_code;
     size_t machine_code_len;
+    unsigned pool_index;
     uint64_t pool_generation;
     JITProgram *pool_prev;
     JITProgram *pool_next;
@@ -362,6 +363,12 @@ struct JITProgram {
     uint64_t active_native_frames;
     size_t active_native_frame_bytes;
     unsigned protection_generation;
+    unsigned char residency_heat;
+    unsigned char specialization_pending;
+    uint64_t residency_heat_epoch;
+    uint64_t residency_last_use;
+    uint64_t specialization_epoch;
+    JITProgram *specialization_next;
     JITRegionSite *region_sites;
     JITRegionExit *region_exits;
     int num_region_exits;
