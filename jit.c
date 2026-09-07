@@ -47,10 +47,12 @@
 
 static int jit_runtime_value_slots(JITProgram *);
 static void jit_program_release_ir(JITProgram *, int);
+static void jit_program_release_native(JITProgram *);
 static int jit_program_restore_ir(JITProgram *);
 static void jit_region_site_mark_spliced(JITProgram *, int);
 static int jit_region_site_snapshot(JITProgram *, int, Program **, Objid *,
 	uint64_t *);
+static void jit_region_request_specialization(JITProgram *);
 
 static int
 jit_deopt_map_bridges_builtin(JITDeoptMap *map)
@@ -1898,18 +1900,17 @@ typedef struct JITPool {
     JITProgram *active_tail;
 } JITPool;
 
-static JITPool jit_shared_pool = { 0, 0, 1, 0, 0, 0, 0 };
+#define JIT_CONTEXT_COUNT 4
+#define JIT_NO_POOL UINT_MAX
+static JITPool jit_pools[JIT_CONTEXT_COUNT];
+static uint64_t jit_next_pool_generation = 1;
 #define JIT_DEFAULT_HOT_THRESHOLD 32
 #define JIT_DEFAULT_MAX_POOL_BYTES ((size_t) 256 * 1024 * 1024)
-#define JIT_MAX_REGION_SPECIALIZATION_ROTATIONS 4
-
 typedef enum {
     JIT_ROTATION_NONE,
     JIT_ROTATION_MEMORY_LIMIT,
     JIT_ROTATION_MANUAL,
-    JIT_ROTATION_POLICY_CHANGE,
-    JIT_ROTATION_PROTECTION_CHANGE,
-    JIT_ROTATION_REGION_SPECIALIZATION
+    JIT_ROTATION_PROTECTION_CHANGE
 } JITRotationReason;
 
 typedef struct {
@@ -1917,16 +1918,24 @@ typedef struct {
     time_t generation_started_at;
     uint64_t rotations;
     unsigned hot_threshold;
+    unsigned effective_hot_threshold;
     unsigned region_specialization_rotations;
     JITRotationReason pending_reason;
     JITRotationReason last_reason;
+    uint64_t activity_requests;
+    uint64_t activity_epoch;
+    uint64_t activity_last_use;
+    uint64_t logical_generation;
+    int compilation_demand;
 } JITPoolPolicy;
 
 static JITPoolPolicy jit_pool_policy = {
-    JIT_DEFAULT_MAX_POOL_BYTES, 0, 0, JIT_DEFAULT_HOT_THRESHOLD, 0,
-    JIT_ROTATION_NONE, JIT_ROTATION_NONE
+    JIT_DEFAULT_MAX_POOL_BYTES, 0, 0, JIT_DEFAULT_HOT_THRESHOLD,
+    JIT_DEFAULT_HOT_THRESHOLD, 0, JIT_ROTATION_NONE, JIT_ROTATION_NONE,
+    0, 0, 0, 1, 0
 };
 static uint64_t next_module_serial = 0;
+static JITProgram *jit_specialization_queue = 0;
 static FILE *jit_perf_map_file = 0;
 static char jit_perf_map_filename[64];
 static time_t jit_profile_detail_time = 0;
@@ -1964,12 +1973,8 @@ jit_rotation_reason_name(JITRotationReason reason)
 	return "memory-limit";
     case JIT_ROTATION_MANUAL:
 	return "manual";
-    case JIT_ROTATION_POLICY_CHANGE:
-	return "policy-change";
     case JIT_ROTATION_PROTECTION_CHANGE:
 	return "protection-change";
-    case JIT_ROTATION_REGION_SPECIALIZATION:
-	return "region-specialization";
     case JIT_ROTATION_NONE:
     default:
 	return "none";
@@ -1977,15 +1982,108 @@ jit_rotation_reason_name(JITRotationReason reason)
 }
 
 static size_t
-jit_pool_reclaimable_bytes(void)
+jit_context_reclaimable_bytes(JITPool *pool)
 {
     size_t bytes = 0;
 
-    if (jit_shared_pool.context)
-	bytes += _MIR_code_allocated_size(jit_shared_pool.context);
-    if (jit_shared_pool.allocator)
-	bytes += jit_shared_pool.allocator->live_bytes;
+    if (pool->context)
+	bytes += _MIR_code_allocated_size(pool->context);
+    if (pool->allocator)
+	bytes += pool->allocator->live_bytes;
     return bytes;
+}
+
+static size_t
+jit_pool_reclaimable_bytes(void)
+{
+    size_t bytes = 0;
+    unsigned i;
+
+    for (i = 0; i < JIT_CONTEXT_COUNT; i++)
+	bytes += jit_context_reclaimable_bytes(&jit_pools[i]);
+    return bytes;
+}
+
+static size_t
+jit_pool_target_bytes(void)
+{
+    return jit_pool_policy.max_pool_bytes
+	- jit_pool_policy.max_pool_bytes / (2 * JIT_CONTEXT_COUNT);
+}
+
+static uint64_t
+jit_pool_resident_programs(void)
+{
+    uint64_t count = 0;
+    unsigned i;
+
+    for (i = 0; i < JIT_CONTEXT_COUNT; i++)
+	count += jit_pools[i].compiled_count;
+    return count;
+}
+
+static void
+jit_pool_advance_activity(void)
+{
+    uint64_t requests = (uint64_t) jit_pool_policy.hot_threshold
+	* MAX(jit_pool_resident_programs(), 1);
+
+    if (requests < 4096)
+	requests = 4096;
+    if (++jit_pool_policy.activity_requests < requests)
+	return;
+    jit_pool_policy.activity_requests = 0;
+    jit_pool_policy.activity_epoch++;
+    if (jit_pool_policy.max_pool_bytes) {
+	size_t used = jit_pool_reclaimable_bytes();
+	size_t target = jit_pool_target_bytes();
+	unsigned adjustment = MAX(jit_pool_policy.effective_hot_threshold / 8, 1);
+
+	if (used < target
+	    && jit_pool_policy.effective_hot_threshold
+	       > jit_pool_policy.hot_threshold) {
+	    if (adjustment > jit_pool_policy.effective_hot_threshold
+		- jit_pool_policy.hot_threshold)
+		adjustment = jit_pool_policy.effective_hot_threshold
+		    - jit_pool_policy.hot_threshold;
+	    jit_pool_policy.effective_hot_threshold -= adjustment;
+	} else if (used > target && jit_pool_policy.compilation_demand
+		   && jit_pool_policy.effective_hot_threshold < UCHAR_MAX) {
+	    if (adjustment > UCHAR_MAX
+		- jit_pool_policy.effective_hot_threshold)
+		adjustment = UCHAR_MAX
+		    - jit_pool_policy.effective_hot_threshold;
+	    jit_pool_policy.effective_hot_threshold += adjustment;
+	}
+    }
+    jit_pool_policy.compilation_demand = 0;
+}
+
+static unsigned
+jit_program_normalized_heat(JITProgram *program)
+{
+    uint64_t elapsed;
+
+    if (!program)
+	return 0;
+    elapsed = jit_pool_policy.activity_epoch - program->residency_heat_epoch;
+    while (elapsed-- && program->residency_heat)
+	program->residency_heat
+	    = (unsigned char) (program->residency_heat * 7 / 8);
+    program->residency_heat_epoch = jit_pool_policy.activity_epoch;
+    return program->residency_heat;
+}
+
+static void
+jit_program_note_activity(JITProgram *program)
+{
+    if (!program)
+	return;
+    jit_program_normalized_heat(program);
+    if (program->residency_heat < UCHAR_MAX)
+	program->residency_heat++;
+    program->residency_last_use = ++jit_pool_policy.activity_last_use;
+    jit_pool_advance_activity();
 }
 
 static void
@@ -1998,14 +2096,14 @@ jit_pool_request_rotation_reason(JITRotationReason reason)
 static int
 jit_pool_rotation_blocks_native_entry(void)
 {
-    return jit_pool_policy.pending_reason != JIT_ROTATION_NONE
-	&& jit_pool_policy.pending_reason != JIT_ROTATION_REGION_SPECIALIZATION;
+    return jit_pool_policy.pending_reason != JIT_ROTATION_NONE;
 }
 
 int
 jit_perf_map_start(void)
 {
     JITProgram *program;
+    unsigned i;
 
     if (jit_perf_map_file)
 	return 1;
@@ -2016,9 +2114,10 @@ jit_perf_map_start(void)
 	jit_perf_map_filename[0] = '\0';
 	return 0;
     }
-    for (program = jit_shared_pool.active_head; program;
-	 program = program->pool_next)
-	jit_perf_map_write_program(program);
+    for (i = 0; i < JIT_CONTEXT_COUNT; i++)
+	for (program = jit_pools[i].active_head; program;
+	     program = program->pool_next)
+	    jit_perf_map_write_program(program);
     return 1;
 }
 
@@ -2097,40 +2196,70 @@ jit_load_externals(MIR_context_t context)
 }
 
 static int
-jit_ensure_shared_context(void)
+jit_ensure_context(JITPool *pool)
 {
-    if (jit_shared_pool.context)
+    if (pool->context)
 	return 1;
-    jit_shared_pool.allocator = jit_mir_allocator_new();
-    if (!jit_shared_pool.allocator)
+    pool->allocator = jit_mir_allocator_new();
+    if (!pool->allocator)
 	return 0;
-    jit_shared_pool.context = MIR_init2(&jit_shared_pool.allocator->interface, 0);
-    if (!jit_shared_pool.context) {
-	jit_mir_allocator_free(jit_shared_pool.allocator);
-	jit_shared_pool.allocator = 0;
+    pool->context = MIR_init2(&pool->allocator->interface, 0);
+    if (!pool->context) {
+	jit_mir_allocator_free(pool->allocator);
+	pool->allocator = 0;
 	return 0;
     }
-    jit_load_externals(jit_shared_pool.context);
+    pool->generation = jit_next_pool_generation++;
+    if (jit_next_pool_generation == 0)
+	jit_next_pool_generation = 1;
+    jit_load_externals(pool->context);
     if (jit_pool_policy.generation_started_at == 0)
 	jit_pool_policy.generation_started_at = time(0);
     return 1;
 }
 
+static JITPool *
+jit_pool_select_compile(unsigned *index)
+{
+    JITPool *best = &jit_pools[0];
+    size_t best_bytes = jit_context_reclaimable_bytes(best);
+    unsigned i;
+
+    for (i = 1; i < JIT_CONTEXT_COUNT; i++) {
+	size_t bytes = jit_context_reclaimable_bytes(&jit_pools[i]);
+
+	if (bytes < best_bytes) {
+	    best = &jit_pools[i];
+	    best_bytes = bytes;
+	}
+    }
+    if (index)
+	*index = best - jit_pools;
+    return best;
+}
+
 static void
 jit_pool_register(JITProgram *program)
 {
-    if (!program || program->pool_generation == jit_shared_pool.generation)
+    JITPool *pool;
+
+    if (!program || program->pool_index >= JIT_CONTEXT_COUNT)
 	return;
-    program->pool_generation = jit_shared_pool.generation;
-    program->pool_prev = jit_shared_pool.active_tail;
+    pool = &jit_pools[program->pool_index];
+    if (program->pool_generation == pool->generation
+	&& (pool->active_head == program || program->pool_prev
+	    || program->pool_next))
+	return;
+    program->pool_generation = pool->generation;
+    program->pool_prev = pool->active_tail;
     program->pool_next = 0;
-    if (jit_shared_pool.active_tail)
-	jit_shared_pool.active_tail->pool_next = program;
+    if (pool->active_tail)
+	pool->active_tail->pool_next = program;
     else
-	jit_shared_pool.active_head = program;
-    jit_shared_pool.active_tail = program;
-    jit_shared_pool.compiled_count++;
-    jit_shared_pool.total_machine_code_bytes += program->machine_code_len;
+	pool->active_head = program;
+    pool->active_tail = program;
+    pool->compiled_count++;
+    pool->total_machine_code_bytes += program->machine_code_len;
     jit_perf_map_write_program(program);
     if (jit_pool_policy.max_pool_bytes
 	&& jit_pool_reclaimable_bytes() >= jit_pool_policy.max_pool_bytes)
@@ -2140,37 +2269,133 @@ jit_pool_register(JITProgram *program)
 static void
 jit_pool_unregister(JITProgram *program)
 {
-    if (!program || program->pool_generation != jit_shared_pool.generation) {
+    JITPool *pool;
+
+    if (!program || program->pool_index >= JIT_CONTEXT_COUNT) {
 	if (program) {
 	    program->pool_generation = 0;
+	    program->pool_index = JIT_NO_POOL;
 	    program->pool_prev = 0;
 	    program->pool_next = 0;
 	}
 	return;
     }
+    pool = &jit_pools[program->pool_index];
+    if (program->pool_generation != pool->generation) {
+	program->pool_generation = 0;
+	program->pool_index = JIT_NO_POOL;
+	program->pool_prev = program->pool_next = 0;
+	return;
+    }
     if (program->pool_prev)
 	program->pool_prev->pool_next = program->pool_next;
     else
-	jit_shared_pool.active_head = program->pool_next;
+	pool->active_head = program->pool_next;
     if (program->pool_next)
 	program->pool_next->pool_prev = program->pool_prev;
     else
-	jit_shared_pool.active_tail = program->pool_prev;
-    if (jit_shared_pool.compiled_count > 0)
-	jit_shared_pool.compiled_count--;
-    if (jit_shared_pool.total_machine_code_bytes >= program->machine_code_len)
-	jit_shared_pool.total_machine_code_bytes -= program->machine_code_len;
+	pool->active_tail = program->pool_prev;
+    if (pool->compiled_count > 0)
+	pool->compiled_count--;
+    if (pool->total_machine_code_bytes >= program->machine_code_len)
+	pool->total_machine_code_bytes -= program->machine_code_len;
     else
-	jit_shared_pool.total_machine_code_bytes = 0;
+	pool->total_machine_code_bytes = 0;
     program->pool_generation = 0;
+    program->pool_index = JIT_NO_POOL;
     program->pool_prev = 0;
     program->pool_next = 0;
 }
 
 static void
+jit_context_rotate(unsigned index)
+{
+    JITPool *pool = &jit_pools[index];
+    JITProgram *current = pool->active_head;
+
+    while (current) {
+	JITProgram *next = current->pool_next;
+
+	current->state = JIT_STATE_PENDING;
+	current->native_function = 0;
+	current->machine_code = 0;
+	current->machine_code_len = 0;
+	current->pool_generation = jit_pool_policy.logical_generation;
+	current->pool_index = JIT_NO_POOL;
+	if (jit_program_normalized_heat(current)
+	    >= jit_pool_policy.hot_threshold)
+	    current->warmup_count = jit_pool_policy.effective_hot_threshold;
+	current->pool_prev = current->pool_next = 0;
+	current = next;
+    }
+    pool->active_head = pool->active_tail = 0;
+    pool->compiled_count = 0;
+    pool->total_machine_code_bytes = 0;
+    if (pool->context)
+	MIR_finish(pool->context);
+    if (pool->allocator)
+	jit_mir_allocator_free(pool->allocator);
+    memset(pool, 0, sizeof(*pool));
+}
+
+static unsigned
+jit_pool_select_victim(void)
+{
+    unsigned victim = 0, i;
+    uint64_t victim_heat = UINT64_MAX;
+    size_t victim_bytes = 1;
+
+    for (i = 0; i < JIT_CONTEXT_COUNT; i++) {
+	JITProgram *program;
+	uint64_t heat = 0;
+	size_t bytes = jit_context_reclaimable_bytes(&jit_pools[i]);
+
+	if (!bytes)
+	    continue;
+	for (program = jit_pools[i].active_head; program;
+	     program = program->pool_next)
+	    heat += jit_program_normalized_heat(program);
+	if (victim_heat == UINT64_MAX
+	    || heat * victim_bytes < victim_heat * bytes) {
+	    victim = i;
+	    victim_heat = heat;
+	    victim_bytes = bytes;
+	}
+    }
+    return victim;
+}
+
+static void
+jit_pool_evict_one(void)
+{
+    unsigned victim = jit_pool_select_victim();
+    JITPoolStats before;
+
+    jit_pool_stats(&before);
+    jit_continuation_materialize_all();
+
+    jit_pool_stats(&before);
+    if (before.native_chain_active_frames != 0)
+	panic("Evicting JIT context with active native frames");
+    jit_context_rotate(victim);
+    jit_pool_policy.pending_reason = jit_pool_policy.max_pool_bytes
+	&& jit_pool_reclaimable_bytes() > jit_pool_target_bytes()
+	? JIT_ROTATION_MEMORY_LIMIT : JIT_ROTATION_NONE;
+    jit_pool_policy.region_specialization_rotations = 0;
+    jit_pool_policy.rotations++;
+    jit_pool_policy.last_reason = JIT_ROTATION_MEMORY_LIMIT;
+    oklog("JIT_POOL_EVICT: context=%u active=%"PRIu64
+	  " reclaimable=%lu remaining=%lu max=%lu\n", victim,
+	  before.active_programs,
+	  (unsigned long) (before.total_native_allocated_bytes
+			   + before.total_mir_heap_bytes),
+	  (unsigned long) jit_pool_reclaimable_bytes(),
+	  (unsigned long) jit_pool_policy.max_pool_bytes);
+}
+
+static void
 jit_pool_rotate(JITRotationReason reason, int log_rotation)
 {
-    JITProgram *current = jit_shared_pool.active_head;
     JITPoolStats before;
     time_t now = time(0);
     time_t elapsed = 0;
@@ -2185,41 +2410,18 @@ jit_pool_rotate(JITRotationReason reason, int log_rotation)
     if (before.native_chain_active_frames != 0)
 	panic("Rotating JIT pool with active native frames");
 
-    while (current) {
-	JITProgram *next = current->pool_next;
-	current->state = JIT_STATE_PENDING;
-	current->native_function = 0;
-	current->machine_code = 0;
-	current->machine_code_len = 0;
-	current->pool_generation = 0;
-	current->warmup_count = 0;
-	current->pool_prev = 0;
-	current->pool_next = 0;
-	current = next;
+    {
+	unsigned i;
+
+	for (i = 0; i < JIT_CONTEXT_COUNT; i++)
+	    jit_context_rotate(i);
     }
-    jit_shared_pool.active_head = 0;
-    jit_shared_pool.active_tail = 0;
-    jit_shared_pool.compiled_count = 0;
-    jit_shared_pool.total_machine_code_bytes = 0;
-    if (jit_shared_pool.context) {
-	MIR_finish(jit_shared_pool.context);
-	jit_shared_pool.context = 0;
-    }
-    if (jit_shared_pool.allocator) {
-	jit_mir_allocator_free(jit_shared_pool.allocator);
-	jit_shared_pool.allocator = 0;
-    }
-    jit_shared_pool.generation++;
-    if (jit_shared_pool.generation == 0)
-	jit_shared_pool.generation = 1;
+    jit_pool_policy.logical_generation++;
+    if (jit_pool_policy.logical_generation == 0)
+	jit_pool_policy.logical_generation = 1;
     jit_pool_policy.generation_started_at = now;
     jit_pool_policy.pending_reason = JIT_ROTATION_NONE;
-    if (reason == JIT_ROTATION_REGION_SPECIALIZATION) {
-	if (jit_pool_policy.region_specialization_rotations < UINT_MAX)
-	    jit_pool_policy.region_specialization_rotations++;
-    }
-    else
-	jit_pool_policy.region_specialization_rotations = 0;
+    jit_pool_policy.region_specialization_rotations = 0;
     if (log_rotation) {
 	jit_pool_policy.rotations++;
 	jit_pool_policy.last_reason = reason;
@@ -2227,7 +2429,7 @@ jit_pool_rotate(JITRotationReason reason, int log_rotation)
 	      " elapsed=%lds active=%"PRIu64" machine=%lu native=%lu"
 	      " mir_heap=%lu reclaimable=%lu max=%lu hot_threshold=%u\n",
 	      jit_rotation_reason_name(reason), before.generation,
-	      jit_shared_pool.generation, (long) elapsed,
+	      jit_pool_policy.logical_generation, (long) elapsed,
 	      before.active_programs,
 	      (unsigned long) before.total_machine_code_bytes,
 	      (unsigned long) before.total_native_allocated_bytes,
@@ -2256,8 +2458,30 @@ jit_pool_maintain(void)
 {
     JITRotationReason reason = jit_pool_policy.pending_reason;
 
-    if (reason != JIT_ROTATION_NONE)
-	jit_pool_rotate(reason, 1);
+    if (jit_specialization_queue) {
+	JITProgram *program;
+
+	jit_continuation_materialize_all();
+	while ((program = jit_specialization_queue)) {
+	    jit_specialization_queue = program->specialization_next;
+	    program->specialization_next = 0;
+	    program->specialization_pending = 0;
+	    if (program->specialization_epoch != db_dispatch_epoch())
+		continue;
+	    if (program->state == JIT_STATE_COMPILED) {
+		jit_program_release_native(program);
+		program->state = JIT_STATE_PENDING;
+		program->warmup_count = jit_pool_policy.hot_threshold;
+	    }
+	}
+    }
+
+    if (reason != JIT_ROTATION_NONE) {
+	if (reason == JIT_ROTATION_MEMORY_LIMIT)
+	    jit_pool_evict_one();
+	else
+	    jit_pool_rotate(reason, 1);
+    }
 }
 
 int
@@ -2267,13 +2491,14 @@ jit_pool_set_policy(unsigned hot_threshold, size_t max_pool_bytes)
 
     if (hot_threshold < 1 || hot_threshold > UCHAR_MAX)
 	return 0;
-    if (hot_threshold != jit_pool_policy.hot_threshold
-	&& (jit_shared_pool.context || jit_shared_pool.compiled_count))
-	jit_pool_request_rotation_reason(JIT_ROTATION_POLICY_CHANGE);
     jit_pool_policy.hot_threshold = hot_threshold;
+    jit_pool_policy.effective_hot_threshold = hot_threshold;
     jit_pool_policy.max_pool_bytes = max_pool_bytes;
+    if (jit_pool_policy.pending_reason == JIT_ROTATION_MEMORY_LIMIT
+	&& (!max_pool_bytes || current_bytes < max_pool_bytes))
+	jit_pool_policy.pending_reason = JIT_ROTATION_NONE;
     if (max_pool_bytes && current_bytes >= max_pool_bytes)
-	jit_pool_request_rotation_reason(JIT_ROTATION_POLICY_CHANGE);
+	jit_pool_request_rotation_reason(JIT_ROTATION_MEMORY_LIMIT);
     return 1;
 }
 
@@ -2300,8 +2525,12 @@ jit_pool_policy_stats(JITPoolPolicyStats *stats)
     if (stats->generation_started_at > 0 && now >= stats->generation_started_at)
 	stats->generation_age = now - stats->generation_started_at;
     stats->hot_threshold = jit_pool_policy.hot_threshold;
+    stats->effective_hot_threshold = jit_pool_policy.effective_hot_threshold;
+    stats->context_count = JIT_CONTEXT_COUNT;
     stats->region_specialization_rotations =
 	jit_pool_policy.region_specialization_rotations;
+    stats->activity_requests = jit_pool_policy.activity_requests;
+    stats->activity_epoch = jit_pool_policy.activity_epoch;
     stats->rotation_pending
 	= jit_pool_policy.pending_reason != JIT_ROTATION_NONE;
     stats->last_rotation_reason
@@ -2324,24 +2553,37 @@ jit_pool_stats(JITPoolStats *stats)
     if (!stats)
 	return;
     memset(stats, 0, sizeof(*stats));
-    stats->generation = jit_shared_pool.generation;
-    stats->active_programs = jit_shared_pool.compiled_count;
-    stats->total_machine_code_bytes = jit_shared_pool.total_machine_code_bytes;
-    if (jit_shared_pool.context)
-	stats->total_native_allocated_bytes
-	    = _MIR_code_allocated_size(jit_shared_pool.context);
-    if (jit_shared_pool.allocator)
-	stats->total_mir_heap_bytes = jit_shared_pool.allocator->live_bytes;
+    stats->generation = jit_pool_policy.logical_generation;
+    {
+	unsigned i;
+
+	for (i = 0; i < JIT_CONTEXT_COUNT; i++) {
+	    JITPool *pool = &jit_pools[i];
+
+	    stats->active_programs += pool->compiled_count;
+	    stats->total_machine_code_bytes += pool->total_machine_code_bytes;
+	    if (pool->context)
+		stats->total_native_allocated_bytes
+		    += _MIR_code_allocated_size(pool->context);
+	    if (pool->allocator)
+		stats->total_mir_heap_bytes += pool->allocator->live_bytes;
+	}
+    }
     for (frame = continuation_frames; frame; frame = frame->next) {
 	stats->active_continuations++;
 	stats->continuation_bytes += sizeof(*frame)
 	    + sizeof(Var) * (frame->retained_capacity
 		+ frame->spare_retained_capacity);
     }
-    for (program = jit_shared_pool.active_head; program;
-	 program = program->pool_next) {
-	stats->native_chain_active_frames += program->active_native_frames;
-	stats->native_chain_frame_bytes += program->active_native_frame_bytes;
+    {
+	unsigned i;
+
+	for (i = 0; i < JIT_CONTEXT_COUNT; i++)
+	    for (program = jit_pools[i].active_head; program;
+		 program = program->pool_next) {
+		stats->native_chain_active_frames += program->active_native_frames;
+		stats->native_chain_frame_bytes += program->active_native_frame_bytes;
+	    }
     }
 }
 
@@ -10359,6 +10601,7 @@ jit_program_unsupported_with_diagnostic(const char *reason, const char *diagnost
     JITProgram *program = mymalloc(sizeof(JITProgram), M_PROGRAM);
 
     memset(program, 0, sizeof(JITProgram));
+    program->pool_index = JIT_NO_POOL;
     program->state = JIT_STATE_UNSUPPORTED;
     program->reason = str_dup(reason ? reason : "unsupported-program");
     program->diagnostic = str_dup(diagnostic ? diagnostic : "none");
@@ -10551,6 +10794,17 @@ jit_program_free(JITProgram *program)
 
     if (!program)
 	return;
+
+    if (program->specialization_pending) {
+	JITProgram **link = &jit_specialization_queue;
+
+	while (*link && *link != program)
+	    link = &(*link)->specialization_next;
+	if (*link)
+	    *link = program->specialization_next;
+	program->specialization_pending = 0;
+	program->specialization_next = 0;
+    }
 
     jit_program_release_native(program);
     jit_program_release_ir(program, 0);
@@ -10849,11 +11103,18 @@ jit_program_stats(JITProgram *program, JITProgramStats *stats)
     stats->native_chain_active_frames = program->active_native_frames;
     stats->native_chain_frame_bytes = program->active_native_frame_bytes;
     stats->machine_code_bytes = program->machine_code_len;
-    if (jit_shared_pool.context && jit_shared_pool.total_machine_code_bytes > 0
+    stats->pool_index = program->pool_index < JIT_CONTEXT_COUNT
+	? (int) program->pool_index : -1;
+    stats->residency_heat = jit_program_normalized_heat(program);
+    stats->residency_heat_epoch = program->residency_heat_epoch;
+    if (program->pool_index < JIT_CONTEXT_COUNT
+	&& jit_pools[program->pool_index].context
+	&& jit_pools[program->pool_index].total_machine_code_bytes > 0
 	&& program->machine_code_len > 0) {
-	size_t total_allocated = _MIR_code_allocated_size(jit_shared_pool.context);
+	JITPool *pool = &jit_pools[program->pool_index];
+	size_t total_allocated = _MIR_code_allocated_size(pool->context);
 	size_t share = (size_t) (((uint64_t) total_allocated * program->machine_code_len)
-				 / jit_shared_pool.total_machine_code_bytes);
+				 / pool->total_machine_code_bytes);
 	stats->native_allocated_bytes = share > program->machine_code_len
 	    ? share : program->machine_code_len;
     } else {
@@ -10929,7 +11190,8 @@ jit_program_compiled_generation(JITProgram *program)
 {
     return program && program->state == JIT_STATE_COMPILED
 	&& program->native_function
-	&& program->pool_generation == jit_shared_pool.generation
+	&& program->pool_index < JIT_CONTEXT_COUNT
+	&& program->pool_generation == jit_pools[program->pool_index].generation
 	&& program->protection_generation == builtin_protection_generation()
 	&& !jit_pool_rotation_blocks_native_entry()
 	? program->pool_generation : 0;
@@ -11197,6 +11459,47 @@ jit_region_site_reset(JITProgram *program, int map_id)
     site->receiver_class = NOTHING;
 }
 
+static int
+jit_region_depends_on(JITProgram *root, JITProgram *target, int depth,
+		      uint64_t dispatch_epoch)
+{
+    JITRegionSite *site;
+
+    if (root == target)
+	return 1;
+    if (!root || depth >= JIT_REGION_MAX_DEPTH)
+	return 0;
+    for (site = root->region_sites; site; site = site->next)
+	if (site->dispatch_epoch == dispatch_epoch && site->target_program
+	    && site->target_program->jit
+	    && jit_region_depends_on(site->target_program->jit, target,
+		depth + 1, dispatch_epoch))
+	    return 1;
+    return 0;
+}
+
+static void
+jit_region_request_specialization(JITProgram *changed)
+{
+    uint64_t dispatch_epoch = db_dispatch_epoch();
+    unsigned i;
+
+    for (i = 0; i < JIT_CONTEXT_COUNT; i++) {
+	JITProgram *program;
+
+	for (program = jit_pools[i].active_head; program;
+	     program = program->pool_next)
+	    if (!program->specialization_pending
+		&& jit_region_depends_on(program, changed, 0,
+		    dispatch_epoch)) {
+		program->specialization_pending = 1;
+		program->specialization_epoch = dispatch_epoch;
+		program->specialization_next = jit_specialization_queue;
+		jit_specialization_queue = program;
+	    }
+    }
+}
+
 int
 jit_region_site_record_hit(JITProgram *program, int map_id,
 			   JITProgram *target)
@@ -11216,7 +11519,7 @@ jit_region_site_record_hit(JITProgram *program, int map_id,
 
 	if (resume && resume->cached_program
 	    && resume->cached_program->jit == target
-	    && resume->cached_dispatch_epoch) {
+	    && resume->cached_dispatch_epoch == db_dispatch_epoch()) {
 	    site->target_program = resume->cached_program;
 	    site->dispatch_epoch = resume->cached_dispatch_epoch;
 	    site->receiver_class = resume->cached_class;
@@ -11225,11 +11528,9 @@ jit_region_site_record_hit(JITProgram *program, int map_id,
     if (site->hits >= JIT_REGION_HOT_THRESHOLD
 	&& site->target_program
 	&& !site->rotation_requested
-	&& jit_pool_policy.region_specialization_rotations
-	       < JIT_MAX_REGION_SPECIALIZATION_ROTATIONS
 	&& program->state == JIT_STATE_COMPILED) {
 	site->rotation_requested = 1;
-	jit_pool_request_rotation_reason(JIT_ROTATION_REGION_SPECIALIZATION);
+	jit_region_request_specialization(program);
     }
     return site->hits >= JIT_REGION_HOT_THRESHOLD && site->target_program;
 }
@@ -11270,15 +11571,16 @@ jit_region_site_mark_spliced(JITProgram *program, int map_id)
     JITRegionSite *site = jit_region_site(program, map_id, 0);
 
     if (site)
-	site->spliced_generation = jit_shared_pool.generation;
+	site->spliced_generation = program->pool_generation;
 }
 
 static void
 jit_program_sync_warmup(JITProgram *program)
 {
     if (program->state == JIT_STATE_PENDING
-	&& program->pool_generation != jit_shared_pool.generation) {
-	program->pool_generation = jit_shared_pool.generation;
+	&& program->pool_generation != jit_pool_policy.logical_generation) {
+	program->pool_generation = jit_pool_policy.logical_generation;
+	program->pool_index = JIT_NO_POOL;
 	program->warmup_count = 0;
     }
 }
@@ -11292,10 +11594,16 @@ jit_program_admit_interpreter_entry(JITProgram *program)
 	return 1;
     if (program->state != JIT_STATE_PENDING)
 	return 0;
+    jit_program_note_activity(program);
+    jit_pool_policy.compilation_demand = 1;
     jit_program_sync_warmup(program);
-    if (program->warmup_count < jit_pool_policy.hot_threshold)
+    if (program->residency_heat >= jit_pool_policy.hot_threshold
+	&& (unsigned) program->warmup_count + 1
+	   < jit_pool_policy.effective_hot_threshold)
+	program->warmup_count = jit_pool_policy.effective_hot_threshold - 1;
+    if (program->warmup_count < jit_pool_policy.effective_hot_threshold)
 	program->warmup_count++;
-    return program->warmup_count >= jit_pool_policy.hot_threshold
+    return program->warmup_count >= jit_pool_policy.effective_hot_threshold
 	&& !jit_pool_rotation_blocks_native_entry();
 }
 
@@ -11311,9 +11619,9 @@ jit_program_claim_native_entry(JITProgram *program)
 	return 0;
     jit_program_sync_warmup(program);
     if ((unsigned) program->warmup_count + 1
-	< jit_pool_policy.hot_threshold)
+	< jit_pool_policy.effective_hot_threshold)
 	return 0;
-    program->warmup_count = jit_pool_policy.hot_threshold;
+    program->warmup_count = jit_pool_policy.effective_hot_threshold;
     return 1;
 }
 
@@ -11476,8 +11784,10 @@ int
 jit_program_compile(JITProgram *program)
 {
     MIRBuild build;
+    JITPool *pool;
     struct timeval started, finished;
     unsigned generation;
+    unsigned pool_index;
 
     if (!program || program->state == JIT_STATE_UNSUPPORTED
 	|| program->state == JIT_STATE_FAILED)
@@ -11488,7 +11798,9 @@ jit_program_compile(JITProgram *program)
 	jit_pool_rotate(JIT_ROTATION_PROTECTION_CHANGE, 1);
     }
     if (program->state == JIT_STATE_COMPILED
-	&& program->pool_generation != jit_shared_pool.generation) {
+	&& (program->pool_index >= JIT_CONTEXT_COUNT
+	    || program->pool_generation
+	       != jit_pools[program->pool_index].generation)) {
 	jit_program_release_native(program);
 	program->state = JIT_STATE_PENDING;
     }
@@ -11501,7 +11813,14 @@ jit_program_compile(JITProgram *program)
     if (program->compile_attempts < UINT32_MAX)
 	program->compile_attempts++;
     gettimeofday(&started, 0);
-    if (!jit_ensure_shared_context() || !build_mir(program, &build, jit_shared_pool.context)) {
+    pool = jit_pool_select_compile(&pool_index);
+    if (!jit_ensure_context(pool)) {
+	program->pool_index = JIT_NO_POOL;
+	return 0;
+    }
+    program->pool_index = pool_index;
+    program->pool_generation = pool->generation;
+    if (!build_mir(program, &build, pool->context)) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
@@ -11513,19 +11832,21 @@ jit_program_compile(JITProgram *program)
 	if (program->diagnostic)
 	    free_str(program->diagnostic);
 	program->diagnostic = str_dup("mir build module failed");
+	program->pool_index = JIT_NO_POOL;
+	program->pool_generation = 0;
 	return 0;
     }
-    MIR_load_module(jit_shared_pool.context, build.module);
-    MIR_gen_init(jit_shared_pool.context);
-    MIR_gen_set_optimize_level(jit_shared_pool.context, 1);
-    MIR_link(jit_shared_pool.context, MIR_set_gen_interface, 0);
-    program->native_function = MIR_gen(jit_shared_pool.context, build.function);
+    MIR_load_module(pool->context, build.module);
+    MIR_gen_init(pool->context);
+    MIR_gen_set_optimize_level(pool->context, 1);
+    MIR_link(pool->context, MIR_set_gen_interface, 0);
+    program->native_function = MIR_gen(pool->context, build.function);
     if (!program->native_function) {
 	gettimeofday(&finished, 0);
 	program->compile_time_us += elapsed_us(&started, &finished);
 	if (program->compile_failures < UINT32_MAX)
 	    program->compile_failures++;
-	MIR_gen_finish(jit_shared_pool.context);
+	MIR_gen_finish(pool->context);
 	program->state = JIT_STATE_FAILED;
 	if (program->reason)
 	    free_str(program->reason);
@@ -11533,15 +11854,16 @@ jit_program_compile(JITProgram *program)
 	if (program->diagnostic)
 	    free_str(program->diagnostic);
 	program->diagnostic = str_dup("mir generator failed");
+	program->pool_index = JIT_NO_POOL;
+	program->pool_generation = 0;
 	return 0;
     }
     program->machine_code = build.function->u.func->machine_code;
     program->machine_code_len = build.function->u.func->machine_code_len;
-    MIR_gen_finish(jit_shared_pool.context);
+    MIR_gen_finish(pool->context);
     jit_program_finalize_runtime_layout(program);
     program->protection_generation = generation;
     program->state = JIT_STATE_COMPILED;
-    program->pool_generation = 0;
     program->warmup_count = 0;
     jit_pool_register(program);
     gettimeofday(&finished, 0);
@@ -13842,6 +14164,7 @@ void
 jit_profile_record_entry(JITProgram *program)
 {
     total_jit_entries++;
+    jit_program_note_activity(program);
 
     if (jit_profile_detail && program) {
 	jit_program_usage(program);

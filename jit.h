@@ -225,6 +225,9 @@ typedef struct {
     size_t machine_code_bytes;
     size_t native_allocated_bytes;
     size_t accounted_bytes;
+    int pool_index;
+    unsigned residency_heat;
+    uint64_t residency_heat_epoch;
 } JITProgramStats;
 
 typedef struct {
@@ -251,7 +254,11 @@ typedef struct {
     time_t generation_started_at;
     time_t generation_age;
     unsigned hot_threshold;
+    unsigned effective_hot_threshold;
+    unsigned context_count;
     unsigned region_specialization_rotations;
+    uint64_t activity_requests;
+    uint64_t activity_epoch;
     int rotation_pending;
     const char *last_rotation_reason;
 } JITPoolPolicyStats;
