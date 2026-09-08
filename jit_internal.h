@@ -483,12 +483,12 @@ extern Var *jit_rt_make_fixed_list_head(int64_t, int, int);
 extern Var *jit_rt_make_empty_list(void);
 extern Var *jit_rt_list_append(Var *, int64_t, int);
 extern Var *jit_rt_list_append_owned(Var *, unsigned *, int, Var *, int64_t,
-				     int);
+				     int, int);
 extern Var *jit_rt_fixed_list_append_owned(Var *, unsigned *, int, Var *, int,
 					   int64_t, int);
 extern Var *jit_rt_fixed_list_store(Var *, int, int64_t, int);
-extern void jit_rt_owned_replace(Var *, int, int64_t, int);
-extern void jit_rt_owned_move(Var *, int, int);
+extern void jit_rt_owned_replace(Var *, unsigned *, int, int64_t, int);
+extern void jit_rt_owned_move(Var *, unsigned *, int, int);
 extern void jit_rt_discard_owned(Var *, int, int64_t, int);
 extern void jit_rt_retain_raw(int64_t, int);
 extern Var *jit_rt_list_index_set(Var *, int, Var *, int64_t, int64_t,

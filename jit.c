@@ -319,9 +319,10 @@ jit_rt_list_append(Var *list, int64_t elem_raw, int elem_type)
 Var *
 jit_rt_list_append_owned(Var *owned_values, unsigned *home_capacities,
 			 int owner, Var *list,
-			 int64_t elem_raw, int elem_type)
+			 int64_t elem_raw, int elem_type, int reserve)
 {
     Var elem, res;
+    int length;
 
     assert(owned_values && owner >= 0);
     assert(owned_values[owner].type == TYPE_NONE
@@ -332,6 +333,21 @@ jit_rt_list_append_owned(Var *owned_values, unsigned *home_capacities,
 	res = owned_values[owner];
 	owned_values[owner].type = TYPE_NONE;
 	owned_values[owner].v.num = 0;
+	length = (int) res.v.list[0].v.num;
+	if (reserve > 1 && refcount(res.v.list) == 1
+	    && length <= INT_MAX - reserve
+	    && home_capacities[owner] < (unsigned) (length + reserve)) {
+	    home_capacities[owner] = length + reserve;
+	    res.v.list = myrealloc(res.v.list,
+		(sizeof(Var) * (home_capacities[owner] + 1)), M_LIST);
+	}
+	if (refcount(res.v.list) == 1
+	    && home_capacities[owner] > (unsigned) length) {
+	    res.v.list[++length] = elem;
+	    res.v.list[0].v.num = length;
+	    owned_values[owner] = res;
+	    return res.v.list;
+	}
     } else {
 	res.type = TYPE_LIST;
 	res.v.list = list;
@@ -393,21 +409,26 @@ jit_rt_fixed_list_store(Var *list, int index, int64_t elem_raw, int elem_type)
 }
 
 void
-jit_rt_owned_replace(Var *owned_values, int value, int64_t raw, int type)
+jit_rt_owned_replace(Var *owned_values, unsigned *home_capacities,
+		     int value, int64_t raw, int type)
 {
     free_var(owned_values[value]);
     owned_values[value] = raw_to_var(raw, type);
+    home_capacities[value] = 0;
 }
 
 void
-jit_rt_owned_move(Var *owned_values, int destination, int source)
+jit_rt_owned_move(Var *owned_values, unsigned *home_capacities,
+		  int destination, int source)
 {
     if (destination == source)
 	return;
     free_var(owned_values[destination]);
     owned_values[destination] = owned_values[source];
+    home_capacities[destination] = home_capacities[source];
     owned_values[source].type = TYPE_NONE;
     owned_values[source].v.num = 0;
+    home_capacities[source] = 0;
 }
 
 Var *
@@ -447,6 +468,15 @@ jit_rt_list_index_set(Var *env, int local_id, Var *list, int64_t index,
     if (index < 1 || index > list[0].v.num) {
 	*err_out = E_RANGE;
 	return 0;
+    }
+
+    if (!(value_type & TYPE_COMPLEX_FLAG)
+	&& env[local_id].type == TYPE_LIST
+	&& env[local_id].v.list == list && refcount(list) == 1) {
+	free_var(list[index]);
+	list[index] = raw_to_var(value_raw, value_type);
+	*err_out = E_NONE;
+	return list;
     }
 
     base.type = TYPE_LIST;
@@ -5040,6 +5070,72 @@ jit_region_cfg_return_owner(JITRegionCFG *region, int result)
 }
 
 static void
+append_list_append_owned(MIRBuild *build, MIR_reg_t result,
+	MIR_reg_t owned_values, int owner, MIR_op_t list, MIR_op_t element,
+	MIR_op_t element_type, int reserve)
+{
+    append(build, MIR_new_call_insn(build->context, 10,
+	MIR_new_ref_op(build->context, build->proto_list_append_owned),
+	MIR_new_ref_op(build->context, build->import_list_append_owned),
+	MIR_new_reg_op(build->context, result),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_int_op(build->context, owner), list, element, element_type,
+	MIR_new_int_op(build->context, reserve)));
+}
+
+static void
+append_fixed_list_append_owned(MIRBuild *build, MIR_reg_t result,
+	MIR_reg_t owned_values, int owner, MIR_op_t list, MIR_op_t index,
+	MIR_op_t element, MIR_op_t element_type)
+{
+    append(build, MIR_new_call_insn(build->context, 10,
+	MIR_new_ref_op(build->context, build->proto_fixed_list_append_owned),
+	MIR_new_ref_op(build->context, build->import_fixed_list_append_owned),
+	MIR_new_reg_op(build->context, result),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_int_op(build->context, owner), list, index, element,
+	element_type));
+}
+
+static void
+append_owned_replace(MIRBuild *build, MIR_reg_t owned_values, int owner,
+	MIR_op_t value, MIR_op_t type)
+{
+    append(build, MIR_new_call_insn(build->context, 7,
+	MIR_new_ref_op(build->context, build->proto_owned_replace),
+	MIR_new_ref_op(build->context, build->import_owned_replace),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_int_op(build->context, owner), value, type));
+}
+
+static void
+append_owned_move(MIRBuild *build, MIR_reg_t owned_values, int destination,
+	int source)
+{
+    append(build, MIR_new_call_insn(build->context, 6,
+	MIR_new_ref_op(build->context, build->proto_owned_move),
+	MIR_new_ref_op(build->context, build->import_owned_move),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_reg_op(build->context, build->home_capacities),
+	MIR_new_int_op(build->context, destination),
+	MIR_new_int_op(build->context, source)));
+}
+
+static void
+append_discard_owned(MIRBuild *build, MIR_reg_t owned_values, int owner,
+	MIR_op_t value, MIR_op_t type)
+{
+    append(build, MIR_new_call_insn(build->context, 6,
+	MIR_new_ref_op(build->context, build->proto_discard_owned),
+	MIR_new_ref_op(build->context, build->import_discard_owned),
+	MIR_new_reg_op(build->context, owned_values),
+	MIR_new_int_op(build->context, owner), value, type));
+}
+
+static void
 append_region_deferred_tail(MIRBuild *build, JITProgram *program,
 	JITInstruction *deferred_tail, MIR_reg_t *values,
 	MIR_reg_t deopt_values, MIR_reg_t owned_values, int *copy_serial)
@@ -5055,16 +5151,10 @@ append_region_deferred_tail(MIRBuild *build, JITProgram *program,
 	? MIR_new_mem_op(build->context, MIR_T_I32,
 	    jit_tag_offset(program, deferred_tail->src2), deopt_values, 0, 1)
 	: MIR_new_int_op(build->context, TYPE_INT);
-    append(build, MIR_new_call_insn(build->context, 9,
-	MIR_new_ref_op(build->context, build->proto_list_append_owned),
-	MIR_new_ref_op(build->context, build->import_list_append_owned),
-	MIR_new_reg_op(build->context, values[deferred_tail->value]),
-	MIR_new_reg_op(build->context, owned_values),
-	MIR_new_reg_op(build->context, build->home_capacities),
-	MIR_new_int_op(build->context,
-	    program->value_owned_slots[deferred_tail->src1]),
+    append_list_append_owned(build, values[deferred_tail->value], owned_values,
+	program->value_owned_slots[deferred_tail->src1],
 	MIR_new_reg_op(build->context, values[deferred_tail->src1]),
-	MIR_new_reg_op(build->context, raw), type));
+	MIR_new_reg_op(build->context, raw), type, 1);
 }
 
 static void
@@ -5265,14 +5355,10 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		    MIR_new_ref_op(build->context, build->import_empty_list),
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value])));
-		append(build, MIR_new_call_insn(build->context, 6,
-		    MIR_new_ref_op(build->context, build->proto_owned_replace),
-		    MIR_new_ref_op(build->context, build->import_owned_replace),
-		    MIR_new_reg_op(build->context, owned_values),
-		    MIR_new_int_op(build->context, owner),
+		append_owned_replace(build, owned_values, owner,
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
-		    MIR_new_int_op(build->context, TYPE_LIST)));
+		    MIR_new_int_op(build->context, TYPE_LIST));
 		continue;
 	    }
 	    if (instruction->kind == HIR_TAC_UNARY
@@ -5302,14 +5388,10 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			MIR_new_reg_op(build->context,
 			    region_values[instruction->value]), source,
 			MIR_new_int_op(build->context, TYPE_INT)));
-		append(build, MIR_new_call_insn(build->context, 6,
-		    MIR_new_ref_op(build->context, build->proto_owned_replace),
-		    MIR_new_ref_op(build->context, build->import_owned_replace),
-		    MIR_new_reg_op(build->context, owned_values),
-		    MIR_new_int_op(build->context, owner),
+		append_owned_replace(build, owned_values, owner,
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
-		    MIR_new_int_op(build->context, TYPE_LIST)));
+		    MIR_new_int_op(build->context, TYPE_LIST));
 		if (instruction->list_capacity > 1)
 		    append(build, MIR_new_insn(build->context, MIR_MOV,
 			MIR_new_mem_op(build->context, MIR_T_I32,
@@ -5344,17 +5426,9 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			    instruction->list_index), element,
 			MIR_new_int_op(build->context, TYPE_INT)));
 		else
-		    append(build, MIR_new_call_insn(build->context, 9,
-			MIR_new_ref_op(build->context,
-			    build->proto_list_append_owned),
-			MIR_new_ref_op(build->context,
-			    build->import_list_append_owned),
-			MIR_new_reg_op(build->context,
-			    region_values[instruction->value]),
-			MIR_new_reg_op(build->context, owned_values),
-			MIR_new_reg_op(build->context, build->home_capacities),
-			MIR_new_int_op(build->context, owner), list, element,
-			MIR_new_int_op(build->context, TYPE_INT)));
+		    append_list_append_owned(build,
+			region_values[instruction->value], owned_values, owner,
+			list, element, MIR_new_int_op(build->context, TYPE_INT), 1);
 		continue;
 	    }
 	    if (instruction->kind == HIR_TAC_BINARY
@@ -5371,14 +5445,10 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		    jit_region_cfg_operand(build, region, instruction->src2,
 			arguments, caller_values, actuals, region_values),
 		    MIR_new_reg_op(build->context, error_out)));
-		append(build, MIR_new_call_insn(build->context, 6,
-		    MIR_new_ref_op(build->context, build->proto_owned_replace),
-		    MIR_new_ref_op(build->context, build->import_owned_replace),
-		    MIR_new_reg_op(build->context, owned_values),
-		    MIR_new_int_op(build->context, owner),
+		append_owned_replace(build, owned_values, owner,
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
-		    MIR_new_int_op(build->context, TYPE_LIST)));
+		    MIR_new_int_op(build->context, TYPE_LIST));
 		continue;
 	    }
 	    if (instruction->kind == HIR_TAC_BINARY
@@ -5538,12 +5608,7 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 	    region_block->result);
 
 	if (source_owner >= 0 && result_owner >= 0)
-	    append(build, MIR_new_call_insn(build->context, 5,
-		MIR_new_ref_op(build->context, build->proto_owned_move),
-		MIR_new_ref_op(build->context, build->import_owned_move),
-		MIR_new_reg_op(build->context, owned_values),
-		MIR_new_int_op(build->context, result_owner),
-		MIR_new_int_op(build->context, source_owner)));
+	    append_owned_move(build, owned_values, result_owner, source_owner);
 	append(build, MIR_new_insn(build->context, MIR_MOV, result,
 		jit_region_cfg_operand(build, region, region_block->result,
 		    arguments, caller_values, actuals, region_values)));
@@ -5770,13 +5835,9 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
 	    MIR_reg_t raw = append_raw_value(build, program, values, raw_value,
 		deopt_values, copy_serial);
 
-	    append(build, MIR_new_call_insn(build->context, 6,
-		MIR_new_ref_op(build->context, build->proto_discard_owned),
-		MIR_new_ref_op(build->context, build->import_discard_owned),
-		MIR_new_reg_op(build->context, owned_values),
-		MIR_new_int_op(build->context, owner),
+	    append_discard_owned(build, owned_values, owner,
 		MIR_new_reg_op(build->context, raw),
-		MIR_new_int_op(build->context, TYPE_LIST)));
+		MIR_new_int_op(build->context, TYPE_LIST));
 	}
     append(build, MIR_new_insn(build->context, MIR_JMP,
 	MIR_new_label_op(build->context, continuation)));
@@ -5835,6 +5896,26 @@ jit_list_tail_consume_mode(JITProgram *program, JITInstruction *tail)
     return program->value_owned_slots[tail->value]
 	== program->value_owned_slots[value]
 	? JIT_LIST_APPEND_CONSUME_HOME : JIT_LIST_APPEND_BORROWED;
+}
+
+static int
+jit_list_tail_reserve(JITProgram *program, JITInstruction *tail)
+{
+    int owner;
+    int reserve = 1;
+
+    if (jit_list_tail_consume_mode(program, tail)
+	!= JIT_LIST_APPEND_CONSUME_HOME)
+	return 1;
+    owner = program->value_owned_slots[tail->src1];
+    while ((tail = jit_unique_list_tail_user(program, tail->value)) != 0) {
+	if (jit_list_tail_consume_mode(program, tail)
+	    != JIT_LIST_APPEND_CONSUME_HOME
+	    || program->value_owned_slots[tail->src1] != owner)
+	    break;
+	reserve++;
+    }
+    return reserve;
 }
 
 static int
@@ -6424,9 +6505,10 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					     MIR_T_I32, "elem_type");
     build->import_list_append = MIR_new_import(build->context, "jit_rt_list_append");
     build->proto_list_append_owned = MIR_new_proto(build->context,
-	"proto_list_append_owned", 1, &res_p, 6, MIR_T_P, "owned_values",
+	"proto_list_append_owned", 1, &res_p, 7, MIR_T_P, "owned_values",
 	MIR_T_P, "home_capacities", MIR_T_I32, "owner", MIR_T_P, "l",
-	MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type");
+	MIR_T_I64, "elem_raw", MIR_T_I32, "elem_type",
+	MIR_T_I32, "reserve");
     build->import_list_append_owned = MIR_new_import(build->context,
 	"jit_rt_list_append_owned");
     build->proto_fixed_list_append_owned = MIR_new_proto(build->context,
@@ -6443,13 +6525,15 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	"jit_rt_fixed_list_store");
 
     build->proto_owned_replace = MIR_new_proto(build->context,
-	"proto_owned_replace", 0, 0, 4, MIR_T_P, "owned_values",
-	MIR_T_I32, "value", MIR_T_I64, "raw", MIR_T_I32, "type");
+	"proto_owned_replace", 0, 0, 5, MIR_T_P, "owned_values",
+	MIR_T_P, "home_capacities", MIR_T_I32, "value",
+	MIR_T_I64, "raw", MIR_T_I32, "type");
     build->import_owned_replace = MIR_new_import(build->context,
 	"jit_rt_owned_replace");
     build->proto_owned_move = MIR_new_proto(build->context,
-	"proto_owned_move", 0, 0, 3, MIR_T_P, "owned_values",
-	MIR_T_I32, "destination", MIR_T_I32, "source");
+	"proto_owned_move", 0, 0, 4, MIR_T_P, "owned_values",
+	MIR_T_P, "home_capacities", MIR_T_I32, "destination",
+	MIR_T_I32, "source");
     build->import_owned_move = MIR_new_import(build->context,
 	"jit_rt_owned_move");
     build->proto_discard_owned = MIR_new_proto(build->context,
@@ -6743,13 +6827,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		MIR_reg_t raw = append_raw_value(build, program, values, value,
 		    deopt_values, &copy_serial);
 
-		append(build, MIR_new_call_insn(build->context, 6,
-		    MIR_new_ref_op(build->context, build->proto_discard_owned),
-		    MIR_new_ref_op(build->context, build->import_discard_owned),
-		    MIR_new_reg_op(build->context, owned_values),
-		    MIR_new_int_op(build->context, owner),
+		append_discard_owned(build, owned_values, owner,
 		    MIR_new_reg_op(build->context, raw),
-		    MIR_new_int_op(build->context, TYPE_LIST)));
+		    MIR_new_int_op(build->context, TYPE_LIST));
 	    }
 	append(build, values_loaded);
 	for (j = 0; map->native_resume
@@ -7908,60 +7988,34 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			    append(build, MIR_new_insn(build->context, MIR_JMP,
 				MIR_new_label_op(build->context, appended)));
 			    append(build, slow);
-			    append(build, MIR_new_call_insn(build->context, 10,
-				MIR_new_ref_op(build->context,
-				    build->proto_fixed_list_append_owned),
-				MIR_new_ref_op(build->context,
-				    build->import_fixed_list_append_owned),
-				MIR_new_reg_op(build->context,
-				    values[instr->value]),
-				MIR_new_reg_op(build->context, owned_values),
-				MIR_new_reg_op(build->context,
-				    build->home_capacities),
-				MIR_new_int_op(build->context,
-				    program->value_owned_slots[instr->src1]),
+			    append_fixed_list_append_owned(build,
+				values[instr->value], owned_values,
+				program->value_owned_slots[instr->src1],
 				MIR_new_reg_op(build->context,
 				    values[instr->src1]),
 				MIR_new_int_op(build->context, fixed_index),
 				MIR_new_reg_op(build->context, raw_value),
-				MIR_new_reg_op(build->context, type_reg)));
+				MIR_new_reg_op(build->context, type_reg));
 			    append(build, appended);
 			} else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME
 			    && fixed_index > 0)
-			    append(build, MIR_new_call_insn(build->context, 10,
-				MIR_new_ref_op(build->context,
-				    build->proto_fixed_list_append_owned),
-				MIR_new_ref_op(build->context,
-				    build->import_fixed_list_append_owned),
-				MIR_new_reg_op(build->context,
-				    values[instr->value]),
-				MIR_new_reg_op(build->context, owned_values),
-				MIR_new_reg_op(build->context,
-				    build->home_capacities),
-				MIR_new_int_op(build->context,
-				    program->value_owned_slots[instr->src1]),
+			    append_fixed_list_append_owned(build,
+				values[instr->value], owned_values,
+				program->value_owned_slots[instr->src1],
 				MIR_new_reg_op(build->context,
 				    values[instr->src1]),
 				MIR_new_int_op(build->context, fixed_index),
 				MIR_new_reg_op(build->context, raw_value),
-				MIR_new_reg_op(build->context, type_reg)));
+				MIR_new_reg_op(build->context, type_reg));
 			else if (consume_mode == JIT_LIST_APPEND_CONSUME_HOME)
-			    append(build, MIR_new_call_insn(build->context, 9,
-				MIR_new_ref_op(build->context,
-				    build->proto_list_append_owned),
-				MIR_new_ref_op(build->context,
-				    build->import_list_append_owned),
-				MIR_new_reg_op(build->context,
-				    values[instr->value]),
-				MIR_new_reg_op(build->context, owned_values),
-				MIR_new_reg_op(build->context,
-				    build->home_capacities),
-				MIR_new_int_op(build->context,
-				    program->value_owned_slots[instr->src1]),
+			    append_list_append_owned(build, values[instr->value],
+				owned_values,
+				program->value_owned_slots[instr->src1],
 				MIR_new_reg_op(build->context,
 				    values[instr->src1]),
 				MIR_new_reg_op(build->context, raw_value),
-				MIR_new_reg_op(build->context, type_reg)));
+				MIR_new_reg_op(build->context, type_reg),
+				jit_list_tail_reserve(program, instr));
 			else
 			    append(build, MIR_new_call_insn(build->context, 6,
 				MIR_new_ref_op(build->context,
@@ -10381,21 +10435,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    else
 			type = MIR_new_int_op(build->context,
 			    program->value_types[instr->value]);
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
-			MIR_new_mem_op(build->context, MIR_T_I32,
-			    program->value_owned_slots[instr->value]
-				* sizeof(unsigned),
-			    build->home_capacities, 0, 1),
-			MIR_new_int_op(build->context, 0)));
-		    append(build, MIR_new_call_insn(build->context, 6,
-			MIR_new_ref_op(build->context,
-			    build->proto_owned_replace),
-			MIR_new_ref_op(build->context,
-			    build->import_owned_replace),
-			MIR_new_reg_op(build->context, owned_values),
-			MIR_new_int_op(build->context,
-			    program->value_owned_slots[instr->value]),
-			MIR_new_reg_op(build->context, raw), type));
+		    append_owned_replace(build, owned_values,
+			program->value_owned_slots[instr->value],
+			MIR_new_reg_op(build->context, raw), type);
 		    if (instr->kind == HIR_TAC_UNARY
 			&& instr->op == HIR_OP_MAKE_SINGLETON_LIST) {
 			int capacity = jit_fixed_list_capacity(program, instr);
@@ -10478,14 +10520,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				       == program->value_owner_root[instr->value]))
 				continue;
 
-			    append(build, MIR_new_call_insn(build->context, 6,
-				MIR_new_ref_op(build->context,
-				    build->proto_discard_owned),
-				MIR_new_ref_op(build->context,
-				    build->import_discard_owned),
-				MIR_new_reg_op(build->context, owned_values),
-				MIR_new_int_op(build->context, owner),
-				MIR_new_reg_op(build->context, raw), type));
+			    append_discard_owned(build, owned_values, owner,
+				MIR_new_reg_op(build->context, raw), type);
 			}
 		    }
 		}
@@ -10494,15 +10530,9 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 			instr->value, deopt_values, &copy_serial);
 		    int owner = jit_resolve_owner_slot(program, instr->value);
 
-		    append(build, MIR_new_call_insn(build->context, 6,
-			MIR_new_ref_op(build->context,
-			    build->proto_discard_owned),
-			MIR_new_ref_op(build->context,
-			    build->import_discard_owned),
-			MIR_new_reg_op(build->context, owned_values),
-			MIR_new_int_op(build->context, owner),
+		    append_discard_owned(build, owned_values, owner,
 			MIR_new_reg_op(build->context, raw),
-			MIR_new_int_op(build->context, TYPE_LIST)));
+			MIR_new_int_op(build->context, TYPE_LIST));
 		}
 		if (instr == block->last)
 		    break;

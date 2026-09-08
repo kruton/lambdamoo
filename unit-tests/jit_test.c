@@ -12568,16 +12568,28 @@ main(void)
 	    Var homes[1];
 	    unsigned capacities[1] = { 0 };
 	    Var *owned_result;
+	    Var *unique;
 
 	    homes[0] = new_list(1);
 	    homes[0].v.list[1].type = TYPE_INT;
 	    homes[0].v.list[1].v.num = 666;
 	    owned_result = jit_rt_list_append_owned(homes, capacities, 0,
-		homes[0].v.list, 777, TYPE_INT);
+		homes[0].v.list, 777, TYPE_INT, 3);
 	    check(owned_result == homes[0].v.list
 		  && homes[0].v.list[0].v.num == 2
-		  && homes[0].v.list[2].v.num == 777,
-		  "owner-backed list append updates its home");
+		  && homes[0].v.list[2].v.num == 777
+		  && capacities[0] == 4,
+		  "owner-backed list append reserves its fixed tail");
+	    unique = owned_result;
+	    owned_result = jit_rt_list_append_owned(homes, capacities, 0,
+		owned_result, 888, TYPE_INT, 2);
+	    owned_result = jit_rt_list_append_owned(homes, capacities, 0,
+		owned_result, 999, TYPE_INT, 1);
+	    check(owned_result == unique && capacities[0] == 4
+		  && owned_result[0].v.num == 4
+		  && owned_result[3].v.num == 888
+		  && owned_result[4].v.num == 999,
+		  "owner-backed fixed tail fills reserved storage");
 	    check(var_refcount(homes[0]) == 1,
 		  "owner-backed list append remains exclusive");
 	    free_var(homes[0]);
@@ -12593,13 +12605,36 @@ main(void)
 	    homes[0].type = TYPE_NONE;
 	    homes[0].v.num = 0;
 	    owned_result = jit_rt_list_append_owned(homes, capacities, 0,
-		partial.v.list, 222, TYPE_INT);
+		partial.v.list, 222, TYPE_INT, 2);
 	    check(homes[0].type == TYPE_LIST
 		  && owned_result == homes[0].v.list
 		  && owned_result[0].v.num == 2
 		  && owned_result[2].v.num == 222,
 		  "resumed owner-backed list append acquires its list");
 	    free_var(partial);
+	    free_var(homes[0]);
+	}
+	{
+	    Var homes[2];
+	    unsigned capacities[2] = { 0, 2 };
+	    Var replacement;
+
+	    homes[0] = new_list(1);
+	    homes[0].v.list[1].type = TYPE_INT;
+	    homes[0].v.list[1].v.num = 111;
+	    homes[1].type = TYPE_LIST;
+	    homes[1].v.list = jit_rt_make_fixed_list_head(222, TYPE_INT, 2);
+	    jit_rt_owned_move(homes, capacities, 0, 1);
+	    check(homes[1].type == TYPE_NONE && capacities[0] == 2
+		  && capacities[1] == 0,
+		  "owned move transfers fixed-list capacity");
+	    replacement = new_list(1);
+	    replacement.v.list[1].type = TYPE_INT;
+	    replacement.v.list[1].v.num = 333;
+	    jit_rt_owned_replace(homes, capacities, 0,
+		(int64_t) (intptr_t) replacement.v.list, TYPE_LIST);
+	    check(homes[0].v.list == replacement.v.list && capacities[0] == 0,
+		  "owned replacement invalidates fixed-list capacity");
 	    free_var(homes[0]);
 	}
 	{
@@ -12665,6 +12700,7 @@ main(void)
 	{
 	    Var env[1];
 	    Var shared;
+	    Var *unique;
 	    Var *updated;
 	    const char *replacement = str_dup("replacement");
 
@@ -12673,6 +12709,12 @@ main(void)
 	    env[0].v.list[1].v.num = 10;
 	    env[0].v.list[2].type = TYPE_INT;
 	    env[0].v.list[2].v.num = 20;
+	    unique = env[0].v.list;
+	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 1,
+		30, TYPE_INT, &rt_err);
+	    check(rt_err == E_NONE && updated == unique
+		  && env[0].v.list == unique && env[0].v.list[1].v.num == 30,
+		  "jit_rt_list_index_set updates unique scalar list in place");
 	    shared = var_ref(env[0]);
 	    updated = jit_rt_list_index_set(env, 0, env[0].v.list, 2,
 		(int64_t) (intptr_t) replacement, TYPE_STR, &rt_err);
