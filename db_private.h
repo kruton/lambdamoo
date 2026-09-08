@@ -140,16 +140,27 @@ extern Object *dbpriv_find_object(Objid);
 				/* Returns 0 if given object is not valid.
 				 */
 
+extern Object *dbpriv_find_frozen_object(Objid);
+extern Objid dbpriv_frozen_last_used_objid(void);
+extern int dbpriv_checkpoint_active(void);
+extern int dbpriv_checkpoint_begin(void);
+extern void dbpriv_checkpoint_merge(void);
+extern Object *dbpriv_checkpoint_touch_object(Objid);
+				/* Interfaces used by the overlay checkpointer. */
+
 /*********** Properties ***********/
 
 extern Propdef dbpriv_new_propdef(const char *name);
 
 extern int dbpriv_count_properties(Objid);
+extern int dbpriv_count_frozen_properties(Objid);
 
 #ifdef PROPERTY_CACHE
 extern void dbpriv_build_property_layouts(void);
+extern void dbpriv_ref_property_layout(Object *);
+extern void dbpriv_renumber_property_layouts(Object *, Objid, Objid);
 extern void dbpriv_release_property_layout(Object *);
-extern Pval *dbpriv_property_value_for_definition(Objid, uint64_t);
+extern Pval *dbpriv_property_value_for_definition(Object *, uint64_t);
 #endif
 
 extern int dbpriv_check_properties_for_chparent(Objid oid,

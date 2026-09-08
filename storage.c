@@ -29,8 +29,6 @@
 #include "structures.h"
 #include "utils.h"
 
-static unsigned alloc_num[Sizeof_Memory_Type];
-
 static inline int
 refcount_overhead(Memory_Type type)
 {
@@ -74,12 +72,14 @@ mymalloc(unsigned size, Memory_Type type)
 	size = 1;
 
     offs = refcount_overhead(type);
+    /* malloc() is the system allocator underlying mymalloc(); the returned
+     * block is private until this function finishes initializing it.
+     */
     memptr = (char *) malloc(size + offs);
     if (!memptr) {
 	sprintf(msg, "memory allocation (size %u) failed!", size);
 	panic(msg);
     }
-    alloc_num[type]++;
 
     if (offs) {
 	memptr += offs;
@@ -124,7 +124,7 @@ void *
 myrealloc(void *ptr, unsigned size, Memory_Type type)
 {
     int offs = refcount_overhead(type);
-    static char msg[100];
+    char msg[100];
 
     ptr = realloc((char *) ptr - offs, size + offs);
     if (!ptr) {
@@ -137,7 +137,6 @@ myrealloc(void *ptr, unsigned size, Memory_Type type)
 void
 myfree(const void *ptr, Memory_Type type)
 {
-    alloc_num[type]--;
     free((char *) ptr - refcount_overhead(type));
 }
 

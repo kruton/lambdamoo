@@ -71,7 +71,52 @@
 #define MP_POLL		2
 #define MP_FAKE		3
 
+#define NIM_MAIN	1
+#define NIM_THREADED	2
+
+#define CPM_FORKED	1
+#define CPM_UNFORKED	2
+#define CPM_JOURNALED	3
+#define CPM_THREADED	4
+
 #include "config.h"
+
+#ifndef NETWORK_IO_MODE
+#  define NETWORK_IO_MODE NIM_MAIN
+#endif
+
+#if NETWORK_IO_MODE != NIM_MAIN && NETWORK_IO_MODE != NIM_THREADED
+#  error Illegal value for "NETWORK_IO_MODE"
+#endif
+
+#if !defined(CHECKPOINT_MODE) || CHECKPOINT_MODE == OPTION_DEFAULT
+#  undef CHECKPOINT_MODE
+#  ifdef UNFORKED_CHECKPOINTS
+#    define CHECKPOINT_MODE CPM_UNFORKED
+#  elif NETWORK_IO_MODE == NIM_THREADED
+#    define CHECKPOINT_MODE CPM_THREADED
+#  else
+#    define CHECKPOINT_MODE CPM_FORKED
+#  endif
+#endif
+
+#if CHECKPOINT_MODE < CPM_FORKED || CHECKPOINT_MODE > CPM_THREADED
+#  error Illegal value for "CHECKPOINT_MODE"
+#endif
+
+#if CHECKPOINT_MODE == CPM_THREADED && !HAVE_PTHREAD_H
+#  error Threaded checkpoints require POSIX threads
+#endif
+
+#if CHECKPOINT_MODE != CPM_FORKED
+#  ifndef UNFORKED_CHECKPOINTS
+#    define UNFORKED_CHECKPOINTS 1
+#  endif
+#endif
+
+#if NETWORK_IO_MODE == NIM_THREADED && CHECKPOINT_MODE == CPM_FORKED
+#  error Forked checkpoints are unsafe with threaded network I/O
+#endif
 
 #if NETWORK_PROTOCOL != NP_SINGLE  &&  !defined(MPLEX_STYLE)
 #  if NETWORK_STYLE == NS_BSD
@@ -102,6 +147,18 @@
          #error You cannot use TLI without having poll()!
 #      endif
 #    endif
+#  endif
+#endif
+
+#if NETWORK_IO_MODE == NIM_THREADED
+#  if NETWORK_PROTOCOL == NP_SINGLE
+#    error Threaded network I/O is not available with NP_SINGLE
+#  endif
+#  if MPLEX_STYLE == MP_FAKE
+#    error Threaded network I/O requires select() or poll()
+#  endif
+#  if !HAVE_PTHREAD_H || !HAVE_STDATOMIC_H || !HAVE_LOCK_FREE_ATOMICS
+#    error Threaded network I/O requires pthreads and lock-free C atomics
 #  endif
 #endif
 

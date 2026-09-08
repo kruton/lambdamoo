@@ -263,6 +263,23 @@ useful for anything other than quick experiments.)
 
 #undef UNFORKED_CHECKPOINTS
 
+/*
+ * CHECKPOINT_MODE selects how normal database checkpoints are produced:
+ *
+ * CPM_FORKED       A child process writes the checkpoint.
+ * CPM_UNFORKED     The main thread writes the checkpoint to completion.
+ * CPM_JOURNALED    The main thread advances an overlay checkpoint between
+ *                  interpreter turns.
+ * CPM_THREADED     A checkpoint thread writes the frozen database while the
+ *                  interpreter uses a live overlay.
+ *
+ * OPTION_DEFAULT selects CPM_THREADED with threaded network I/O and
+ * CPM_FORKED otherwise.  UNFORKED_CHECKPOINTS remains a compatibility option
+ * and changes the non-threaded default to CPM_UNFORKED.
+ */
+
+#undef CHECKPOINT_MODE
+
 /******************************************************************************
  * The MUD Client Protocol (MCP) defines a means for multiplexing out
  * of band data onto a player connection using a standard message format.
@@ -393,6 +410,20 @@ useful for anything other than quick experiments.)
  */
 
 #undef MPLEX_STYLE
+
+/******************************************************************************
+ * NETWORK_IO_MODE selects which thread performs multi-user network I/O:
+ *
+ * NIM_MAIN       The interpreter thread performs multiplexing and I/O, as in
+ *                traditional LambdaMOO servers.
+ * NIM_THREADED   A dedicated thread performs multiplexing and socket I/O;
+ *                the interpreter consumes bounded per-connection buffers.
+ *
+ * Threaded I/O requires pthreads, lock-free C atomics, MP_SELECT or MP_POLL,
+ * and unforked database checkpoints.  It is opt-in.
+ */
+
+#undef NETWORK_IO_MODE
 
 /******************************************************************************
  * The built-in MOO function open_network_connection(), when enabled,

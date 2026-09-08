@@ -121,7 +121,7 @@ extern void stream_endfill(Stream *, size_t);
 #define TRY_STREAM				\
 {						\
     enable_stream_exceptions();			\
-    if (ES_exceptionStack)			\
+    if (ES_GetExceptionStack())			\
 	panic("TRY_STREAM not outermost");	\
     TRY
 

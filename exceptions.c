@@ -35,7 +35,53 @@
 
 #include "exceptions.h"
 
-ES_CtxBlock *ES_exceptionStack = 0;
+#include "config.h"
+#include "options.h"
+
+#if CHECKPOINT_MODE == CPM_THREADED
+#  include <pthread.h>
+#endif
+
+#if CHECKPOINT_MODE == CPM_THREADED
+static pthread_key_t exception_stack_key;
+static pthread_once_t exception_stack_once = PTHREAD_ONCE_INIT;
+
+static void
+make_exception_stack_key(void)
+{
+    if (pthread_key_create(&exception_stack_key, NULL) != 0)
+	panic("Can't create exception-stack thread key");
+}
+
+ES_CtxBlock *
+ES_GetExceptionStack(void)
+{
+    pthread_once(&exception_stack_once, make_exception_stack_key);
+    return pthread_getspecific(exception_stack_key);
+}
+
+void
+ES_SetExceptionStack(ES_CtxBlock *stack)
+{
+    pthread_once(&exception_stack_once, make_exception_stack_key);
+    if (pthread_setspecific(exception_stack_key, (const void *) stack) != 0)
+	panic("Can't set exception-stack thread key");
+}
+#else
+static ES_CtxBlock *exception_stack = 0;
+
+ES_CtxBlock *
+ES_GetExceptionStack(void)
+{
+    return exception_stack;
+}
+
+void
+ES_SetExceptionStack(ES_CtxBlock *stack)
+{
+    exception_stack = stack;
+}
+#endif
 
 Exception ANY;
 
@@ -45,7 +91,7 @@ ES_RaiseException(Exception * exception, int value)
     ES_CtxBlock *cb, *xb;
     int i;
 
-    for (xb = ES_exceptionStack; xb; xb = xb->link) {
+    for (xb = ES_GetExceptionStack(); xb; xb = xb->link) {
 	for (i = 0; i < xb->nx; i++) {
 	    if (xb->array[i] == exception || xb->array[i] == &ANY)
 		goto doneSearching;
@@ -56,8 +102,8 @@ ES_RaiseException(Exception * exception, int value)
     if (!xb)
 	panic("Unhandled exception!");
 
-    for (cb = ES_exceptionStack; cb != xb && !cb->finally; cb = cb->link);
-    ES_exceptionStack = cb;
+    for (cb = ES_GetExceptionStack(); cb != xb && !cb->finally; cb = cb->link);
+    ES_SetExceptionStack(cb);
     cb->id = exception;
     cb->value = value;
     longjmp((void *) cb->jmp, 1);

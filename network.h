@@ -168,6 +168,13 @@ extern int network_process_io(int timeout);
 				 * timeout).
 				 */
 
+#if NETWORK_IO_MODE == NIM_THREADED
+extern int network_work_pending(void);
+				/* Return true if buffered network work can be
+				 * processed without blocking.
+				 */
+#endif
+
 extern const char *network_connection_name(network_handle nh);
 				/* Return some human-readable identification
 				 * for the specified connection.  It should fit

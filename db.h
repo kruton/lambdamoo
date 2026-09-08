@@ -62,6 +62,17 @@ extern int db_flush(enum db_flush_type);
 				 * argument.  Returns true on success.
 				 */
 
+extern void db_checkpoint_barrier(const char *operation);
+				/* Finish an overlay checkpoint before a mutation
+				 * which would otherwise copy a large subtree.
+				 * OPERATION identifies it in checkpoint warnings.
+				 */
+
+extern int db_checkpoint_finished(int *success);
+				/* Report and consume completion of an asynchronous
+				 * overlay checkpoint.
+				 */
+
 extern int64_t db_disk_size(void);
 				/* Return the total size, in bytes, of the most
 				 * recent full representation of the database
@@ -331,6 +342,8 @@ enum bi_prop {
 typedef struct {
     enum bi_prop built_in;	/* true iff property is a built-in one */
     Objid definer;		/* if !built_in, the object defining prop */
+    Objid oid;			/* object whose property slot is addressed */
+    int index;			/* property slot in that object */
     void *ptr;			/* null iff property not found */
 } db_prop_handle;
 
