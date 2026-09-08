@@ -120,6 +120,9 @@ gen_waif_propdefs(Object *o)
 	    if (pd->name[0] == WAIF_PROP_PREFIX) {
 		wpd->defs[cnt].name = str_ref(pd->name);
 		wpd->defs[cnt].hash = pd->hash;
+#ifdef PROPERTY_CACHE
+		wpd->defs[cnt].id = pd->id;
+#endif
 		++cnt;
 	    }
     }
