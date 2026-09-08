@@ -776,9 +776,28 @@ warning(const char *s, const char *t)
 }
 
 static int32_t unget_buffer[5], unget_count;
+static const unsigned char *input_bytes;
+static size_t input_bytes_left;
 #if UNICODE_STRINGS
 static int32_t getc_state;
 #endif
+
+static int32_t
+lex_getbyte(void *unused UNUSED_)
+{
+    while (input_bytes_left == 0) {
+	const char *bytes;
+	size_t length;
+
+	if (!(*(client.get_bytes))(client_data, &bytes, &length))
+	    return EOF;
+	input_bytes = (const unsigned char *) bytes;
+	input_bytes_left = length;
+    }
+
+    input_bytes_left--;
+    return *input_bytes++;
+}
 
 static int32_t
 lex_getc(void)
@@ -787,9 +806,9 @@ lex_getc(void)
 	return unget_buffer[--unget_count];
     else
 #if !UNICODE_STRINGS
-	return (*(client.getch))(client_data);
+	return lex_getbyte(0);
 #else
-	return get_utf_call(client.getch, client_data, &getc_state);
+	return get_utf_call(lex_getbyte, 0, &getc_state);
 #endif
 }
 
@@ -1194,6 +1213,8 @@ parse_program(DB_Version version, Parser_Client c, void *data)
     if (token_stream == 0)
 	token_stream = new_stream(1024);
     unget_count = 0;
+    input_bytes = 0;
+    input_bytes_left = 0;
 #if UNICODE_STRINGS
     getc_state = -1;
 #endif
@@ -1286,27 +1307,31 @@ my_error(void *data, const char *msg)
     state->errors = listappend(state->errors, v);
 }
 
-static int32_t
-my_getc(void *data)
+static int
+my_get_bytes(void *data, const char **bytes, size_t *length)
 {
-    struct parser_state	*state = (struct parser_state *) data;
-    Var      code;
-    uint8_t  c;
+    static const char newline = '\n';
+    struct parser_state *state = (struct parser_state *) data;
+    Var code = state->code;
 
-    code = state->code;
-    if (task_timed_out  ||  state->cur_string > code.v.list[0].v.num)
-	return EOF;
-    else if (!(c = code.v.list[state->cur_string].v.str[state->cur_char])) {
-	state->cur_string++;
-	state->cur_char = 0;
-	return '\n';
-    } else {
-	state->cur_char++;
-	return c;
+    if (task_timed_out || state->cur_string > code.v.list[0].v.num)
+	return 0;
+    if (state->cur_char == 0) {
+	*bytes = code.v.list[state->cur_string].v.str;
+	*length = strlen(*bytes);
+	state->cur_char = 1;
+	if (*length != 0)
+	    return 1;
     }
+
+    *bytes = &newline;
+    *length = 1;
+    state->cur_string++;
+    state->cur_char = 0;
+    return 1;
 }
 
-static Parser_Client list_parser_client = { my_error, 0, my_getc };
+static Parser_Client list_parser_client = { my_error, 0, my_get_bytes };
 
 Program *
 parse_list_as_program(Var code, Var *errors)

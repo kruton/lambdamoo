@@ -26,7 +26,8 @@
 typedef struct {
     void (*error) (void *, const char *);
     void (*warning) (void *, const char *);
-    int32_t (*getch) (void *);
+    /* A successful call must return a span valid until the next call. */
+    int (*get_bytes) (void *, const char **, size_t *);
 } Parser_Client;
 
 extern Program *parse_program(DB_Version, Parser_Client, void *);

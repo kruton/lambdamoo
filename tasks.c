@@ -553,6 +553,7 @@ struct state {
     Objid player;
     int nerrors;
     char *input;
+    size_t input_length;
 };
 
 static void
@@ -565,18 +566,21 @@ my_error(void *data, const char *msg)
 }
 
 static int
-my_getc(void *data)
+my_get_bytes(void *data, const char **bytes, size_t *length)
 {
     struct state *s = data;
 
-    if (*(s->input) != '\0')
-	return *(s->input++);
-    else
-	return EOF;
+    if (s->input_length == 0)
+	return 0;
+    *bytes = s->input;
+    *length = s->input_length;
+    s->input += s->input_length;
+    s->input_length = 0;
+    return 1;
 }
 
 static Parser_Client client =
-{my_error, 0, my_getc};
+{my_error, 0, my_get_bytes};
 
 static void
 end_programming(tqueue * tq)
@@ -603,6 +607,7 @@ end_programming(tqueue * tq)
 	    s.player = tq->player;
 	    s.nerrors = 0;
 	    s.input = stream_contents(tq->program_stream);
+	    s.input_length = stream_length(tq->program_stream);
 
 	    program = parse_program(current_db_version, client, &s);
 

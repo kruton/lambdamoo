@@ -541,7 +541,8 @@ dbio_scxnf(const char *format,...)
  *---------------------*/
 
 struct state {
-    char prev_char;
+    int at_line_start;
+    char input_buffer[4096];
     const char *(*fmtr) (void *);
     void *data;
 };
@@ -570,32 +571,53 @@ my_warning(void *data, const char *msg)
 }
 
 static int
-my_getc(void *data)
+my_get_bytes(void *data, const char **bytes, size_t *length)
 {
     struct state *s = data;
-    int c;
+    size_t offset = 0;
 
-    c = fgetc(input);
-    if (c == '.' && s->prev_char == '\n') {
-	/* end-of-verb marker in DB */
-	c = fgetc(input);	/* skip next newline */
-	return EOF;
+    if (s->at_line_start) {
+	int c = fgetc(input);
+
+	if (c == '.') {
+	    (void)fgetc(input);       /* skip the newline after the marker */
+	    return 0;
+	}
+	if (c == EOF) {
+	    my_error(data, "Unexpected EOF");
+	    return 0;
+	}
+	s->input_buffer[offset++] = c;
+	if (c == '\n') {
+	    *bytes = s->input_buffer;
+	    *length = offset;
+	    return 1;
+	}
     }
-    if (c == EOF)
-	my_error(data, "Unexpected EOF");
-    s->prev_char = c;
-    return c;
+
+    if (!fgets(s->input_buffer + offset,
+	       sizeof(s->input_buffer) - offset, input)) {
+	if (offset == 0) {
+	    my_error(data, "Unexpected EOF");
+	    return 0;
+	}
+    }
+
+    *bytes = s->input_buffer;
+    *length = strlen(s->input_buffer);
+    s->at_line_start = s->input_buffer[*length - 1] == '\n';
+    return 1;
 }
 
 static Parser_Client parser_client =
-{my_error, my_warning, my_getc};
+{my_error, my_warning, my_get_bytes};
 
 Program *
 dbio_read_program(DB_Version version, const char *(*fmtr) (void *), void *data)
 {
     struct state s;
 
-    s.prev_char = '\n';
+    s.at_line_start = 1;
     s.fmtr = fmtr;
     s.data = data;
     return parse_program(version, parser_client, &s);
