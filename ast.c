@@ -132,6 +132,12 @@ allocate(int size, Memory_Type type)
     return arena_alloc(ast_arena, size);
 }
 
+void *
+alloc_ast(int size)
+{
+    return allocate(size, M_AST);
+}
+
 char *
 alloc_string(const char *buffer)
 {
