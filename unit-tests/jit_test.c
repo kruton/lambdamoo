@@ -10189,6 +10189,35 @@ main(void)
 	jit_program_free(builtin_deopt);
     }
 
+    /* A specialized builtin's type guard still has unpacked arguments. */
+    {
+	JITProgram *builtin_guard = string_length_program("127001");
+	JITInstruction *guard = builtin_guard->blocks->first->next;
+	JITDeoptMap *map = &builtin_guard->deopt_maps[1];
+
+	builtin_guard->value_is_tagged = allocate(builtin_guard->num_values);
+	builtin_guard->value_is_tagged[1] = 1;
+	guard->kind = HIR_TAC_GUARD_TYPE;
+	guard->guarded_operands = 1;
+	guard->guarded_type_masks[0] = JIT_TYPE_MASK(TYPE_INT);
+	map->reason = JIT_DEOPT_TYPE_GUARD;
+	ticks = 10;
+	check(jit_program_execute(builtin_guard, env, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, deopt_stack)
+	      == JIT_RUN_FALLBACK,
+	      "specialized built-in type guard did not deopt");
+	check(deopt.reason == JIT_DEOPT_TYPE_GUARD
+	      && deopt.stack_depth == 1 && deopt_stack[0].type == TYPE_LIST,
+	      "specialized built-in type guard did not pack its arguments");
+	if (deopt_stack[0].type == TYPE_LIST)
+	    check(deopt_stack[0].v.list[0].v.num == 1
+		  && deopt_stack[0].v.list[1].type == TYPE_STR
+		  && !strcmp(deopt_stack[0].v.list[1].v.str, "127001"),
+		  "specialized built-in type guard packed the wrong argument");
+	free_var(deopt_stack[0]);
+	jit_program_free(builtin_guard);
+    }
+
     /* Property read deopt test */
     {
 	JITProgram *get_prog = get_prop_program();

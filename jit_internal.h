@@ -164,6 +164,14 @@ struct JITReconstructionState {
 };
 
 static inline int
+jit_deopt_map_has_unpacked_builtin_args(JITDeoptMap *map)
+{
+    return (map->reason == JIT_DEOPT_ARITHMETIC_TYPE
+	    || map->reason == JIT_DEOPT_TYPE_GUARD)
+	&& map->builtin_func >= 0 && map->builtin_args >= 0;
+}
+
+static inline int
 jit_deopt_map_is_specialized_builtin(JITDeoptMap *map)
 {
     return map->reason == JIT_DEOPT_ARITHMETIC_TYPE

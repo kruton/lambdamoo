@@ -13710,7 +13710,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    }
 	}
 	if (!suspend_zero_boundary && deopt_stack && (map->stack_depth
-			    || (jit_deopt_map_is_specialized_builtin(map)
+			    || (jit_deopt_map_has_unpacked_builtin_args(map)
 				&& map->builtin_args == 0)))
 	    stack_values = deopt_stack;
 	for (i = stack_start; stack_values && i < (int) map->stack_depth; i++) {
@@ -13735,7 +13735,7 @@ jit_program_execute_in_context(JITProgram *program,
 	    stack_values[i - stack_start] = jit_take_boundary_stack_value(program,
 		map, i, type, deopt_values, owned_values, home_states);
 	}
-	if (stack_values && jit_deopt_map_is_specialized_builtin(map)) {
+	if (stack_values && jit_deopt_map_has_unpacked_builtin_args(map)) {
 	    int outer_depth = compact_boundary ? 0
 		: map->stack_depth - map->builtin_args;
 	    Var args = new_list(map->builtin_args);
