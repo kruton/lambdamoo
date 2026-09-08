@@ -51,6 +51,11 @@ static Stmt    	       *prog_start;
 static int		dollars_ok;
 static DB_Version	language_version;
 
+typedef struct Stmt_Sequence {
+    Stmt *head;
+    Stmt *tail;
+} Stmt_Sequence;
+
 static void	error(const char *, const char *);
 static void	warning(const char *, const char *);
 static int	find_id(char *name);
@@ -58,6 +63,9 @@ static void	yyerror(const char *s);
 static int32_t	yylex(void);
 static Scatter *scatter_from_arglist(Arg_List *);
 static Scatter *add_scatter_item(Scatter *, Scatter *);
+static Stmt_Sequence *new_stmt_sequence(void);
+static Stmt_Sequence *append_stmt(Stmt_Sequence *, Stmt *);
+static Stmt *take_stmt_sequence(Stmt_Sequence *);
 static void	vet_scatter(Scatter *);
 static void	push_loop_name(const char *);
 static void	pop_loop_name(void);
@@ -71,6 +79,7 @@ static void	check_loop_name(const char *, enum loop_exit_kind);
 
 %union {
   Stmt	       *stmt;
+  struct Stmt_Sequence *stmts;
   Expr	       *expr;
   int32_t	chr;		/* Used to carry non-ASCII characters */
   Num		integer;
@@ -84,7 +93,8 @@ static void	check_loop_name(const char *, enum loop_exit_kind);
   Scatter      *scatter;
 }
 
-%type	<stmt>   statements statement elsepart
+%type	<stmts>  statements
+%type	<stmt>   statement elsepart
 %type	<arm>    elseifs
 %type   <expr>   expr default
 %type   <args>   arglist ne_arglist codes
@@ -120,24 +130,14 @@ static void	check_loop_name(const char *, enum loop_exit_kind);
 %%
 
 program:  statements
-		{ prog_start = $1; }
+		{ prog_start = take_stmt_sequence($1); }
 	;
 
 statements:
 	  /* NOTHING */
-		{ $$ = 0; }
+		{ $$ = new_stmt_sequence(); }
 	| statements statement
-		{
-		    if ($1) {
-			Stmt *tmp = $1;
-
-			while (tmp->next)
-			    tmp = tmp->next;
-			tmp->next = $2;
-			$$ = $1;
-		    } else
-			$$ = $2;
-		}
+		{ $$ = append_stmt($1, $2); }
 	;
 
 statement:
@@ -145,7 +145,7 @@ statement:
 		{
 
 		    $$ = alloc_stmt(STMT_COND);
-		    $$->s.cond.arms = alloc_cond_arm($3, $5);
+		    $$->s.cond.arms = alloc_cond_arm($3, take_stmt_sequence($5));
 		    $$->s.cond.arms->next = $6;
 		    $$->s.cond.otherwise = $7;
 		}
@@ -158,7 +158,7 @@ statement:
 		    $$ = alloc_stmt(STMT_LIST);
 		    $$->s.list.id = find_id($2);
 		    $$->s.list.expr = $5;
-		    $$->s.list.body = $8;
+		    $$->s.list.body = take_stmt_sequence($8);
 		    pop_loop_name();
 		}
 	| tFOR tID tIN '[' expr tTO expr ']'
@@ -171,7 +171,7 @@ statement:
 		    $$->s.range.id = find_id($2);
 		    $$->s.range.from = $5;
 		    $$->s.range.to = $7;
-		    $$->s.range.body = $10;
+		    $$->s.range.body = take_stmt_sequence($10);
 		    pop_loop_name();
 		}
 	| tWHILE '(' expr ')'
@@ -183,7 +183,7 @@ statement:
 		    $$ = alloc_stmt(STMT_WHILE);
 		    $$->s.loop.id = -1;
 		    $$->s.loop.condition = $3;
-		    $$->s.loop.body = $6;
+		    $$->s.loop.body = take_stmt_sequence($6);
 		    pop_loop_name();
 		}
 	| tWHILE tID '(' expr ')'
@@ -195,7 +195,7 @@ statement:
 		    $$ = alloc_stmt(STMT_WHILE);
 		    $$->s.loop.id = find_id($2);
 		    $$->s.loop.condition = $4;
-		    $$->s.loop.body = $7;
+		    $$->s.loop.body = take_stmt_sequence($7);
 		    pop_loop_name();
 		}
 	| tFORK '(' expr ')'
@@ -207,7 +207,7 @@ statement:
 		    $$ = alloc_stmt(STMT_FORK);
 		    $$->s.fork.id = -1;
 		    $$->s.fork.time = $3;
-		    $$->s.fork.body = $6;
+		    $$->s.fork.body = take_stmt_sequence($6);
 		    resume_loop_scope();
 		}
 	| tFORK tID '(' expr ')'
@@ -219,7 +219,7 @@ statement:
 		    $$ = alloc_stmt(STMT_FORK);
 		    $$->s.fork.id = find_id($2);
 		    $$->s.fork.time = $4;
-		    $$->s.fork.body = $7;
+		    $$->s.fork.body = take_stmt_sequence($7);
 		    resume_loop_scope();
 		}
 	| expr ';'
@@ -266,14 +266,14 @@ statement:
     	| tTRY statements excepts tENDTRY
 		{
 		    $$ = alloc_stmt(STMT_TRY_EXCEPT);
-		    $$->s.catch.body = $2;
+		    $$->s.catch.body = take_stmt_sequence($2);
 		    $$->s.catch.excepts = $3;
 		}
     	| tTRY statements tFINALLY statements tENDTRY
 		{
 		    $$ = alloc_stmt(STMT_TRY_FINALLY);
-		    $$->s.finally.body = $2;
-		    $$->s.finally.handler = $4;
+		    $$->s.finally.body = take_stmt_sequence($2);
+		    $$->s.finally.handler = take_stmt_sequence($4);
 		}
 	;
 
@@ -282,7 +282,8 @@ elseifs:
 		{ $$ = 0; }
 	| elseifs tELSEIF '(' expr ')' statements
 		{
-		    Cond_Arm *this_arm = alloc_cond_arm($4, $6);
+		    Cond_Arm *this_arm = alloc_cond_arm($4,
+						 take_stmt_sequence($6));
 
 		    if ($1) {
 		        Cond_Arm *tmp = $1;
@@ -300,7 +301,7 @@ elsepart:
 	  /* NOTHING */
 		{ $$ = 0; }
 	| tELSE statements
-		{ $$ = $2; }
+		{ $$ = take_stmt_sequence($2); }
 	;
 
 excepts:
@@ -334,7 +335,8 @@ excepts:
 
 except:
 	  opt_id '(' codes ')' statements
-		{ $$ = alloc_except($1 ? find_id($1) : -1, $3, $5); }
+		{ $$ = alloc_except($1 ? find_id($1) : -1, $3,
+				  take_stmt_sequence($5)); }
 	;
 
 opt_id:
@@ -730,6 +732,32 @@ static Parser_Client	client;
 static void	       *client_data;
 static Names	       *local_names;
 
+static Stmt_Sequence *
+new_stmt_sequence(void)
+{
+    Stmt_Sequence *sequence = alloc_ast(sizeof(Stmt_Sequence));
+
+    sequence->head = sequence->tail = 0;
+    return sequence;
+}
+
+static Stmt_Sequence *
+append_stmt(Stmt_Sequence *sequence, Stmt *stmt)
+{
+    if (sequence->tail)
+	sequence->tail->next = stmt;
+    else
+	sequence->head = stmt;
+    sequence->tail = stmt;
+    return sequence;
+}
+
+static Stmt *
+take_stmt_sequence(Stmt_Sequence *sequence)
+{
+    return sequence->head;
+}
+
 static int
 find_id(char *name)
 {
@@ -776,9 +804,28 @@ warning(const char *s, const char *t)
 }
 
 static int32_t unget_buffer[5], unget_count;
+static const unsigned char *input_bytes;
+static size_t input_bytes_left;
 #if UNICODE_STRINGS
 static int32_t getc_state;
 #endif
+
+static int32_t
+lex_getbyte(void *unused UNUSED_)
+{
+    while (input_bytes_left == 0) {
+	const char *bytes;
+	size_t length;
+
+	if (!(*(client.get_bytes))(client_data, &bytes, &length))
+	    return EOF;
+	input_bytes = (const unsigned char *) bytes;
+	input_bytes_left = length;
+    }
+
+    input_bytes_left--;
+    return *input_bytes++;
+}
 
 static int32_t
 lex_getc(void)
@@ -787,9 +834,9 @@ lex_getc(void)
 	return unget_buffer[--unget_count];
     else
 #if !UNICODE_STRINGS
-	return (*(client.getch))(client_data);
+	return lex_getbyte(0);
 #else
-	return get_utf_call(client.getch, client_data, &getc_state);
+	return get_utf_call(lex_getbyte, 0, &getc_state);
 #endif
 }
 
@@ -1194,6 +1241,8 @@ parse_program(DB_Version version, Parser_Client c, void *data)
     if (token_stream == 0)
 	token_stream = new_stream(1024);
     unget_count = 0;
+    input_bytes = 0;
+    input_bytes_left = 0;
 #if UNICODE_STRINGS
     getc_state = -1;
 #endif
@@ -1256,9 +1305,7 @@ parse_program(DB_Version version, Parser_Client c, void *data)
 
 	prog = generate_code(prog_start, version);
 	prog->num_var_names = local_names->size;
-	prog->var_names = local_names->names;
-
-	myfree(local_names, M_NAMES);
+	prog->var_names = take_names(local_names);
 	free_stmt(prog_start);
 
 	return prog;
@@ -1286,27 +1333,31 @@ my_error(void *data, const char *msg)
     state->errors = listappend(state->errors, v);
 }
 
-static int32_t
-my_getc(void *data)
+static int
+my_get_bytes(void *data, const char **bytes, size_t *length)
 {
-    struct parser_state	*state = (struct parser_state *) data;
-    Var      code;
-    uint8_t  c;
+    static const char newline = '\n';
+    struct parser_state *state = (struct parser_state *) data;
+    Var code = state->code;
 
-    code = state->code;
-    if (task_timed_out  ||  state->cur_string > code.v.list[0].v.num)
-	return EOF;
-    else if (!(c = code.v.list[state->cur_string].v.str[state->cur_char])) {
-	state->cur_string++;
-	state->cur_char = 0;
-	return '\n';
-    } else {
-	state->cur_char++;
-	return c;
+    if (task_timed_out || state->cur_string > code.v.list[0].v.num)
+	return 0;
+    if (state->cur_char == 0) {
+	*bytes = code.v.list[state->cur_string].v.str;
+	*length = strlen(*bytes);
+	state->cur_char = 1;
+	if (*length != 0)
+	    return 1;
     }
+
+    *bytes = &newline;
+    *length = 1;
+    state->cur_string++;
+    state->cur_char = 0;
+    return 1;
 }
 
-static Parser_Client list_parser_client = { my_error, 0, my_getc };
+static Parser_Client list_parser_client = { my_error, 0, my_get_bytes };
 
 Program *
 parse_list_as_program(Var code, Var *errors)

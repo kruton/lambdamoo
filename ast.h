@@ -199,6 +199,7 @@ extern void begin_code_allocation(void);
 extern void end_code_allocation(int);
 
 extern Stmt *alloc_stmt(enum Stmt_Kind);
+extern void *alloc_ast(int);
 extern Cond_Arm *alloc_cond_arm(Expr *, Stmt *);
 extern Expr *alloc_expr(enum Expr_Kind);
 extern Expr *alloc_var(var_type);
