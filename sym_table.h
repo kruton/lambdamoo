@@ -26,12 +26,15 @@ typedef struct {
     unsigned max_size;
     unsigned size;
     const char **names;
+    unsigned hash_size;
+    unsigned *hash_slots;
 } Names;
 
 extern Names *new_builtin_names(DB_Version);
 extern int first_user_slot(DB_Version);
 extern unsigned find_or_add_name(Names **, const char *);
 extern int find_name(Names *, const char *);
+extern const char **take_names(Names *);
 extern void free_names(Names *);
 
 /* Environment slots for built-in variables */

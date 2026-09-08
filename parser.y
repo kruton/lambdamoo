@@ -1305,9 +1305,7 @@ parse_program(DB_Version version, Parser_Client c, void *data)
 
 	prog = generate_code(prog_start, version);
 	prog->num_var_names = local_names->size;
-	prog->var_names = local_names->names;
-
-	myfree(local_names, M_NAMES);
+	prog->var_names = take_names(local_names);
 	free_stmt(prog_start);
 
 	return prog;

@@ -27,6 +27,41 @@
 #include "utils.h"
 #include "version.h"
 
+#define INITIAL_HASH_SIZE 64
+
+static void
+clear_hash_slots(unsigned *slots, unsigned size)
+{
+    unsigned i;
+
+    for (i = 0; i < size; i++)
+	slots[i] = 0;
+}
+
+static void
+insert_name_index(Names *names, unsigned slot)
+{
+    unsigned bucket = str_hash(names->names[slot]) & (names->hash_size - 1);
+
+    while (names->hash_slots[bucket])
+	bucket = (bucket + 1) & (names->hash_size - 1);
+    names->hash_slots[bucket] = slot + 1;
+}
+
+static void
+resize_name_index(Names *names, unsigned new_size)
+{
+    unsigned i;
+
+    if (names->hash_slots)
+	myfree(names->hash_slots, M_NAMES);
+    names->hash_size = new_size;
+    names->hash_slots = mymalloc(sizeof(unsigned) * new_size, M_NAMES);
+    clear_hash_slots(names->hash_slots, new_size);
+    for (i = 0; i < names->size; i++)
+	insert_name_index(names, i);
+}
+
 static Names *
 new_names(unsigned max_size)
 {
@@ -35,6 +70,8 @@ new_names(unsigned max_size)
     names->names = mymalloc(sizeof(char *) * max_size, M_NAMES);
     names->max_size = max_size;
     names->size = 0;
+    names->hash_size = 0;
+    names->hash_slots = 0;
 
     return names;
 }
@@ -48,6 +85,10 @@ copy_names(Names * old)
     new->size = old->size;
     for (i = 0; i < new->size; i++)
 	new->names[i] = str_ref(old->names[i]);
+    new->hash_size = old->hash_size;
+    new->hash_slots = mymalloc(sizeof(unsigned) * old->hash_size, M_NAMES);
+    for (i = 0; i < old->hash_size; i++)
+	new->hash_slots[i] = old->hash_slots[i];
 
     return new;
 }
@@ -95,6 +136,7 @@ new_builtin_names(DB_Version version)
 	    bi->names[SLOT_INT] = str_dup("INT");
 	    bi->names[SLOT_FLOAT] = str_dup("FLOAT");
 	}
+	resize_name_index(bi, INITIAL_HASH_SIZE);
     }
     return copy_names(builtins[version]);
 }
@@ -113,12 +155,15 @@ find_name(Names * names, const char *str)
 unsigned
 find_or_add_name(Names ** names, const char *str)
 {
-    unsigned i;
+    unsigned bucket, i;
 
-    for (i = 0; i < (*names)->size; i++)
-	if (!mystrcasecmp((*names)->names[i], str)) {	/* old name */
+    bucket = str_hash(str) & ((*names)->hash_size - 1);
+    while ((*names)->hash_slots[bucket]) {
+	i = (*names)->hash_slots[bucket] - 1;
+	if (!mystrcasecmp((*names)->names[i], str))
 	    return i;
-	}
+	bucket = (bucket + 1) & ((*names)->hash_size - 1);
+    }
     if ((*names)->size == (*names)->max_size) {
 	unsigned old_max = (*names)->max_size;
 	Names *new = new_names(old_max * 2);
@@ -127,12 +172,32 @@ find_or_add_name(Names ** names, const char *str)
 	for (i = 0; i < old_max; i++)
 	    new->names[i] = (*names)->names[i];
 	new->size = old_max;
+	new->hash_size = (*names)->hash_size;
+	new->hash_slots = (*names)->hash_slots;
 	myfree((*names)->names, M_NAMES);
 	myfree(*names, M_NAMES);
 	*names = new;
     }
+    if (((*names)->size + 1) * 3 >= (*names)->hash_size * 2) {
+	resize_name_index(*names, (*names)->hash_size * 2);
+	bucket = str_hash(str) & ((*names)->hash_size - 1);
+	while ((*names)->hash_slots[bucket])
+	    bucket = (bucket + 1) & ((*names)->hash_size - 1);
+    }
     (*names)->names[(*names)->size] = str_dup(str);
-    return (*names)->size++;
+    i = (*names)->size++;
+    (*names)->hash_slots[bucket] = i + 1;
+    return i;
+}
+
+const char **
+take_names(Names *names)
+{
+    const char **result = names->names;
+
+    myfree(names->hash_slots, M_NAMES);
+    myfree(names, M_NAMES);
+    return result;
 }
 
 void
@@ -142,6 +207,7 @@ free_names(Names * names)
 
     for (i = 0; i < names->size; i++)
 	free_str(names->names[i]);
+    myfree(names->hash_slots, M_NAMES);
     myfree(names->names, M_NAMES);
     myfree(names, M_NAMES);
 }
