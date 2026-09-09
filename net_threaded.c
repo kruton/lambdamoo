@@ -825,7 +825,6 @@ network_process_io(int timeout)
 	    } else if (h && h->closed) {
 		close_sh = h->shandle;
 		notify_close = h->notify_close;
-		free_nhandle(h);
 	    } else
 		h = NULL;
 	}
@@ -870,8 +869,13 @@ network_process_io(int timeout)
 	} else if (h) {
 	    if (input)
 		consume_input(h, input);
-	    else if (notify_close)
-		server_close(close_sh);
+	    else {
+		if (notify_close)
+		    server_close(close_sh);
+		pthread_mutex_lock(&io_mutex);
+		free_nhandle(h);
+		pthread_mutex_unlock(&io_mutex);
+	    }
 	    did_io = 1;
 	    wake_io_thread();
 	} else {
