@@ -4742,9 +4742,21 @@ test_builtin_result_type_inference(void)
 	{"location", TYPE_OBJ},
 	{"tostr", TYPE_STR},
 	{"toliteral", TYPE_STR},
+	{"strsub", TYPE_STR},
+	{"tochar", TYPE_STR},
 	{"tonum", TYPE_INT},
 	{"toint", TYPE_INT},
-	{"tofloat", TYPE_FLOAT}
+	{"equal", TYPE_INT},
+	{"strcmp", TYPE_INT},
+	{"ord", TYPE_INT},
+	{"tofloat", TYPE_FLOAT},
+	{"sqrt", TYPE_FLOAT},
+	{"ceil", TYPE_FLOAT},
+	{"floor", TYPE_FLOAT},
+	{"trunc", TYPE_FLOAT},
+	{"listappend", TYPE_LIST},
+	{"listinsert", TYPE_LIST},
+	{"listset", TYPE_LIST}
     };
     var_type inferred = TYPE_NONE;
     unsigned i;

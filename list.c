@@ -1433,18 +1433,23 @@ register_list(void)
     register_function("setadd", 2, 2, bf_setadd, TYPE_LIST, TYPE_ANY);
     register_function("setremove", 2, 2, bf_setremove, TYPE_LIST, TYPE_ANY);
     register_function("listappend", 2, 3, bf_listappend,
-		      TYPE_LIST, TYPE_ANY, TYPE_INT);
+		      TYPE_LIST, TYPE_ANY, TYPE_INT),
+	register_function_jit_direct(1);
     register_function("listinsert", 2, 3, bf_listinsert,
-		      TYPE_LIST, TYPE_ANY, TYPE_INT);
+		      TYPE_LIST, TYPE_ANY, TYPE_INT),
+	register_function_jit_direct(1);
     register_function("listdelete", 2, 2, bf_listdelete, TYPE_LIST, TYPE_INT);
     register_function("listset", 3, 3, bf_listset,
-		      TYPE_LIST, TYPE_ANY, TYPE_INT);
+		      TYPE_LIST, TYPE_ANY, TYPE_INT),
+	register_function_jit_direct(1);
     register_function("equal", 2, 2, bf_equal, TYPE_ANY, TYPE_ANY),
-	register_function_jit_compact_return_only(1);
+	register_function_jit_compact_return_only(1),
+	register_function_jit_direct(1);
     register_function("is_member", 2, 2, bf_is_member, TYPE_ANY, TYPE_LIST);
 
     /* string */
-    register_function("tostr", 0, -1, bf_tostr);
+    register_function("tostr", 0, -1, bf_tostr),
+	register_function_jit_direct(1);
     register_function("toliteral", 1, 1, bf_toliteral, TYPE_ANY);
     setup_pattern_cache();
     register_function("match", 2, 3, bf_match, TYPE_STR, TYPE_STR, TYPE_ANY);
@@ -1453,12 +1458,16 @@ register_list(void)
     register_function("crypt", 1, 2, bf_crypt, TYPE_STR, TYPE_STR);
     register_function("index", 2, 3, bf_index, TYPE_STR, TYPE_STR, TYPE_ANY);
     register_function("rindex", 2, 3, bf_rindex, TYPE_STR, TYPE_STR, TYPE_ANY);
-    register_function("strcmp", 2, 2, bf_strcmp, TYPE_STR, TYPE_STR);
+    register_function("strcmp", 2, 2, bf_strcmp, TYPE_STR, TYPE_STR),
+	register_function_jit_direct(1);
     register_function("strsub", 3, 4, bf_strsub,
-		      TYPE_STR, TYPE_STR, TYPE_STR, TYPE_ANY);
-    register_function("tochar", 1, 1, bf_tochar, TYPE_ANY);
+		      TYPE_STR, TYPE_STR, TYPE_STR, TYPE_ANY),
+	register_function_jit_direct(1);
+    register_function("tochar", 1, 1, bf_tochar, TYPE_ANY),
+	register_function_jit_direct(1);
     register_function("charname", 1, 1, bf_charname, TYPE_STR);
-    register_function("ord", 1, 1, bf_ord, TYPE_STR);
+    register_function("ord", 1, 1, bf_ord, TYPE_STR),
+	register_function_jit_direct(1);
     register_function("encode_chars", 2, 2, bf_encode_chars,
 		      TYPE_ANY, TYPE_STR);
     register_function("decode_chars", 2, 3, bf_decode_chars,

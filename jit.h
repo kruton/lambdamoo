@@ -403,7 +403,7 @@ extern int jit_region_exit_frame_count(JITProgram *, int);
 extern int jit_region_exit_materialize(JITProgram *, int, int,
 	JITContinuationFrame *, struct activation *, int *);
 extern int jit_region_exit_call(JITProgram *, int, int,
-	JITContinuationFrame *, Var *, Objid *, const char **);
+	JITContinuationFrame *, Var *, Objid *, const char **, int *);
 extern void jit_continuation_free(JITContinuationFrame *);
 extern void jit_continuation_materialize_all(void);
 extern int jit_program_dump_hir(JITProgram *, void (*)(const char *, void *),

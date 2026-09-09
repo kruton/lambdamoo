@@ -2155,6 +2155,10 @@ do {								\
 				Var nested_args;
 				Objid nested_class;
 				const char *nested_verb;
+				int receiver_is_this;
+#ifdef WAIF_CORE
+				Var nested_receiver;
+#endif
 
 				LOAD_STATE_VARIABLES();
 				if (!jit_region_exit_materialize(caller->prog->jit,
@@ -2166,11 +2170,19 @@ do {								\
 				    break;
 				if (!jit_region_exit_call(caller->prog->jit,
 					deopt.region_exit, frame, continuation,
-					&nested_args, &nested_class, &nested_verb))
+					&nested_args, &nested_class, &nested_verb,
+					&receiver_is_this))
 				    panic("JIT region side-exit call reconstruction failed");
+#ifdef WAIF_CORE
+				nested_receiver = RUN_ACTIV.THIS;
+				if (!receiver_is_this) {
+				    nested_receiver.type = TYPE_OBJ;
+				    nested_receiver.v.obj = nested_class;
+				}
+#endif
 				STORE_STATE_VARIABLES();
 				err = call_verb2(nested_class, nested_verb
-				    WAIF_COMMA_ARG(RUN_ACTIV.THIS), nested_args, 0);
+				    WAIF_COMMA_ARG(nested_receiver), nested_args, 0);
 				if (err != E_NONE) {
 				    free_var(nested_args);
 				    panic("JIT region side-exit call dispatch changed");

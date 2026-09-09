@@ -811,9 +811,10 @@ bf_min(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr UNUSED_)
     if (!bad_types)
 	r = var_ref(r);
     free_var(arglist);
-    if (bad_types)
+    if (bad_types) {
+	free_var(r);
 	return make_error_pack(E_TYPE);
-    else
+    } else
 	return make_var_pack(r);
 }
 
@@ -843,9 +844,10 @@ bf_max(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr UNUSED_)
     if (!bad_types)
 	r = var_ref(r);
     free_var(arglist);
-    if (bad_types)
+    if (bad_types) {
+	free_var(r);
 	return make_error_pack(E_TYPE);
-    else
+    } else
 	return make_var_pack(r);
 }
 
@@ -1327,11 +1329,16 @@ register_numbers(void)
     register_db_load_hooks(DBLOAD_SEQ_numbers,
 			   NULL, after_load_seed_rng,
 			   "seed random number generator");
-    register_function("toint", 1, 1, bf_toint, TYPE_ANY);
-    register_function("tonum", 1, 1, bf_toint, TYPE_ANY);
-    register_function("tofloat", 1, 1, bf_tofloat, TYPE_ANY);
-    register_function("min", 1, -1, bf_min, TYPE_NUMERIC);
-    register_function("max", 1, -1, bf_max, TYPE_NUMERIC);
+    register_function("toint", 1, 1, bf_toint, TYPE_ANY),
+	register_function_jit_direct(1);
+    register_function("tonum", 1, 1, bf_toint, TYPE_ANY),
+	register_function_jit_direct(1);
+    register_function("tofloat", 1, 1, bf_tofloat, TYPE_ANY),
+	register_function_jit_direct(1);
+    register_function("min", 1, -1, bf_min, TYPE_NUMERIC),
+	register_function_jit_direct(1);
+    register_function("max", 1, -1, bf_max, TYPE_NUMERIC),
+	register_function_jit_direct(1);
     register_function("abs", 1, 1, bf_abs, TYPE_NUMERIC);
     register_function("random", 0, 1, bf_random, TYPE_INT);
     register_function("time", 0, 0, bf_time);
@@ -1340,7 +1347,8 @@ register_numbers(void)
     register_function("floatstr", 2, 3, bf_floatstr,
 		      TYPE_FLOAT, TYPE_INT, TYPE_ANY);
 
-    register_function("sqrt", 1, 1, bf_sqrt, TYPE_FLOAT);
+    register_function("sqrt", 1, 1, bf_sqrt, TYPE_FLOAT),
+	register_function_jit_direct(1);
     register_function("sin", 1, 1, bf_sin, TYPE_FLOAT);
     register_function("cos", 1, 1, bf_cos, TYPE_FLOAT);
     register_function("tan", 1, 1, bf_tan, TYPE_FLOAT);
@@ -1356,9 +1364,12 @@ register_numbers(void)
     register_function("exp", 1, 1, bf_exp, TYPE_FLOAT);
     register_function("log", 1, 1, bf_log, TYPE_FLOAT);
     register_function("log10", 1, 1, bf_log10, TYPE_FLOAT);
-    register_function("ceil", 1, 1, bf_ceil, TYPE_FLOAT);
-    register_function("floor", 1, 1, bf_floor, TYPE_FLOAT);
-    register_function("trunc", 1, 1, bf_trunc, TYPE_FLOAT);
+    register_function("ceil", 1, 1, bf_ceil, TYPE_FLOAT),
+	register_function_jit_direct(1);
+    register_function("floor", 1, 1, bf_floor, TYPE_FLOAT),
+	register_function_jit_direct(1);
+    register_function("trunc", 1, 1, bf_trunc, TYPE_FLOAT),
+	register_function_jit_direct(1);
     register_function("expm1", 1, 1, bf_expm1, TYPE_FLOAT);
     register_function("log1p", 1, 1, bf_log1p, TYPE_FLOAT);
     register_function("erf", 1, 1, bf_erf, TYPE_FLOAT);

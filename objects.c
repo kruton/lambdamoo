@@ -639,7 +639,8 @@ bf_object_bytes(Var arglist, Byte next UNUSED_, void *vdata UNUSED_, Objid progr
 void
 register_objects(void)
 {
-    register_function("toobj", 1, 1, bf_toobj, TYPE_ANY);
+    register_function("toobj", 1, 1, bf_toobj, TYPE_ANY),
+	register_function_jit_direct(1);
     register_function("typeof", 1, 1, bf_typeof, TYPE_ANY),
 	register_function_jit_compact_return_only(1);
     register_function("create", 1, 2, bf_create, TYPE_OBJ, TYPE_OBJ),

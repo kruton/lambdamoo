@@ -194,6 +194,7 @@ extern void register_function_dbio(bf_read_type, bf_write_type);
 extern void register_function_free(bf_free_type);
 extern void register_function_state(bf_import_type, bf_export_type);
 extern void register_function_jit_compact_return_only(int);
+extern void register_function_jit_direct(int);
 
 /*--------------*
  |  invocation  |
@@ -201,6 +202,12 @@ extern void register_function_jit_compact_return_only(int);
 
 extern package call_bi_func(unsigned, Var, Byte, Objid, void *);
 /* will free or use Var arglist */
+
+/* Direct JIT calls borrow their argument list. Only audited, restartable
+ * builtins may opt in: no VM calls, suspension, or externally visible effects.
+ * Failure leaves the arguments intact for canonical interpreter execution.
+ */
+extern int call_bi_func_jit(unsigned, Var, Objid, Var *);
 
 /*-----------------*
  |  serialization  |
@@ -220,6 +227,7 @@ extern void free_bi_func_data(Byte f_id, void *vdata);
 extern unsigned builtin_protection_generation(void);
 extern int builtin_function_is_protected(unsigned);
 extern int builtin_function_is_jit_compact_return_only(unsigned, int);
+extern int builtin_function_is_jit_direct(unsigned);
 extern void load_server_options(void);
 
 #endif		/* !Functions_H */

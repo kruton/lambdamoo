@@ -177,12 +177,20 @@ infer_builtin_result_type(const char *name, var_type *result)
 	|| !strcmp(name, "parent") || !strcmp(name, "owner")
 	|| !strcmp(name, "location"))
 	*result = TYPE_OBJ;
-    else if (!strcmp(name, "tostr") || !strcmp(name, "toliteral"))
+    else if (!strcmp(name, "tostr") || !strcmp(name, "toliteral")
+	     || !strcmp(name, "strsub") || !strcmp(name, "tochar"))
 	*result = TYPE_STR;
-    else if (!strcmp(name, "tonum") || !strcmp(name, "toint"))
+    else if (!strcmp(name, "tonum") || !strcmp(name, "toint")
+	     || !strcmp(name, "equal") || !strcmp(name, "strcmp")
+	     || !strcmp(name, "ord"))
 	*result = TYPE_INT;
-    else if (!strcmp(name, "tofloat"))
+    else if (!strcmp(name, "tofloat") || !strcmp(name, "sqrt")
+	     || !strcmp(name, "ceil") || !strcmp(name, "floor")
+	     || !strcmp(name, "trunc"))
 	*result = TYPE_FLOAT;
+    else if (!strcmp(name, "listappend") || !strcmp(name, "listinsert")
+	     || !strcmp(name, "listset"))
+	*result = TYPE_LIST;
 #ifdef WAIF_CORE
     else if (!strcmp(name, "new_waif"))
 	*result = TYPE_WAIF;
@@ -4870,7 +4878,6 @@ jit_consumer_contract(HIRSSAInstr *instr)
     if (instr->kind == HIR_TAC_UNARY) {
 	switch (instr->op) {
 	case HIR_OP_COMPLEMENT:
-	case HIR_OP_TOINT:
 	    contract.operands[0] = JIT_TYPE_MASK(TYPE_INT);
 	    contract.tagged_dispatch = 1;
 	    break;
@@ -4893,6 +4900,7 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	    contract.operands[0] = JIT_TYPE_MASK(TYPE_OBJ);
 	    contract.tagged_dispatch = 1;
 	    break;
+	case HIR_OP_TOINT:
 	case HIR_OP_NOT:
 	case HIR_OP_TYPEOF:
 	case HIR_OP_MAKE_SINGLETON_LIST:
@@ -4961,6 +4969,8 @@ jit_consumer_contract(HIRSSAInstr *instr)
 	contract.operands[1] = JIT_TYPE_MASK(TYPE_LIST);
 	contract.tagged_dispatch = 1;
 	break;
+    case HIR_OP_MIN:
+    case HIR_OP_MAX:
     case HIR_OP_EQ:
     case HIR_OP_NE:
 	contract.tagged_dispatch = 1;
@@ -5050,7 +5060,7 @@ static int
 jit_consumer_uses_explicit_type_guards(HIRSSAInstr *instr)
 {
     if (instr->kind == HIR_TAC_UNARY)
-	return instr->op == HIR_OP_COMPLEMENT || instr->op == HIR_OP_TOINT
+	return instr->op == HIR_OP_COMPLEMENT
 	    || instr->op == HIR_OP_NEGATE || instr->op == HIR_OP_ABS
 	    || instr->op == HIR_OP_LENGTH;
     if (instr->kind != HIR_TAC_BINARY)
@@ -6410,6 +6420,12 @@ jit_build_value_ownership(JITProgram *program)
 						 instr->value])))))) {
 		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
 		    program->value_owner_root[instr->value] = instr->value;
+		} else if (instr->kind == HIR_TAC_CALL
+			   && builtin_function_is_jit_direct(instr->func)
+			   && !jit_value_type_is_scalar(program, instr->value)) {
+		    program->value_ownership[instr->value] = JIT_OWNERSHIP_OWNED;
+		    program->value_owner_root[instr->value] = instr->value;
+		    program->value_owned_slots[instr->value] = program->num_owned_slots++;
 		} else if (instr->kind == HIR_TAC_BINARY
 			 && instr->op == HIR_OP_GET_PROP) {
 		    program->value_ownership[instr->value] =
@@ -6981,6 +6997,9 @@ jit_published_owner_value(JITProgram *program, JITInstruction *instr,
 	|| !program->value_owned_slots
 	|| program->value_owned_slots[instr->value] != owner_slot)
 	return 0;
+    if (instr->kind == HIR_TAC_CALL
+	&& builtin_function_is_jit_direct(instr->func))
+	return instr->value;
     if (instr->kind == HIR_TAC_UNARY
 	&& instr->op == HIR_OP_MAKE_SINGLETON_LIST)
 	return instr->value;
@@ -7130,26 +7149,6 @@ done:
     return result;
 }
 
-static int
-jit_owner_slot_is_stable(JITProgram *program, int owner_slot)
-{
-    JITBlock *block;
-
-    if (owner_slot < 0)
-	return 0;
-    for (block = program->blocks; block; block = block->next) {
-	JITInstruction *instr;
-
-	for (instr = block->first; instr; instr = instr->next) {
-	    if (jit_instruction_consumes_owner(program, instr, owner_slot))
-		return 0;
-	    if (instr == block->last)
-		break;
-	}
-    }
-    return 1;
-}
-
 static void
 jit_build_deopt_owner_slots(JITProgram *program)
 {
@@ -7183,7 +7182,7 @@ jit_build_deopt_owner_slots(JITProgram *program)
 			&& jit_resolve_owner_slot(program, instr->src2) == owner));
 
 		map->local_owner_slots[slot] =
-		    !consumed && jit_owner_slot_is_stable(program, owner)
+		    !consumed && owner >= 0
 		    && jit_owner_value_must_be_current(program, instr, value)
 		    ? owner : -1;
 		local_owners += map->local_owner_slots[slot] >= 0;
@@ -7201,7 +7200,7 @@ jit_build_deopt_owner_slots(JITProgram *program)
 		map->stack_owner_slots[slot] = map->stack_slots
 		    && map->stack_slots[slot].kind != RSS_VALUE ? -1
 		    : (!consumed
-		       && jit_owner_slot_is_stable(program, owner)
+		       && owner >= 0
 		       && jit_owner_value_must_be_current(program, instr, value)
 		       ? owner : -1);
 		stack_owners += map->stack_owner_slots[slot] >= 0;
@@ -8812,13 +8811,6 @@ hir_create_jit_program(HIRContext *ctx, HIRSSAProgram *ssa,
 		    && !binary_type_pair_is_valid(ssa_instr->op, t1, t2))
 		    instr->kind = HIR_TAC_DEOPT;
 	    }
-	    if (ssa_instr->kind == HIR_TAC_BINARY
-		&& (ssa_instr->op == HIR_OP_MIN || ssa_instr->op == HIR_OP_MAX)
-		&& (value_is_tagged[ssa_instr->value]
-		    || value_types[ssa_instr->value] != TYPE_INT
-		    || value_types[ssa_instr->src1] != TYPE_INT
-		    || value_types[ssa_instr->src2] != TYPE_INT))
-		instr->kind = HIR_TAC_DEOPT;
 	    if (!uses_tagged && ssa_instr->kind == HIR_TAC_BINARY
 		&& (ssa_instr->op == HIR_OP_EQ || ssa_instr->op == HIR_OP_NE
 		    || ssa_instr->op == HIR_OP_LT || ssa_instr->op == HIR_OP_LE

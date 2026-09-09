@@ -15,6 +15,7 @@
 #include "exceptions.h"
 #include "execute.h"
 #include "functions.h"
+#include "integer_arithmetic.h"
 #include "jit_internal.h"
 #include "list.h"
 #include "log.h"
@@ -60,6 +61,18 @@ jit_deopt_map_bridges_builtin(JITDeoptMap *map)
     return (map->reason == JIT_DEOPT_BUILTIN_CALL && map->builtin_func >= 0)
 	|| (jit_deopt_map_is_specialized_builtin(map)
 	    && builtin_function_is_protected((unsigned) map->builtin_func));
+}
+
+/* Database overrides can return any type, invalidating builtin result-type
+ * inference. Keep their returns in the interpreter instead of resuming a
+ * continuation compiled for the builtin's original result. */
+static int
+jit_deopt_map_has_protected_builtin(JITDeoptMap *map)
+{
+    return map->builtin_func >= 0
+	&& (map->reason == JIT_DEOPT_BUILTIN_CALL
+	    || jit_deopt_map_is_specialized_builtin(map))
+	&& builtin_function_is_protected((unsigned) map->builtin_func);
 }
 
 static inline double
@@ -158,7 +171,7 @@ jit_rt_str_concat(const char *s1, const char *s2, int32_t *err_out)
 }
 
 int
-jit_rt_str_concat_owned(Var *owned_values, int owner, const char *s1,
+jit_rt_str_concat_owned(Var *owned_values, unsigned *capacities, int owner, const char *s1,
 			const char *s2, int last_use, int64_t *result_out,
 			int32_t *err_out)
 {
@@ -176,12 +189,49 @@ jit_rt_str_concat_owned(Var *owned_values, int owner, const char *s1,
 	*err_out = E_NONE;
 	return 0;
     }
+    if (capacities && home->type == TYPE_STR && home->v.str == s1
+	&& (last_use & JIT_LAST_USE_SRC1) && refcount(s1) == 1) {
+	size_t length = memo_strlen(s1), tail = memo_strlen(s2);
+	size_t limit = server_int_option_cached(SVO_MAX_STRING_CONCAT);
+	size_t total;
+	char *buffer = (char *) s1;
+	int self = s1 == s2;
+
+	if (length > limit || tail > limit - length
+	    || length >= UINT_MAX || tail >= UINT_MAX - length) {
+	    *err_out = E_QUOTA;
+	    return 1;
+	}
+	total = length + tail;
+	if (capacities[owner] < total) {
+	    size_t capacity = total < 64 ? 64 : total;
+	    if (capacity <= (UINT_MAX - 1) / 2)
+		capacity *= 2;
+	    if (capacity > limit)
+		capacity = limit;
+	    if (capacity >= UINT_MAX)
+		capacity = UINT_MAX - 1;
+	    buffer = myrealloc(buffer, capacity + 1, M_STRING);
+	    capacities[owner] = capacity;
+	}
+	memmove(buffer + length, self ? buffer : s2, tail);
+	buffer[total] = '\0';
+#ifdef MEMO_STRLEN
+	((int *) buffer)[-2] = total;
+#endif
+	home->v.str = buffer;
+	*result_out = (int64_t) (intptr_t) buffer;
+	*err_out = E_NONE;
+	return 1;
+    }
     result = jit_rt_str_concat(s1, s2, err_out);
     if (*err_out != E_NONE)
 	return 1;
     free_var(*home);
     home->type = TYPE_STR;
     home->v.str = result;
+    if (capacities)
+	capacities[owner] = 0;
     *result_out = (int64_t) (intptr_t) result;
     return 1;
 }
@@ -394,6 +444,7 @@ jit_rt_fixed_list_append_owned(Var *owned_values, unsigned *home_capacities,
 	res.type = TYPE_LIST;
 	res.v.list = list;
 	res = listappend(var_ref(res), elem);
+	owned_values[owner] = res;
     }
     home_capacities[owner] = 0;
     return res.v.list;
@@ -670,6 +721,23 @@ jit_rt_get_prop_int(int64_t receiver_raw, int receiver_type,
     return raw;
 }
 
+static int64_t
+jit_rt_get_prop_obj(int64_t receiver_raw, int receiver_type,
+		    const char *pname, int64_t progr_num, int32_t *err_out)
+{
+    int64_t raw = 0, type = TYPE_NONE;
+
+    if (!jit_rt_get_prop_typed(receiver_raw, receiver_type, pname, progr_num,
+	    &raw, &type, err_out))
+	return 0;
+    if (type != TYPE_OBJ) {
+	free_var(raw_to_var(raw, type));
+	*err_out = E_TYPE;
+	return 0;
+    }
+    return raw;
+}
+
 int
 jit_rt_put_prop(int64_t oid_num, const char *pname, int64_t progr_num,
 		int64_t rhs_raw, int rhs_type, int32_t *err_out)
@@ -832,6 +900,97 @@ jit_rt_var_raw(const Var *value)
     if (value->type == TYPE_ERR)
 	return value->v.err;
     return value->v.num;
+}
+
+static int64_t
+jit_rt_double_raw(double value)
+{
+    return double_to_raw(value);
+}
+
+static double
+jit_rt_raw_double(int64_t value)
+{
+    return raw_to_double(value);
+}
+
+static int64_t
+jit_rt_direct_builtin(int64_t func, Var *arguments, int64_t progr,
+	Num *raw_out, Num *type_out, Var *homes, unsigned *capacities, int64_t owner,
+	int64_t expected_type)
+{
+    Var args, result;
+
+    args.type = TYPE_LIST;
+    args.v.list = arguments;
+    if (!call_bi_func_jit((unsigned) func, args, (Objid) progr, &result))
+	return 0;
+    if (expected_type != TYPE_ANY && result.type != expected_type) {
+	free_var(result);
+	return 0;
+    }
+    if (owner < 0 && result.type != TYPE_INT && result.type != TYPE_OBJ
+	&& result.type != TYPE_ERR && result.type != TYPE_FLOAT) {
+	free_var(result);
+	return 0;
+    }
+    *raw_out = jit_rt_var_raw(&result);
+    if (type_out)
+	*type_out = result.type;
+    if (owner >= 0) {
+	free_var(homes[owner]);
+	homes[owner] = result;
+	capacities[owner] = 0;
+    } else
+	free_var(result);
+    return 1;
+}
+
+static int64_t
+jit_rt_region_builtin(int64_t func, Var *arguments, int64_t progr,
+	Var *homes, unsigned *capacities, int64_t owner, int64_t expected_type,
+	int *ok)
+{
+    Num raw = 0;
+
+    *ok = jit_rt_direct_builtin(func, arguments, progr, &raw, 0,
+	homes, capacities, owner, expected_type);
+    return raw;
+}
+
+static double
+jit_rt_region_builtin_float(int64_t func, Var *arguments, int64_t progr,
+	int *ok)
+{
+    Num raw = 0;
+
+    *ok = jit_rt_direct_builtin(func, arguments, progr, &raw, 0,
+	0, 0, -1, TYPE_FLOAT);
+    return raw_to_double(raw);
+}
+
+/* Unary conversions and two-argument min/max retain their unpacked HIR
+ * operands. Borrow them while calling the same audited builtin as CALL. */
+static int64_t
+jit_rt_scalar_builtin(int64_t func, int64_t count, int64_t raw1, int64_t type1,
+	int64_t raw2, int64_t type2, int64_t progr, Num *raw_out, Num *type_out,
+	int64_t expected_type)
+{
+    Var args = new_list((int) count);
+    int64_t ok;
+
+    args.v.list[1] = raw_to_var(raw1, (int) type1);
+    if (type1 != TYPE_FLOAT)
+	args.v.list[1] = var_ref(args.v.list[1]);
+    if (count == 2) {
+	args.v.list[2] = raw_to_var(raw2, (int) type2);
+	if (type2 != TYPE_FLOAT)
+	    args.v.list[2] = var_ref(args.v.list[2]);
+    }
+    ok = jit_rt_direct_builtin(func, args.v.list, progr, raw_out, type_out,
+	0, 0, -1, expected_type);
+    free_var(args);
+    return ok;
 }
 
 typedef int64_t (*NativeFunction) (JITExecutionContext *, JITNativeFrame *,
@@ -2215,6 +2374,8 @@ jit_load_externals(MIR_context_t context)
 		      (void *) jit_rt_get_prop_typed);
     MIR_load_external(context, "jit_rt_get_prop_int",
 		      (void *) jit_rt_get_prop_int);
+    MIR_load_external(context, "jit_rt_get_prop_obj",
+		      (void *) jit_rt_get_prop_obj);
     MIR_load_external(context, "jit_rt_put_prop", (void *) jit_rt_put_prop);
     MIR_load_external(context, "jit_rt_seconds_left", (void *) jit_rt_seconds_left);
     MIR_load_external(context, "jit_rt_time", (void *) jit_rt_time);
@@ -2223,6 +2384,13 @@ jit_load_externals(MIR_context_t context)
     MIR_load_external(context, "jit_rt_valid", (void *) jit_rt_valid);
     MIR_load_external(context, "jit_rt_parent", (void *) jit_rt_parent);
     MIR_load_external(context, "jit_rt_var_raw", (void *) jit_rt_var_raw);
+    MIR_load_external(context, "jit_rt_double_raw", (void *) jit_rt_double_raw);
+    MIR_load_external(context, "jit_rt_raw_double", (void *) jit_rt_raw_double);
+    MIR_load_external(context, "jit_rt_direct_builtin", (void *) jit_rt_direct_builtin);
+    MIR_load_external(context, "jit_rt_region_builtin", (void *) jit_rt_region_builtin);
+    MIR_load_external(context, "jit_rt_region_builtin_float",
+	(void *) jit_rt_region_builtin_float);
+    MIR_load_external(context, "jit_rt_scalar_builtin", (void *) jit_rt_scalar_builtin);
 }
 
 static int
@@ -2680,6 +2848,7 @@ typedef struct {
     MIR_item_t import_get_prop;
     MIR_item_t proto_get_prop_int;
     MIR_item_t import_get_prop_int;
+    MIR_item_t import_get_prop_obj;
     MIR_item_t proto_put_prop;
     MIR_item_t import_put_prop;
     MIR_item_t proto_seconds_left;
@@ -2688,6 +2857,18 @@ typedef struct {
     MIR_item_t import_time;
     MIR_item_t proto_index;
     MIR_item_t import_index;
+    MIR_item_t proto_scalar_builtin;
+    MIR_item_t import_scalar_builtin;
+    MIR_item_t proto_direct_builtin;
+    MIR_item_t import_direct_builtin;
+    MIR_item_t proto_region_builtin;
+    MIR_item_t import_region_builtin;
+    MIR_item_t proto_region_builtin_float;
+    MIR_item_t import_region_builtin_float;
+    MIR_item_t proto_double_raw;
+    MIR_item_t import_double_raw;
+    MIR_item_t proto_raw_double;
+    MIR_item_t import_raw_double;
     MIR_item_t proto_rindex;
     MIR_item_t import_rindex;
     MIR_item_t proto_valid;
@@ -3478,6 +3659,7 @@ static int
 jit_call_has_native_continuation(JITProgram *program, JITInstruction *call)
 {
     return call->deopt_map > 0 && call->deopt_map < program->num_deopt_maps
+	&& !jit_deopt_map_has_protected_builtin(&program->deopt_maps[call->deopt_map])
 	&& program->deopt_maps[call->deopt_map].native_resume
 	&& program->deopt_maps[call->deopt_map].native_resume->valid;
 }
@@ -3634,6 +3816,7 @@ typedef struct JITRegionCFG JITRegionCFG;
 typedef enum {
     JIT_REGION_VALUE_ARGUMENT,
     JIT_REGION_VALUE_CONSTANT,
+    JIT_REGION_VALUE_RECEIVER,
     JIT_REGION_VALUE_TEMPORARY
 } JITRegionCFGValueKind;
 
@@ -3644,6 +3827,9 @@ typedef struct {
     Num constant;
     var_type type;
     int owner;
+    int virtualized;
+    int nonnegative;
+    UNum maximum;
 } JITRegionCFGValue;
 
 typedef struct {
@@ -3669,8 +3855,10 @@ typedef struct {
     int src1;
     int src2;
     int copy_base;
+    int range_end;
     int num_copies;
     int call;
+    unsigned func;
     unsigned ticks;
     int loop_check;
     int list_index;
@@ -3687,6 +3875,8 @@ typedef struct {
     JITRegionCFGSnapshot caller;
     int num_arguments;
     int arguments[JIT_REGION_MAX_ARGUMENTS];
+    int argument_list;
+    int receiver;
 } JITRegionCFGCall;
 
 typedef enum {
@@ -3723,6 +3913,7 @@ struct JITRegionCFG {
     int num_blocks;
     int num_arguments;
     int num_loops;
+    unsigned argument_masks[JIT_REGION_MAX_ARGUMENTS];
     int has_effect;
     int owner_base;
     int num_owners;
@@ -3732,6 +3923,7 @@ struct JITRegionCFG {
 typedef struct {
     int target_value;
     int runtime_slot;
+    var_type type;
 } JITRegionExitValue;
 
 typedef struct {
@@ -3740,11 +3932,13 @@ typedef struct {
     const char *verb;
     Objid receiver_class;
     int map;
+    int receiver_is_this;
     int dispatched;
     int num_values;
     JITRegionExitValue *values;
     int num_arguments;
     int argument_slots[JIT_REGION_MAX_ARGUMENTS];
+    var_type argument_types[JIT_REGION_MAX_ARGUMENTS];
 } JITRegionExitFrame;
 
 struct JITRegionExit {
@@ -3846,14 +4040,19 @@ jit_region_exit_frame_register(JITProgram *program, JITRegionExitFrame *frame,
     for (i = 0; i < frame->num_values; i++) {
 	frame->values[i].target_value = snapshot->values[i].target_value;
 	frame->values[i].runtime_slot = program->num_region_exit_values++;
+	frame->values[i].type = region->values[
+	    snapshot->values[i].region_value].type;
     }
     if (!call)
 	return;
     frame->verb = str_ref(call->verb);
     frame->receiver_class = call->receiver_class;
+    frame->receiver_is_this = call->receiver < 0;
     frame->num_arguments = call->num_arguments;
-    for (i = 0; i < frame->num_arguments; i++)
+    for (i = 0; i < frame->num_arguments; i++) {
 	frame->argument_slots[i] = program->num_region_exit_values++;
+	frame->argument_types[i] = region->values[call->arguments[i]].type;
+    }
 }
 
 static int
@@ -3945,6 +4144,19 @@ jit_region_cfg_supported_binary(HIROp op)
 }
 
 static int
+jit_region_cfg_supported_type(var_type type)
+{
+    return type == TYPE_INT || type == TYPE_OBJ || type == TYPE_FLOAT
+	|| type == TYPE_STR || type == TYPE_LIST;
+}
+
+static int
+jit_region_cfg_supported_list_element(var_type type)
+{
+    return jit_region_cfg_supported_type(type);
+}
+
+static int
 jit_region_cfg_argument_index(JITProgram *program, int value)
 {
     JITInstruction *definition = jit_value_definition(program, value);
@@ -3961,6 +4173,78 @@ jit_region_cfg_argument_index(JITProgram *program, int value)
 	|| index <= 0 || index > JIT_REGION_MAX_ARGUMENTS)
 	return 0;
     return (int) index;
+}
+
+/* Choose entry specializations before importing instructions. A guard on a
+ * copied argument constrains the argument as well as its SSA copy; changing
+ * only the copy's type leaves the entry guard unable to admit the region. */
+static int
+jit_region_cfg_constrain_argument(JITProgram *program, JITRegionCFG *region,
+	int value, unsigned mask, int depth)
+{
+    JITBlock *block;
+    int argument = jit_region_cfg_argument_index(program, value);
+
+    if (argument) {
+	region->argument_masks[argument - 1] &= mask;
+	return region->argument_masks[argument - 1] != 0;
+    }
+    if (depth >= JIT_REGION_MAX_VALUES)
+	return 0;
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    JITCopy *copy;
+
+	    if (instr->kind == HIR_TAC_PARALLEL_COPY)
+		for (copy = instr->copies; copy; copy = copy->next)
+		    if (copy->dst == value && copy->src != value
+			&& !jit_region_cfg_constrain_argument(program, region,
+			    copy->src, mask, depth + 1))
+			return 0;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 1;
+}
+
+static int
+jit_region_cfg_argument_constraints(JITProgram *program, JITRegionCFG *region)
+{
+    JITBlock *block;
+    int argument;
+
+    for (argument = 0; argument < JIT_REGION_MAX_ARGUMENTS; argument++)
+	region->argument_masks[argument] = JIT_TYPE_MASK(TYPE_INT)
+	    | JIT_TYPE_MASK(TYPE_OBJ) | JIT_TYPE_MASK(TYPE_FLOAT)
+	    | JIT_TYPE_MASK(TYPE_LIST);
+    for (block = program->blocks; block; block = block->next) {
+	JITInstruction *instr;
+
+	for (instr = block->first; instr; instr = instr->next) {
+	    if (instr->kind == HIR_TAC_GUARD_TYPE) {
+		int values[JIT_MAX_GUARD_OPERANDS] = { instr->src1, instr->src2 };
+		int operand;
+
+		for (operand = 0; operand < JIT_MAX_GUARD_OPERANDS; operand++)
+		    if ((instr->guarded_operands & (1U << operand))
+			&& !jit_region_cfg_constrain_argument(program, region,
+			    values[operand], instr->guarded_type_masks[operand], 0))
+			return 0;
+	    }
+	    if (((instr->kind == HIR_TAC_BINARY && instr->op == HIR_OP_INDEX)
+		 || instr->kind == HIR_TAC_RANGE_REF
+		 || (instr->kind == HIR_TAC_UNARY && instr->op == HIR_OP_LENGTH))
+		&& !jit_region_cfg_constrain_argument(program, region, instr->src1,
+		    JIT_TYPE_MASK(TYPE_LIST), 0))
+		return 0;
+	    if (instr == block->last)
+		break;
+	}
+    }
+    return 1;
 }
 
 static int
@@ -4014,6 +4298,10 @@ jit_region_cfg_add_value(JITRegionCFG *region, JITRegionCFGValueKind kind,
     value->constant = constant;
     value->type = type;
     value->owner = -1;
+    value->virtualized = 0;
+    value->nonnegative = kind == JIT_REGION_VALUE_CONSTANT
+	&& type == TYPE_INT && constant >= 0;
+    value->maximum = value->nonnegative ? (UNum) constant : 0;
     return region->num_values - 1;
 }
 
@@ -4027,13 +4315,34 @@ jit_region_cfg_value(JITProgram *program, JITRegionCFG *region,
 
     if (value <= 0 || value >= program->num_values)
 	return -1;
+    if (value_map[value] == -2)
+	return -1;
     if (value_map[value] >= 0)
 	return value_map[value];
     definition = jit_value_definition(program, value);
     argument = jit_region_cfg_argument_index(program, value);
-    if (argument)
+
+    if (argument) {
+	unsigned mask = region->argument_masks[argument - 1];
+	var_type type;
+
+	if (program->value_types && program->value_is_tagged
+	    && !program->value_is_tagged[value])
+	    mask &= JIT_TYPE_MASK(program->value_types[value]);
+	/* Preserve the integer specialization of unconstrained tagged inputs.
+	 * The outer call emits the runtime tag check for this chosen type. */
+	type = mask & JIT_TYPE_MASK(TYPE_INT) ? TYPE_INT
+	    : mask & JIT_TYPE_MASK(TYPE_OBJ) ? TYPE_OBJ
+	    : mask & JIT_TYPE_MASK(TYPE_FLOAT) ? TYPE_FLOAT
+	    : mask & JIT_TYPE_MASK(TYPE_LIST) ? TYPE_LIST : TYPE_ANY;
+	if (type == TYPE_ANY)
+	    return -1;
 	value_map[value] = jit_region_cfg_add_value(region,
-	    JIT_REGION_VALUE_ARGUMENT, argument, value, 0, TYPE_INT);
+	    JIT_REGION_VALUE_ARGUMENT, argument, value, 0, type);
+    } else if (definition && definition->kind == HIR_TAC_LOAD_LOCAL
+	       && definition->local_id == SLOT_THIS)
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_RECEIVER, 0, value, 0, TYPE_OBJ);
     else if (integer_constant_value(program, value, &constant))
 	value_map[value] = jit_region_cfg_add_value(region,
 	    JIT_REGION_VALUE_CONSTANT, 0, value, constant, TYPE_INT);
@@ -4041,6 +4350,12 @@ jit_region_cfg_value(JITProgram *program, JITRegionCFG *region,
 	     && definition->literal_type == TYPE_OBJ)
 	value_map[value] = jit_region_cfg_add_value(region,
 	    JIT_REGION_VALUE_CONSTANT, 0, value, definition->literal, TYPE_OBJ);
+    else if (definition && definition->kind == HIR_TAC_CONST
+	     && (definition->literal_type == TYPE_FLOAT
+		 || definition->literal_type == TYPE_STR))
+	value_map[value] = jit_region_cfg_add_value(region,
+	    JIT_REGION_VALUE_CONSTANT, 0, value, definition->literal,
+	    definition->literal_type);
     else if (definition && definition->kind == HIR_TAC_CONST
 	     && definition->literal_type == TYPE_LIST
 	     && definition->literal) {
@@ -4058,7 +4373,7 @@ jit_region_cfg_value(JITProgram *program, JITRegionCFG *region,
 
 	if (!source || source->kind != HIR_TAC_LOAD_LOCAL
 	    || source->local_id != SLOT_ARGS)
-	    return -1;
+	    goto ordinary_value;
 	value_map[value] = jit_region_cfg_add_value(region,
 	    JIT_REGION_VALUE_CONSTANT, 0, value, region->num_arguments,
 	    TYPE_INT);
@@ -4069,6 +4384,8 @@ jit_region_cfg_value(JITProgram *program, JITRegionCFG *region,
 	    definition->src2);
 
 	if (left < 0 || right < 0
+	    || region->values[left].type != TYPE_INT
+	    || region->values[right].type != TYPE_INT
 	    || region->values[left].kind != JIT_REGION_VALUE_CONSTANT
 	    || region->values[right].kind != JIT_REGION_VALUE_CONSTANT
 	    || !jit_region_cfg_fold_binary(definition->op,
@@ -4213,7 +4530,8 @@ jit_region_cfg_snapshot_value(JITProgram *program, JITRegionCFG *region,
     int i;
 
     if (target_value <= 0 || target_value >= program->num_values
-	|| (type != TYPE_INT && type != TYPE_ANY))
+	|| (type != TYPE_INT && type != TYPE_OBJ && type != TYPE_FLOAT
+	    && type != TYPE_ANY && type != TYPE_LIST && type != TYPE_STR))
 	return 0;
 
     for (i = 0; i < snapshot->num_values; i++)
@@ -4222,6 +4540,16 @@ jit_region_cfg_snapshot_value(JITProgram *program, JITRegionCFG *region,
     if (snapshot->num_values >= JIT_REGION_MAX_VALUES
 	|| (region_value = jit_region_cfg_value(program, region, value_map,
 		target_value)) < 0)
+	return 0;
+    if (region->values[region_value].virtualized == 2)
+	return 0;
+    if (region->values[region_value].type != TYPE_INT
+	&& region->values[region_value].type != TYPE_OBJ
+	&& region->values[region_value].type != TYPE_FLOAT
+	&& region->values[region_value].type != TYPE_LIST
+	&& region->values[region_value].type != TYPE_STR)
+	return 0;
+    if (type != TYPE_ANY && type != region->values[region_value].type)
 	return 0;
     snapshot->values[snapshot->num_values].target_value = target_value;
     snapshot->values[snapshot->num_values].region_value = region_value;
@@ -4313,7 +4641,10 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		return 0;
 	    break;
 	case HIR_TAC_CONST:
-	    if (instr->literal_type == TYPE_INT
+	    if ((instr->literal_type == TYPE_INT
+		 || instr->literal_type == TYPE_OBJ
+		 || instr->literal_type == TYPE_FLOAT
+		 || instr->literal_type == TYPE_STR)
 		&& jit_region_cfg_value(program, region, value_map,
 		    instr->value) < 0)
 		return 0;
@@ -4350,12 +4681,23 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		    &region->instructions[region->num_instructions++];
 		memset(copy_instruction, 0, sizeof(*copy_instruction));
 		copy_instruction->kind = HIR_TAC_PARALLEL_COPY;
+		copy_instruction->value = -1;
+		copy_instruction->src1 = copy_instruction->src2 = -1;
 		copy_instruction->copy_base = region->num_copies;
 		for (copy = instr->copies; copy; copy = copy->next) {
-		    int dst = jit_region_cfg_value(program, region, value_map,
-			copy->dst);
-		    int src = jit_region_cfg_value(program, region, value_map,
-			copy->src);
+		    int dst, src;
+
+		    if (program->value_use_counts
+			&& program->value_use_counts[copy->dst] == 0) {
+			/* A dead copy can still occur in a reconstruction map.
+			 * Refuse such snapshots rather than saving an unset register. */
+			if (value_map[copy->dst] >= 0)
+			    return 0;
+			value_map[copy->dst] = -2;
+			continue;
+		    }
+		    dst = jit_region_cfg_value(program, region, value_map, copy->dst);
+		    src = jit_region_cfg_value(program, region, value_map, copy->src);
 
 		    if (dst < 0 || src < 0)
 			return 0;
@@ -4375,6 +4717,36 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		    region->num_instructions--;
 	    }
 	    break;
+	case HIR_TAC_RANGE_REF:
+	    {
+		JITDeoptMap *map;
+		int end;
+
+		if (instr->deopt_map <= 0
+		    || instr->deopt_map >= program->num_deopt_maps)
+		    return 0;
+		map = &program->deopt_maps[instr->deopt_map];
+		if (map->stack_depth < 1)
+		    return 0;
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		src1 = jit_region_cfg_value(program, region, value_map, instr->src1);
+		src2 = jit_region_cfg_value(program, region, value_map, instr->src2);
+		end = jit_region_cfg_value(program, region, value_map,
+		    map->stack_values[map->stack_depth - 1]);
+		if (value < 0 || src1 < 0 || src2 < 0 || end < 0
+		    || region->values[src1].type != TYPE_LIST
+		    || region->values[src1].virtualized
+		    || region->values[src2].type != TYPE_INT
+		    || region->values[end].type != TYPE_INT
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, src2))
+		    return 0;
+		region->values[value].type = TYPE_LIST;
+		region->values[value].virtualized = 2;
+		region->instructions[region->num_instructions - 1].range_end = end;
+	    }
+	    break;
 	case HIR_TAC_UNARY:
 	    if (instr->op == HIR_OP_CHECK_LIST_FOR_SPLICE) {
 		src1 = jit_region_cfg_value(program, region, value_map,
@@ -4390,7 +4762,8 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		src1 = jit_region_cfg_value(program, region, value_map,
 		    instr->src1);
 		if (value < 0 || src1 < 0
-		    || region->values[src1].type != TYPE_INT
+		    || !jit_region_cfg_supported_list_element(
+			region->values[src1].type)
 		    || !jit_region_cfg_add_instruction(region, instr->kind,
 			instr->op, value, src1, -1))
 		    return 0;
@@ -4402,9 +4775,17 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 	    if (instr->op == HIR_OP_LENGTH) {
 		value = jit_region_cfg_value(program, region, value_map,
 		    instr->value);
-		if (value < 0 || region->values[value].kind
-		    != JIT_REGION_VALUE_CONSTANT)
+		if (value < 0)
 		    return 0;
+		if (region->values[value].kind != JIT_REGION_VALUE_CONSTANT) {
+		    src1 = jit_region_cfg_value(program, region, value_map,
+			instr->src1);
+		    if (src1 < 0 || region->values[src1].type != TYPE_LIST
+			|| !jit_region_cfg_add_instruction(region, instr->kind,
+			    instr->op, value, src1, -1))
+			return 0;
+		    region->values[value].type = TYPE_INT;
+		}
 		break;
 	    }
 	    if (instr->op != HIR_OP_COMPLEMENT)
@@ -4414,6 +4795,7 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 	    src1 = jit_region_cfg_value(program, region, value_map,
 		instr->src1);
 	    if (value < 0 || src1 < 0
+		|| region->values[src1].type != TYPE_INT
 		|| region->values[value].kind != JIT_REGION_VALUE_TEMPORARY
 		|| !jit_region_cfg_add_instruction(region, instr->kind,
 		    instr->op, value, src1, -1))
@@ -4438,7 +4820,23 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		    || !jit_region_cfg_add_instruction(region, instr->kind,
 			instr->op, value, src1, -1))
 		    return 0;
+		/* Property receivers are object-specialized at the load, before
+		 * their guarded dispatch. Other property values remain integers. */
 		region->values[value].type = TYPE_INT;
+		{
+		    JITBlock *use_block;
+		    for (use_block = program->blocks; use_block;
+			 use_block = use_block->next) {
+			JITInstruction *use;
+			for (use = use_block->first; use; use = use->next) {
+			    if (use->kind == HIR_TAC_CALL_VERB
+				&& use->src1 == instr->value)
+				region->values[value].type = TYPE_OBJ;
+			    if (use == use_block->last)
+				break;
+			}
+		    }
+		}
 		region->instructions[region->num_instructions - 1].property =
 		    (const char *) (intptr_t) property->literal;
 		break;
@@ -4454,7 +4852,8 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		if (value < 0 || src1 < 0 || src2 < 0
 		    || region->values[src1].type != TYPE_LIST
 		    || (instr->op == HIR_OP_LIST_ADD_TAIL
-			&& region->values[src2].type != TYPE_INT)
+			&& !jit_region_cfg_supported_list_element(
+			    region->values[src2].type))
 		    || (instr->op == HIR_OP_LIST_APPEND
 			&& region->values[src2].type != TYPE_LIST)
 		    || !jit_region_cfg_add_instruction(region, instr->kind,
@@ -4475,6 +4874,20 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		&& value >= 0
 		&& region->values[value].kind == JIT_REGION_VALUE_ARGUMENT)
 		break;
+	    if (instr->op == HIR_OP_INDEX && value >= 0) {
+		src1 = jit_region_cfg_value(program, region, value_map, instr->src1);
+		src2 = jit_region_cfg_value(program, region, value_map, instr->src2);
+		if (src1 < 0 || src2 < 0 || region->values[src1].type != TYPE_LIST
+		    || region->values[src2].type != TYPE_INT
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, src2))
+		    return 0;
+		region->values[value].type = TYPE_INT;
+		(void) jit_region_cfg_snapshot(program, region,
+		    &region->instructions[region->num_instructions - 1].exit,
+		    value_map, instr->deopt_map);
+		break;
+	    }
 	    if (!jit_region_cfg_supported_binary(instr->op))
 		return 0;
 	    src1 = jit_region_cfg_value(program, region, value_map,
@@ -4483,6 +4896,21 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		instr->src2);
 	    if (value < 0 || src1 < 0 || src2 < 0
 		|| region->values[value].kind != JIT_REGION_VALUE_TEMPORARY
+		|| (region->values[src1].type != TYPE_FLOAT
+		    && (region->values[src1].type != TYPE_INT
+			|| region->values[src2].type != TYPE_INT)
+		    && !((instr->op == HIR_OP_EQ || instr->op == HIR_OP_NE)
+			 && region->values[src1].type == TYPE_OBJ
+			 && region->values[src2].type == TYPE_OBJ))
+		|| ((region->values[src1].type == TYPE_FLOAT
+		     || region->values[src2].type == TYPE_FLOAT)
+		    && (region->values[src1].type != TYPE_FLOAT
+			|| region->values[src2].type != TYPE_FLOAT
+			|| (instr->op != HIR_OP_ADD && instr->op != HIR_OP_SUB
+			    && instr->op != HIR_OP_MUL
+			    && instr->op != HIR_OP_EQ && instr->op != HIR_OP_NE
+			    && instr->op != HIR_OP_LT && instr->op != HIR_OP_LE
+			    && instr->op != HIR_OP_GT && instr->op != HIR_OP_GE)))
 		|| ((instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
 		     || instr->op == HIR_OP_LSHR)
 		    && region->values[src2].kind == JIT_REGION_VALUE_CONSTANT
@@ -4492,7 +4920,11 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		|| !jit_region_cfg_add_instruction(region, instr->kind,
 		    instr->op, value, src1, src2))
 		return 0;
-	    region->values[value].type = TYPE_INT;
+	    region->values[value].type =
+		region->values[src1].type == TYPE_FLOAT
+		&& (instr->op == HIR_OP_ADD || instr->op == HIR_OP_SUB
+		    || instr->op == HIR_OP_MUL)
+		? TYPE_FLOAT : TYPE_INT;
 	    if ((((instr->op == HIR_OP_SHL || instr->op == HIR_OP_SHR
 		   || instr->op == HIR_OP_LSHR)
 		  && region->values[src2].kind != JIT_REGION_VALUE_CONSTANT)
@@ -4509,6 +4941,35 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		    || region->values[src2].constant == 0)
 		&& instr->deopt_map <= 0)
 		return 0;
+	    break;
+	case HIR_TAC_CALL:
+	    {
+		JITRegionCFGInstruction *region_instruction;
+		JITDeoptMap *map;
+
+		value = jit_region_cfg_value(program, region, value_map,
+		    instr->value);
+		src1 = jit_region_cfg_value(program, region, value_map,
+		    instr->src1);
+		if (!builtin_function_is_jit_direct(instr->func)
+		    || instr->deopt_map <= 0
+		    || instr->deopt_map >= program->num_deopt_maps
+		    || value < 0 || src1 < 0
+		    || region->values[value].kind
+		       != JIT_REGION_VALUE_TEMPORARY
+		    || !jit_region_cfg_supported_type(region->values[value].type)
+		    || region->values[src1].type != TYPE_LIST)
+		    return 0;
+		map = &program->deopt_maps[instr->deopt_map];
+		if (map->reason != JIT_DEOPT_BUILTIN_CALL
+		    || map->builtin_func != (int) instr->func
+		    || !jit_region_cfg_add_instruction(region, instr->kind,
+			instr->op, value, src1, -1))
+		    return 0;
+		region_instruction =
+		    &region->instructions[region->num_instructions - 1];
+		region_instruction->func = instr->func;
+	    }
 	    break;
 	case HIR_TAC_CALL_VERB:
 	    {
@@ -4527,7 +4988,6 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		memset(arguments, 0, sizeof(arguments));
 		if (depth >= JIT_REGION_MAX_DEPTH
 		    || region->num_calls >= JIT_REGION_MAX_CALLS
-		    || !jit_region_is_this(program, instr->src1, 0)
 		    || !jit_fixed_list_values(program, instr->src3, arguments,
 			&argument_count)
 		    || !jit_region_site_status(program, instr->deopt_map,
@@ -4555,10 +5015,24 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		call_index = region->num_calls++;
 		region_call = &region->calls[call_index];
 		memset(region_call, 0, sizeof(*region_call));
+		region_call->argument_list = -1;
+		region_call->receiver = jit_region_is_this(program, instr->src1, 0)
+		    ? -1 : jit_region_cfg_value(program, region, value_map,
+			instr->src1);
+		if (region_call->receiver < 0
+		    && !jit_region_is_this(program, instr->src1, 0))
+		    return 0;
+		if (region_call->receiver >= 0
+		    && region->values[region_call->receiver].type != TYPE_OBJ)
+		    return 0;
 		region_call->receiver_class = receiver_class;
 		region_call->dispatch_epoch = dispatch_epoch;
 		region_call->verb = resume->cached_verb;
 		region_call->num_arguments = argument_count;
+		region_call->argument_list = jit_region_cfg_value(program, region,
+		    value_map, instr->src3);
+		if (region_call->argument_list < 0)
+		    return 0;
 		for (argument = 0; argument < argument_count; argument++) {
 		    region_call->arguments[argument] = jit_region_cfg_value(
 			program, region, value_map, arguments[argument]);
@@ -4573,14 +5047,31 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 		    M_PROGRAM);
 		memset(region_call->target, 0, sizeof(*region_call->target));
 		if (!jit_region_cfg_depth(target_program->jit,
-			region_call->target, depth + 1, argument_count)
-		    || !jit_region_cfg_add_instruction(region,
-			HIR_TAC_CALL_VERB, 0, value, call_index, -1))
+			region_call->target, depth + 1, argument_count))
+		    return 0;
+		for (argument = 0; argument < region_call->target->num_values;
+		     argument++)
+		    if (region_call->target->values[argument].kind
+			== JIT_REGION_VALUE_ARGUMENT) {
+			JITRegionCFGValue *target_argument =
+			    &region_call->target->values[argument];
+			int actual = region_call->arguments[
+			    target_argument->argument - 1];
+
+			if ((target_argument->type != TYPE_INT
+			     && target_argument->type != TYPE_OBJ
+			     && target_argument->type != TYPE_FLOAT
+			     && target_argument->type != TYPE_LIST)
+			    || region->values[actual].type
+			       != target_argument->type)
+			    return 0;
+		    }
+		if (!jit_region_cfg_add_instruction(region, HIR_TAC_CALL_VERB,
+			0, value, call_index, -1))
 		    return 0;
 		region->values[value].type =
 		    jit_region_cfg_return_type(region_call->target);
-		if (region->values[value].type != TYPE_INT
-		    && region->values[value].type != TYPE_LIST)
+		if (!jit_region_cfg_supported_type(region->values[value].type))
 		    return 0;
 		region_instruction =
 		    &region->instructions[region->num_instructions - 1];
@@ -4642,9 +5133,9 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 			int guarded = jit_region_cfg_value(program, region,
 			    value_map, guard_values[operand]);
 
-			if (guarded < 0
+			if (guarded < 0 || region->values[guarded].type == TYPE_ANY
 			    || !(instr->guarded_type_masks[operand]
-				 & JIT_TYPE_MASK(TYPE_INT)))
+				 & JIT_TYPE_MASK(region->values[guarded].type)))
 			    return 0;
 		    }
 		if (region_block->loop_header && !region_block->loop_check) {
@@ -4676,7 +5167,8 @@ jit_region_cfg_import_block(JITProgram *program, JITRegionCFG *region,
 	case HIR_TAC_BRANCH_FALSE:
 	    if (instr != block->last || block->num_successors != 2
 		|| (region_block->condition = jit_region_cfg_value(program,
-		    region, value_map, instr->src1)) < 0)
+		    region, value_map, instr->src1)) < 0
+		|| region->values[region_block->condition].type != TYPE_INT)
 		return 0;
 	    region_block->terminator = JIT_REGION_CFG_BRANCH;
 	    region_block->false_successor = block_map[block->successors[0]];
@@ -4711,6 +5203,278 @@ finished:
 }
 
 static int
+jit_region_cfg_snapshot_uses(JITRegionCFGSnapshot *snapshot, int value)
+{
+    int use;
+    int count = 0;
+
+    for (use = 0; use < snapshot->num_values; use++)
+	if (snapshot->values[use].region_value == value)
+	    count++;
+    return count;
+}
+
+static int
+jit_region_cfg_value_uses(JITRegionCFG *region, int value)
+{
+    int count = 0;
+    int instruction;
+    int block;
+    int call;
+
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++) {
+	JITRegionCFGInstruction *instr = &region->instructions[instruction];
+
+	if (instr->kind == HIR_TAC_UNARY && instr->src1 == value)
+	    count++;
+	else if (instr->kind == HIR_TAC_BINARY) {
+	    if (instr->src1 == value)
+		count++;
+	    if (instr->src2 == value)
+		count++;
+	} else if (instr->kind == HIR_TAC_RANGE_REF) {
+	    count += instr->src1 == value;
+	    count += instr->src2 == value;
+	    count += instr->range_end == value;
+	} else if (instr->kind == HIR_TAC_CALL && instr->src1 == value)
+	    count++;
+	else if (instr->kind == HIR_TAC_PUT_PROP && instr->value == value)
+	    count++;
+	else if (instr->kind == HIR_TAC_PARALLEL_COPY) {
+	    int copy;
+
+	    for (copy = 0; copy < instr->num_copies; copy++)
+		if (region->copies[instr->copy_base + copy].src == value)
+		    count++;
+	}
+	count += jit_region_cfg_snapshot_uses(&instr->exit, value);
+    }
+    for (block = 0; block < region->num_blocks; block++) {
+	JITRegionCFGBlock *region_block = &region->blocks[block];
+
+	if (region_block->condition == value)
+	    count++;
+	if (region_block->result == value)
+	    count++;
+	count += jit_region_cfg_snapshot_uses(&region_block->exit, value);
+    }
+    for (call = 0; call < region->num_calls; call++) {
+	JITRegionCFGCall *region_call = &region->calls[call];
+	int argument;
+
+	if (region_call->argument_list == value)
+	    count++;
+	for (argument = 0; argument < region_call->num_arguments; argument++)
+	    if (region_call->arguments[argument] == value)
+		count++;
+	count += jit_region_cfg_snapshot_uses(&region_call->caller, value);
+    }
+    return count;
+}
+
+static JITRegionCFGInstruction *
+jit_region_cfg_definition(JITRegionCFG *region, int value)
+{
+    int instruction;
+
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++)
+	if (region->instructions[instruction].value == value)
+	    return &region->instructions[instruction];
+    return 0;
+}
+
+static int
+jit_region_cfg_virtualize_list(JITRegionCFG *region, int value)
+{
+    JITRegionCFGInstruction *definition;
+
+    if (value < 0 || value >= region->num_values
+	|| region->values[value].kind != JIT_REGION_VALUE_TEMPORARY
+	|| region->values[value].type != TYPE_LIST
+	|| jit_region_cfg_value_uses(region, value) != 1
+	|| !(definition = jit_region_cfg_definition(region, value)))
+	return 0;
+    if (definition->kind == HIR_TAC_CONST)
+	;
+    else if (definition->kind == HIR_TAC_UNARY
+	     && definition->op == HIR_OP_MAKE_SINGLETON_LIST)
+	;
+    else if (definition->kind == HIR_TAC_BINARY
+	     && definition->op == HIR_OP_LIST_ADD_TAIL) {
+	if (!jit_region_cfg_virtualize_list(region, definition->src1))
+	    return 0;
+    } else
+	return 0;
+    region->values[value].virtualized = 1;
+    return 1;
+}
+
+static void
+jit_region_cfg_virtualize_arguments(JITRegionCFG *region)
+{
+    int call;
+
+    for (call = 0; call < region->num_calls; call++)
+	(void) jit_region_cfg_virtualize_list(region,
+	    region->calls[call].argument_list);
+}
+
+static int
+jit_region_cfg_borrowed_list(JITRegionCFG *region, int value, int depth)
+{
+    int i, copies = 0;
+
+    if (depth >= JIT_REGION_MAX_VALUES)
+	return 0;
+    if (region->values[value].kind == JIT_REGION_VALUE_ARGUMENT)
+	return 1;
+    if (jit_region_cfg_definition(region, value))
+	return 0;
+    for (i = 0; i < region->num_copies; i++)
+	if (region->copies[i].dst == value) {
+	    if (!jit_region_cfg_borrowed_list(region, region->copies[i].src,
+		    depth + 1))
+		return 0;
+	    copies++;
+	}
+    return copies > 0;
+}
+
+/* A slice has no Var or allocation. Only length and integer indexing may
+ * consume it; all other uses require ordinary execution and a real list. */
+static int
+jit_region_cfg_validate_slices(JITRegionCFG *region)
+{
+    int value, i;
+
+    for (i = 0; i < region->num_instructions; i++)
+	if (region->instructions[i].kind == HIR_TAC_RANGE_REF
+	    && !jit_region_cfg_borrowed_list(region,
+		region->instructions[i].src1, 0))
+	    return 0;
+
+    for (value = 0; value < region->num_values; value++) {
+	int uses = 0;
+
+	if (region->values[value].virtualized != 2)
+	    continue;
+	for (i = 0; i < region->num_instructions; i++) {
+	    JITRegionCFGInstruction *instr = &region->instructions[i];
+
+	    if (instr->src1 == value
+		&& ((instr->kind == HIR_TAC_UNARY && instr->op == HIR_OP_LENGTH)
+		    || (instr->kind == HIR_TAC_BINARY && instr->op == HIR_OP_INDEX)))
+		uses++;
+	}
+	if (uses != jit_region_cfg_value_uses(region, value))
+	    return 0;
+	for (i = 0; i < region->num_copies; i++)
+	    if (region->copies[i].dst == value)
+		return 0;
+    }
+    return 1;
+}
+
+/* Facts describe SSA values, not storage homes. Do not specialize parallel
+ * copy destinations: their incoming values can differ across loop edges. */
+static void
+jit_region_cfg_specialize(JITRegionCFG *region)
+{
+    int changed, i;
+    unsigned char copied[JIT_REGION_MAX_VALUES] = {0};
+
+    for (i = 0; i < region->num_copies; i++)
+	copied[region->copies[i].dst] = 1;
+    do {
+	changed = 0;
+	for (i = 0; i < region->num_instructions; i++) {
+	    JITRegionCFGInstruction *instr = &region->instructions[i];
+	    JITRegionCFGValue *dst, *left, *right;
+	    IntegerArithmeticOperation operation;
+	    IntegerArithmeticResult folded;
+	    Num value;
+	    int arithmetic = 1, constant = 0;
+
+	    if (instr->kind != HIR_TAC_BINARY || instr->value < 0
+		|| instr->src1 < 0 || instr->src2 < 0
+		|| copied[instr->value])
+		continue;
+	    dst = &region->values[instr->value];
+	    left = &region->values[instr->src1];
+	    right = &region->values[instr->src2];
+	    if (dst->type != TYPE_INT || left->type != TYPE_INT
+		|| right->type != TYPE_INT)
+		continue;
+	    if (dst->kind != JIT_REGION_VALUE_CONSTANT
+		&& left->kind == JIT_REGION_VALUE_CONSTANT
+		&& right->kind == JIT_REGION_VALUE_CONSTANT) {
+		switch (instr->op) {
+		case HIR_OP_ADD: operation = INTEGER_ADD; break;
+		case HIR_OP_SUB: operation = INTEGER_SUBTRACT; break;
+		case HIR_OP_MUL: operation = INTEGER_MULTIPLY; break;
+		case HIR_OP_DIV: operation = INTEGER_DIVIDE; break;
+		case HIR_OP_MOD: operation = INTEGER_MODULUS; break;
+		case HIR_OP_SHL: operation = INTEGER_SHIFT_LEFT; break;
+		case HIR_OP_SHR: operation = INTEGER_SHIFT_RIGHT; break;
+		case HIR_OP_LSHR: operation = INTEGER_LOGICAL_SHIFT_RIGHT; break;
+		default:
+		    arithmetic = 0;
+		    constant = jit_region_cfg_fold_binary(instr->op,
+			left->constant, right->constant, &value);
+		    break;
+		}
+		if (arithmetic) {
+		    folded = integer_arithmetic(operation, left->constant,
+			right->constant);
+		    constant = folded.succeeded;
+		    value = folded.value;
+		}
+		if (constant) {
+		    dst->kind = JIT_REGION_VALUE_CONSTANT;
+		    dst->constant = value;
+		    dst->nonnegative = value >= 0;
+		    dst->maximum = value >= 0 ? (UNum) value : 0;
+		    changed = 1;
+		}
+	    }
+	    if (!dst->nonnegative && right->kind == JIT_REGION_VALUE_CONSTANT
+		&& right->constant >= 0
+		&& (instr->op == HIR_OP_BITAND
+		    || (instr->op == HIR_OP_MOD && right->constant > 0
+			&& left->nonnegative))) {
+		dst->nonnegative = 1;
+		dst->maximum = right->constant - (instr->op == HIR_OP_MOD);
+		changed = 1;
+	    }
+	}
+    } while (changed);
+    for (i = 0; i < region->num_calls; i++) {
+	JITRegionCFGCall *call = &region->calls[i];
+	int value;
+
+	for (value = 0; value < call->target->num_values; value++) {
+	    JITRegionCFGValue *formal = &call->target->values[value];
+	    JITRegionCFGValue *actual;
+
+	    if (formal->kind != JIT_REGION_VALUE_ARGUMENT)
+		continue;
+	    actual = &region->values[call->arguments[formal->argument - 1]];
+	    if (actual->type != formal->type)
+		continue;
+	    formal->nonnegative = actual->nonnegative;
+	    formal->maximum = actual->maximum;
+	    if (actual->kind == JIT_REGION_VALUE_CONSTANT) {
+		formal->kind = JIT_REGION_VALUE_CONSTANT;
+		formal->constant = actual->constant;
+	    }
+	}
+	jit_region_cfg_specialize(call->target);
+    }
+}
+
+static int
 jit_region_cfg_depth(JITProgram *program, JITRegionCFG *region, int depth,
 		     int num_arguments)
 {
@@ -4736,6 +5500,8 @@ jit_region_cfg_depth(JITProgram *program, JITRegionCFG *region, int depth,
 	    max_block = block->id;
     if (!program->blocks || max_block <= 0)
 	goto done;
+    if (!jit_region_cfg_argument_constraints(program, region))
+	goto done;
     blocks = mymalloc((max_block + 1) * sizeof(*blocks), M_PROGRAM);
     state = mymalloc(max_block + 1, M_PROGRAM);
     block_map = mymalloc((max_block + 1) * sizeof(*block_map), M_PROGRAM);
@@ -4758,7 +5524,9 @@ jit_region_cfg_depth(JITProgram *program, JITRegionCFG *region, int depth,
 	    && !jit_region_cfg_import_block(program, region, block, value_map,
 		block_map, depth))
 	    goto done;
-    valid = region->num_blocks > 0;
+    valid = region->num_blocks > 0 && jit_region_cfg_validate_slices(region);
+    if (valid)
+	jit_region_cfg_virtualize_arguments(region);
 
 done:
     if (value_map)
@@ -4964,6 +5732,34 @@ jit_test_region_cfg_calls(JITProgram *program, int *calls,
 }
 
 int
+jit_test_region_cfg_virtual_values(JITProgram *program, int *values)
+{
+    JITRegionCFG region;
+    int value;
+
+    if (!jit_region_cfg(program, &region))
+	return 0;
+    *values = 0;
+    for (value = 0; value < region.num_values; value++)
+	if (region.values[value].virtualized)
+	    (*values)++;
+    jit_region_cfg_clear(&region);
+    return 1;
+}
+
+int
+jit_test_region_cfg_return_type(JITProgram *program, var_type *type)
+{
+    JITRegionCFG region;
+
+    if (!jit_region_cfg(program, &region))
+	return 0;
+    *type = jit_region_cfg_return_type(&region);
+    jit_region_cfg_clear(&region);
+    return 1;
+}
+
+int
 jit_test_region_cfg_exits(JITProgram *program, int *exits, int *values)
 {
     JITRegionCFG region;
@@ -5004,34 +5800,157 @@ jit_region_cfg_operand(MIRBuild *build, JITRegionCFG *region, int value,
 	    caller_values[arguments[region_value->argument - 1]]);
     }
     if (region_value->kind == JIT_REGION_VALUE_CONSTANT)
-	return MIR_new_int_op(build->context, region_value->constant);
+	return region_value->type == TYPE_FLOAT
+	    ? MIR_new_double_op(build->context,
+		raw_to_double(region_value->constant))
+	    : MIR_new_int_op(build->context, region_value->constant);
     return MIR_new_reg_op(build->context, region_values[value]);
 }
 
+static MIR_op_t
+jit_region_cfg_raw_operand(MIRBuild *build, JITRegionCFG *region, int value,
+	int *arguments, MIR_reg_t *caller_values, MIR_op_t *actuals,
+	MIR_reg_t *region_values, int *copy_serial)
+{
+    MIR_op_t operand = jit_region_cfg_operand(build, region, value, arguments,
+	caller_values, actuals, region_values);
+    MIR_reg_t raw;
+    char name[32];
+
+    if (region->values[value].type != TYPE_FLOAT)
+	return operand;
+    sprintf(name, "region_raw%d", (*copy_serial)++);
+    raw = new_reg(build, name);
+    append(build, MIR_new_call_insn(build->context, 4,
+	MIR_new_ref_op(build->context, build->proto_double_raw),
+	MIR_new_ref_op(build->context, build->import_double_raw),
+	MIR_new_reg_op(build->context, raw), operand));
+    return MIR_new_reg_op(build->context, raw);
+}
+
 static int
-jit_region_cfg_assign_owners(JITProgram *root_program, JITRegionCFG *region)
+jit_region_cfg_is_return_value(JITRegionCFG *region, int value)
+{
+    int block;
+
+    for (block = 0; block < region->num_blocks; block++)
+	if (region->blocks[block].terminator == JIT_REGION_CFG_RETURN
+	    && region->blocks[block].result == value)
+	    return 1;
+    return 0;
+}
+
+static int
+jit_region_cfg_copy_destination(JITRegionCFG *region, int value)
+{
+    int instruction;
+
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++)
+	if (region->instructions[instruction].kind == HIR_TAC_PARALLEL_COPY) {
+	    JITRegionCFGInstruction *copy = &region->instructions[instruction];
+	    int item;
+
+	    for (item = 0; item < copy->num_copies; item++)
+		if (region->copies[copy->copy_base + item].dst == value)
+		    return 1;
+	}
+    return 0;
+}
+
+static int
+jit_region_cfg_return_source_owner(JITRegionCFG *region, int value)
+{
+    int source_owner = jit_resolve_owner_slot(region->program,
+	region->values[value].source_value);
+    int block;
+
+    for (block = 0; block < region->num_blocks; block++) {
+	int result = region->blocks[block].result;
+
+	if (region->blocks[block].terminator == JIT_REGION_CFG_RETURN
+	    && result >= 0 && result < region->num_values
+	    && jit_resolve_owner_slot(region->program,
+		region->values[result].source_value) == source_owner)
+	    return 1;
+    }
+    return 0;
+}
+
+static int
+jit_region_cfg_call_result_owner(JITRegionCFG *region, int call)
+{
+    int instruction;
+
+    for (instruction = 0; instruction < region->num_instructions;
+	 instruction++)
+	if (region->instructions[instruction].kind == HIR_TAC_CALL_VERB
+	    && region->instructions[instruction].call == call)
+	    return region->values[
+		region->instructions[instruction].value].owner;
+    return -1;
+}
+
+static int
+jit_region_cfg_assign_owners(JITProgram *root_program, JITRegionCFG *region,
+			     int result_owner)
 {
     int value;
     int call;
     int instruction;
 
     region->owner_base = root_program->num_owned_slots;
-    region->num_owners = region->program->num_owned_slots;
-    root_program->num_owned_slots += region->num_owners;
-    root_program->num_region_owned_slots += region->num_owners;
-    for (value = 0; value < region->num_values; value++)
-	if (region->values[value].type == TYPE_LIST) {
+    region->num_owners = 0;
+    for (value = 0; value < region->num_values; value++) {
+	if (region->values[value].kind == JIT_REGION_VALUE_CONSTANT
+	    && region->values[value].type == TYPE_STR) {
+	    const char *literal = jit_region_literal_register(root_program,
+		(const char *) (intptr_t) region->values[value].constant);
+
+	    region->values[value].constant = (Num) (intptr_t) literal;
+	}
+	if (region->values[value].kind == JIT_REGION_VALUE_TEMPORARY
+	    && !region->values[value].virtualized
+	    && (region->values[value].type == TYPE_STR
+	    || region->values[value].type == TYPE_LIST
+#ifdef WAIF_CORE
+	    || region->values[value].type == TYPE_WAIF
+#endif
+	    )) {
 	    int owner = jit_resolve_owner_slot(region->program,
 		region->values[value].source_value);
+	    JITRegionCFGInstruction *definition =
+		jit_region_cfg_definition(region, value);
+	    int prior;
 
-	    if (owner >= 0)
-		region->values[value].owner = region->owner_base + owner;
-	    else {
+	    if (result_owner >= 0
+		&& (jit_region_cfg_is_return_value(region, value)
+		    || (owner >= 0
+			&& jit_region_cfg_return_source_owner(region, value)))) {
+		region->values[value].owner = result_owner;
+		continue;
+	    }
+	    if ((definition && definition->kind == HIR_TAC_BINARY
+		 && definition->op == HIR_OP_LIST_ADD_TAIL)
+		|| jit_region_cfg_copy_destination(region, value))
+		continue;
+	    for (prior = 0; owner >= 0 && prior < value; prior++)
+		if (!region->values[prior].virtualized
+		    && region->values[prior].kind
+		       == JIT_REGION_VALUE_TEMPORARY
+		    && region->values[prior].owner >= 0
+		    && jit_resolve_owner_slot(region->program,
+			region->values[prior].source_value) == owner) {
+		    region->values[value].owner = region->values[prior].owner;
+		    break;
+		}
+	    if (region->values[value].owner < 0) {
 		region->values[value].owner = root_program->num_owned_slots++;
 		root_program->num_region_owned_slots++;
 		region->num_owners++;
 	    }
 	}
+    }
     for (instruction = 0; instruction < region->num_instructions;
 	 instruction++) {
 	JITRegionCFGInstruction *instr = &region->instructions[instruction];
@@ -5045,17 +5964,32 @@ jit_region_cfg_assign_owners(JITProgram *root_program, JITRegionCFG *region)
 	    for (copy = 0; copy < instr->num_copies; copy++) {
 		JITRegionCFGCopy *item = &region->copies[instr->copy_base + copy];
 
-		if (region->values[item->src].type == TYPE_LIST) {
-		    region->values[item->dst].type = TYPE_LIST;
+		if (region->values[item->src].type == TYPE_STR
+		    || region->values[item->src].type == TYPE_LIST
+#ifdef WAIF_CORE
+		    || region->values[item->src].type == TYPE_WAIF
+#endif
+		    ) {
+		    region->values[item->dst].type =
+			region->values[item->src].type;
 		    region->values[item->dst].owner =
 			region->values[item->src].owner;
 		}
 	    }
 	}
     }
+    if (result_owner >= 0) {
+	int block;
+
+	for (block = 0; block < region->num_blocks; block++)
+	    if (region->blocks[block].terminator == JIT_REGION_CFG_RETURN
+		&& region->values[region->blocks[block].result].owner < 0)
+		return 0;
+    }
     for (call = 0; call < region->num_calls; call++)
 	if (!jit_region_cfg_assign_owners(root_program,
-		region->calls[call].target))
+		region->calls[call].target,
+		jit_region_cfg_call_result_owner(region, call)))
 	    return 0;
     return 1;
 }
@@ -5064,7 +5998,12 @@ static int
 jit_region_cfg_return_owner(JITRegionCFG *region, int result)
 {
     if (result < 0 || result >= region->num_values
-	|| region->values[result].type != TYPE_LIST)
+	|| (region->values[result].type != TYPE_STR
+	    && region->values[result].type != TYPE_LIST
+#ifdef WAIF_CORE
+	    && region->values[result].type != TYPE_WAIF
+#endif
+	    ))
 	return -1;
     return region->values[result].owner;
 }
@@ -5160,7 +6099,7 @@ append_region_deferred_tail(MIRBuild *build, JITProgram *program,
 static void
 append_region_exit_frame(MIRBuild *build, JITRegionExitFrame *frame,
 	JITRegionCFGSnapshot *snapshot, JITRegionExitPath *source,
-	JITProgram *root_program, MIR_reg_t deopt_values)
+	JITProgram *root_program, MIR_reg_t deopt_values, int *copy_serial)
 {
     int value;
 
@@ -5170,10 +6109,10 @@ append_region_exit_frame(MIRBuild *build, JITRegionExitFrame *frame,
 		sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
 		jit_region_exit_value_offset(root_program,
 		    frame->values[value].runtime_slot), deopt_values, 0, 1),
-	    jit_region_cfg_operand(build, source->region,
+	    jit_region_cfg_raw_operand(build, source->region,
 		snapshot->values[value].region_value, source->arguments,
 		source->caller_values, source->actuals,
-		source->region_values)));
+		source->region_values, copy_serial)));
     if (source->call)
 	for (value = 0; value < source->call->num_arguments; value++)
 	    append(build, MIR_new_insn(build->context, MIR_MOV,
@@ -5181,10 +6120,10 @@ append_region_exit_frame(MIRBuild *build, JITRegionExitFrame *frame,
 		    sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
 		    jit_region_exit_value_offset(root_program,
 			frame->argument_slots[value]), deopt_values, 0, 1),
-		jit_region_cfg_operand(build, source->region,
+		jit_region_cfg_raw_operand(build, source->region,
 		    source->call->arguments[value], source->arguments,
 		    source->caller_values, source->actuals,
-		    source->region_values)));
+		    source->region_values, copy_serial)));
 }
 
 static void
@@ -5210,7 +6149,7 @@ append_region_exact_exit(MIRBuild *build, JITRegionCFG *region,
     for (frame = 0; frame < depth; frame++)
 	append_region_exit_frame(build, &exit->frames[frame],
 	    &path[frame].call->caller, &path[frame], root_program,
-	    deopt_values);
+	    deopt_values, copy_serial);
     memset(&source, 0, sizeof(source));
     source.region = region;
     source.arguments = arguments;
@@ -5218,7 +6157,7 @@ append_region_exact_exit(MIRBuild *build, JITRegionCFG *region,
     source.actuals = actuals;
     source.region_values = region_values;
     append_region_exit_frame(build, &exit->frames[depth], snapshot, &source,
-	root_program, deopt_values);
+	root_program, deopt_values, copy_serial);
     append(build, MIR_new_insn(build->context, MIR_BLE,
 	MIR_new_label_op(build->context, cold),
 	MIR_new_reg_op(build->context, tick_result),
@@ -5232,6 +6171,9 @@ append_region_exact_exit(MIRBuild *build, JITRegionCFG *region,
 	MIR_new_int_op(build->context, JIT_REGION_EXIT_ENCODE(exit_id))));
     return_shared_status(build, JIT_RUN_REGION_EXIT);
 }
+
+static void append_region_cfg_dependency_guards(MIRBuild *, JITRegionCFG *,
+	MIR_reg_t, MIR_op_t, Objid, uint64_t, MIR_label_t, int *);
 
 static void
 append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
@@ -5247,6 +6189,7 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
     MIR_label_t labels[JIT_REGION_MAX_BLOCKS];
     MIR_label_t instruction_exits[JIT_REGION_MAX_INSTRUCTIONS];
     MIR_reg_t region_values[JIT_REGION_MAX_VALUES];
+    MIR_reg_t slice_lengths[JIT_REGION_MAX_VALUES];
     int instruction_exit_ids[JIT_REGION_MAX_INSTRUCTIONS];
     int block;
     int instruction_index;
@@ -5254,10 +6197,23 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
     char name[32];
 
     memset(region_values, 0, sizeof(region_values));
+    memset(slice_lengths, 0, sizeof(slice_lengths));
     for (value = 0; value < region->num_values; value++)
-	if (region->values[value].kind == JIT_REGION_VALUE_TEMPORARY) {
+	if ((region->values[value].kind == JIT_REGION_VALUE_TEMPORARY
+	     || region->values[value].kind == JIT_REGION_VALUE_RECEIVER)
+	    && region->values[value].virtualized != 1) {
 	    sprintf(name, "region_value%d", (*copy_serial)++);
-	    region_values[value] = new_reg(build, name);
+	    region_values[value] = region->values[value].type == TYPE_FLOAT
+		? MIR_new_func_reg(build->context, build->function->u.func,
+		    MIR_T_D, name) : new_reg(build, name);
+	    if (region->values[value].kind == JIT_REGION_VALUE_RECEIVER)
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_reg_op(build->context, region_values[value]),
+		    MIR_new_reg_op(build->context, receiver)));
+	    if (region->values[value].virtualized == 2) {
+		sprintf(name, "region_slice_len%d", (*copy_serial)++);
+		slice_lengths[value] = new_reg(build, name);
+	    }
 	}
     for (block = 0; block < region->num_blocks; block++)
 	labels[block] = MIR_new_label(build->context);
@@ -5291,6 +6247,13 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 	    MIR_op_t dst;
 	    MIR_op_t src1;
 	    MIR_op_t src2;
+
+	    if (instruction->kind != HIR_TAC_PUT_PROP
+		&& instruction->value >= 0
+		&& (region->values[instruction->value].virtualized == 1
+		    || region->values[instruction->value].kind
+		       == JIT_REGION_VALUE_CONSTANT))
+		continue;
 
 	    if (instruction->kind == HIR_TAC_TICK) {
 		append(build, MIR_new_insn(build->context, MIR_ADD,
@@ -5328,8 +6291,14 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			instruction->copy_base + copy];
 
 		    sprintf(name, "region_copy%d", (*copy_serial)++);
-		    temps[copy] = new_reg(build, name);
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
+		    temps[copy] = region->values[region_copy->src].type
+			== TYPE_FLOAT
+			? MIR_new_func_reg(build->context,
+			    build->function->u.func, MIR_T_D, name)
+			: new_reg(build, name);
+		    append(build, MIR_new_insn(build->context,
+			region->values[region_copy->src].type == TYPE_FLOAT
+			? MIR_DMOV : MIR_MOV,
 			MIR_new_reg_op(build->context, temps[copy]),
 			jit_region_cfg_operand(build, region,
 			    region_copy->src, arguments, caller_values,
@@ -5339,7 +6308,9 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		    JITRegionCFGCopy *region_copy = &region->copies[
 			instruction->copy_base + copy];
 
-		    append(build, MIR_new_insn(build->context, MIR_MOV,
+		    append(build, MIR_new_insn(build->context,
+			region->values[region_copy->dst].type == TYPE_FLOAT
+			? MIR_DMOV : MIR_MOV,
 			MIR_new_reg_op(build->context,
 			    region_values[region_copy->dst]),
 			MIR_new_reg_op(build->context, temps[copy])));
@@ -5364,9 +6335,9 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 	    if (instruction->kind == HIR_TAC_UNARY
 		&& instruction->op == HIR_OP_MAKE_SINGLETON_LIST) {
 		int owner = region->values[instruction->value].owner;
-		MIR_op_t source = jit_region_cfg_operand(build, region,
+		MIR_op_t source = jit_region_cfg_raw_operand(build, region,
 		    instruction->src1, arguments, caller_values, actuals,
-		    region_values);
+		    region_values, copy_serial);
 
 		if (instruction->list_capacity > 1)
 		    append(build, MIR_new_call_insn(build->context, 6,
@@ -5376,7 +6347,8 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			    build->import_fixed_list_head),
 			MIR_new_reg_op(build->context,
 			    region_values[instruction->value]), source,
-			MIR_new_int_op(build->context, TYPE_INT),
+			MIR_new_int_op(build->context,
+			    region->values[instruction->src1].type),
 			MIR_new_int_op(build->context,
 			    instruction->list_capacity)));
 		else
@@ -5387,7 +6359,8 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			    build->import_singleton_list),
 			MIR_new_reg_op(build->context,
 			    region_values[instruction->value]), source,
-			MIR_new_int_op(build->context, TYPE_INT)));
+			MIR_new_int_op(build->context,
+			    region->values[instruction->src1].type)));
 		append_owned_replace(build, owned_values, owner,
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
@@ -5407,9 +6380,9 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		MIR_op_t list = jit_region_cfg_operand(build, region,
 		    instruction->src1, arguments, caller_values, actuals,
 		    region_values);
-		MIR_op_t element = jit_region_cfg_operand(build, region,
+		MIR_op_t element = jit_region_cfg_raw_operand(build, region,
 		    instruction->src2, arguments, caller_values, actuals,
-		    region_values);
+		    region_values, copy_serial);
 
 		if (owner < 0 || owner != region->values[instruction->value].owner)
 		    panic("Region list-tail ownership was not coalesced");
@@ -5424,11 +6397,13 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 			list,
 			MIR_new_int_op(build->context,
 			    instruction->list_index), element,
-			MIR_new_int_op(build->context, TYPE_INT)));
+			MIR_new_int_op(build->context,
+			    region->values[instruction->src2].type)));
 		else
 		    append_list_append_owned(build,
 			region_values[instruction->value], owned_values, owner,
-			list, element, MIR_new_int_op(build->context, TYPE_INT), 1);
+			list, element, MIR_new_int_op(build->context,
+			    region->values[instruction->src2].type), 1);
 		continue;
 	    }
 	    if (instruction->kind == HIR_TAC_BINARY
@@ -5459,7 +6434,9 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 
 		append(build, MIR_new_call_insn(build->context, 8,
 		    MIR_new_ref_op(build->context, build->proto_get_prop_int),
-		    MIR_new_ref_op(build->context, build->import_get_prop_int),
+		    MIR_new_ref_op(build->context,
+			region->values[instruction->value].type == TYPE_OBJ
+			? build->import_get_prop_obj : build->import_get_prop_int),
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
 		    jit_region_cfg_operand(build, region, instruction->src1,
@@ -5482,6 +6459,50 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		append(build, normal);
 		continue;
 	    }
+	    if (instruction->kind == HIR_TAC_CALL) {
+		MIR_reg_t builtin_ok;
+		MIR_op_t destination = MIR_new_reg_op(build->context,
+		    region_values[instruction->value]);
+		var_type result_type = region->values[instruction->value].type;
+		int owner = region->values[instruction->value].owner;
+
+		sprintf(name, "region_builtin_ok%d", (*copy_serial)++);
+		builtin_ok = new_reg(build, name);
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_reg_op(build->context, builtin_ok),
+		    MIR_new_int_op(build->context, 0)));
+		if (result_type == TYPE_FLOAT)
+		    append(build, MIR_new_call_insn(build->context, 7,
+			MIR_new_ref_op(build->context,
+			    build->proto_region_builtin_float),
+			MIR_new_ref_op(build->context,
+			    build->import_region_builtin_float), destination,
+			MIR_new_int_op(build->context, instruction->func),
+			jit_region_cfg_operand(build, region, instruction->src1,
+			    arguments, caller_values, actuals, region_values),
+			MIR_new_reg_op(build->context, progr),
+			MIR_new_reg_op(build->context, builtin_ok)));
+		else
+		    append(build, MIR_new_call_insn(build->context, 11,
+			MIR_new_ref_op(build->context,
+			    build->proto_region_builtin),
+			MIR_new_ref_op(build->context,
+			    build->import_region_builtin), destination,
+			MIR_new_int_op(build->context, instruction->func),
+			jit_region_cfg_operand(build, region, instruction->src1,
+			    arguments, caller_values, actuals, region_values),
+			MIR_new_reg_op(build->context, progr),
+			MIR_new_reg_op(build->context, owned_values),
+			MIR_new_reg_op(build->context,
+			    build->home_capacities),
+			MIR_new_int_op(build->context, owner),
+			MIR_new_int_op(build->context, result_type),
+			MIR_new_reg_op(build->context, builtin_ok)));
+		append(build, MIR_new_insn(build->context, MIR_BF,
+		    MIR_new_label_op(build->context, cold),
+		    MIR_new_reg_op(build->context, builtin_ok)));
+		continue;
+	    }
 	    if (instruction->kind == HIR_TAC_CALL_VERB) {
 		JITRegionCFGCall *region_call =
 		    &region->calls[instruction->call];
@@ -5489,6 +6510,34 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		MIR_label_t nested_continuation =
 		    MIR_new_label(build->context);
 		int argument;
+		MIR_reg_t nested_receiver = receiver;
+
+		if (region_call->receiver >= 0) {
+		    MIR_reg_t guard;
+		    sprintf(name, "nested_receiver%d", (*copy_serial)++);
+		    nested_receiver = new_reg(build, name);
+		    append(build, MIR_new_insn(build->context, MIR_MOV,
+			MIR_new_reg_op(build->context, nested_receiver),
+			jit_region_cfg_operand(build, region, region_call->receiver,
+			    arguments, caller_values, actuals, region_values)));
+		    sprintf(name, "nested_guard%d", (*copy_serial)++);
+		    guard = new_reg(build, name);
+		    append(build, MIR_new_call_insn(build->context, 7,
+			MIR_new_ref_op(build->context, build->proto_region_guard),
+			MIR_new_ref_op(build->context, build->import_region_guard),
+			MIR_new_reg_op(build->context, guard),
+			MIR_new_reg_op(build->context, nested_receiver),
+			MIR_new_int_op(build->context, TYPE_OBJ),
+			MIR_new_int_op(build->context, region_call->receiver_class),
+			MIR_new_int_op(build->context, region_call->dispatch_epoch)));
+		    append(build, MIR_new_insn(build->context, MIR_BF,
+			MIR_new_label_op(build->context, cold),
+			MIR_new_reg_op(build->context, guard)));
+		    append_region_cfg_dependency_guards(build, region_call->target,
+			nested_receiver, MIR_new_int_op(build->context, TYPE_OBJ),
+			region_call->receiver_class, region_call->dispatch_epoch,
+			cold, copy_serial);
+		}
 
 		for (argument = 0; argument < region_call->num_arguments;
 		     argument++)
@@ -5506,7 +6555,7 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		    MIR_new_reg_op(build->context,
 			region_values[instruction->value]),
 		    nested_continuation, root_program, deopt_values, owned_values,
-		    tick_result, timed_out, receiver, progr, error_out,
+		    tick_result, timed_out, nested_receiver, progr, error_out,
 		    deopt_map_out, caller_map, deferred_tail, path, depth + 1,
 		    region->values[instruction->value].owner, copy_serial);
 		append(build, nested_continuation);
@@ -5548,10 +6597,113 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		append(build, committed);
 		continue;
 	    }
+	    if (instruction->kind == HIR_TAC_RANGE_REF) {
+		MIR_label_t empty = MIR_new_label(build->context);
+		MIR_label_t done = MIR_new_label(build->context);
+		MIR_op_t length = MIR_new_reg_op(build->context,
+		    slice_lengths[instruction->value]);
+		MIR_op_t end = jit_region_cfg_operand(build, region,
+		    instruction->range_end, arguments, caller_values, actuals,
+		    region_values);
+		MIR_reg_t base, offset;
+
+		sprintf(name, "region_slice_base%d", (*copy_serial)++);
+		base = new_reg(build, name);
+		sprintf(name, "region_slice_offset%d", (*copy_serial)++);
+		offset = new_reg(build, name);
+		dst = MIR_new_reg_op(build->context, region_values[instruction->value]);
+		src1 = jit_region_cfg_operand(build, region, instruction->src1,
+		    arguments, caller_values, actuals, region_values);
+		src2 = jit_region_cfg_operand(build, region, instruction->src2,
+		    arguments, caller_values, actuals, region_values);
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_reg_op(build->context, base), src1));
+		append(build, MIR_new_insn(build->context, MIR_MOV, dst, src1));
+		append(build, MIR_new_insn(build->context, MIR_BGT,
+		    MIR_new_label_op(build->context, empty), src2, end));
+		append(build, MIR_new_insn(build->context, MIR_BLT,
+		    MIR_new_label_op(build->context, cold), src2,
+		    MIR_new_int_op(build->context, 1)));
+		append(build, MIR_new_insn(build->context, MIR_BGT,
+		    MIR_new_label_op(build->context, cold), end,
+		    MIR_new_mem_op(build->context, sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+			offsetof(Var, v.num), base, 0, 1)));
+		append(build, MIR_new_insn(build->context, MIR_SUB, length, end, src2));
+		append(build, MIR_new_insn(build->context, MIR_ADD, length, length,
+		    MIR_new_int_op(build->context, 1)));
+		append(build, MIR_new_insn(build->context, MIR_SUB,
+		    MIR_new_reg_op(build->context, offset), src2,
+		    MIR_new_int_op(build->context, 1)));
+		append(build, MIR_new_insn(build->context, MIR_MUL,
+		    MIR_new_reg_op(build->context, offset),
+		    MIR_new_reg_op(build->context, offset),
+		    MIR_new_int_op(build->context, sizeof(Var))));
+		append(build, MIR_new_insn(build->context, MIR_ADD, dst, dst,
+		    MIR_new_reg_op(build->context, offset)));
+		append(build, MIR_new_insn(build->context, MIR_JMP,
+		    MIR_new_label_op(build->context, done)));
+		append(build, empty);
+		append(build, MIR_new_insn(build->context, MIR_MOV, length,
+		    MIR_new_int_op(build->context, 0)));
+		append(build, done);
+		continue;
+	    }
 	    dst = MIR_new_reg_op(build->context,
 		region_values[instruction->value]);
 	    src1 = jit_region_cfg_operand(build, region, instruction->src1,
 		arguments, caller_values, actuals, region_values);
+	    if ((instruction->kind == HIR_TAC_UNARY
+		 && instruction->op == HIR_OP_LENGTH)
+		|| (instruction->kind == HIR_TAC_BINARY
+		    && instruction->op == HIR_OP_INDEX)) {
+		MIR_reg_t list, length;
+		MIR_label_t failed = instruction_exits[instruction_index]
+		    ? instruction_exits[instruction_index] : cold;
+
+		sprintf(name, "region_list%d", (*copy_serial)++);
+		list = new_reg(build, name);
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_reg_op(build->context, list), src1));
+		sprintf(name, "region_length%d", (*copy_serial)++);
+		length = new_reg(build, name);
+		append(build, MIR_new_insn(build->context, MIR_MOV,
+		    MIR_new_reg_op(build->context, length),
+		    slice_lengths[instruction->src1]
+		    ? MIR_new_reg_op(build->context, slice_lengths[instruction->src1])
+		    : MIR_new_mem_op(build->context, sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+			offsetof(Var, v.num), list, 0, 1)));
+		if (instruction->op == HIR_OP_LENGTH)
+		    append(build, MIR_new_insn(build->context, MIR_MOV, dst,
+			MIR_new_reg_op(build->context, length)));
+		else {
+		    MIR_reg_t address;
+		    src2 = jit_region_cfg_operand(build, region, instruction->src2,
+			arguments, caller_values, actuals, region_values);
+		    append(build, MIR_new_insn(build->context, MIR_BLT,
+			MIR_new_label_op(build->context, failed), src2,
+			MIR_new_int_op(build->context, 1)));
+		    append(build, MIR_new_insn(build->context, MIR_BGT,
+			MIR_new_label_op(build->context, failed), src2,
+			MIR_new_reg_op(build->context, length)));
+		    sprintf(name, "region_element%d", (*copy_serial)++);
+		    address = new_reg(build, name);
+		    append(build, MIR_new_insn(build->context, MIR_MUL,
+			MIR_new_reg_op(build->context, address), src2,
+			MIR_new_int_op(build->context, sizeof(Var))));
+		    append(build, MIR_new_insn(build->context, MIR_ADD,
+			MIR_new_reg_op(build->context, address),
+			MIR_new_reg_op(build->context, address),
+			MIR_new_reg_op(build->context, list)));
+		    append(build, MIR_new_insn(build->context, MIR_BNE,
+			MIR_new_label_op(build->context, failed),
+			MIR_new_mem_op(build->context, MIR_T_I32, offsetof(Var, type),
+			    address, 0, 1), MIR_new_int_op(build->context, TYPE_INT)));
+		    append(build, MIR_new_insn(build->context, MIR_MOV, dst,
+			MIR_new_mem_op(build->context, sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+			    offsetof(Var, v.num), address, 0, 1)));
+		}
+		continue;
+	    }
 	    if (instruction->kind == HIR_TAC_UNARY)
 		append(build, MIR_new_insn(build->context, MIR_XOR,
 		    dst, src1, MIR_new_int_op(build->context, -1)));
@@ -5559,7 +6711,41 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
 		src2 = jit_region_cfg_operand(build, region,
 		    instruction->src2, arguments, caller_values, actuals,
 		    region_values);
-		if (instruction->op == HIR_OP_DIV
+		if (region->values[instruction->src1].type == TYPE_FLOAT) {
+		    MIR_insn_code_t code = float_binary_code(instruction->op);
+
+		    if (code == MIR_INVALID_INSN)
+			panic("Unsupported float operation in region");
+		    append(build, MIR_new_insn(build->context, code,
+			dst, src1, src2));
+		} else if (instruction->op == HIR_OP_MOD
+		    && region->values[instruction->src2].kind
+		       == JIT_REGION_VALUE_CONSTANT
+		    && region->values[instruction->src2].constant > 0
+		    && (((UNum) region->values[instruction->src2].constant
+			 & ((UNum) region->values[instruction->src2].constant - 1))
+			== 0)) {
+		    MIR_label_t negative = MIR_new_label(build->context);
+		    MIR_label_t done = MIR_new_label(build->context);
+		    MIR_op_t mask = MIR_new_int_op(build->context,
+			region->values[instruction->src2].constant - 1);
+
+		    if (!region->values[instruction->src1].nonnegative)
+			append(build, MIR_new_insn(build->context, MIR_BLT,
+			    MIR_new_label_op(build->context, negative), src1,
+			    MIR_new_int_op(build->context, 0)));
+		    append(build, MIR_new_insn(build->context, MIR_AND,
+			dst, src1, mask));
+		    if (!region->values[instruction->src1].nonnegative) {
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, negative);
+			append(build, MIR_new_insn(build->context, MIR_NEG, dst, src1));
+			append(build, MIR_new_insn(build->context, MIR_AND, dst, dst, mask));
+			append(build, MIR_new_insn(build->context, MIR_NEG, dst, dst));
+		    }
+		    append(build, done);
+		} else if (instruction->op == HIR_OP_DIV
 		    || instruction->op == HIR_OP_MOD) {
 		    MIR_label_t exceptional =
 			instruction_exits[instruction_index]
@@ -5606,12 +6792,18 @@ append_region_cfg_body(MIRBuild *build, JITRegionCFG *region,
     if (region_block->terminator == JIT_REGION_CFG_RETURN) {
 	int source_owner = jit_region_cfg_return_owner(region,
 	    region_block->result);
+	var_type result_type = region->values[region_block->result].type;
+	MIR_op_t result_value = jit_region_cfg_operand(build, region,
+	    region_block->result, arguments, caller_values, actuals,
+	    region_values);
 
-	if (source_owner >= 0 && result_owner >= 0)
+	if (source_owner >= 0 && result_owner >= 0
+	    && source_owner != result_owner)
 	    append_owned_move(build, owned_values, result_owner, source_owner);
-	append(build, MIR_new_insn(build->context, MIR_MOV, result,
-		jit_region_cfg_operand(build, region, region_block->result,
-		    arguments, caller_values, actuals, region_values)));
+	append(build, MIR_new_insn(build->context,
+		result_type == TYPE_FLOAT
+		? MIR_DMOV : MIR_MOV, result,
+		result_value));
 	    append(build, MIR_new_insn(build->context, MIR_JMP,
 		MIR_new_label_op(build->context, continuation)));
 	} else if (region_block->terminator == JIT_REGION_CFG_BRANCH) {
@@ -5663,11 +6855,21 @@ append_region_cfg_dependency_guards(MIRBuild *build, JITRegionCFG *region,
 	MIR_reg_t receiver, MIR_op_t receiver_type, Objid root_class,
 	uint64_t root_epoch, MIR_label_t cold, int *copy_serial)
 {
-    int call;
+    int call, value;
+
+    for (value = 0; value < region->num_values; value++)
+	if (region->values[value].kind == JIT_REGION_VALUE_RECEIVER) {
+	    append(build, MIR_new_insn(build->context, MIR_BNE,
+		MIR_new_label_op(build->context, cold), receiver_type,
+		MIR_new_int_op(build->context, TYPE_OBJ)));
+	    break;
+	}
 
     for (call = 0; call < region->num_calls; call++) {
 	JITRegionCFGCall *region_call = &region->calls[call];
 
+	if (region_call->receiver >= 0)
+	    continue;
 	if (region_call->receiver_class != root_class
 	    || region_call->dispatch_epoch != root_epoch) {
 	    MIR_reg_t guard;
@@ -5708,9 +6910,13 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
     MIR_label_t success;
     MIR_reg_t dispatch_guard;
     MIR_reg_t path_ticks;
+    MIR_reg_t region_result = 0;
     MIR_op_t receiver_type;
+    MIR_op_t result_operand;
     JITRegionExitPath path[JIT_REGION_MAX_DEPTH + 1];
+    MIR_op_t root_actuals[JIT_REGION_MAX_ARGUMENTS];
     int arguments[JIT_REGION_MAX_ARGUMENTS];
+    var_type argument_types[JIT_REGION_MAX_ARGUMENTS];
     unsigned char guarded_arguments[JIT_REGION_MAX_ARGUMENTS];
     int argument_count;
     var_type result_type;
@@ -5722,16 +6928,19 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
     char name[32];
 
     memset(arguments, 0, sizeof(arguments));
+    memset(argument_types, 0, sizeof(argument_types));
     memset(path, 0, sizeof(path));
     if (!continuation)
 	return 0;
     if (!jit_region_cfg_call(program, call, &region, arguments,
 	    &argument_count, &receiver_class, &dispatch_epoch))
 	return 0;
+    jit_region_cfg_specialize(&region);
     result_type = jit_region_cfg_return_type(&region);
     if (call->value <= 0 || call->value >= program->num_values
 	|| call->src1 <= 0 || call->src1 >= program->num_values
-	|| (result_type != TYPE_INT && result_type != TYPE_LIST)
+	|| (result_type != TYPE_INT && result_type != TYPE_OBJ
+	    && result_type != TYPE_FLOAT && result_type != TYPE_LIST)
 	|| (!program->value_is_tagged[call->value]
 	    && program->value_types[call->value] != result_type))
 	goto fail;
@@ -5746,14 +6955,19 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
 		goto fail;
 	    value = arguments[argument - 1];
 	    if (value <= 0 || value >= program->num_values
+		|| (region_value->type != TYPE_INT
+		    && region_value->type != TYPE_OBJ
+		    && region_value->type != TYPE_FLOAT
+		    && region_value->type != TYPE_LIST)
 		|| (!program->value_is_tagged[value]
-		    && program->value_types[value] != TYPE_INT))
+		    && program->value_types[value] != region_value->type)
+		|| region_value->type == TYPE_ANY)
 		goto fail;
 	}
     }
-    if (result_type == TYPE_LIST)
+    if (result_type == TYPE_STR || result_type == TYPE_LIST)
 	result_owner = jit_resolve_owner_slot(program, call->value);
-    if (!jit_region_cfg_assign_owners(program, &region))
+    if (!jit_region_cfg_assign_owners(program, &region, result_owner))
 	goto fail;
 
     cold = MIR_new_label(build->context);
@@ -5764,6 +6978,13 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
 	? MIR_new_mem_op(build->context, MIR_T_I32,
 	    jit_tag_offset(program, call->src1), deopt_values, 0, 1)
 	: MIR_new_int_op(build->context, program->value_types[call->src1]);
+    for (node = 0; node < region.num_values; node++)
+	if (region.values[node].kind == JIT_REGION_VALUE_RECEIVER) {
+	    append(build, MIR_new_insn(build->context, MIR_BNE,
+		MIR_new_label_op(build->context, cold), receiver_type,
+		MIR_new_int_op(build->context, TYPE_OBJ)));
+	    break;
+	}
     append(build, MIR_new_call_insn(build->context, 7,
 	MIR_new_ref_op(build->context, build->proto_region_guard),
 	MIR_new_ref_op(build->context, build->import_region_guard),
@@ -5785,14 +7006,34 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
 	    int argument = region.values[node].argument;
 	    int value = arguments[argument - 1];
 
+	    argument_types[argument - 1] = region.values[node].type;
 	    guarded_arguments[argument - 1] = 1;
 	    if (program->value_is_tagged[value])
 		append(build, MIR_new_insn(build->context, MIR_BNE,
 		    MIR_new_label_op(build->context, cold),
 		    MIR_new_mem_op(build->context, MIR_T_I32,
 			jit_tag_offset(program, value), deopt_values, 0, 1),
-		    MIR_new_int_op(build->context, TYPE_INT)));
+		    MIR_new_int_op(build->context, region.values[node].type)));
 	}
+    for (operand = 0; operand < argument_count; operand++) {
+	int value = arguments[operand];
+
+	if (argument_types[operand] == TYPE_FLOAT
+	    && program->value_is_tagged[value]) {
+	    MIR_reg_t converted;
+
+	    sprintf(name, "region_float_arg%d", (*copy_serial)++);
+	    converted = MIR_new_func_reg(build->context,
+		build->function->u.func, MIR_T_D, name);
+	    append(build, MIR_new_call_insn(build->context, 4,
+		MIR_new_ref_op(build->context, build->proto_raw_double),
+		MIR_new_ref_op(build->context, build->import_raw_double),
+		MIR_new_reg_op(build->context, converted),
+		MIR_new_reg_op(build->context, values[value])));
+	    root_actuals[operand] = MIR_new_reg_op(build->context, converted);
+	} else
+	    root_actuals[operand] = MIR_new_reg_op(build->context, values[value]);
+    }
     append(build, MIR_new_insn(build->context, MIR_BNE,
 	MIR_new_label_op(build->context, cold),
 	MIR_new_mem_op(build->context, MIR_T_I32, 0, timed_out, 0, 1),
@@ -5803,8 +7044,16 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
     append(build, MIR_new_insn(build->context, MIR_MOV,
 	MIR_new_reg_op(build->context, path_ticks),
 	MIR_new_int_op(build->context, 0)));
-    append_region_cfg_body(build, &region, arguments, values, 0, path_ticks,
-	cold, MIR_new_reg_op(build->context, values[call->value]), success,
+    if (program->value_is_tagged[call->value] && result_type == TYPE_FLOAT) {
+	sprintf(name, "region_result%d", (*copy_serial)++);
+	region_result = MIR_new_func_reg(build->context,
+	    build->function->u.func, MIR_T_D, name);
+	result_operand = MIR_new_reg_op(build->context, region_result);
+    } else
+	result_operand = MIR_new_reg_op(build->context, values[call->value]);
+    append_region_cfg_body(build, &region, arguments, values, root_actuals,
+	path_ticks,
+	cold, result_operand, success,
 	program, deopt_values, owned_values, tick_result, timed_out,
 	values[call->src1], progr, error_out, deopt_map_out, call->deopt_map,
 	deferred_tail, path, 0, result_owner, copy_serial);
@@ -5817,6 +7066,12 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
 	MIR_new_reg_op(build->context, tick_result),
 	MIR_new_reg_op(build->context, tick_result),
 	MIR_new_reg_op(build->context, path_ticks)));
+    if (region_result)
+	append(build, MIR_new_call_insn(build->context, 4,
+	    MIR_new_ref_op(build->context, build->proto_double_raw),
+	    MIR_new_ref_op(build->context, build->import_double_raw),
+	    MIR_new_reg_op(build->context, values[call->value]),
+	    MIR_new_reg_op(build->context, region_result)));
     if (program->value_is_tagged[call->value])
 	append(build, MIR_new_insn(build->context, MIR_MOV,
 	    MIR_new_mem_op(build->context, MIR_T_I32,
@@ -6402,6 +7657,79 @@ jit_analyze_owned_last_uses(JITProgram *program)
     myfree(roots, M_PROGRAM);
 }
 
+static void
+append_scalar_builtin(MIRBuild *build, JITProgram *program,
+	JITInstruction *instr, MIR_reg_t *values, MIR_reg_t deopt_values,
+	MIR_reg_t deopt_map_out, MIR_reg_t progr, MIR_reg_t status,
+	MIR_label_t common_return, int *serial)
+{
+    MIR_reg_t ok, raw_out, type_out;
+    MIR_op_t raw[2], type[2];
+    MIR_label_t done = MIR_new_label(build->context);
+    int sources[2] = {instr->src1, instr->src2};
+    int count = instr->kind == HIR_TAC_UNARY ? 1 : 2;
+    int tagged = program->value_is_tagged
+	&& program->value_is_tagged[instr->value];
+    int i;
+    char name[40];
+
+    for (i = 0; i < 2; i++) {
+	int value = sources[i];
+
+	raw[i] = MIR_new_int_op(build->context, 0);
+	type[i] = MIR_new_int_op(build->context, TYPE_INT);
+	if (i >= count)
+	    continue;
+	raw[i] = MIR_new_reg_op(build->context,
+	    append_raw_value(build, program, values, value, deopt_values, serial));
+	type[i] = program->value_is_tagged && program->value_is_tagged[value]
+	    ? MIR_new_mem_op(build->context, sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32,
+		jit_tag_offset(program, value), deopt_values, 0, 1)
+	    : MIR_new_int_op(build->context, program->value_types[value]);
+    }
+    sprintf(name, "scalar_ok%d", (*serial)++);
+    ok = new_reg(build, name);
+    sprintf(name, "scalar_raw%d", (*serial)++);
+    raw_out = new_reg(build, name);
+    sprintf(name, "scalar_type%d", (*serial)++);
+    type_out = new_reg(build, name);
+    append(build, MIR_new_insn(build->context, MIR_ADD,
+	MIR_new_reg_op(build->context, raw_out),
+	MIR_new_reg_op(build->context, deopt_values),
+	MIR_new_int_op(build->context, instr->value * sizeof(Num))));
+    append(build, tagged
+	? MIR_new_insn(build->context, MIR_ADD,
+	    MIR_new_reg_op(build->context, type_out),
+	    MIR_new_reg_op(build->context, deopt_values),
+	    MIR_new_int_op(build->context, jit_tag_offset(program, instr->value)))
+	: MIR_new_insn(build->context, MIR_MOV,
+	    MIR_new_reg_op(build->context, type_out),
+	    MIR_new_int_op(build->context, 0)));
+    append(build, MIR_new_call_insn(build->context, 13,
+	MIR_new_ref_op(build->context, build->proto_scalar_builtin),
+	MIR_new_ref_op(build->context, build->import_scalar_builtin),
+	MIR_new_reg_op(build->context, ok),
+	MIR_new_int_op(build->context, instr->func),
+	MIR_new_int_op(build->context, count), raw[0], type[0], raw[1], type[1],
+	MIR_new_reg_op(build->context, progr),
+	MIR_new_reg_op(build->context, raw_out),
+	MIR_new_reg_op(build->context, type_out),
+	MIR_new_int_op(build->context,
+	    tagged ? TYPE_ANY : program->value_types[instr->value])));
+    append(build, MIR_new_insn(build->context, MIR_BT,
+	MIR_new_label_op(build->context, done), MIR_new_reg_op(build->context, ok)));
+    append_deopt_exit(build, program, instr, values, deopt_map_out,
+	deopt_values, status, common_return);
+    append(build, done);
+    append(build, MIR_new_insn(build->context,
+	!tagged && program->value_types[instr->value] == TYPE_FLOAT ? MIR_DMOV : MIR_MOV,
+	MIR_new_reg_op(build->context, values[instr->value]),
+	MIR_new_mem_op(build->context,
+	    !tagged && program->value_types[instr->value] == TYPE_FLOAT
+	    ? MIR_T_D : (sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32),
+	    instr->value * sizeof(Num), deopt_values, 0, 1)));
+}
+
 static int
 build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 {
@@ -6443,6 +7771,7 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     snprintf(module_name, sizeof(module_name), "moo_mod_%" PRIu64, ++next_module_serial);
     build->module = MIR_new_module(build->context, module_name);
     MIR_type_t res_i64 = MIR_T_I64;
+    MIR_type_t res_double = MIR_T_D;
     MIR_type_t res_p = MIR_T_P;
     MIR_type_t res_i32 = MIR_T_I32;
     MIR_type_t tag_t = sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32;
@@ -6465,7 +7794,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					    MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_P, "err");
     build->import_str_concat = MIR_new_import(build->context, "jit_rt_str_concat");
     build->proto_str_concat_owned = MIR_new_proto(build->context,
-	"proto_str_concat_owned", 1, &res_i32, 7, MIR_T_P, "owned_values",
+	"proto_str_concat_owned", 1, &res_i32, 8, MIR_T_P, "owned_values",
+	MIR_T_P, "capacities",
 	MIR_T_I32, "owner", MIR_T_P, "s1", MIR_T_P, "s2", MIR_T_I32,
 	"last_use", MIR_T_P, "result", MIR_T_P, "err");
     build->import_str_concat_owned = MIR_new_import(build->context,
@@ -6586,6 +7916,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	MIR_T_P, "err");
     build->import_get_prop_int = MIR_new_import(build->context,
 	"jit_rt_get_prop_int");
+    build->import_get_prop_obj = MIR_new_import(build->context,
+	"jit_rt_get_prop_obj");
 
     build->proto_put_prop = MIR_new_proto(build->context, "proto_put_prop", 1, &res_i32, 6,
 					  MIR_T_I64, "oid", MIR_T_P, "pname", MIR_T_I64, "progr",
@@ -6601,6 +7933,42 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
     build->proto_index = MIR_new_proto(build->context, "proto_index", 1, &res_i64, 2,
 				       MIR_T_P, "source", MIR_T_P, "what");
     build->import_index = MIR_new_import(build->context, "jit_rt_index");
+    build->proto_scalar_builtin = MIR_new_proto(build->context,
+	"proto_scalar_builtin", 1, &res_i64, 10,
+	MIR_T_I64, "func", MIR_T_I64, "count", MIR_T_I64, "raw1",
+	MIR_T_I64, "type1", MIR_T_I64, "raw2", MIR_T_I64, "type2",
+	MIR_T_I64, "progr", MIR_T_P, "raw_out", MIR_T_P, "type_out",
+	MIR_T_I64, "expected_type");
+    build->import_scalar_builtin = MIR_new_import(build->context,
+	"jit_rt_scalar_builtin");
+    build->proto_direct_builtin = MIR_new_proto(build->context,
+	"proto_direct_builtin", 1, &res_i64, 9,
+	MIR_T_I64, "func", MIR_T_P, "arguments", MIR_T_I64, "progr",
+	MIR_T_P, "raw_out", MIR_T_P, "type_out", MIR_T_P, "homes",
+	MIR_T_P, "capacities", MIR_T_I64, "owner", MIR_T_I64, "expected_type");
+    build->import_direct_builtin = MIR_new_import(build->context,
+	"jit_rt_direct_builtin");
+    build->proto_region_builtin = MIR_new_proto(build->context,
+	"proto_region_builtin", 1, &res_i64, 8,
+	MIR_T_I64, "func", MIR_T_P, "arguments", MIR_T_I64, "progr",
+	MIR_T_P, "homes", MIR_T_P, "capacities", MIR_T_I64, "owner",
+	MIR_T_I64, "expected_type", MIR_T_P, "ok");
+    build->import_region_builtin = MIR_new_import(build->context,
+	"jit_rt_region_builtin");
+    build->proto_region_builtin_float = MIR_new_proto(build->context,
+	"proto_region_builtin_float", 1, &res_double, 4,
+	MIR_T_I64, "func", MIR_T_P, "arguments", MIR_T_I64, "progr",
+	MIR_T_P, "ok");
+    build->import_region_builtin_float = MIR_new_import(build->context,
+	"jit_rt_region_builtin_float");
+    build->proto_double_raw = MIR_new_proto(build->context,
+	"proto_double_raw", 1, &res_i64, 1, MIR_T_D, "value");
+    build->import_double_raw = MIR_new_import(build->context,
+	"jit_rt_double_raw");
+    build->proto_raw_double = MIR_new_proto(build->context,
+	"proto_raw_double", 1, &res_double, 1, MIR_T_I64, "value");
+    build->import_raw_double = MIR_new_import(build->context,
+	"jit_rt_raw_double");
 
     build->proto_rindex = MIR_new_proto(build->context, "proto_rindex", 1, &res_i64, 2,
 					MIR_T_P, "source", MIR_T_P, "what");
@@ -6836,6 +8204,27 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 	     && j < map->native_resume->num_values; j++) {
 	    JITResumeValue *resume = &map->native_resume->values[j];
 
+	    if (resume->source == JIT_RESUME_RESULT
+		&& program->value_owned_slots
+		&& program->value_owned_slots[resume->value] >= 0) {
+		int value = resume->value;
+		MIR_reg_t raw = append_raw_value(build, program, values, value,
+		    deopt_values, &copy_serial);
+		MIR_op_t type = program->value_is_tagged[value]
+		    ? MIR_new_mem_op(build->context, tag_t,
+			jit_tag_offset(program, value), deopt_values, 0, 1)
+		    : MIR_new_int_op(build->context, program->value_types[value]);
+
+		/* The canonical result is borrowed from the resumed frame.
+		 * Reestablish the home promised by direct-call ownership. */
+		append(build, MIR_new_call_insn(build->context, 4,
+		    MIR_new_ref_op(build->context, build->proto_retain_raw),
+		    MIR_new_ref_op(build->context, build->import_retain_raw),
+		    MIR_new_reg_op(build->context, raw), type));
+		append_owned_replace(build, owned_values,
+		    program->value_owned_slots[value],
+		    MIR_new_reg_op(build->context, raw), type);
+	    }
 	    if (resume->source == JIT_RESUME_CONSTANT) {
 		JITResumeLiteral *literal = &map->native_resume->literals[
 		    resume->index];
@@ -7407,21 +8796,64 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 					  status, common_return);
 			break;
 		    } else if (instr->op == HIR_OP_TOINT) {
-			int val_fl = program->value_types
-			    && program->value_types[instr->value] == TYPE_FLOAT;
-			int src_fl = program->value_types
-			    && program->value_types[instr->src1] == TYPE_FLOAT;
-			if (val_fl || src_fl) {
-			    append_deopt_exit(build, program, instr,
-					      values, deopt_map_out, deopt_values,
-					      status, common_return);
+			MIR_insn_code_t error_move = sizeof(enum error) == sizeof(Num)
+			    ? MIR_MOV : sizeof(enum error) == 1 ? MIR_UEXT8
+			    : sizeof(enum error) == 2 ? MIR_UEXT16 : MIR_UEXT32;
+
+			if (program->value_types
+			    && program->value_types[instr->value] == TYPE_FLOAT) {
+			    append_deopt_exit(build, program, instr, values,
+				deopt_map_out, deopt_values, status, common_return);
 			    break;
 			}
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context,
-								 values[instr->value]),
-						  MIR_new_reg_op(build->context,
-								 values[instr->src1])));
+			if (program->value_is_tagged
+			    && program->value_is_tagged[instr->src1]) {
+			    MIR_label_t scalar = MIR_new_label(build->context);
+			    MIR_label_t error_scalar = MIR_new_label(build->context);
+			    MIR_label_t done = MIR_new_label(build->context);
+			    MIR_op_t type = MIR_new_mem_op(build->context, tag_t,
+				jit_tag_offset(program, instr->src1), deopt_values, 0, 1);
+			    int types[] = {TYPE_INT, TYPE_OBJ};
+			    int t;
+
+			    for (t = 0; t < 2; t++)
+				append(build, MIR_new_insn(build->context, MIR_BEQ,
+				    MIR_new_label_op(build->context, scalar), type,
+				    MIR_new_int_op(build->context, types[t])));
+			    append(build, MIR_new_insn(build->context, MIR_BEQ,
+				MIR_new_label_op(build->context, error_scalar), type,
+				MIR_new_int_op(build->context, TYPE_ERR)));
+			    append_scalar_builtin(build, program, instr, values,
+				deopt_values, deopt_map_out, progr, status,
+				common_return, &copy_serial);
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, error_scalar);
+			    /* A tagged raw union may contain padding above v.err. */
+			    append(build, MIR_new_insn(build->context, error_move,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1])));
+			    append(build, MIR_new_insn(build->context, MIR_JMP,
+				MIR_new_label_op(build->context, done)));
+			    append(build, scalar);
+			    append(build, MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1])));
+			    append(build, done);
+			} else if (!program->value_types
+				|| program->value_types[instr->src1] == TYPE_INT
+				|| program->value_types[instr->src1] == TYPE_OBJ
+				|| program->value_types[instr->src1] == TYPE_ERR)
+			    append(build, MIR_new_insn(build->context,
+				program->value_types
+				&& program->value_types[instr->src1] == TYPE_ERR
+				? error_move : MIR_MOV,
+				MIR_new_reg_op(build->context, values[instr->value]),
+				MIR_new_reg_op(build->context, values[instr->src1])));
+			else
+			    append_scalar_builtin(build, program, instr, values,
+				deopt_values, deopt_map_out, progr, status,
+				common_return, &copy_serial);
 		    } else if (instr->op == HIR_OP_TYPEOF) {
 			if (program->value_is_tagged
 			    && program->value_is_tagged[instr->src1]) {
@@ -8586,13 +10018,14 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				    MIR_new_reg_op(build->context, deopt_values),
 				    MIR_new_int_op(build->context,
 					instr->value * sizeof(Num))));
-				append(build, MIR_new_call_insn(build->context, 10,
+				append(build, MIR_new_call_insn(build->context, 11,
 				    MIR_new_ref_op(build->context,
 					build->proto_str_concat_owned),
 				    MIR_new_ref_op(build->context,
 					build->import_str_concat_owned),
 				    MIR_new_reg_op(build->context, transferred),
 				    MIR_new_reg_op(build->context, owned_values),
+				    MIR_new_reg_op(build->context, build->home_capacities),
 				    MIR_new_int_op(build->context, owner),
 				    MIR_new_reg_op(build->context,
 					values[instr->src1]),
@@ -8886,41 +10319,44 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				&copy_serial);
 			break;
 		    }
-		    if (instr->op == HIR_OP_MIN) {
-			MIR_label_t is_lhs = MIR_new_label(build->context);
+		    if (instr->op == HIR_OP_MIN || instr->op == HIR_OP_MAX) {
+			int type = program->value_types
+			    ? program->value_types[instr->value] : TYPE_INT;
+			MIR_label_t is_rhs = MIR_new_label(build->context);
 			MIR_label_t done = MIR_new_label(build->context);
-			append(build, MIR_new_insn(build->context, MIR_BLT,
-						  MIR_new_label_op(build->context, is_lhs),
-						  MIR_new_reg_op(build->context, values[instr->src1]),
-						  MIR_new_reg_op(build->context, values[instr->src2])));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_reg_op(build->context, values[instr->src2])));
+			MIR_insn_code_t compare, move;
+
+			if ((program->value_is_tagged
+			     && (program->value_is_tagged[instr->value]
+				 || program->value_is_tagged[instr->src1]
+				 || program->value_is_tagged[instr->src2]))
+			    || (type != TYPE_INT && type != TYPE_FLOAT)
+			    || (program->value_types
+				&& (program->value_types[instr->src1] != type
+				    || program->value_types[instr->src2] != type))) {
+			    append_scalar_builtin(build, program, instr, values,
+				deopt_values, deopt_map_out, progr, status,
+				common_return, &copy_serial);
+			    break;
+			}
+			move = type == TYPE_FLOAT ? MIR_DMOV : MIR_MOV;
+			compare = instr->op == HIR_OP_MIN
+			    ? (type == TYPE_FLOAT ? MIR_DBGT : MIR_BGT)
+			    : (type == TYPE_FLOAT ? MIR_DBLT : MIR_BLT);
+			/* Keep the first argument on ties, including signed zero. */
+			append(build, MIR_new_insn(build->context, compare,
+			    MIR_new_label_op(build->context, is_rhs),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, values[instr->src2])));
+			append(build, MIR_new_insn(build->context, move,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, values[instr->src1])));
 			append(build, MIR_new_insn(build->context, MIR_JMP,
-						  MIR_new_label_op(build->context, done)));
-			append(build, is_lhs);
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_reg_op(build->context, values[instr->src1])));
-			append(build, done);
-			break;
-		    }
-		    if (instr->op == HIR_OP_MAX) {
-			MIR_label_t is_lhs = MIR_new_label(build->context);
-			MIR_label_t done = MIR_new_label(build->context);
-			append(build, MIR_new_insn(build->context, MIR_BGT,
-						  MIR_new_label_op(build->context, is_lhs),
-						  MIR_new_reg_op(build->context, values[instr->src1]),
-						  MIR_new_reg_op(build->context, values[instr->src2])));
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_reg_op(build->context, values[instr->src2])));
-			append(build, MIR_new_insn(build->context, MIR_JMP,
-						  MIR_new_label_op(build->context, done)));
-			append(build, is_lhs);
-			append(build, MIR_new_insn(build->context, MIR_MOV,
-						  MIR_new_reg_op(build->context, values[instr->value]),
-						  MIR_new_reg_op(build->context, values[instr->src1])));
+			    MIR_new_label_op(build->context, done)));
+			append(build, is_rhs);
+			append(build, MIR_new_insn(build->context, move,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_reg_op(build->context, values[instr->src2])));
 			append(build, done);
 			break;
 		    }
@@ -9791,6 +11227,78 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    append_return_zero(build, result, status, common_return);
 		    break;
 		case HIR_TAC_CALL:
+		    if (builtin_function_is_jit_direct(instr->func)
+			&& instr->value > 0 && instr->src1 > 0
+			&& instr->deopt_map > 0) {
+			MIR_label_t canonical = MIR_new_label(build->context);
+			MIR_label_t done = MIR_new_label(build->context);
+			MIR_reg_t ok, raw_out, type_out;
+			char name[40];
+			int owner = jit_resolve_owner_slot(program, instr->value);
+			int arg_owner = jit_resolve_owner_slot(program, instr->src1);
+			int tagged = program->value_is_tagged
+			    && program->value_is_tagged[instr->value];
+
+			sprintf(name, "builtin_ok%d", copy_serial++);
+			ok = new_reg(build, name);
+			sprintf(name, "builtin_raw%d", copy_serial++);
+			raw_out = new_reg(build, name);
+			sprintf(name, "builtin_type%d", copy_serial++);
+			type_out = new_reg(build, name);
+			append(build, MIR_new_insn(build->context, MIR_ADD,
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, deopt_values),
+			    MIR_new_int_op(build->context, instr->value * sizeof(Num))));
+			append(build, tagged
+			    ? MIR_new_insn(build->context, MIR_ADD,
+				MIR_new_reg_op(build->context, type_out),
+				MIR_new_reg_op(build->context, deopt_values),
+				MIR_new_int_op(build->context,
+				    jit_tag_offset(program, instr->value)))
+			    : MIR_new_insn(build->context, MIR_MOV,
+				MIR_new_reg_op(build->context, type_out),
+				MIR_new_int_op(build->context, 0)));
+			append(build, MIR_new_call_insn(build->context, 12,
+			    MIR_new_ref_op(build->context, build->proto_direct_builtin),
+			    MIR_new_ref_op(build->context, build->import_direct_builtin),
+			    MIR_new_reg_op(build->context, ok),
+			    MIR_new_int_op(build->context, instr->func),
+			    MIR_new_reg_op(build->context, values[instr->src1]),
+			    MIR_new_reg_op(build->context, progr),
+			    MIR_new_reg_op(build->context, raw_out),
+			    MIR_new_reg_op(build->context, type_out),
+			    MIR_new_reg_op(build->context, owned_values),
+			    MIR_new_reg_op(build->context, build->home_capacities),
+			    MIR_new_int_op(build->context, owner),
+			    MIR_new_int_op(build->context,
+				tagged ? TYPE_ANY : program->value_types[instr->value])));
+			append(build, MIR_new_insn(build->context, MIR_BF,
+			    MIR_new_label_op(build->context, canonical),
+			    MIR_new_reg_op(build->context, ok)));
+			append(build, MIR_new_insn(build->context,
+			    !tagged && program->value_types[instr->value] == TYPE_FLOAT
+			    ? MIR_DMOV : MIR_MOV,
+			    MIR_new_reg_op(build->context, values[instr->value]),
+			    MIR_new_mem_op(build->context,
+				!tagged && program->value_types[instr->value] == TYPE_FLOAT
+				? MIR_T_D : (sizeof(Num) == 8 ? MIR_T_I64 : MIR_T_I32),
+				instr->value * sizeof(Num), deopt_values, 0, 1)));
+			if ((instr->owned_last_use & JIT_LAST_USE_SRC1)
+			    && (arg_owner < 0 || arg_owner != owner))
+			    append_discard_owned(build, owned_values, arg_owner,
+				MIR_new_reg_op(build->context, values[instr->src1]),
+				MIR_new_int_op(build->context, TYPE_LIST));
+			append(build, MIR_new_insn(build->context, MIR_JMP,
+			    MIR_new_label_op(build->context, done)));
+			append(build, canonical);
+			append_materialized_exit(build, program, instr->deopt_map,
+			    values, deopt_map_out, deopt_values, status,
+			    common_return, JIT_RUN_CALL_VERB);
+			if (resume_continuations[instr->deopt_map])
+			    append(build, resume_continuations[instr->deopt_map]);
+			append(build, done);
+			break;
+		    }
 		    if (instr->deopt_map > 0
 			&& instr->deopt_map < program->num_deopt_maps
 			&& jit_deopt_map_bridges_builtin(&program->deopt_maps[instr->deopt_map])) {
@@ -10382,17 +11890,27 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 				      common_return);
 		    break;
 		case HIR_TAC_CALL_VERB:
-		    if (!(instr->deopt_map > 0
-			&& instr->deopt_map < program->num_deopt_maps
-		    && append_region_call(build, program, instr, values,
-			tick_result, timed_out, progr, error_out, owned_values,
-			deopt_map_out, deopt_values, status, common_return,
-			    resume_continuations[instr->deopt_map],
-			    jit_region_deferred_list_tail(program, instr),
-			    &copy_serial)))
-			append_materialized_exit(build, program, instr->deopt_map,
-			    values, deopt_map_out, deopt_values, status,
-			    common_return, JIT_RUN_CALL_VERB);
+		    {
+			JITInstruction *deferred_tail =
+			    jit_region_deferred_list_tail(program, instr);
+
+			if (deferred_tail
+			    && !deferred_region_lists[deferred_tail->value])
+			    deferred_tail = 0;
+			if (!(instr->deopt_map > 0
+			    && instr->deopt_map < program->num_deopt_maps
+			    && append_region_call(build, program, instr, values,
+				tick_result, timed_out, progr, error_out, owned_values,
+				deopt_map_out, deopt_values, status, common_return,
+				resume_continuations[instr->deopt_map], deferred_tail,
+				&copy_serial))) {
+			    append_region_deferred_tail(build, program, deferred_tail,
+				values, deopt_values, owned_values, &copy_serial);
+			    append_materialized_exit(build, program, instr->deopt_map,
+				values, deopt_map_out, deopt_values, status,
+				common_return, JIT_RUN_CALL_VERB);
+			}
+		    }
 		    if (instr->deopt_map > 0
 			&& instr->deopt_map < program->num_deopt_maps
 			&& resume_continuations[instr->deopt_map])
@@ -10404,7 +11922,8 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		case HIR_TAC_PHI:
 		    break;
 		}
-		if (instr->kind == HIR_TAC_CALL
+		if ((instr->kind == HIR_TAC_CALL
+		     && !builtin_function_is_jit_direct(instr->func))
 		    || instr->kind == HIR_TAC_CALL_VERB
 		    || instr->kind == HIR_TAC_DEOPT
 		    || instr->kind == HIR_TAC_PUT_PROP
@@ -11296,6 +12815,20 @@ jit_region_leaf_terminal_put(JITBlock *block, JITInstruction *instr)
 }
 
 static int
+jit_region_leaf_direct_call(JITProgram *program, JITInstruction *instr)
+{
+    return instr->kind == HIR_TAC_CALL
+	&& builtin_function_is_jit_direct(instr->func)
+	&& instr->value > 0 && instr->value < program->num_values
+	&& instr->src1 > 0 && instr->src1 < program->num_values
+	&& program->value_types && program->value_is_tagged
+	&& !program->value_is_tagged[instr->value]
+	&& !program->value_is_tagged[instr->src1]
+	&& jit_region_cfg_supported_type(program->value_types[instr->value])
+	&& program->value_types[instr->src1] == TYPE_LIST;
+}
+
+static int
 jit_region_leaf_visit(JITProgram *program, JITBlock **blocks,
 		      unsigned char *colors, int max_block, int id,
 		      int *instructions, int allow_verb_calls)
@@ -11314,7 +12847,8 @@ jit_region_leaf_visit(JITProgram *program, JITBlock **blocks,
     block = blocks[id];
     for (instr = block->first; instr; instr = instr->next) {
 	if (++*instructions > 128
-	    || instr->kind == HIR_TAC_CALL
+	    || (instr->kind == HIR_TAC_CALL
+		&& !jit_region_leaf_direct_call(program, instr))
 	    || (instr->kind == HIR_TAC_CALL_VERB && !allow_verb_calls)
 	    || (instr->kind == HIR_TAC_PUT_PROP
 		&& !jit_region_leaf_terminal_put(block, instr))
@@ -11408,7 +12942,6 @@ jit_program_is_recursive_region_candidate(JITProgram *program)
 		int count = 0;
 
 		if (++calls > JIT_REGION_MAX_CALLS
-		    || !jit_region_is_this(program, instr->src1, 0)
 		    || !jit_fixed_list_values(program, instr->src3,
 			arguments, &count))
 		    goto done;
@@ -11706,8 +13239,8 @@ jit_resume_map_compare(const void *left, const void *right)
 static int
 jit_resume_map_candidate(JITDeoptMap *map)
 {
-    /* Protection can change without rebuilding metadata. Index specialized
-       built-ins even while unprotected, and check protection at lookup. */
+    /* Protection can change without rebuilding metadata. Keep the index
+       stable and reject protected builtin returns at lookup. */
     return (map->reason == JIT_DEOPT_VERB_CALL
 	    || map->reason == JIT_DEOPT_BUILTIN_CALL
 	    || jit_deopt_map_is_specialized_builtin(map))
@@ -11767,6 +13300,7 @@ jit_program_resume_map(JITProgram *program, ResumeKey key)
 	if (jit_resume_key_compare(entry->key, key))
 	    break;
 	if ((map->reason == JIT_DEOPT_VERB_CALL || jit_deopt_map_bridges_builtin(map))
+	    && !jit_deopt_map_has_protected_builtin(map)
 	    && jit_resume_map_candidate(map))
 	    return entry->map_id;
     }
@@ -12497,6 +14031,8 @@ jit_continuation_capture(JITProgram *program, int map_id, Num *deopt_values,
 	    || frame->runtime_bytes != runtime_bytes))
 	return 0;
     map = &program->deopt_maps[map_id];
+    if (jit_deopt_map_has_protected_builtin(map))
+	return 0;
 #ifdef JIT_TESTING
     if (map->native_resume)
 	jit_test_build_resume_recipe(program, map->native_resume);
@@ -12930,6 +14466,14 @@ jit_region_exit_frame_count(JITProgram *program, int exit_id)
     return program->region_exits[exit_id].num_frames;
 }
 
+static Var
+jit_region_exit_materialized_scalar(Num raw, var_type type)
+{
+    Var value = raw_to_var(raw, type);
+
+    return type == TYPE_STR || type == TYPE_LIST ? var_ref(value) : value;
+}
+
 int
 jit_region_exit_materialize(JITProgram *program, int exit_id, int frame_id,
 	JITContinuationFrame *continuation, activation *a, int *ticks)
@@ -12988,9 +14532,9 @@ jit_region_exit_materialize(JITProgram *program, int exit_id, int frame_id,
 	if (value) {
 	    Var materialized;
 
-	    materialized.type = TYPE_INT;
-	    materialized.v.num = continuation->deopt_values[
-		jit_runtime_base_value_slots(program) + value->runtime_slot];
+	    materialized = jit_region_exit_materialized_scalar(
+		continuation->deopt_values[jit_runtime_base_value_slots(program)
+		    + value->runtime_slot], value->type);
 	    free_var(a->rt_env[i]);
 	    a->rt_env[i] = materialized;
 	}
@@ -13007,9 +14551,9 @@ jit_region_exit_materialize(JITProgram *program, int exit_id, int frame_id,
 	    JITRegionExitValue *value = jit_region_exit_value(frame,
 		map->stack_values[i]);
 
-	    materialized.type = TYPE_INT;
-	    materialized.v.num = continuation->deopt_values[
-		jit_runtime_base_value_slots(program) + value->runtime_slot];
+	    materialized = jit_region_exit_materialized_scalar(
+		continuation->deopt_values[jit_runtime_base_value_slots(program)
+		    + value->runtime_slot], value->type);
 	} else {
 	    materialized.type = slot.kind == RSS_CATCH ? TYPE_CATCH
 		: slot.kind == RSS_FINALLY ? TYPE_FINALLY : TYPE_INT;
@@ -13036,7 +14580,7 @@ jit_region_exit_materialize(JITProgram *program, int exit_id, int frame_id,
 int
 jit_region_exit_call(JITProgram *program, int exit_id, int frame_id,
 	JITContinuationFrame *continuation, Var *args, Objid *receiver_class,
-	const char **verb)
+	const char **verb, int *receiver_is_this)
 {
     JITRegionExit *exit;
     JITRegionExitFrame *frame;
@@ -13055,12 +14599,13 @@ jit_region_exit_call(JITProgram *program, int exit_id, int frame_id,
 	|| frame->num_arguments > JIT_REGION_MAX_ARGUMENTS)
 	return 0;
     *args = new_list(frame->num_arguments);
-    for (i = 0; i < frame->num_arguments; i++) {
-	args->v.list[i + 1].type = TYPE_INT;
-	args->v.list[i + 1].v.num = continuation->deopt_values[
-	    jit_runtime_base_value_slots(program) + frame->argument_slots[i]];
-    }
+    for (i = 0; i < frame->num_arguments; i++)
+	args->v.list[i + 1] = jit_region_exit_materialized_scalar(
+	    continuation->deopt_values[jit_runtime_base_value_slots(program)
+		+ frame->argument_slots[i]], frame->argument_types[i]);
     *receiver_class = frame->receiver_class;
+    if (receiver_is_this)
+	*receiver_is_this = frame->receiver_is_this;
     *verb = frame->verb;
     return 1;
 }
@@ -13068,8 +14613,8 @@ jit_region_exit_call(JITProgram *program, int exit_id, int frame_id,
 #ifdef JIT_TESTING
 int
 jit_test_region_exit_materialize(JITProgram *program, JITProgram *target,
-	Program *bytecode_program, int target_map, int target_value, Num raw,
-	Num path_ticks, activation *a, int *ticks)
+	Program *bytecode_program, int target_map, int target_value,
+	var_type type, Num raw, Num path_ticks, activation *a, int *ticks)
 {
     JITContinuationFrame continuation;
     Num *deopt_values;
@@ -13098,6 +14643,7 @@ jit_test_region_exit_materialize(JITProgram *program, JITProgram *target,
 	mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
     program->region_exits[0].frames[0].values[0].target_value = target_value;
     program->region_exits[0].frames[0].values[0].runtime_slot = 1;
+    program->region_exits[0].frames[0].values[0].type = type;
     slots = jit_runtime_value_slots(program);
     deopt_values = mymalloc(sizeof(Num) * slots, M_PROGRAM);
     memset(deopt_values, 0, sizeof(Num) * slots);
@@ -13152,8 +14698,10 @@ jit_test_region_exit_chain(JITProgram *program, JITProgram *parent,
     exit->frames[0].values = mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
     exit->frames[0].values[0].target_value = 1;
     exit->frames[0].values[0].runtime_slot = 1;
+    exit->frames[0].values[0].type = TYPE_INT;
     exit->frames[0].num_arguments = 1;
     exit->frames[0].argument_slots[0] = 2;
+    exit->frames[0].argument_types[0] = TYPE_INT;
     exit->frames[1].target = target;
     exit->frames[1].bytecode_program = target_bytecode;
     exit->frames[1].map = target_map;
@@ -13161,6 +14709,7 @@ jit_test_region_exit_chain(JITProgram *program, JITProgram *parent,
     exit->frames[1].values = mymalloc(sizeof(JITRegionExitValue), M_PROGRAM);
     exit->frames[1].values[0].target_value = 1;
     exit->frames[1].values[0].runtime_slot = 3;
+    exit->frames[1].values[0].type = TYPE_INT;
     slots = jit_runtime_value_slots(program);
     deopt_values = mymalloc(sizeof(Num) * slots, M_PROGRAM);
     memset(deopt_values, 0, sizeof(Num) * slots);
@@ -13175,7 +14724,7 @@ jit_test_region_exit_chain(JITProgram *program, JITProgram *parent,
 	&& jit_region_exit_materialize(program, 0, 0, &continuation,
 	    parent_activation, ticks)
 	&& jit_region_exit_call(program, 0, 0, &continuation, args,
-	    &receiver_class, &verb)
+	    &receiver_class, &verb, 0)
 	&& receiver_class == 2 && !strcmp(verb, "nested_region")
 	&& jit_region_exit_materialize(program, 0, 1, &continuation,
 	    target_activation, ticks);

@@ -55,6 +55,7 @@ struct bft_entry {
     bf_export_type export;
     int protected;
     int jit_compact_return_only;
+    int jit_direct;
 };
 
 static struct bft_entry bf_table[MAX_FUNC];
@@ -88,6 +89,7 @@ register_function(const char *name, int minargs, int maxargs, bf_type func, ...)
     bf_table[top_bf_table].export = NULL;
     bf_table[top_bf_table].protected = 0;
     bf_table[top_bf_table].jit_compact_return_only = 0;
+    bf_table[top_bf_table].jit_direct = 0;
 
     var_type *proto = NULL;
     if (num_arg_types > 0) {
@@ -551,6 +553,60 @@ builtin_function_is_jit_compact_return_only(unsigned n, int nargs)
 	&& bf_table[n].jit_compact_return_only
 	&& nargs >= 0 && bf_table[n].minargs == nargs
 	&& bf_table[n].maxargs == nargs;
+}
+
+void
+register_function_jit_direct(int enabled)
+{
+    if (top_bf_table == 0)
+	panic("register_function_jit_direct: register_function() not called?");
+    bf_table[top_bf_table - 1].jit_direct = enabled != 0;
+}
+
+int
+builtin_function_is_jit_direct(unsigned n)
+{
+    /* Ownership layout must remain stable when protection changes and the
+     * compiler restores discarded IR. Check protection at the call below. */
+    return n < top_bf_table && bf_table[n].jit_direct;
+}
+
+int
+call_bi_func_jit(unsigned n, Var arglist, Objid progr, Var *result)
+{
+    struct bft_entry *f;
+    package p;
+    int k, count, checked;
+
+    if (!builtin_function_is_jit_direct(n) || bf_table[n].protected
+	|| arglist.type != TYPE_LIST)
+	return 0;
+    f = &bf_table[n];
+    count = arglist.v.list[0].v.num;
+    if (count < f->minargs || (f->maxargs != -1 && count > f->maxargs))
+	return 0;
+    checked = f->maxargs == -1 ? f->minargs : count;
+    for (k = 0; k < checked; k++) {
+	var_type proto = f->prototype[k];
+	var_type type = arglist.v.list[k + 1].type;
+
+	if (!(proto == TYPE_ANY || proto == type
+	      || (proto == TYPE_NUMERIC
+		  && (type == TYPE_INT || type == TYPE_FLOAT))))
+	    return 0;
+    }
+    p = f->func(var_ref(arglist), 1, 0, progr);
+    if (p.kind == BI_RETURN) {
+	*result = p.u.ret;
+	return 1;
+    }
+    if (p.kind == BI_RAISE) {
+	free_var(p.u.raise.code);
+	free_str(p.u.raise.msg);
+	free_var(p.u.raise.value);
+    } else if (p.kind != BI_ABORT)
+	panic("Non-restartable result from direct JIT builtin");
+    return 0;
 }
 
 Num _server_int_option_cache[SVO__CACHE_SIZE];

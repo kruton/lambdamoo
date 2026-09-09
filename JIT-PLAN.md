@@ -2785,3 +2785,289 @@ A new operation or call path is complete only when:
 * the eligibility census has no regression; and
 * a stable runtime census demonstrates movement to a later substantive boundary
   or an increased native-completion rate.
+
+### 14.6 MIR level 2 experiment with regions (2026-09-08)
+
+Two binaries built with the existing configuration differed only in
+`MIR_gen_set_optimize_level()`: level 1 versus level 2. Both included the
+builtin guard reconstruction fix described below. Disposable servers loaded
+the same migrated copy of `codepoint.db`; its seven suspended activations
+received the missing source-origin metadata using the checkout migration tool
+with `--default-first-line 1`. Benchmark and login verbs were unchanged.
+
+After one discarded warm-up per benchmark and server, five serial pairs
+alternated level order (1/2, 2/1, 1/2, 2/1, 1/2). Timings are the benchmark
+verbs' existing `ftime()` results. All samples were retained.
+
+| Benchmark | Level 1 median | Level 2 median | Time reduction |
+| --- | ---: | ---: | ---: |
+| `#168:test(300000)` | 17.322208 s | 16.931062 s | 2.3% |
+| `#168:test2(3000)` | 1.829715 s | 1.694646 s | 7.4% |
+
+Level 1 `test` samples were 22.162573, 21.514430, 17.148693, 17.217275,
+and 17.322208 seconds; level 2 samples were 16.813119, 17.033265, 17.247672,
+16.757379, and 16.931062 seconds. The overlapping ranges and two slow level 1
+samples limit confidence in the small `test` improvement. Level 2 won all five
+`test2` pairs: level 1 samples were 1.829715, 1.793008, 1.842999, 1.839368,
+and 1.666854 seconds; level 2 samples were 1.660038, 1.779854, 1.741083,
+1.694646, and 1.629598 seconds.
+
+In this database SHA1 is defined on `#437`, and `#430:hash` is inherited from
+`#420`; the older object numbers elsewhere in this plan are not applicable.
+SHA1 reported one successful compilation at each level: 351,596 versus
+616,774 microseconds and 103,920 versus 87,264 machine-code bytes. The final
+pools each held 37 compiled programs: used machine code was 330,224 versus
+275,216 bytes, while MIR heap was 32,085,717 versus 42,306,942 bytes. These
+are single-run compilation and memory observations, not repeated averages.
+Detailed runtime profiling was disabled, so zero-valued execution counters
+are not evidence of zero deoptimizations. Both servers returned the expected
+empty-input SHA1 and SHA-256 digests and shut down cleanly.
+
+This supports testing level 2 as a hot-tier policy, especially for `test2`,
+but does not justify a universal default change. Level 1 remains the default.
+The scripts, binaries, raw results, and summary are in
+`/tmp/mir-level-experiment/`; `fixed-results.json` contains the completed
+comparison. Earlier partial runs in that directory are excluded.
+
+The experiment also exposed a pre-existing level 1 reconstruction bug during
+repeated logins. `#25:domain_literal("127.0.0.1")` initially returned 127001,
+then raised `E_TYPE` after compilation. Debugger inspection showed that the
+string operand survived, but a specialized `tonum` guard's map had reason
+`JIT_DEOPT_TYPE_GUARD`. Argument-list reconstruction recognized only
+`JIT_DEOPT_ARITHMETIC_TYPE`, so the interpreter resumed its builtin-call
+instruction with a string where it required a list. Reconstruction now
+recognizes unpacked builtin arguments on either map kind, independently of
+builtin bridging policy. A focused native guard regression and the JIT/HIR
+suites pass; 100-call numeric-address and hostname reproductions pass at
+both MIR levels. No database login checks were bypassed.
+
+### 14.7 Audited native builtin calls
+
+The native compiler now handles `tonum`/`toint`, `tofloat`, `toobj`, `min`,
+`max`, `equal`, `strcmp`, `listappend`, `listinsert`, `listset`, `ord`,
+`tochar`, `sqrt`, `floor`, `ceil`, `trunc`, `tostr`, and `strsub` without a
+VM crossing on successful, unprotected calls.
+
+Integer/object/error inputs to `tonum`/`toint` retain an allocation-free
+conversion, including tagged inputs; error codes are normalized to their
+actual field width rather than copying padding from the raw union. Known
+two-argument integer and float
+`min`/`max` calls use native comparisons; float ties preserve the first
+argument, including signed zero. Other admitted cases call the audited
+builtin implementation directly from native code, retaining its argument
+validation, Unicode behavior, list copy-on-write, and numeric semantics.
+These helper calls still construct boxed argument lists; eliminating those
+allocations is a further optimization.
+
+The direct-call registration flag admits only synchronous, restartable
+builtins. The helper borrows its argument list, publishes successful complex
+results into native ownership slots, and preserves arguments for canonical
+interpreter handling of errors and quota aborts. Failed float `min`/`max`
+now release their retained result, and empty-string character decoding no
+longer reads past the string terminator.
+
+Protected builtins retain canonical dispatch and finish in the interpreter.
+Their database overrides can return arbitrary types, so resuming native
+code with the original builtin's inferred result type is unsafe. Protection
+changes after compilation are covered by regression checks.
+
+`python3 test-support/jit-builtins.py DATABASE --moo ./moo` runs interpreted
+versus compiled comparisons against a disposable database. It checks native
+entry/completion and VM/deopt counters, shared lists, nested owned results,
+Unicode, arity/type errors, protection toggles, and both quota modes. The
+database must load with the current server and provide `$server_options`.
+
+Validation passed at MIR level 1 and in a separate AddressSanitizer build
+using MIR level 2: 125 comparisons, 82 successful cases with zero VM calls
+and deoptimizations, 19 protection checks, four catchable quota checks, and
+one uncatchable quota check. JIT/HIR unit tests and the four installed l8tf
+tests also passed. The main build retains MIR level 1.
+
+This expands builtin lowering inside native verb bodies. The boxed helper
+internals are not visible to MIR optimization.
+
+### 14.8 General builtin calls in regions
+
+The region CFG importer now accepts `HIR_TAC_CALL` for audited direct builtins
+when the argument list and result have statically representable types. Integer,
+object, float, string, and list results remain unboxed in region registers;
+string and list results use the region's ownership homes. Argument-list
+construction now preserves integer, object, float, string, and list element
+types, including raw conversion for float elements and root-program retention
+for embedded string literals.
+
+A successful builtin stays within the stitched region. Arity, type, builtin
+error, quota, or late admission failure takes the region's cold verb-call
+boundary, which reruns the side-effect-free callee in the interpreter. Region
+eligibility applies the same direct-admission and static-type checks as the CFG
+importer, so unsupported or protected calls are not advertised as region
+leaves. The existing terminal-property-write rule continues to prevent a cold
+restart after a committed effect.
+
+Focused CFG tests cover direct-call import and fixed result-type inference.
+Live disposable-server probes reached `spliced=1` for string, float, and list
+results and for a float argument to `tostr`; an invalid `tochar` preserved its
+catchable `E_INVARG` result through cold fallback. The JIT/HIR suites, four
+installed l8tf tests, 125-case builtin differential suite, and 73-case
+deoptimization census pass at MIR level 1. The JIT/HIR unit tests and the
+125-case differential suite also pass in the separate AddressSanitizer build
+with leak detection disabled as prescribed for that checkout.
+
+A controlled MIR level 1 A/B built both binaries from the same tree and changed
+only whether direct-builtin callees were admitted as region leaves. The servers
+ran sequentially, with two discarded warm-ups and five measured samples each.
+`#168:test(300000)` improved from a 17.396570-second median to 17.222837
+seconds (**1.0%**); `#168:test2(3000)` improved from 1.820418 seconds to
+1.784579 seconds (**2.0%**). Individual `test` samples ranged from 16.97 to
+22.98 seconds, so its small difference is within substantial host variance;
+the result supports a modest improvement rather than a precise effect size.
+
+### 14.9 Region-wide ownership and fixed-list allocation elimination
+
+The stitched CFG now tracks the aggregate list used to carry fixed verb-call
+arguments as well as the scalar elements already passed to the nested region.
+A region-wide use pass virtualizes singleton/list-tail construction chains when
+their only aggregate use is that stitched call. The list allocation, owner
+home, capacity tracking, and append operations are then omitted completely.
+Scalar elements continue to flow directly into the callee.
+
+Virtualization is blocked when any instruction, branch, return, parallel copy,
+caller reconstruction snapshot, or exact side-exit snapshot observes the list.
+Such values retain their existing allocation and exit reconstruction. This
+keeps materialization at the existing observable boundary while eliminating it
+from the common stitched path; it does not yet create a new lazy aggregate
+descriptor for lists that must appear in an exact-exit snapshot.
+
+Region ownership homes are now assigned densely from the values that survive
+the region pass. Values which shared a source-program ownership home continue
+to share one region home, list-tail and parallel-copy destinations inherit
+their source home, and virtual values reserve no home. Complex stitched return
+values use the caller's result home directly, removing the ownership transfer
+helper at the return boundary. Existing fixed-capacity list construction still
+reuses fresh storage for observable list-tail chains.
+
+Focused JIT tests verify that a two-element fixed call-argument chain is
+virtualized. The JIT/HIR suites, four installed l8tf tests, 125-case builtin
+differential suite, and 73-case deoptimization census pass. A sequential
+five-sample A/B against the immediately preceding region-builtin build measured
+`#168:test(300000)` at 16.968239 versus 16.806708 seconds (**1.0% faster**) and
+`#168:test2(3000)` at 1.745996 versus 1.567112 seconds (**10.2% faster**).
+`test` continued to show a bimodal roughly 17/22-second distribution, while
+all five `test2` candidate samples were below all five baseline samples.
+
+### 14.10 Tagged region argument admission regression (2026-09-08)
+
+The pending tagged-value work initially removed the default integer
+specialization of tagged region arguments without replacing its admission
+logic. The CFG left these inputs as `TYPE_ANY`, even when their copied values
+fed integer operations; the outer emitter then rejected the region. It also
+rejected multi-type guards such as INT-or-FLOAT rather than checking whether
+the region's selected type satisfied the guard. These were compilation-time
+admission failures, producing ordinary VM calls rather than runtime deopts.
+Debugger inspection caught both arguments of a hot `#508:SHR` region still
+typed `TYPE_ANY` at the emitter's rejection path.
+
+Region construction now collects argument constraints before importing the
+body, following parallel copies back to their argument inputs. Unconstrained
+tagged inputs retain an integer specialization; float/object constraints select
+those scalar specializations instead. Entry checks still guard the actual
+runtime tags, and each internal type guard must admit the selected type.
+Incompatible tags use the canonical call fallback. Existing fixed-list
+virtualization, ownership homes, and typed exact exits remain enabled.
+
+A clean `eb4fa01` source snapshot and the fixed pending tree used the same
+configuration (MIR level 1), input database, and unmodified benchmark verbs.
+Each server ran separately, with one discarded warm-up per benchmark followed
+by five sequential sample pairs. Detailed profiling was disabled. Timings are
+the benchmark verbs' own results, including all outliers.
+
+| Benchmark | Clean base median | Fixed pending median |
+| --- | ---: | ---: |
+| `#168:test(300000)` | 17.154550 s | 16.950170 s |
+| `#168:test2(3000)` | 1.706916 s | 1.598617 s |
+
+The regressed pending tree had measured 8.163726 seconds for warmed `test2`.
+Final `test2` samples were 1.576768, 1.598617, 1.576442, 1.621039, and
+1.622654 seconds. Final `test` samples were 16.517368, 16.505944, 21.270348,
+17.080276, and 16.950170 seconds; its small base difference remains subject to
+host variance. Final warm-ups were 23.238037 seconds for `test` and 2.285821
+seconds for `test2`. Both builds produced matching empty-input SHA1 and SHA-256
+digests. In the fixed build, `ROTR32` again reports both `SHR` and `SHL` as
+`spliced=1`. Raw comparison data is in `/tmp/region-regression-baseline/` and
+`/tmp/region-regression-final/`. The final run includes the ownership fixes
+below and ran after all builds and validation jobs finished.
+
+Focused unit cases cover unconstrained copied arguments, INT-or-FLOAT guards,
+copied float/object constraints, and recursive calls with tagged inputs.
+`test-support/jit-region-arguments.py` checks actual stitching and compares
+integer, float, object, string, and list inputs and exceptional shift counts
+against results obtained before compilation.
+
+Broader builtin validation also exposed ownership gaps in the pending work:
+resumed fixed-list construction now republishes its owner home, and native
+continuations retain canonical builtin results into their assigned homes before
+later instructions consume them. Builtin direct-call capability is now
+independent of protection status, so restoring discarded IR after a protection
+change preserves owner-slot numbering. The runtime helper still rejects
+protected calls and uses the canonical database override. Protection tests wrap
+the overridden result in a list to exercise ownership cleanup after fallback.
+
+### 14.11 SHA-256 region specialization (2026-09-08)
+
+Regions can now load object-valued properties and stitch calls through those
+receivers. The property load retains permission and type checks, and each
+different receiver is checked against its cached object and dispatch epoch.
+Exact exits reconstruct the actual nested receiver instead of assuming `this`.
+This admits helper chains such as the SHA-256 sigma verbs calling through
+`this.bit_utils`.
+
+A specialization pass propagates integer constants and nonnegative bounds
+into nested region arguments. It folds arithmetic using the VM's integer
+arithmetic implementation and lowers positive power-of-two remainders to masks,
+preserving signed remainder semantics for negative inputs. Parallel-copy
+destinations are excluded from constant folding. This specializes constant
+rotation counts without introducing a SHA-specific intrinsic.
+
+List arguments now support lengths, guarded integer indexing, and list loops
+inside regions. Non-escaping slices of borrowed argument lists become pointer
+and length views, with bounds checked at the original slice operation. Views
+may feed only length and indexing; escaping slices and unsupported consumers
+still use ordinary execution. This does not yet make the entire SHA padding
+verb eligible: its list writes and other unsupported operations remain a
+separate limitation.
+
+Exclusive last-use string concatenation can reuse geometrically grown storage
+in an ownership home. Shared strings keep copy semantics, self-appends handle
+reallocation, and quota checks occur before mutation. Region snapshots can
+retain real list/string values; virtual slices and eliminated dead copies
+cannot enter a reconstruction snapshot.
+
+`test-support/jit-region-arguments.py` verifies stitching, polymorphic
+fallbacks, signed remainders, list loops, virtual slices, changed object
+receivers, and exact exits. It also checks six SHA-256 vectors around block
+boundaries. String helper tests cover shared aliases, self-appends, buffer
+reuse, and quotas.
+
+Sequential measurements against the immediately preceding pending build
+(`test(300000)`, `test2(3000)`, one warmup and five steady samples each):
+
+| Benchmark | Previous steady median | New warmup | New steady median |
+| --- | ---: | ---: | ---: |
+| `:test` | 16.950170 s | 16.734882 s | 16.672787 s |
+| `:test2` | 1.598617 s | 2.242605 s | 0.585020 s |
+
+The SHA-256 steady-state reduction is 63.4% (2.73x throughput). The small
+`:test` difference is within the observed run-to-run variation. All four sigma
+calls and `words_to_bebytes` show `spliced=1` in `raw_hash`; padding remains
+`spliced=0`. Both benchmark digests match. Results and HIR are recorded in
+`/tmp/sha256-region-final/results.json`. JIT/HIR unit tests, the installed
+four-test L8TF subset, live region checks, and SHA vectors pass; the live
+checks and vectors also pass with AddressSanitizer.
+
+Validation: JIT and HIR unit targets, the four installed l8tf tests, and all
+three live stitched-argument cases pass. The expanded builtin suite passes on
+both the optimized and separate ASan builds: 125 value comparisons, including
+82 successful native-only cases, 19 protection checks, four catchable quota
+checks, and one uncatchable quota check. The original optimized-build cleanup
+failure was traced in GDB to the database's `#36` eval wrapper consuming a
+canonical `tostr` result with an empty native owner home.

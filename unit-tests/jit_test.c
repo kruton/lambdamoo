@@ -1330,6 +1330,80 @@ region_bitxor_program(void)
 }
 
 static JITProgram *
+region_tagged_identity_program(var_type type)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *argument = instruction(HIR_TAC_BINARY);
+    JITInstruction *guard = instruction(HIR_TAC_GUARD_TYPE);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+
+    program->num_values = 4;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = type;
+    program->value_is_tagged[3] = 1;
+    use_compact_tag_slots(program);
+    add_entry_deopt_map(program);
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    args->value = 1;
+    args->local_id = SLOT_ARGS;
+    args->next = one;
+    one->value = 2;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = argument;
+    argument->value = 3;
+    argument->op = HIR_OP_INDEX;
+    argument->src1 = 1;
+    argument->src2 = 2;
+    argument->next = guard;
+    guard->src1 = 3;
+    guard->guarded_operands = 1;
+    guard->guarded_type_masks[0] = JIT_TYPE_MASK(type);
+    guard->next = ret;
+    ret->src1 = 3;
+    ret->literal_type = type;
+    block->first = args;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
+region_copied_argument_program(unsigned mask)
+{
+    JITProgram *program = region_tagged_identity_program(TYPE_INT);
+    JITInstruction *argument = program->blocks->first->next->next;
+    JITInstruction *guard = argument->next;
+    JITInstruction *copy = instruction(HIR_TAC_PARALLEL_COPY);
+
+    program->num_values = 5;
+    program->value_types = myrealloc(program->value_types,
+	sizeof(var_type) * program->num_values, M_PROGRAM);
+    program->value_is_tagged = myrealloc(program->value_is_tagged,
+	program->num_values, M_PROGRAM);
+    program->value_types[3] = TYPE_ANY;
+    program->value_types[4] = TYPE_ANY;
+    program->value_is_tagged[4] = 1;
+    copy->copies = allocate(sizeof(JITCopy));
+    copy->copies->src = 3;
+    copy->copies->dst = 4;
+    argument->next = copy;
+    copy->next = guard;
+    guard->src1 = 4;
+    guard->guarded_operands = mask ? 1 : 0;
+    guard->guarded_type_masks[0] = mask;
+    guard->next->src1 = 4;
+    return program;
+}
+
+static JITProgram *
 region_put_prop_program(int terminal)
 {
     JITProgram *program = new_jit_program();
@@ -1581,6 +1655,65 @@ region_conditional_shift_program(void)
 }
 
 static JITProgram *
+region_builtin_call_program(void)
+{
+    JITProgram *program = new_jit_program();
+    JITBlock *block = allocate(sizeof(JITBlock));
+    JITInstruction *args = instruction(HIR_TAC_LOAD_LOCAL);
+    JITInstruction *one = instruction(HIR_TAC_CONST);
+    JITInstruction *argument = instruction(HIR_TAC_BINARY);
+    JITInstruction *arguments = instruction(HIR_TAC_UNARY);
+    JITInstruction *call = instruction(HIR_TAC_CALL);
+    JITInstruction *ret = instruction(HIR_TAC_RETURN);
+    JITDeoptMap *map;
+
+    program->num_values = 6;
+    program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[2] = TYPE_INT;
+    program->value_types[3] = TYPE_INT;
+    program->value_types[4] = TYPE_LIST;
+    program->value_types[5] = TYPE_INT;
+    add_entry_deopt_map(program);
+    program->deopt_maps = myrealloc(program->deopt_maps,
+	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
+    map = &program->deopt_maps[1];
+    memset(map, 0, sizeof(*map));
+    program->num_deopt_maps = 2;
+    map->reason = JIT_DEOPT_BUILTIN_CALL;
+    map->builtin_func = 42;
+    program->blocks = program->last_block = block;
+    block->id = 1;
+    args->value = 1;
+    args->local_id = SLOT_ARGS;
+    args->next = one;
+    one->value = 2;
+    one->literal_type = TYPE_INT;
+    one->literal = 1;
+    one->next = argument;
+    argument->value = 3;
+    argument->op = HIR_OP_INDEX;
+    argument->src1 = 1;
+    argument->src2 = 2;
+    argument->next = arguments;
+    arguments->value = 4;
+    arguments->op = HIR_OP_MAKE_SINGLETON_LIST;
+    arguments->src1 = 3;
+    arguments->next = call;
+    call->value = 5;
+    call->src1 = 4;
+    call->func = 42;
+    call->deopt_map = 1;
+    call->next = ret;
+    ret->src1 = 5;
+    block->first = args;
+    block->last = ret;
+    return program;
+}
+
+static JITProgram *
 region_recursive_call_program(void)
 {
     JITProgram *program = new_jit_program();
@@ -1600,6 +1733,15 @@ region_recursive_call_program(void)
 
     program->num_values = 12;
     program->num_blocks = 1;
+    program->value_types = allocate(sizeof(var_type) * program->num_values);
+    program->value_is_tagged = allocate(program->num_values);
+    program->value_types[1] = TYPE_LIST;
+    program->value_types[3] = program->value_types[5] = TYPE_ANY;
+    program->value_is_tagged[3] = program->value_is_tagged[5] = 1;
+    program->value_types[6] = TYPE_OBJ;
+    program->value_types[7] = program->value_types[8] = TYPE_LIST;
+    program->value_types[9] = TYPE_ANY;
+    program->value_is_tagged[9] = 1;
     add_entry_deopt_map(program);
     program->deopt_maps = myrealloc(program->deopt_maps,
 	    sizeof(JITDeoptMap) * 2, M_PROGRAM);
@@ -5299,7 +5441,12 @@ test_program_metadata_api(void)
 	JITProgram *divide_program = region_divide_program();
 	JITProgram *conditional_program = region_conditional_shift_program();
 	JITProgram *loop_program = region_loop_program();
+	JITProgram *builtin_program = region_builtin_call_program();
 	JITProgram *recursive_program = region_recursive_call_program();
+	JITProgram *tagged_float_program =
+	    region_tagged_identity_program(TYPE_FLOAT);
+	JITProgram *tagged_string_program =
+	    region_tagged_identity_program(TYPE_STR);
 	JITProgram *put_program = region_put_prop_program(1);
 	JITProgram *nonterminal_put_program = region_put_prop_program(0);
 	JITProgram *get_program = region_get_prop_program();
@@ -5307,6 +5454,7 @@ test_program_metadata_api(void)
 	int nodes, guards;
 	int blocks, instructions, branches, returns;
 	int exits, exit_values;
+	var_type return_type;
 
 	check(jit_test_region_cfg(straight_program, &blocks, &instructions,
 		&branches, &returns)
@@ -5337,6 +5485,12 @@ test_program_metadata_api(void)
 	check(jit_test_region_cfg_exits(loop_program, &exits, &exit_values)
 	      && exits == 1 && exit_values == 2,
 	      "region loop did not retain its exact periodic checkpoint");
+	check(jit_program_is_region_leaf(builtin_program)
+	      && jit_test_region_cfg(builtin_program, &blocks, &instructions,
+		  &branches, &returns)
+	      && blocks == 1 && instructions == 2
+	      && branches == 0 && returns == 1,
+	      "region CFG did not import a direct builtin call");
 	check(jit_program_is_region_leaf(put_program)
 	      && jit_test_region_cfg(put_program, &blocks, &instructions,
 		  &branches, &returns)
@@ -5357,6 +5511,31 @@ test_program_metadata_api(void)
 	check(jit_test_region_cfg_calls(recursive_program, &guards, &nodes)
 	      && guards == 1 && nodes == 1,
 	      "region CFG did not recursively import a monomorphic callee");
+	check(jit_test_region_cfg_virtual_values(recursive_program, &nodes)
+	      && nodes == 2,
+	      "region CFG did not virtualize a fixed call argument list");
+	check(jit_test_region_cfg_return_type(tagged_float_program, &return_type)
+	      && return_type == TYPE_FLOAT,
+	      "region CFG did not specialize a guarded tagged float");
+	check(!jit_test_region_cfg_return_type(tagged_string_program,
+		&return_type),
+	      "region CFG specialized a tagged complex value without ownership proof");
+	{
+	    unsigned masks[] = { 0, JIT_TYPE_MASK(TYPE_INT)
+		| JIT_TYPE_MASK(TYPE_FLOAT), JIT_TYPE_MASK(TYPE_FLOAT),
+		JIT_TYPE_MASK(TYPE_OBJ) };
+	    var_type expected[] = { TYPE_INT, TYPE_INT, TYPE_FLOAT, TYPE_OBJ };
+	    unsigned index;
+
+	    for (index = 0; index < sizeof(masks) / sizeof(masks[0]); index++) {
+		JITProgram *copied = region_copied_argument_program(masks[index]);
+
+		check(jit_test_region_cfg_return_type(copied, &return_type)
+		      && return_type == expected[index],
+		      "region CFG lost the specialization of a copied tagged argument");
+		jit_program_free(copied);
+	    }
+	}
 	{
 	    JITProgram *chain[4];
 	    Program targets[4] = { { 0 }, { 0 }, { 0 }, { 0 } };
@@ -5382,7 +5561,10 @@ test_program_metadata_api(void)
 	jit_program_free(divide_program);
 	jit_program_free(conditional_program);
 	jit_program_free(loop_program);
+	jit_program_free(builtin_program);
 	jit_program_free(recursive_program);
+	jit_program_free(tagged_float_program);
+	jit_program_free(tagged_string_program);
 	jit_program_free(put_program);
 	jit_program_free(nonterminal_put_program);
 	jit_program_free(get_program);
@@ -5408,7 +5590,7 @@ test_program_metadata_api(void)
 	env[0].type = TYPE_STR;
 	env[0].v.str = str_dup("old local");
 	check(jit_test_region_exit_materialize(root, target, &bytecode, 1, 1,
-		42, 3, &callee, &ticks),
+		TYPE_INT, 42, 3, &callee, &ticks),
 	      "exact region side exit did not materialize its callee");
 	check(ticks == 7 && callee.pc == 71 && callee.error_pc == 71
 	      && callee.rt_env[0].type == TYPE_INT
@@ -5417,6 +5599,43 @@ test_program_metadata_api(void)
 	      && callee.base_rt_stack[0].type == TYPE_INT
 	      && callee.base_rt_stack[0].v.num == 42,
 	      "exact region side exit restored the wrong state or ticks");
+	while (callee.top_rt_stack > callee.base_rt_stack)
+	    free_var(*--callee.top_rt_stack);
+	free_var(env[0]);
+	target->bytecode_program = 0;
+	jit_program_free(root);
+	jit_program_free(target);
+    }
+    {
+	JITProgram *root = new_jit_program();
+	JITProgram *target = typed_deopt_program(TYPE_FLOAT, 0);
+	Program bytecode = { 0 };
+	activation callee = { 0 };
+	Var env[1];
+	Var stack[1];
+	double number = 3.25;
+	Num raw;
+	int ticks = 10;
+
+	memcpy(&raw, &number, sizeof(raw));
+
+	bytecode.num_var_names = 1;
+	bytecode.jit = target;
+	target->bytecode_program = &bytecode;
+	callee.prog = &bytecode;
+	callee.rt_env = env;
+	callee.base_rt_stack = callee.top_rt_stack = stack;
+	callee.rt_stack_size = 1;
+	callee.temp.type = TYPE_NONE;
+	env[0].type = TYPE_NONE;
+	check(jit_test_region_exit_materialize(root, target, &bytecode, 1, 1,
+		TYPE_FLOAT, raw, 3, &callee, &ticks)
+	      && callee.rt_env[0].type == TYPE_FLOAT
+	      && fl_unbox(callee.rt_env[0].v.fnum) == number
+	      && callee.top_rt_stack == callee.base_rt_stack + 1
+	      && callee.base_rt_stack[0].type == TYPE_FLOAT
+	      && fl_unbox(callee.base_rt_stack[0].v.fnum) == number,
+	      "exact region side exit lost an unboxed float");
 	while (callee.top_rt_stack > callee.base_rt_stack)
 	    free_var(*--callee.top_rt_stack);
 	free_var(env[0]);
@@ -5905,6 +6124,24 @@ test_numeric_and_comparison_lowering_matrix(void)
     };
     unsigned i;
 
+    {
+	JITProgram *program = tagged_unary_program(HIR_OP_TOINT);
+	Var env[1], result;
+	int ticks = 10, timed_out = 0;
+	enum error error = E_NONE;
+
+	/* v.err can be narrower than the raw Num payload. */
+	memset(env, 0xbe, sizeof(env));
+	env[0].type = TYPE_ERR;
+	env[0].v.err = E_INVARG;
+	check(jit_program_execute(program, env, &result, &ticks, &timed_out,
+		&error, 0, 0, 0) == JIT_RUN_RETURNED,
+	      "tagged error conversion did not execute natively");
+	check(result.type == TYPE_INT && result.v.num == E_INVARG,
+	      "integer conversion copied padding above the error code");
+	free_var(result);
+	jit_program_free(program);
+    }
     for (i = 0; i < sizeof(integer_ops) / sizeof(integer_ops[0]); i++) {
 	JITProgram *program = binary_program(17, 3, integer_ops[i]);
 
@@ -11198,7 +11435,6 @@ main(void)
 	    Var protected_stack[1];
 	    JITContinuationFrame *continuation = 0;
 	    JITDeoptMap *map = &str_length->deopt_maps[1];
-	    Var returned;
 
 	    map->resume_key.code_unit = 0;
 	    map->resume_key.site = 1;
@@ -11214,8 +11450,8 @@ main(void)
 	    check(jit_program_resume_map(str_length, map->resume_key) == -1,
 		  "unprotected specialized builtin exposed a resume map");
 	    hir_test_set_length_protected(1);
-	    check(jit_program_resume_map(str_length, map->resume_key) == 1,
-		  "resume index missed newly protected specialized builtin");
+	    check(jit_program_resume_map(str_length, map->resume_key) == -1,
+		  "protected builtin exposed an unsafe typed resume");
 	    hir_test_set_length_protected(0);
 	    check(jit_program_resume_map(str_length, map->resume_key) == -1,
 		  "resume index retained stale builtin protection");
@@ -11230,25 +11466,14 @@ main(void)
 	    check(protected_deopt.reason == JIT_DEOPT_ARITHMETIC_TYPE
 		  && protected_deopt.boundary == JIT_BOUNDARY_BUILTIN,
 		  "protected length lost its boundary classification");
-	    check(continuation != 0,
-		  "protected length did not capture a native continuation");
+	    check(continuation == 0,
+		  "protected length captured an unsafe typed continuation");
 	    check(protected_deopt.stack_depth == 1
 		  && protected_stack[0].type == TYPE_LIST
 		  && protected_stack[0].v.list[0].v.num == 1
 		  && protected_stack[0].v.list[1].type == TYPE_STR,
 		  "protected length did not materialize its arguments");
 	    free_var(protected_stack[0]);
-	    returned.type = TYPE_INT;
-	    returned.v.num = 5;
-	    jit_continuation_set_result(continuation, returned);
-	    check((jit_program_execute)(str_length, 0, &result, &ticks,
-				       &timed_out, &error, 0, &protected_deopt,
-				       protected_stack, 2, -1,
-				       continuation, 0) == JIT_RUN_RETURNED,
-		  "protected length continuation did not return");
-	    check(result.type == TYPE_INT && result.v.num == 5,
-		  "protected length continuation returned the wrong value");
-	    jit_continuation_free(continuation);
 	}
 	hir_test_set_length_protected(0);
 	ticks = 10;
@@ -12473,29 +12698,49 @@ main(void)
 	    Var homes[1];
 	    const char *owned;
 	    int64_t owned_raw = 0;
+	    unsigned capacities[1] = {0};
 
 	    homes[0].type = TYPE_NONE;
-	    check(jit_rt_str_concat_owned(homes, 0, "a", "b",
+	    check(jit_rt_str_concat_owned(homes, capacities, 0, "a", "b",
 		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
 		  && rt_err == E_NONE && homes[0].type == TYPE_STR
 		  && homes[0].v.str == (const char *) (intptr_t) owned_raw
 		  && !strcmp(homes[0].v.str, "ab"),
 		  "owned string concat publishes an empty home");
 	    owned = homes[0].v.str;
-	    check(jit_rt_str_concat_owned(homes, 0, owned, "c",
+	    check(jit_rt_str_concat_owned(homes, capacities, 0, owned, "c",
 		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
 		  && rt_err == E_NONE && !strcmp(homes[0].v.str, "abc")
 		  && var_refcount(homes[0]) == 1,
 		  "owned string concat transfers a last-use operand");
 	    owned = homes[0].v.str;
-	    check(jit_rt_str_concat_owned(homes, 0, "prefix", owned,
+	    {
+		const char *shared = str_ref(owned);
+
+		check(jit_rt_str_concat_owned(homes, capacities, 0, owned, "d",
+		    JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		    && !strcmp(shared, "abc") && !strcmp(homes[0].v.str, "abcd"),
+		    "string capacity reuse changed a shared string");
+		free_str(shared);
+		owned = homes[0].v.str;
+		check(jit_rt_str_concat_owned(homes, capacities, 0, owned, owned,
+		    JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		    && !strcmp(homes[0].v.str, "abcdabcd"),
+		    "string capacity growth lost a self-append operand");
+		owned = homes[0].v.str;
+		check(jit_rt_str_concat_owned(homes, capacities, 0, owned, "e",
+		    JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
+		    && homes[0].v.str == owned && !strcmp(owned, "abcdabcde"),
+		    "exclusive string append did not reuse capacity");
+	    }
+	    check(jit_rt_str_concat_owned(homes, capacities, 0, "prefix", owned,
 		JIT_LAST_USE_SRC2, &owned_raw, &rt_err)
 		  && rt_err == E_NONE
-		  && !strcmp(homes[0].v.str, "prefixabc")
+		  && !strcmp(homes[0].v.str, "prefixabcdabcde")
 		  && var_refcount(homes[0]) == 1,
 		  "owned string concat transfers a last-use right operand");
 	    owned = homes[0].v.str;
-	    check(!jit_rt_str_concat_owned(homes, 0, "x", "y",
+	    check(!jit_rt_str_concat_owned(homes, capacities, 0, "x", "y",
 		JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
 		  && rt_err == E_NONE && homes[0].v.str == owned,
 		  "owned string concat rejects an owner mismatch");
@@ -12505,7 +12750,7 @@ main(void)
 
 		owned_raw = 17;
 		_server_int_option_cache[SVO_MAX_STRING_CONCAT] = 3;
-		check(jit_rt_str_concat_owned(homes, 0, owned, "x",
+		check(jit_rt_str_concat_owned(homes, capacities, 0, owned, "x",
 		    JIT_LAST_USE_SRC1, &owned_raw, &rt_err)
 		      && rt_err == E_QUOTA && owned_raw == 17
 		      && homes[0].type == TYPE_STR
@@ -12718,11 +12963,14 @@ main(void)
 		partial.v.list, 2, 222, TYPE_INT);
 	    check(fixed_result[0].v.num == 2
 		  && fixed_result[1].v.num == 111
-		  && fixed_result[2].v.num == 222,
+		  && fixed_result[2].v.num == 222
+		  && homes[0].type == TYPE_LIST
+		  && homes[0].v.list == fixed_result
+		  && partial.v.list[0].v.num == 1,
 		  "resumed fixed list construction grows a canonical list");
 	    free_var(partial);
-	    partial.v.list = fixed_result;
-	    free_var(partial);
+	    jit_rt_discard_owned(homes, 0, (int64_t) (intptr_t) fixed_result,
+		TYPE_LIST);
 	}
 
 	/* Indexed local updates preserve shared lists and acquire the RHS. */

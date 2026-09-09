@@ -480,7 +480,7 @@ extern int jit_rt_is_true(int64_t, int);
 extern int jit_rt_equality(int64_t, int, int64_t, int, int);
 extern int jit_rt_str_cmp(const char *, const char *, int);
 extern const char *jit_rt_str_concat(const char *, const char *, int32_t *);
-extern int jit_rt_str_concat_owned(Var *, int, const char *, const char *,
+extern int jit_rt_str_concat_owned(Var *, unsigned *, int, const char *, const char *,
 				   int, int64_t *, int32_t *);
 extern const char *jit_rt_str_ref(const char *, int64_t, int32_t *);
 extern const char *jit_rt_str_range_ref(const char *, int64_t, int64_t, int32_t *);
@@ -538,9 +538,11 @@ extern int jit_test_deopt_map_is_suspend_zero(JITProgram *, JITDeoptMap *,
 	Num *, Var *, unsigned char *);
 extern int jit_test_region_cfg(JITProgram *, int *, int *, int *, int *);
 extern int jit_test_region_cfg_calls(JITProgram *, int *, int *);
+extern int jit_test_region_cfg_virtual_values(JITProgram *, int *);
+extern int jit_test_region_cfg_return_type(JITProgram *, var_type *);
 extern int jit_test_region_cfg_exits(JITProgram *, int *, int *);
 extern int jit_test_region_exit_materialize(JITProgram *, JITProgram *,
-	Program *, int, int, Num, Num, struct activation *, int *);
+	Program *, int, int, var_type, Num, Num, struct activation *, int *);
 extern int jit_test_region_exit_chain(JITProgram *, JITProgram *, Program *,
 	int, JITProgram *, Program *, int, struct activation *,
 	struct activation *, int *, Var *);

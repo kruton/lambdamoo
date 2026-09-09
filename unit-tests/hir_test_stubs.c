@@ -198,6 +198,19 @@ builtin_function_is_protected(unsigned n)
     return n == 6 && test_length_protected;
 }
 
+int
+builtin_function_is_jit_direct(unsigned n)
+{
+    return n == 42;
+}
+
+int
+call_bi_func_jit(unsigned n UNUSED_, Var args UNUSED_, Objid progr UNUSED_,
+		 Var *result UNUSED_)
+{
+    return 0;
+}
+
 void
 hir_test_set_length_protected(int protected)
 {
