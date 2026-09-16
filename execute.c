@@ -1823,6 +1823,11 @@ do {						\
     RUN_ACTIV.top_rt_stack = rts;		\
 } while (0)
 
+/* Reset bookkeeping only; stack values must already have been consumed or
+ * transferred to a continuation or boundary operand locals. */
+#define CLEAR_RT_STACK_STATE() \
+    (rts = RUN_ACTIV.top_rt_stack = RUN_ACTIV.base_rt_stack)
+
 #define RAISE_ERROR(the_err) 			\
 do {						\
     if (RUN_ACTIV.debug) { 			\
@@ -2008,6 +2013,7 @@ do {								\
 
 		    jit_continuation_attach(continuation, caller);
 		    jit_continuation_mark_dispatched(continuation);
+		    CLEAR_RT_STACK_STATE();
 		    STORE_STATE_VARIABLES();
 		    jit_profile_record_vm_call(caller->prog->jit);
 		    e = suspend_task(make_suspend_pack(enqueue_suspended_task,
@@ -2028,6 +2034,7 @@ do {								\
 		    RUN_ACTIV.base_rt_stack[0].v.num = 0;
 		    jit_continuation_attach(continuation, caller);
 		    jit_continuation_mark_dispatched(continuation);
+		    CLEAR_RT_STACK_STATE();
 		    STORE_STATE_VARIABLES();
 		    p = call_bi_func(deopt.builtin_func, args, 1,
 				     caller->progr, 0);
@@ -2112,6 +2119,7 @@ do {								\
 			RUN_ACTIV.base_rt_stack[operand].type = TYPE_NONE;
 			RUN_ACTIV.base_rt_stack[operand].v.num = 0;
 		    }
+		    CLEAR_RT_STACK_STATE();
 
 		    if (args.type != TYPE_LIST || verb.type != TYPE_STR)
 			err = E_TYPE;
