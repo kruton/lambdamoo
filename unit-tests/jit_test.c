@@ -5645,6 +5645,38 @@ test_program_metadata_api(void)
     }
     {
 	JITProgram *root = new_jit_program();
+	JITProgram *target = typed_deopt_program(TYPE_LIST, 0);
+	Program bytecode = { 0 };
+	activation callee = { 0 };
+	Var env[1];
+	Var stack[1];
+	int ticks = 10;
+
+	bytecode.num_var_names = 1;
+	bytecode.jit = target;
+	target->bytecode_program = &bytecode;
+	callee.prog = &bytecode;
+	callee.rt_env = env;
+	callee.base_rt_stack = callee.top_rt_stack = stack;
+	callee.rt_stack_size = 1;
+	callee.temp.type = TYPE_NONE;
+	env[0].type = TYPE_STR;
+	env[0].v.str = str_dup("old local");
+	check(jit_test_region_exit_materialize(root, target, &bytecode, 1, 1,
+		TYPE_LIST, 0, 3, &callee, &ticks)
+	      && callee.rt_env[0].type == TYPE_NONE
+	      && callee.top_rt_stack == callee.base_rt_stack + 1
+	      && callee.base_rt_stack[0].type == TYPE_NONE,
+	      "exact region side exit created a null complex value");
+	while (callee.top_rt_stack > callee.base_rt_stack)
+	    free_var(*--callee.top_rt_stack);
+	free_var(env[0]);
+	target->bytecode_program = 0;
+	jit_program_free(root);
+	jit_program_free(target);
+    }
+    {
+	JITProgram *root = new_jit_program();
 	JITProgram *parent = typed_deopt_program(TYPE_INT, 0);
 	JITProgram *target = typed_deopt_program(TYPE_INT, 0);
 	JITDeoptMap *parent_map = &parent->deopt_maps[1];
@@ -9808,8 +9840,15 @@ main(void)
 	jit_program_free(boundary_program);
     }
 
-    check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
-	  "MIR dump failed");
+    {
+	JITProgram before;
+
+	memcpy(&before, program, sizeof(before));
+	check(jit_program_dump_mir(program, check_mir_line, &mir_dump),
+	      "MIR dump failed");
+	check(!memcmp(&before, program, sizeof(before)),
+	      "MIR dump mutated pending program metadata");
+    }
     check(mir_dump.lines > 0, "MIR dump was empty");
     check(mir_dump.found_source_marker,
 	  "MIR dump did not contain PC and line information");
@@ -9850,6 +9889,20 @@ main(void)
 	  "machine-code dump did not contain hex bytes");
     check(jit_program_state(program) == JIT_STATE_COMPILED,
 	  "machine-code dump did not compile lazily");
+    {
+	JITProgram before;
+	struct mir_dump repeated_dump = { 0 };
+	int i;
+
+	memcpy(&before, program, sizeof(before));
+	for (i = 0; i < 3; i++) {
+	    check(jit_program_dump_mir(program, check_mir_line,
+				       &repeated_dump),
+		  "compiled MIR dump failed");
+	    check(!memcmp(&before, program, sizeof(before)),
+		  "MIR dump mutated installed program metadata");
+	}
+    }
     {
 	JITProgramStats stats;
 

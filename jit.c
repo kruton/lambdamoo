@@ -14469,9 +14469,7 @@ jit_region_exit_frame_count(JITProgram *program, int exit_id)
 static Var
 jit_region_exit_materialized_scalar(Num raw, var_type type)
 {
-    Var value = raw_to_var(raw, type);
-
-    return type == TYPE_STR || type == TYPE_LIST ? var_ref(value) : value;
+    return materialize_deopt_value(type, raw);
 }
 
 int
@@ -15526,18 +15524,47 @@ int
 jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *),
 		     void *data)
 {
+    JITProgram scratch;
+    JITRegionSite *site, **link;
     JITMIRAllocator *allocator;
     MIR_context_t context;
     MIRBuild build;
     FILE *file;
     char line[1024];
-    int release_ir;
+    int release_ir, success = 0;
 
     if (!program || !program->eligible)
 	return 0;
+    /* MIR construction owns mutable metadata, even without code generation.
+     * Borrow the input tables, but never rebuild the installed program's
+     * status locations, region exits, or runtime owner-slot layout.
+     */
+    scratch = *program;
+    scratch.status_locations = 0;
+    scratch.num_status_locations = 0;
+    scratch.value_constant_bits = 0;
+    scratch.constant_value_ids = 0;
+    scratch.value_constants = 0;
+    scratch.num_constant_values = 0;
+    scratch.region_exits = 0;
+    scratch.num_region_exits = scratch.region_exit_capacity = 0;
+    scratch.num_region_exit_values = 0;
+    scratch.region_literals = 0;
+    scratch.num_region_literals = scratch.region_literal_capacity = 0;
+    scratch.num_owned_slots -= scratch.num_region_owned_slots;
+    scratch.num_region_owned_slots = 0;
+    scratch.region_sites = 0;
+    link = &scratch.region_sites;
+    for (site = program->region_sites; site; site = site->next) {
+	*link = mymalloc(sizeof(**link), M_PROGRAM);
+	**link = *site;
+	(*link)->next = 0;
+	link = &(*link)->next;
+    }
+    program = &scratch;
     release_ir = !program->blocks;
     if (release_ir && !jit_program_restore_ir(program))
-	return 0;
+	goto failure;
     allocator = jit_mir_allocator_new();
     if (!allocator)
 	goto failure;
@@ -15569,14 +15596,25 @@ jit_program_dump_mir(JITProgram *program, void (*add_line)(const char *, void *)
     fclose(file);
     MIR_finish(context);
     jit_mir_allocator_free(allocator);
-    if (release_ir)
-	jit_program_release_ir(program, 0);
-    return 1;
+    success = 1;
 
 failure:
+    jit_program_clear_region_exits(program);
+    if (program->status_locations)
+	myfree(program->status_locations, M_PROGRAM);
+    if (program->value_constant_bits)
+	myfree(program->value_constant_bits, M_PROGRAM);
+    if (program->constant_value_ids)
+	myfree(program->constant_value_ids, M_PROGRAM);
+    if (program->value_constants)
+	myfree(program->value_constants, M_PROGRAM);
+    while ((site = program->region_sites)) {
+	program->region_sites = site->next;
+	myfree(site, M_PROGRAM);
+    }
     if (release_ir)
 	jit_program_release_ir(program, 0);
-    return 0;
+    return success;
 }
 
 int

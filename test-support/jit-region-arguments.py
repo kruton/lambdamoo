@@ -90,6 +90,17 @@ lines += [
 lines += [
     ';;for i in [1..40] r=#430:hash(""); endfor return 1;',
     ';jit_pool_rotate()',
+    ';;for i in [1..40] r=#430:hash(""); endfor return 1;',
+    ';jit_pool_rotate()',
+    ';;#430:hash(""); return 1;',
+    ';;before=disassemble(#430,"raw_hash","hir"); spliced=0; '
+    'for x in (before) if (index(x,"spliced=1")) spliced=1; endif endfor '
+    'if (!spliced) return {"FAIL","MIR dump needs stitched regions"}; endif '
+    'for i in [1..3] d=disassemble(#430,"raw_hash","mir"); '
+    'if (!length(d) || !equal(before,disassemble(#430,"raw_hash","hir"))) '
+    'return {"FAIL","MIR dump changed installed metadata"}; endif endfor '
+    'return {"PASS","read-only stitched MIR dump"};',
+    ';;#430:hash(""); return {"PASS","execution after MIR dump"};',
 ]
 for message in ["", "abc", "a" * 55, "a" * 56, "a" * 64, "a" * 1000]:
     expected = hashlib.sha256(message.encode()).hexdigest()
@@ -106,6 +117,7 @@ with tempfile.TemporaryDirectory(prefix="moo-region-arguments-") as directory:
          str(temp / "server.log"), sys.argv[1], str(temp / "output.db"),
          "-p", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sock = None
+    line = "server startup"
     output = ""
     try:
         deadline = time.monotonic() + 90
@@ -131,6 +143,10 @@ with tempfile.TemporaryDirectory(prefix="moo-region-arguments-") as directory:
                 if b"(End of traceback)" in response:
                     raise RuntimeError(response.decode(errors="replace"))
             output += response.decode(errors="replace")
+    except Exception:
+        print("Failed command:", line)
+        print((temp / "server.log").read_text())
+        raise
     finally:
         if sock:
             try:
@@ -143,9 +159,9 @@ with tempfile.TemporaryDirectory(prefix="moo-region-arguments-") as directory:
         except subprocess.TimeoutExpired:
             server.terminate()
             server.wait(timeout=30)
-    if '"FAIL"' in output or output.count('{"PASS",') != len(cases) + 8:
+    if '"FAIL"' in output or output.count('{"PASS",') != len(cases) + 10:
         print(output)
         print((temp / "server.log").read_text())
         raise SystemExit(1)
     print(f"PASS: {len(cases) + 2} stitched argument/receiver/fallback cases, "
-          "6 SHA-256 vectors")
+          "repeated MIR dumps, 6 SHA-256 vectors")

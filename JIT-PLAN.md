@@ -3071,3 +3071,256 @@ both the optimized and separate ASan builds: 125 value comparisons, including
 checks, and one uncatchable quota check. The original optimized-build cleanup
 failure was traced in GDB to the database's `#36` eval wrapper consuming a
 canonical `tostr` result with an empty native owner home.
+
+### 14.12 Fresh performance baseline and next optimization (2026-09-17)
+
+The next performance slice is **lazy reconstruction of fixed scalar argument
+lists used only by stitched calls and exit snapshots**. The current profile
+supports removing allocation and ownership work within existing regions before
+attempting to stitch the complete SHA-256 padding verb. A separately reproduced
+MIR-disassembly correctness bug must be fixed before using live MIR dumps to
+validate that implementation; see the diagnostic prerequisite below.
+
+#### Measurement conditions
+
+The measured source was `ae16f33fa26857ca5b11f433be8c1a193ba66824`, with no
+tracked modifications. `make -j4 moo test-jit test-hir-tac` passed using the
+existing configuration: GCC `-O3 -g`, MIR level 1, Unicode code/core, i64/bq64b,
+XML, all WAIF features, bitwise operators, and threaded BSD/TCP networking.
+The existing hot threshold (32), pool budget (256 MiB), and benchmark verbs
+were preserved. The input database SHA-256 was
+`12fa4b5a6b9fa4bfe3da87692b55dcff97779702769d819ddbba5fcedf5b5ddc`;
+the rebuilt binary SHA-256 was
+`7fbc6baff417684aedd186ab86778353fd77885b8eb3a888c2a61b93303529b0`.
+
+A disposable server read `codepoint.db` and used a temporary output database
+and local port. Live source inspection resolved `#168:test` to `#437:sha1`,
+and `#168:test2` to `#430:hash`, inherited from `#420`. Padding is defined on
+`#500`; bit utilities are `#508`. This database's SHA1 implementation suspends
+once per completed 80-round block, unlike some earlier measurements above.
+The benchmark source was not changed.
+
+Each benchmark had two discarded warm-ups, then five unprofiled measurements
+with detailed JIT counters disabled. Timings are the existing verbs' `ftime()`
+results; all samples, including the slow SHA1 sample, are retained.
+
+| Benchmark | Discarded warm-ups (seconds) | Five steady samples (seconds) | Median |
+| --- | --- | --- | ---: |
+| `test(300000)` | 11.269134, 10.414792 | 10.230657, 11.007516, 15.680360, 11.246870, 10.812432 | 11.007516 s |
+| `test2(3000)` | 2.348306, 0.721211 | 0.677241, 0.668231, 0.652484, 0.673551, 0.681068 | 0.673551 s |
+
+HIR inspection before and after those samples showed identical region target
+states: the four sigma sites, `Ch`, `Maj`, and `words_to_bebytes` were stitched
+in `raw_hash`, while padding was not. No pool rotation was pending. These are
+new baselines, not an A/B comparison with the historical 0.585020-second result.
+Six SHA-256 vectors (empty, `abc`, and 55, 56, 64, and 1000 `a` characters)
+and the empty-input SHA1 digest matched Python's hashlib, allowing the existing
+uppercase SHA-256 presentation.
+
+#### Profiles and diagnostic counters
+
+Separate `perf record -F 199 -e cycles:u --call-graph dwarf,8192` captures
+attached to the warmed disposable server. SHA-256 ran 22 benchmark invocations
+within a 25-second capture (3,279 samples); SHA1 ran two within a 35-second
+capture (4,396 samples). Each workload executed for more than ten seconds.
+Both captures had zero lost samples and used `jit_perf_map(1)` native symbols.
+Profiled timings are excluded from the baseline.
+
+| Self-time category or symbol | SHA1 | SHA-256 |
+| --- | ---: | ---: |
+| Main generated hash body | 21.24% | 19.46% |
+| `malloc` + `_int_malloc` + `cfree` | 10.63% | 14.43% |
+| `complex_free_var` | 2.09% | 4.56% |
+| `db_find_property` | 2.65% | 7.69% |
+| `jit_program_execute_in_context` | 7.23% | 2.11% |
+| `jit_continuation_capture` | 4.81% | 1.71% |
+| Interpreter `run` | 1.53% | 2.71% |
+
+These are exclusive self-time percentages, not additive inclusive call-tree
+totals. The three allocator symbols are only part of allocation overhead.
+SHA-256 also spends 4.88% in `jit_rt_region_guard`, 1.96% in
+`jit_rt_get_prop_obj`, 1.94% in `jit_rt_owned_replace`, and 1.95% in
+`jit_rt_discard_owned`. Within `malloc` self-time, 3.63 percentage points of the
+whole capture have `jit_rt_make_fixed_list_head` on the call stack and another
+1.10 points have `jit_rt_make_singleton_list`. This gives a concrete allocation
+target. Property lookup is another substantial candidate, but caching or
+hoisting it needs an independent proof for permissions and mutable state.
+
+SHA1 retains a different bottleneck mix: compact-call entry, continuation
+capture, and string allocation in `intToHex`. Its profile attributes 1.53
+percentage points of total samples to `malloc` under `jit_rt_str_ref` and
+2.03 points to `_int_malloc` under string concatenation. The SHA-256 allocation
+slice must therefore retain SHA1 as a regression workload, not promise the
+same improvement for both hashes.
+
+A fresh disposable session collected detailed counters after warm-up, without
+MIR disassembly. For one `test(300000)`, SHA1 recorded 300,000 completions,
+300,000 VM crossings, 1,800,000 continuation captures/resumes, and 1,800,000
+compact calls/returns; `intToHex` completed 1,500,000 times. SHA1 had zero
+deoptimizations. For one `test2(3000)`, padding completed 3,000 times and made
+6,000 compact calls to `$list_utils:make`. `raw_hash` recorded 3,000 completions,
+14,998 VM crossings/captures, and 3,000 promotions. Its cumulative deopt counter
+was two; that counter includes warm-up, so this run does not establish a
+zero-deopt steady-state claim. All inspected verbs had zero retained runtime,
+continuation, and native-frame bytes after completion. Detailed-run timings
+are not baseline samples.
+
+#### Padding admission audit
+
+Padding is a broader change than enabling one list store. Its restored HIR has
+221 values, 18 blocks, and 255 instructions, versus the region candidate's
+128-instruction limit. `jit_region_leaf_visit()` explicitly rejects its
+`suspend` call at bytecode PC 154 and indexed writes at PCs 232, 244, and 265;
+the latter is the nested `Mp[$][$] = l` update. The two `make` call sites also
+report ineligible targets. The region importer has no indexed-write lowering,
+and its list-view rules reject slicing a virtual slice, as padding does with
+`block = M[s..s+63]` followed by `word = block[s..s+3]`. There is no range-write
+instruction in this padding verb. All restored source lines currently report
+line 1, so PCs and source expressions are the useful audit identifiers.
+
+Padding's generated body is 0.95% self-time in the SHA-256 capture; this excludes
+its allocation and other helpers and is not a bound on total padding cost.
+Nevertheless, the measured fixed-list allocation path is a smaller, more
+directly supported next optimization than broadening all these admission rules.
+
+#### Selected implementation slice
+
+Extend Section 14.9's virtualization to fixed integer argument lists inside
+regions whose only additional uses are caller or exact-exit snapshots.
+`jit_region_cfg_value_uses()` currently counts those snapshot references, and
+`jit_region_cfg_virtualize_list()` consequently retains their allocation.
+Regenerated MIR for the sigma regions still contains two-element
+`jit_rt_make_fixed_list_head` calls and owner publication before nested dispatch
+guards. The existing outer-call optimization also defers only the final tail,
+but generalizing outer argument construction is a separate follow-up.
+
+* Add a compiler-owned fixed-list recovery recipe to region snapshot/exit
+  metadata. It records ordered integer element sources and a virtual aggregate
+  identity; constants remain immediate and nonconstant elements remain live in
+  exact-exit storage. Keep ordinary materialized-value sources intact.
+* Admit only uninterrupted fixed construction chains with no aggregate use
+  except the stitched call and reconstruction snapshots. Reject observable
+  indexing, returns, stores, identity-sharing outside the recipe, complex
+  elements, and unproved availability. Do not increase region size/depth limits.
+* Omit admitted list allocation, append, owner-home reservation, and cleanup
+  from the successful region path. On a dispatch/tag miss or exact side exit,
+  reconstruct the required list or construction prefix once per virtual
+  identity, then use ordinary reference transfers for multiple snapshot uses.
+  Preserve exact PCs, ticks, quota/error behavior, and post-effect state; never
+  replay completed effects to reconstruct arguments.
+* Verify dominance and initialized scalar sources for every recipe, retain its
+  deoptimization liveness, account for metadata/storage, and release recipes
+  with the owning program. Database persistence and public builtins stay
+  unchanged.
+* Test hot success without the allocation, dispatch invalidation, wrong tags,
+  nested exact exits, prefix reconstruction, tick/timeout exits, shared snapshot
+  references, and conservative rejection of escaping or complex-element lists.
+  Run JIT/HIR tests, live region/builtin comparisons and SHA vectors, then the
+  relevant separate test suite and an isolated ASan build. Compare matching
+  baseline/candidate builds with alternating run order and at least five warm
+  sample pairs; require consistent runtime improvement and reduced allocation
+  cost without a SHA1 regression or new semantic failures.
+
+#### Diagnostic prerequisite: MIR dumps mutate live region metadata
+
+After all primary timings, profiles, and digest checks, dumping `raw_hash` MIR
+and running `test2` again aborted. A second disposable session reproduced the
+failure with detailed profiling disabled: warm `test2`, evaluate
+`length(disassemble(#430, "raw_hash", "mir"))`, then run `test2(3000)`.
+Debugger attachment stopped in `abort` through `malloc_printerr`, reached while
+allocating the padding callee's native runtime.
+
+The paused caller was `#430:raw_hash` with `num_owned_slots=28` and
+`num_region_owned_slots=24`, but its published layout still had
+`owned_offset=6560`, `capacities_offset=6816`, `states_offset=6880`, and
+`bytes=6896`: space for only 16 complete 16-byte `Var` homes and 16 capacity/state
+entries. `jit_program_dump_mir()` invokes `build_mir()` on the live program;
+region owner assignment increments its slot counts while the published runtime
+layout remains unchanged. Native-entry initialization then uses the enlarged
+count against the old layout. This is a correctness prerequisite, not a
+performance result.
+
+Make MIR inspection use isolated compilation metadata before relying on it for
+further live validation. Merely recomputing the layout after a dump is
+insufficient: installed native code and suspended continuations still use the
+original offsets, exit IDs, and ownership layout. Add a regression which warms
+a region-heavy verb, dumps MIR repeatedly, and verifies unchanged live metadata,
+digest results, suspension/resumption, and cleanup under ASan. No compiler fix
+was made during this measurement milestone.
+
+Raw artifacts are retained in `/tmp/jit-next-MDV76N/`: `metadata.json` records
+source/configuration/checksums, `responses.json` records the full command/output
+transcript, and `summary.json` contains unrounded baseline samples. The two
+`*.perf.data` files, `perf-918623.map`, and self/flat reports retain profiling
+evidence. `diagnostic/counters.json` and `diagnostic/debugger-*.json` retain
+the independent counter results and failure evidence. Both disposable server
+processes exited; the original input database and benchmark source were
+unchanged.
+
+### 14.13 Read-only MIR inspection (2026-09-17)
+
+The correctness prerequisite identified in 14.12 is addressed by building MIR
+against a scratch `JITProgram`. Input IR and immutable analysis tables are
+borrowed; missing IR is restored only into the scratch program. Status
+locations, scalar constant tables, region exits/literals, and region-site
+records are private to the dump and released afterward. Region owner allocation
+starts from the original non-region owner count. Installed native code, runtime
+offsets, exit IDs, ownership counts, and specialization markers are unchanged.
+
+Regression coverage includes byte-for-byte program metadata checks before
+compilation and after repeated compiled dumps, plus a disposable Codepoint
+server which warms stitched SHA-256 regions, dumps MIR three times, checks HIR
+metadata, executes the benchmark again, and verifies six digest vectors.
+Focused JIT/HIR tests and live checks pass in both the normal build and a
+separate AddressSanitizer build with matching feature options.
+The configured `make test` suite also passes all four tests.
+Linking the new unit tests against the pre-fix `jit.c` fails the pending and
+installed metadata checks, confirming that the regression detects the old bug.
+
+One early normal-build live run disconnected without a retained server log;
+subsequent normal runs and the sanitizer run passed. The harness now prints the
+failed command and server log on exceptions so a recurrence can be diagnosed.
+This fix makes no performance-path optimization; the allocation work proposed
+in 14.12 remains the next performance milestone.
+
+### 14.14 Fixed-list recovery safety gate and exact-exit fix (2026-09-18)
+
+An implementation of 14.12's fixed integer-list recovery recipes removed the
+targeted allocations, but repeated optimized-build testing exposed an invalid
+activation state during exact-exit cleanup. A suspended 1,000-byte SHA-256 run
+intermittently reached `free_rt_env()` with a `TYPE_LIST` value whose payload
+was null; other reproductions reached double-free detection. AddressSanitizer
+did not reproduce the optimized-build failure reliably. The allocation-elision
+changes were therefore removed rather than retained behind an incomplete
+admission rule.
+
+Crucially, the same suspended-task failure then reproduced with the complete
+recipe change removed. It is therefore not attributable to list recovery. The
+stress case has exposed a pre-existing stitched-region or exact-exit problem
+which the earlier shorter validation happened not to reproduce consistently.
+A debugger stopped in `complex_free_var()` while unwinding the timed-out
+`raw_hash` activation; the value was tagged `TYPE_LIST` but carried a null list
+pointer. A general dominance check over snapshot values did not prevent the
+failure and was also removed.
+
+The invalid value came from an inconsistency in exact-exit reconstruction.
+Ordinary continuation materialization already maps a null raw string/list
+payload to `TYPE_NONE`, but `jit_region_exit_materialized_scalar()` constructed
+the requested static type directly and then retained it. A null snapshot slot
+therefore became an invalid `TYPE_LIST` with a null payload. Exact exits now use
+the ordinary ownership-aware materializer, preserving its null-complex handling
+as well as its existing string/list retention and float boxing behavior.
+
+A focused regression reconstructs a null list snapshot into both a local and
+operand-stack slot and verifies that both become `TYPE_NONE`. The live harness
+now performs a second warm/rotate cycle before asserting that `raw_hash` is
+stitched, avoiding a false failure when the first post-rotation compilation
+only gathers region-site heat. Focused JIT/HIR tests pass, and three consecutive
+optimized live runs passed repeated rotations, repeated MIR dumps, execution
+after each dump, and all six SHA-256 vectors without activation corruption.
+
+The fixed-list recipe changes remain reverted. With the baseline exact-exit
+bug fixed, 14.12's allocation-elision slice is again the next performance step.
+Its reimplementation must still require every virtual aggregate in every
+registered exit frame to be reconstructed rather than emitted through an
+ordinary, potentially absent region slot.
