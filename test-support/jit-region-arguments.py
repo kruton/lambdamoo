@@ -60,6 +60,28 @@ for label, source, warm, inputs in cases:
         'endfor return {"PASS",' + json.dumps(label) + '};',
     ]
 lines.insert(2, ';add_property(#0,"__region_arg_expected",{},{player,"rw"})')
+for name, source in [
+    ("__region_table", "t={}; for i in [0..255] t={@t,i}; endfor return t;"),
+    ("__region_lookup", "{b,t}=args; r=0; for c in (b) r=t[c+1]; endfor return r;"),
+    ("__region_one", "return 1;"),
+    ("__region_nested", "return {this:__region_lookup(args[1],this:__region_table())};"),
+    ("__region_sibling", "return {this:__region_one(),this:__region_lookup(args[1],this:__region_table())};"),
+]:
+    lines += [
+        ';add_verb(#0,{player,"rxd",' + json.dumps(name) + '},{"this","none","this"})',
+        ';set_verb_code(#0,' + json.dumps(name) + ',{' + json.dumps(source) + '})',
+    ]
+for name, expected in [("__region_nested", "{8}"), ("__region_sibling", "{1,8}")]:
+    # Separate tasks exercise compact resume before and after pool rotation;
+    # a single warming loop would leave the wrapper interpreted throughout.
+    for iteration in range(120):
+        lines.append(';;r=#0:' + name + '({1,2,3,4,5,6,7,8}); '
+                     'if (!equal(r,' + expected + ')) return {"FAIL","nested arguments",'
+                     + str(iteration + 1) + ',r}; endif return 1;')
+    lines.append(';;spliced=0; for x in (disassemble(#0,' + json.dumps(name) +
+                 ',"hir")) if (index(x,"spliced=1")) spliced=1; endif endfor '
+                 'if (!spliced) return {"FAIL","nested call not stitched"}; endif '
+                 'return {"PASS",' + json.dumps(name) + '};')
 lines += [
     ';add_property(#0,"__region_arg_receiver",#1,{player,"rw"})',
     ';add_property(#1,"__region_arg_bias",1,{player,"rw"})',
@@ -159,9 +181,9 @@ with tempfile.TemporaryDirectory(prefix="moo-region-arguments-") as directory:
         except subprocess.TimeoutExpired:
             server.terminate()
             server.wait(timeout=30)
-    if '"FAIL"' in output or output.count('{"PASS",') != len(cases) + 10:
+    if '"FAIL"' in output or output.count('{"PASS",') != len(cases) + 12:
         print(output)
         print((temp / "server.log").read_text())
         raise SystemExit(1)
-    print(f"PASS: {len(cases) + 2} stitched argument/receiver/fallback cases, "
+    print(f"PASS: {len(cases) + 4} stitched argument/receiver/fallback cases, "
           "repeated MIR dumps, 6 SHA-256 vectors")

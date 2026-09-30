@@ -7001,6 +7001,17 @@ append_region_cfg_call(MIRBuild *build, JITProgram *program,
     append_region_cfg_dependency_guards(build, &region, values[call->src1],
 	receiver_type, receiver_class, dispatch_epoch, cold, copy_serial);
 
+    /* Flattening a fixed argument list introduces uses of its elements that
+       are absent from ordinary SSA liveness.  An earlier call may resume with
+       only the list, not the registers used to construct it.  Reload those
+       elements from the surviving list before entering the region.  A deferred
+       tail's final element is still live at the adjacent call. */
+    for (operand = 0; operand < argument_count - (deferred_tail != 0);
+	 operand++)
+	append_resume_value(build, program, values, arguments[operand],
+	    values[deferred_tail ? deferred_tail->src1 : call->src3],
+	    operand + 1, deopt_values, copy_serial);
+
     memset(guarded_arguments, 0, sizeof(guarded_arguments));
     for (node = 0; node < region.num_values; node++)
 	if (region.values[node].kind == JIT_REGION_VALUE_ARGUMENT
