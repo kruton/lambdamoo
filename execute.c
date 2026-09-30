@@ -1984,12 +1984,16 @@ do {								\
 	    } else if (jit_result == JIT_RUN_ABORT_TICKS) {
 		bv = bc.vector + source_location.bytecode_pc;
 		error_bv = bc.vector + source_location.error_pc;
+		if (deopt.materialized)
+		    rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
 		STORE_STATE_VARIABLES();
 		abort_task(ABORT_TICKS);
 		return OUTCOME_ABORTED;
 	    } else if (jit_result == JIT_RUN_ABORT_SECONDS) {
 		bv = bc.vector + source_location.bytecode_pc;
 		error_bv = bc.vector + source_location.error_pc;
+		if (deopt.materialized)
+		    rts = RUN_ACTIV.base_rt_stack + deopt.stack_depth;
 		STORE_STATE_VARIABLES();
 		abort_task(ABORT_SECONDS);
 		return OUTCOME_ABORTED;

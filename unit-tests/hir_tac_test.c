@@ -2104,7 +2104,7 @@ test_deopt_live_if_else_local_keeps_phi(void)
     check_int("deopt-live ifelse local phi count",
 	      hir_ssa_count_kind(ssa, HIR_TAC_PHI), 1);
     check_int("deopt-live ifelse materialization snapshots",
-	      hir_ssa_local_snapshot_count(ssa), 2);
+	      hir_ssa_local_snapshot_count(ssa), 7);
     check_int("deopt-live ifelse local verify errors",
 	      hir_context_error_count(ctx), 0);
 
@@ -4095,7 +4095,7 @@ test_repeated_local_assignment_ssa(void)
     check_int("repeat assign ssa stores",
 	      hir_ssa_count_kind(ssa, HIR_TAC_STORE_LOCAL), 0);
     check_int("repeat assign materialization snapshots",
-	      hir_ssa_local_snapshot_count(ssa), 0);
+	      hir_ssa_local_snapshot_count(ssa), 6);
     check_int("repeat assign verify errors", hir_context_error_count(ctx), 0);
 
     hir_context_free(ctx);

@@ -3452,11 +3452,13 @@ append_status_exits(MIRBuild *build, JITStatusExit *exit,
 	    append(build, MIR_new_insn(build->context, MIR_JMP,
 		MIR_new_label_op(build->context,
 		    labels[program->deopt_maps[exit->deopt_map].native_error_block])));
-	else if (exit->status == JIT_RUN_ERROR && exit->deopt_map > 0
+	else if ((exit->status == JIT_RUN_ERROR
+		  || exit->status == JIT_RUN_ABORT_TICKS
+		  || exit->status == JIT_RUN_ABORT_SECONDS) && exit->deopt_map > 0
 	    && exit->deopt_map < program->num_deopt_maps)
 	    append_materialized_exit(build, program, exit->deopt_map, values,
 		deopt_map_out, deopt_values, status, common_return,
-		JIT_RUN_ERROR);
+		exit->status);
 	else
 	    return_shared_status(build, exit->status);
 	myfree(exit, M_PROGRAM);
@@ -8283,10 +8285,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 
 			tick_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
-			    -1, instr->bytecode_pc, instr->source_lineno);
+			    instr->deopt_map, instr->bytecode_pc,
+			    instr->source_lineno);
 			seconds_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
-			    -1, instr->bytecode_pc, instr->source_lineno);
+			    instr->deopt_map, instr->bytecode_pc,
+			    instr->source_lineno);
 			batch_exit->label = MIR_new_label(build->context);
 			batch_exit->tick_abort = tick_abort;
 			batch_exit->seconds_abort = seconds_abort;
@@ -8320,10 +8324,12 @@ build_mir(JITProgram *program, MIRBuild *build, MIR_context_t context)
 		    if (instr->op != HIR_OP_CHARGE_TICK) {
 			tick_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_TICKS, E_NONE,
-			    -1, instr->bytecode_pc, instr->source_lineno);
+			    instr->deopt_map, instr->bytecode_pc,
+			    instr->source_lineno);
 			seconds_abort = new_status_exit(build, &status_exits,
 			    &last_status_exit, JIT_RUN_ABORT_SECONDS, E_NONE,
-			    -1, instr->bytecode_pc, instr->source_lineno);
+			    instr->deopt_map, instr->bytecode_pc,
+			    instr->source_lineno);
 		    }
 		    append(build, MIR_new_insn(build->context, MIR_SUB,
 						  MIR_new_reg_op(build->context,
@@ -15148,7 +15154,9 @@ jit_program_execute_in_context(JITProgram *program,
     if (native_result == JIT_RUN_FALLBACK
 	|| native_result == JIT_RUN_CALL_VERB
 	|| native_result == JIT_RUN_REGION_EXIT
-	|| (native_result == JIT_RUN_ERROR && deopt_map >= 0)) {
+	|| ((native_result == JIT_RUN_ERROR
+	     || native_result == JIT_RUN_ABORT_TICKS
+	     || native_result == JIT_RUN_ABORT_SECONDS) && deopt_map >= 0)) {
 	JITDeoptMap *map;
 	Var *stack_values = 0;
 	unsigned materialized_depth;

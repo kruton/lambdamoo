@@ -7453,6 +7453,40 @@ test_typed_deopt_materialization(void)
     Var inputs[4];
     int i;
 
+    /* Abort snapshots must retain complex locals and stack values, including
+       on the batched slow path used by recursive native call chains. */
+    for (i = 0; i < 4; i++) {
+	JITProgram *program = typed_deopt_program(TYPE_LIST, 1);
+	JITInstruction *tick = program->blocks->last;
+	JITDeoptState deopt;
+	Var input = new_list(1);
+	Var stack[1];
+	Var result;
+	int ticks = i < 2 ? 1 : 10;
+	int timed_out = i >= 2;
+	enum error error = E_NONE;
+
+	input.v.list[1].type = TYPE_INT;
+	input.v.list[1].v.num = 42;
+	tick->kind = HIR_TAC_TICK;
+	tick->op = 0;
+	tick->tick_batch_count = i % 2 ? 3 : 1;
+	check(jit_program_execute(program, &input, &result, &ticks,
+				  &timed_out, &error, 0, &deopt, stack)
+	      == (i < 2 ? JIT_RUN_ABORT_TICKS : JIT_RUN_ABORT_SECONDS),
+	      "tick snapshot returned the wrong abort status");
+	check(deopt.map_id == 1 && deopt.materialized
+	      && deopt.stack_depth == 1 && deopt.bytecode_pc == 71,
+	      "tick abort lost its recovery map");
+	check(stack[0].type == TYPE_LIST
+	      && stack[0].v.list[1].v.num == 42
+	      && input.type == TYPE_LIST && input.v.list[1].v.num == 42,
+	      "tick abort lost its complex stack value or local");
+	free_var(stack[0]);
+	free_var(input);
+	jit_program_free(program);
+    }
+
     inputs[0].type = TYPE_ERR;
     inputs[0].v.err = E_INVARG;
     inputs[1].type = TYPE_OBJ;

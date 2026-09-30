@@ -2054,6 +2054,7 @@ static int
 hir_kind_can_materialize(HIRTacKind kind)
 {
     switch (kind) {
+    case HIR_TAC_TICK:
     case HIR_TAC_DEOPT:
     case HIR_TAC_GUARD_TYPE:
     case HIR_TAC_LOAD_LOCAL:
@@ -5273,6 +5274,8 @@ jit_instruction_exit_mask(JITInstruction *instr, int16_t *value_types,
     if (!jit_instr_can_materialize(instr))
 	return JIT_EXIT_NONE;
     switch (instr->kind) {
+    case HIR_TAC_TICK:
+	return instr->op == HIR_OP_CHARGE_TICK ? JIT_EXIT_NONE : JIT_EXIT_DEOPT;
     case HIR_TAC_LOAD_LOCAL:
 	return instr->value > 0 && instr->value < num_values
 	    && value_is_tagged && value_is_tagged[instr->value]
